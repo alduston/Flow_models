@@ -1,0 +1,20 @@
+# Core scientific computing
+numpy>=1.21.0
+scipy>=1.7.0
+
+# Machine learning frameworks
+torch>=1.12.0
+torchvision>=0.13.0
+
+# GPU acceleration (optional - requires CUDA)
+cupy-cuda12x>=10.0.0  # For CUDA 12.x
+# Alternative for CUDA 11.x: cupy-cuda11x>=10.0.0
+
+# Data analysis and visualization
+matplotlib>=3.5.0
+scikit-learn>=1.0.0
+
+# Standard library dependencies (usually included with Python)
+# dataclasses (Python 3.7+)
+# typing (Python 3.5+)
+# itertools, functools, math, time, os, re, glob, shutil, subprocess, sys, pathlib, logging, contextlib, ctypes
