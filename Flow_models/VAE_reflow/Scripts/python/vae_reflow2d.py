@@ -732,7 +732,7 @@ class AVRCConfig2D:
 
     # === NEW: periodic “fresh RF on current coupling” probe ====================
     test_rf_every: int = 10              # run probe every this many rounds
-    test_rf_steps: int = 10000         # RF training iters
+    test_rf_steps: int = 25000         # RF training iters
     test_rf_batch: int = 2048
     test_rf_lr: float = 1e-3
     test_rf_clip: float = 1.0
@@ -812,25 +812,34 @@ def _disp_metrics_vec(pred: torch.Tensor, ell: torch.Tensor):
     nmse = float((resid2/(ell2+eps)).mean().detach().cpu())
     return {"mse": mse, "nmse": nmse}
 
+
 def train_rectified_flow_on_pairs_2d(make_pairs_fn,
                                      steps=10_000, batch=2048, lr=1e-3, clip=1.0,
-                                     hidden=128, depth=4, log_every=200, seed=None):
-    """
-    Generic RF trainer on arbitrary pair generator:
-      make_pairs_fn(B) -> (x0, x1), both (B,2) tensors on device.
-    """
+                                     hidden=128, depth=4, log_every=200, seed=None,
+                                     midpoints_K: int | None = None,
+                                     weight_decay: float = 0.0):
     if seed is not None:
+        # preserve global RNG state to avoid side-effects
+        torch_state = torch.random.get_rng_state()
+        np_state = np.random.get_state()
         torch.manual_seed(seed); np.random.seed(seed)
+
     Vx = VelocityX2D(hidden=hidden, depth=depth).to(device)
-    opt = torch.optim.Adam(Vx.parameters(), lr=lr, betas=(0.9,0.99))
+    opt = torch.optim.Adam(Vx.parameters(), lr=lr, betas=(0.9,0.99),
+                           weight_decay=weight_decay)
     t0 = time.time()
     for it in range(1, steps+1):
-        x0, x1 = make_pairs_fn(batch)                 # endpoints
-        t  = torch.rand(batch,1, device=device, dtype=TDTYPE)
-        xt = (1.0 - t)*x0 + t*x1
-        ell= (x1 - x0).detach()
-        pred = Vx(xt, t)
-        loss = F.mse_loss(pred, ell)
+        x0, x1 = make_pairs_fn(batch)
+        if midpoints_K is None:
+            t = torch.rand(batch,1, device=device, dtype=TDTYPE)
+        else:
+            idx = torch.randint(midpoints_K, (batch,), device=device)
+            t = ((idx + 0.5)/float(midpoints_K)).view(batch,1).type_as(x0)
+
+        xt  = (1.0 - t)*x0 + t*x1
+        ell = (x1 - x0).detach()
+        pred= Vx(xt, t)
+        loss= F.mse_loss(pred, ell)
         opt.zero_grad(set_to_none=True); loss.backward()
         nn.utils.clip_grad_norm_(Vx.parameters(), clip); opt.step()
         if (it % log_every) == 0:
@@ -838,8 +847,12 @@ def train_rectified_flow_on_pairs_2d(make_pairs_fn,
             print(f"[fresh-RF] step {it}/{steps}  loss={float(loss):.4f}  NMSE={dm['nmse']:.4f}  (+{time.time()-t0:.1f}s)")
             t0 = time.time()
 
+    if seed is not None:
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+
     @torch.no_grad()
-    def sampler(n: int, nfe: int, init="gauss", enc: nn.Module | None = None, fuzz_eps: float = 1e-2):
+    def sampler(n: int, nfe: int, init="gauss", enc=None, fuzz_eps=1e-2):
         x = sample_init_points(n, init, enc=enc, eps=fuzz_eps)
         dt = 1.0/float(max(nfe,1))
         for i in range(nfe):
@@ -1374,7 +1387,7 @@ class AVRC2D:
         self.device =  "cuda" if torch.cuda.is_available() else "cpu"
         print(f'Training on {self.device}')
         self._disp_scale0 = None   # locked y-axis anchor from dispersion at t=0 (first frame)
-
+        self.round_idx = 0
 
     @torch.no_grad()
     def _init_crossings_subset(self):
@@ -1450,15 +1463,17 @@ class AVRC2D:
         # 1) Train a fresh RF on the CURRENT coupling pairs
         Vx, rf_sampler = train_rectified_flow_on_pairs_2d(
             make_pairs_fn=self._make_pairs_encoder_current(),
-            steps=self.cfg.test_rf_steps,
-            batch=self.cfg.test_rf_batch,
+            steps= self.cfg.pretrain_steps,           # ↑ more than 10k
+            batch=self.cfg.batch,                                  # match V’s batch (4096)
             lr=self.cfg.test_rf_lr,
             clip=self.cfg.test_rf_clip,
-            hidden=self.cfg.test_rf_hidden,
-            depth=self.cfg.test_rf_depth,
-            log_every=self.cfg.test_rf_log_every,
+            hidden=self.cfg.vel_hidden, depth=self.cfg.vel_depth,  # match V’s nets
+            log_every=5000,
             seed=self.cfg.test_rf_seed,
+            midpoints_K=(self.cfg.critic_match_rf_K or self.cfg.recon_k),
+            weight_decay=self.cfg.critic_weight_decay              # match V’s decay
         )
+
 
         # 2) Build a sampler for the CURRENT velocity field V with the SAME interface
         v_sampler = make_current_V_sampler(self.V)
@@ -1764,7 +1779,8 @@ class AVRC2D:
         self.opt_enc.step()
         # Apply optional encoder LR decay (default 1.0 = no decay)
         decay = getattr(self.cfg, "enc_lr_decay", 1.0)
-        if decay != 1.0:
+        post_anneal_idx = self.round_idx - ( self.cfg.rounds - self.cfg.post_anneal_rounds)
+        if decay != 1.0 and post_anneal_idx > 0:
             for g in self.opt_enc.param_groups:
                 g['lr'] *= decay
 
@@ -1929,7 +1945,7 @@ class AVRC2D:
                     f"FlowRecon@K={self.cfg.recon_k} MSE≈{recon_mse:.5f}"
                 )
                 t0 = time.time()
-
+            self.round_idx += 1
 
     # ------------------------------ critic rounds ------------------------------
     def _critic_round_adaptive(self):
@@ -2015,20 +2031,45 @@ def batch_dispersion_metrics(pred: torch.Tensor, ell: torch.Tensor, t: torch.Ten
     nmse = mse / (torch.mean((ell**2).sum(dim=1)) + eps)
     return {"mse": float(mse.detach().cpu()), "nmse": float(nmse.detach().cpu())}
 
-def train_rectified_flow_2d(steps=10000, batch=2048, lr=1e-3, clip=1.0, log_every=200,
-                            hidden=128, depth=4, small_t_gamma: float | None = None):
+
+def train_rectified_flow_2d(
+    steps=10000, batch=2048, lr=1e-3, clip=1.0, log_every=200,
+    hidden=128, depth=4, small_t_gamma: float | None = None,
+    *,                 # ---- new kwargs below (all optional; keep BC) ----
+    midpoints_K: int | None = None,        # None -> Uniform[0,1] (old behavior)
+    weight_decay: float = 0.0,             # match V’s decay (e.g., 1e-5)
+    seed: int | None = None                # reproducible w/o poisoning global RNG
+):
     """
-    Standard RF: x0~N(0,I), x1~p*, t~U(0,1), x_t=(1-t)x0+t x1, target ℓ=x1-x0.
+    Standard RF on independent coupling:
+      x0 ~ N(0,I), x1 ~ p*, x_t = (1-t)x0 + t x1, target ℓ = x1 - x0.
+    If `midpoints_K` is set, train exactly at RF midpoints t=(i+0.5)/K to match
+    your V head’s training/evaluation grid.
     """
+    # ---- preserve & set RNG if requested (prevents global side-effects) ----
+    if seed is not None:
+        torch_state = torch.random.get_rng_state()
+        np_state    = np.random.get_state()
+        torch.manual_seed(seed); np.random.seed(seed)
+
     Vx = VelocityX2D(hidden=hidden, depth=depth).to(device)
-    opt = torch.optim.Adam(Vx.parameters(), lr=lr, betas=(0.9,0.99))
+    opt = torch.optim.Adam(Vx.parameters(), lr=lr, betas=(0.9, 0.99),
+                           weight_decay=weight_decay)
+
     for it in range(1, steps+1):
         x0, x1, _ = make_pairs_random(batch)
-        t  = torch.rand(batch,1, device=device, dtype=TDTYPE)
-        xt = (1.0 - t)*x0 + t*x1
-        ell= (x1 - x0).detach()
+
+        if midpoints_K is None:
+            t  = torch.rand(batch, 1, device=device, dtype=TDTYPE)          # old behavior
+        else:
+            idx = torch.randint(midpoints_K, (batch,), device=device)
+            t   = ((idx + 0.5) / float(midpoints_K)).view(batch, 1).type_as(x0)
+
+        xt  = (1.0 - t) * x0 + t * x1
+        ell = (x1 - x0).detach()
         pred = Vx(xt, t)
         loss = F.mse_loss(pred, ell)
+
         opt.zero_grad(set_to_none=True); loss.backward()
         nn.utils.clip_grad_norm_(Vx.parameters(), clip); opt.step()
 
@@ -2041,6 +2082,11 @@ def train_rectified_flow_2d(steps=10000, batch=2048, lr=1e-3, clip=1.0, log_ever
                 extra = f"  wNMSE((1-t)^{small_t_gamma})={float(wn):.4f}"
             print(f"[RF] step {it}/{steps}  loss={float(loss):.4f}  NMSE={disp['nmse']:.4f}{extra}")
 
+    # ---- restore RNG states if we changed them ----
+    if seed is not None:
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
+
     @torch.no_grad()
     def rf_sampler(n: int, nfe: int):
         x = torch.randn(n, 2, device=device, dtype=TDTYPE)
@@ -2049,7 +2095,9 @@ def train_rectified_flow_2d(steps=10000, batch=2048, lr=1e-3, clip=1.0, log_ever
             t = torch.full((n,1), (i+0.5)*dt, device=device, dtype=TDTYPE)
             x = x + dt * Vx(x, t)
         return x
+
     return Vx, rf_sampler
+
 
 
 # In[32]:
@@ -2469,7 +2517,7 @@ def main1(target = "checker"):
         viz_camera = (10, -40),
         lam_disp_start=1.0, lam_disp_end=1.0,
         lam_align_start=0.0, lam_align_end=1.0,
-        enc_lr_decay=0.99,
+        enc_lr_decay=.975,
         viz_latent = True,
     ))
     avrc.train(progress=True, seed=0)
@@ -2478,7 +2526,17 @@ def main1(target = "checker"):
     # 2) Train STANDARD Rectified Flow baseline (2D)
     print("[main] training Rectified Flow baseline...")
     rf_model, rf_sampler = train_rectified_flow_2d(
-        steps=10000, batch=4096, lr=1e-3, clip=1.0, log_every=300, hidden=128, depth=4
+        steps= avrc.cfg.pretrain_steps,                  # give it real budget
+        batch=avrc.cfg.batch,                                        # match V’s batch
+        lr=1e-3,
+        clip=1.0,
+        log_every=5000,
+        hidden=avrc.cfg.vel_hidden,                                  # match capacity
+        depth=avrc.cfg.vel_depth,
+        # ---- new fairness knobs ----
+        midpoints_K=(avrc.cfg.critic_match_rf_K or avrc.cfg.recon_k),# same t-grid
+        weight_decay=avrc.cfg.critic_weight_decay,                   # same L2/decay
+        seed=avrc.cfg.test_rf_seed                                   # reproducible & isolated
     )
     print("[main] RF baseline trained.")
 
@@ -3313,6 +3371,5 @@ if __name__ == "__main__":
         print("[warn] Could not parse --examples, using defaults.")
         examples = ['checker', '8g', 'spiral', 'moons', 'rings', 'scurve', 'pinwheel']
     meta_run_examples(examples)
-
 
 
