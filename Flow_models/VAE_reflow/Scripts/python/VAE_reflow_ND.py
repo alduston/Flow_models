@@ -2665,10 +2665,18 @@ import os, re, glob, shutil, subprocess, sys
 from pathlib import Path
 
 def numeric_key(path: str):
-    """Sort by the last number in the basename; fallback to name for ties."""
+    import os, re
     base = os.path.basename(path)
-    m = re.search(r'(\d+)(?!.*\d)', base)  # last run of digits
-    return (int(m.group(1)) if m else float('inf'), base.lower())
+    # match patterns like cross_00010.png or cross_00010_p01.png
+    m = re.search(r'_(\d+)(?:_p(\d+))?\.png$', base)
+    if m:
+        round_num = int(m.group(1))
+        proj_num  = int(m.group(2)) if m.group(2) is not None else -1
+        return (round_num, proj_num, base.lower())
+    # generic fallback: first number, then name
+    nums = re.findall(r'(\d+)', base)
+    return (int(nums[0]) if nums else float('inf'), -1, base.lower())
+
 
 def ensure_dir(p: Path):
     if p.exists():
@@ -2727,12 +2735,11 @@ from pathlib import Path
 import numpy as np
 
 def encode_from_stage(stage_dir: Path, out_path: Path, fps: int):
-    # Prefer ffmpeg if available
     if shutil.which("ffmpeg"):
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
-            "-i", str(Path(stage_dir) / "%06d.png"),
+            "-i", str(Path(stage_dir) / "frame_%06d.png"),  # <-- was "%06d.png"
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
             str(out_path),
         ]
@@ -3346,11 +3353,31 @@ def _stage_and_zip(example: str, log_path: Path, out_root: Path = Path("meta_run
 
 
 
+
 def meta_run_examples(examples: list[tuple[str, str, int]]):
     """
     examples: list of (target, embedding, K) triples, e.g.
       [('checker','linear',3), ('moons','identity',2), ('rings','rff',8)]
     """
+    import re, glob
+
+    def _discover_proj_indices(pattern: str) -> list[int]:
+        """
+        Scan files matching `pattern` (e.g., 'viz_crossings3d/cross_*.png')
+        and return sorted unique projection indices extracted from suffix '_pXX.png'.
+        """
+        files = glob.glob(pattern)
+        idxs = set()
+        rx = re.compile(r"_p(\d+)\.png$")
+        for f in files:
+            m = rx.search(f)
+            if m:
+                try:
+                    idxs.add(int(m.group(1)))
+                except ValueError:
+                    pass
+        return sorted(idxs)
+
     out_root = Path("meta_runs")
     out_root.mkdir(exist_ok=True)
 
@@ -3377,16 +3404,62 @@ def meta_run_examples(examples: list[tuple[str, str, int]]):
             # Full pipeline per example
             main1(target, embedding=str(embedding), K=int(K))
 
-            # Movies from generated frames
-            movies = [
-                ("Crossings movie",         "viz_crossings3d/cross_*.png",         "viz_crossings3d/crossings_evolution.mp4", 5),
-                ("Latent movie",            "viz_crossings3d/latent_[0-9]*.png",   "viz_crossings3d/latent_evolution.mp4",     5),
-                ("Latent means (μ) movie",  "viz_crossings3d/latent_mu_*.png",     "viz_crossings3d/latent_mu_evolution.mp4",  5),
-                ("Dispersion movie",        "viz_crossings3d/dispersion_*.png",    "viz_crossings3d/dispersion_evolution.mp4", 5),
-                ("RF probe movie",          "rf_snapshots/rf_probe_*.png",         "rf_snapshots/rf_probe_evolution.mp4",      3),
-            ]
-            for name, g, out, fps in movies:
-                make_movie(name, g, out, fps)
+            # -------- Movies from generated frames (one movie per projection) --------
+            # Crossings
+            cross_dir = "viz_crossings3d"
+            cross_glob_all = f"{cross_dir}/cross_*.png"
+            cross_ps = _discover_proj_indices(cross_glob_all)
+            if cross_ps:
+                for p in cross_ps:
+                    make_movie(f"Crossings movie (p={p:02d})",
+                               f"{cross_dir}/cross_*_p{p:02d}.png",
+                               f"{cross_dir}/crossings_p{p:02d}.mp4", 5)
+            else:
+                # Fallback (legacy, no projection suffix)
+                make_movie("Crossings movie", cross_glob_all, f"{cross_dir}/crossings_evolution.mp4", 5)
+
+            # Latent scatter
+            latent_glob_all = f"{cross_dir}/latent_*.png"
+            latent_ps = _discover_proj_indices(latent_glob_all)
+            if latent_ps:
+                for p in latent_ps:
+                    make_movie(f"Latent movie (p={p:02d})",
+                               f"{cross_dir}/latent_*_p{p:02d}.png",
+                               f"{cross_dir}/latent_p{p:02d}.mp4", 5)
+            else:
+                make_movie("Latent movie", f"{cross_dir}/latent_[0-9]*.png",
+                           f"{cross_dir}/latent_evolution.mp4", 5)
+
+            # Latent means (mu)
+            mu_glob_all = f"{cross_dir}/latent_mu_*.png"
+            mu_ps = _discover_proj_indices(mu_glob_all)
+            if mu_ps:
+                for p in mu_ps:
+                    make_movie(f"Latent means (μ) movie (p={p:02d})",
+                               f"{cross_dir}/latent_mu_*_p{p:02d}.png",
+                               f"{cross_dir}/latent_mu_p{p:02d}.mp4", 5)
+            else:
+                make_movie("Latent means (μ) movie", mu_glob_all,
+                           f"{cross_dir}/latent_mu_evolution.mp4", 5)
+
+            # Dispersion (no projection)
+            make_movie("Dispersion movie",
+                       f"{cross_dir}/dispersion_*.png",
+                       f"{cross_dir}/dispersion_evolution.mp4", 5)
+
+            # RF probe (may include projection suffixes)
+            rf_dir = "rf_snapshots"
+            rf_glob_all = f"{rf_dir}/rf_probe_*.png"
+            rf_ps = _discover_proj_indices(rf_glob_all)
+            if rf_ps:
+                for p in rf_ps:
+                    make_movie(f"RF probe movie (p={p:02d})",
+                               f"{rf_dir}/rf_probe_*_p{p:02d}.png",
+                               f"{rf_dir}/rf_probe_p{p:02d}.mp4", 3)
+            else:
+                make_movie("RF probe movie", rf_glob_all,
+                           f"{rf_dir}/rf_probe_evolution.mp4", 3)
+            # ------------------------------------------------------------------------
 
             # Training plots from this run's log.txt
             run_plots_from_log(str(log_path), out_dir="training_plots")
@@ -3405,8 +3478,10 @@ def meta_run_examples(examples: list[tuple[str, str, int]]):
         _wipe_work_dirs()
 
 
+
 if __name__ == "__main__":
-    
+  
+    #main1('checker', embedding = 'sine_wiggle', K = 9)
     import argparse, ast
 
     parser = argparse.ArgumentParser(
