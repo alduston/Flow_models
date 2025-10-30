@@ -2942,6 +2942,7 @@ def main1(target="checker", embedding="identity", K=2):
         jitter_lambda = .99
     ))
     avrc.train(progress=True, seed=0)
+    print(f'USING jitter = {jitter_lambda}, disp_anneal = {[lam_disp_start, lam_disp_end]}, align_anneal = {[lam_align_start, lam_align_end]}, a_rounds = {rounds - post_anneal_rounds}, rounds = {round}')
 
     rf_model, rf_sampler = train_rectified_flow_nd(
         D=K,                                   # <--- ambient dimension
