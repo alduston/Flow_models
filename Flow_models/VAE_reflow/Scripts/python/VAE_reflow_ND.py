@@ -408,15 +408,24 @@ def project_nd(X: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
     """
     return X @ P
 
+
 # ===================== EMBEDDING: globals & helpers =====================
 EMBEDDING_MODE = "identity"   # {"identity","linear","sine_wiggle","rff","radial"}
 EMBEDDING_DIM  = 2            # target ambient dimension K after embedding
 
+# global cache: (mode, m, k_dim, device, dtype) -> params dict
+_EMBED_CACHE: dict[tuple, dict[str, torch.Tensor | None]] = {}
+
 def set_embedding(mode: str = "identity", dim: int = 2):
-    """Set global embedding mode and ambient dimension K."""
-    global EMBEDDING_MODE, EMBEDDING_DIM
+    """
+    Set global embedding mode and ambient dimension K.
+    Also clears the cached random params so that switching mode/dim regenerates them once.
+    """
+    global EMBEDDING_MODE, EMBEDDING_DIM, _EMBED_CACHE
     EMBEDDING_MODE = str(mode).lower().strip()
     EMBEDDING_DIM  = int(dim)
+    _EMBED_CACHE.clear()   # important: avoid mixing params from old dims/modes
+
 
 # ---------- linear-algebra helpers ----------
 def _qr_tall(k: int, m: int, *, device, dtype):
@@ -425,9 +434,8 @@ def _qr_tall(k: int, m: int, *, device, dtype):
     """
     assert k >= m and k > 0 and m > 0
     G = torch.randn(k, m, device=device, dtype=dtype)
-    # reduced QR gives Q:(k×m), R:(m×m)
-    Q, _ = torch.linalg.qr(G, mode='reduced')
-    return Q  # (k,m)
+    Q, _ = torch.linalg.qr(G, mode='reduced')  # Q:(k,m)
+    return Q
 
 def _qr_wide(m: int, k: int, *, device, dtype):
     """
@@ -435,8 +443,8 @@ def _qr_wide(m: int, k: int, *, device, dtype):
     """
     assert m >= k and k > 0 and m > 0
     G = torch.randn(m, k, device=device, dtype=dtype)
-    Q, _ = torch.linalg.qr(G, mode='reduced')  # Q:(m,k), columns orthonormal
-    return Q  # (m,k)
+    Q, _ = torch.linalg.qr(G, mode='reduced')  # Q:(m,k)
+    return Q
 
 def _orthonormal_complement(Q: torch.Tensor, k: int, s: int, *, device, dtype):
     """
@@ -447,104 +455,212 @@ def _orthonormal_complement(Q: torch.Tensor, k: int, s: int, *, device, dtype):
     m = Q.shape[1]
     assert Q.shape == (k, m)
     G = torch.randn(k, s, device=device, dtype=dtype)
-    G = G - Q @ (Q.transpose(0,1) @ G)     # project out span(Q)
+    # project G to be orthogonal to span(Q)
+    G = G - Q @ (Q.transpose(0,1) @ G)
     Qp, _ = torch.linalg.qr(G, mode='reduced')  # (k,s)
     return Qp[:, :s]
 
-# ---------- embedding kernels ----------
+
+# ---------- cache helper ----------
+def _get_cached(key: tuple, builder):
+    """
+    key: (mode, m, k_dim, device, dtype, ...)
+    builder: () -> dict[str, Tensor]
+    """
+    if key not in _EMBED_CACHE:
+        _EMBED_CACHE[key] = builder()
+    return _EMBED_CACHE[key]
+
+
+# ---------- linear embedding (deterministic) ----------
+@torch.no_grad()
+def _get_linear_params(m: int, k_dim: int, device, dtype):
+    key = ("linear", m, k_dim, device, dtype)
+    def _build():
+        if k_dim > m:
+            Q = _qr_tall(k_dim, m, device=device, dtype=dtype)  # (k,m)
+            return {"Q": Q}
+        else:
+            return {}  # no params needed
+    return _get_cached(key, _build)
+
 @torch.no_grad()
 def _embed_linear(X: torch.Tensor, k_dim: int) -> torch.Tensor:
     """
-    Linear lift/reduce into R^{k_dim}. X: (n,m). Returns Z: (n,k_dim)
+    Deterministic linear lift/reduce into R^{k_dim}. X: (n,m).
     """
     device, dtype = X.device, X.dtype
     n, m = X.shape
     if k_dim > m:
-        Q = _qr_tall(k_dim, m, device=device, dtype=dtype)  # (k,m)
-        Z = X @ Q.transpose(0,1)                            # (n,k)
+        params = _get_linear_params(m, k_dim, device, dtype)
+        Q = params["Q"]                      # (k,m)
+        return X @ Q.transpose(0, 1)         # (n,k)
     else:
-        Z = X[:, :k_dim]
-    return Z
+        return X[:, :k_dim]
+
+
+# ---------- sine-wiggle embedding (deterministic) ----------
+@torch.no_grad()
+def _get_sine_wiggle_params(m: int, k_dim: int, device, dtype,
+                            amp: float = 0.25, freq: float = 1.0):
+    """
+    Build (once) and cache the random ingredients for sine-wiggle embedding.
+    Ensures the target is stationary across calls.
+    """
+    key = ("sine_wiggle", m, k_dim, device, dtype, float(amp), float(freq))
+    def _build():
+        params: dict[str, torch.Tensor | None] = {}
+        # case 1: lift 2 -> K (K > m)
+        if k_dim > m:
+            Q = _qr_tall(k_dim, m, device=device, dtype=dtype)  # (k,m)
+            s = k_dim - m                                       # true complement size
+            if s > 0:
+                Q_perp = _orthonormal_complement(Q, k_dim, s, device=device, dtype=dtype)  # (k,s)
+                R = torch.randn(s, m, device=device, dtype=dtype) * freq
+                b = 2.0 * math.pi * torch.rand(s, device=device, dtype=dtype)
+            else:
+                Q_perp, R, b = None, None, None
+            params.update(dict(
+                Q=Q, Q_perp=Q_perp, R=R, b=b,
+                amp=torch.tensor(amp, device=device, dtype=dtype),
+            ))
+        # case 2: same dim (K == m)  <-- your K=2 case
+        elif k_dim == m:
+            # keep linear part fixed (identity)
+            Q = torch.eye(m, device=device, dtype=dtype)
+            R = torch.randn(m, m, device=device, dtype=dtype) * freq
+            b = 2.0 * math.pi * torch.rand(m, device=device, dtype=dtype)
+            params.update(dict(
+                Q=Q, Q_perp=None, R=R, b=b,
+                amp=torch.tensor(amp, device=device, dtype=dtype),
+            ))
+        # case 3: reduce (K < m)
+        else:
+            A = _qr_wide(m, k_dim, device=device, dtype=dtype)  # (m,k)
+            R = torch.randn(k_dim, m, device=device, dtype=dtype) * freq
+            b = 2.0 * math.pi * torch.rand(k_dim, device=device, dtype=dtype)
+            params.update(dict(
+                A=A, R=R, b=b,
+                amp=torch.tensor(amp, device=device, dtype=dtype),
+            ))
+        return params
+    return _get_cached(key, _build)
 
 @torch.no_grad()
-def _embed_sine_wiggle(X: torch.Tensor, k_dim: int, amp: float = 0.25, freq: float = 1.0) -> torch.Tensor:
-    """
-    Linear lift plus small sinusoidal wiggle in orthogonal directions when k_dim>m.
-    If k_dim<m, reduce then add intra-subspace sinusoid.
-    """
+def _embed_sine_wiggle(X: torch.Tensor, k_dim: int,
+                       amp: float = 0.25, freq: float = 1.0) -> torch.Tensor:
     device, dtype = X.device, X.dtype
     n, m = X.shape
+    params = _get_sine_wiggle_params(m, k_dim, device, dtype, amp=amp, freq=freq)
 
-    if k_dim >= m:
-        # base linear lift
-        Q = _qr_tall(k_dim, m, device=device, dtype=dtype)      # (k,m)
-        Zlin = X @ Q.transpose(0,1)                              # (n,k)
-        # wiggle in orthogonal complement
-        s = min(m, max(1, k_dim - m))                            # at least 1 if we truly lifted
-        Q_perp = _orthonormal_complement(Q, k_dim, s, device=device, dtype=dtype)
-        if Q_perp is not None and s > 0:
-            R = torch.randn(s, m, device=device, dtype=dtype) * freq
-            b = 2.0*math.pi*torch.rand(s, device=device, dtype=dtype)
-            H = torch.sin(X @ R.transpose(0,1) + b)              # (n,s)
-            Zwig = H @ Q_perp.transpose(0,1)                     # (n,k)
-            Z = Zlin + amp * Zwig
+    # lift
+    if k_dim > m:
+        Q      = params["Q"]      # (k,m)
+        Q_perp = params["Q_perp"] # (k,s) or None
+        amp_t  = params["amp"]
+        Zlin = X @ Q.transpose(0, 1)  # (n,k)
+        if Q_perp is not None:
+            R = params["R"]          # (s,m)
+            b = params["b"]          # (s,)
+            H = torch.sin(X @ R.transpose(0, 1) + b)  # (n,s)
+            Zwig = H @ Q_perp.transpose(0, 1)         # (n,k)
+            return Zlin + amp_t * Zwig
         else:
-            Z = Zlin
-    else:
-        # reduce then wiggle within the k-dim subspace
-        A = _qr_wide(m, k_dim, device=device, dtype=dtype)       # (m,k)
-        Zlin = X @ A                                             # (n,k)
-        R = torch.randn(k_dim, m, device=device, dtype=dtype) * freq
-        b = 2.0*math.pi*torch.rand(k_dim, device=device, dtype=dtype)
-        H = torch.sin(X @ R.transpose(0,1) + b)                  # (n,k)
-        Z = Zlin + amp * H
+            return Zlin
 
-    return Z
+    # same dim
+    elif k_dim == m:
+        Q     = params["Q"]   # (m,m)
+        R     = params["R"]   # (m,m)
+        b     = params["b"]   # (m,)
+        amp_t = params["amp"]
+        Zlin  = X @ Q.transpose(0, 1)             # == X
+        H     = torch.sin(X @ R.transpose(0, 1) + b)  # (n,m)
+        return Zlin + amp_t * H
+
+    # reduce
+    else:  # k_dim < m
+        A     = params["A"]   # (m,k)
+        R     = params["R"]   # (k,m)
+        b     = params["b"]   # (k,)
+        amp_t = params["amp"]
+        Zlin  = X @ A                         # (n,k)
+        H     = torch.sin(X @ R.transpose(0, 1) + b)  # (n,k)
+        return Zlin + amp_t * H
+
+
+# ---------- RFF embedding (deterministic) ----------
+@torch.no_grad()
+def _get_rff_params(m: int, k_dim: int, device, dtype, freq: float):
+    key = ("rff", m, k_dim, device, dtype, float(freq))
+    def _build():
+        M = max(1, k_dim // 2)
+        W = torch.randn(M, m, device=device, dtype=dtype) * freq  # (M,m)
+        b = 2.0 * math.pi * torch.rand(M, device=device, dtype=dtype)
+        # if we need linear pad later, we can draw once here
+        extra = None
+        if 2 * M < k_dim:
+            extra = torch.randn(m, k_dim - 2 * M, device=device, dtype=dtype)
+        return {"W": W, "b": b, "extra": extra, "M": M}
+    return _get_cached(key, _build)
 
 @torch.no_grad()
 def _embed_rff(X: torch.Tensor, k_dim: int, freq: float = 1.0) -> torch.Tensor:
-    """
-    Random Fourier Features lift into R^{k_dim}.
-    """
     device, dtype = X.device, X.dtype
     n, m = X.shape
-    M = max(1, k_dim // 2)
-    W = torch.randn(M, m, device=device, dtype=dtype) * freq     # (M,m)
-    b = 2.0*math.pi*torch.rand(M, device=device, dtype=dtype)    # (M,)
+    params = _get_rff_params(m, k_dim, device, dtype, freq)
+    W, b, extra, M = params["W"], params["b"], params["extra"], params["M"]
 
-    C = torch.cos(X @ W.transpose(0,1) + b)  # (n,M)
-    S = torch.sin(X @ W.transpose(0,1) + b)  # (n,M)
-    Z = torch.cat([C, S], dim=1)             # (n,2M)
+    C = torch.cos(X @ W.transpose(0, 1) + b)  # (n,M)
+    S = torch.sin(X @ W.transpose(0, 1) + b)  # (n,M)
+    Z = torch.cat([C, S], dim=1)              # (n,2M)
 
     if Z.shape[1] < k_dim:
-        pad = X @ torch.randn(m, k_dim - Z.shape[1], device=device, dtype=dtype)  # linear pad
+        # deterministic pad
+        pad = X @ extra                        # (n, k_dim - 2M)
         Z = torch.cat([Z, pad], dim=1)
     else:
         Z = Z[:, :k_dim]
     return Z
 
+
+# ---------- radial embedding (deterministic) ----------
+@torch.no_grad()
+def _get_radial_params(m: int, k_dim: int, device, dtype):
+    key = ("radial", m, k_dim, device, dtype)
+    def _build():
+        base = m + 4  # X + r + r^2 + sin r + cos r
+        n_extra = max(0, k_dim - base)
+        extra_ws = None
+        if n_extra > 0:
+            extra_ws = torch.randn(m, n_extra, device=device, dtype=dtype)
+        return {"extra_ws": extra_ws, "n_extra": n_extra}
+    return _get_cached(key, _build)
+
 @torch.no_grad()
 def _embed_radial(X: torch.Tensor, k_dim: int) -> torch.Tensor:
-    """
-    Radial feature expansion (r, r^2, sin r, cos r, plus quadratic pads as needed).
-    """
     device, dtype = X.device, X.dtype
     n, m = X.shape
     r = torch.linalg.norm(X, dim=1, keepdim=True)  # (n,1)
-    feats = [X, r, r**2, torch.sin(r), torch.cos(r)]
-    Z = torch.cat(feats, dim=1)  # (n, m+4)
+    Z = torch.cat([X, r, r**2, torch.sin(r), torch.cos(r)], dim=1)  # (n, m+4)
 
-    # pad with squared random linear forms if needed
-    while Z.shape[1] < k_dim:
-        w = torch.randn(m, 1, device=device, dtype=dtype)
-        Z = torch.cat([Z, (X @ w)**2], dim=1)
-    Z = Z[:, :k_dim]
-    return Z
+    if Z.shape[1] >= k_dim:
+        return Z[:, :k_dim]
 
+    params = _get_radial_params(m, k_dim, device, dtype)
+    extra_ws, n_extra = params["extra_ws"], params["n_extra"]
+    if n_extra > 0:
+        extra_feats = (X @ extra_ws) ** 2      # (n, n_extra)
+        Z = torch.cat([Z, extra_feats], dim=1)
+    return Z[:, :k_dim]
+
+
+# ---------- public dispatch ----------
 @torch.no_grad()
 def embed_to_k(X2d: torch.Tensor, mode: str, k_dim: int) -> torch.Tensor:
     """
     Dispatch entry: X2d (n,2) --> Z (n,k_dim) according to mode.
+    All modes are now stationary (random parts are cached).
     """
     mode = str(mode).lower().strip()
     if k_dim == 2 and mode in ("identity", "", None):
@@ -560,6 +676,7 @@ def embed_to_k(X2d: torch.Tensor, mode: str, k_dim: int) -> torch.Tensor:
         return _embed_radial(X2d, k_dim)
     else:
         raise ValueError(f"unknown embedding mode: {mode}")
+
 
 
 
