@@ -20,6 +20,23 @@ import torch.nn.functional as F
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TDTYPE = torch.float32
 
+
+def _square_limits(xlim, ylim, c_exp = 1.15):
+    """
+    Make xlim, ylim square in data coordinates.
+    We keep the centers the same, just expand the smaller span.
+    """
+    x0, x1 = float(xlim[0]), float(xlim[1])
+    y0, y1 = float(ylim[0]), float(ylim[1])
+    xc = 0.5 * (x0 + x1)
+    yc = 0.5 * (y0 + y1)
+    w = x1 - x0
+    h = y1 - y0
+    side = c_exp * max(w, h)
+    xlim_sq = (xc - 0.5*side, xc + 0.5*side)
+    ylim_sq = (yc - 0.5*side, yc + 0.5*side)
+    return list(xlim_sq), list(ylim_sq)
+
 # --------------------------------- random utils ---------------------------------------
 def seed_everything(seed: int | None):
     if seed is None: return
@@ -45,6 +62,103 @@ class MLP(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
     def forward(self, x): return self.net(x)
+
+# ------------------------------ Enhanced MLP (RF) ------------------------------------
+class SinusoidalTimeEmbedding(nn.Module):
+    """Sinusoidal time embedding: maps t∈[0,1] (B,1) to (B,dim)."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = int(dim)
+        # frequencies: exponential range as in transformer pos-emb
+        half = self.dim // 2
+        exp_range = torch.arange(half).float()
+        # register as buffer to keep on same device/dtype
+        self.register_buffer("freqs", torch.exp(-math.log(10000.0) * exp_range / max(1, half)), persistent=False)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (B,1) in [0,1]
+        angles = t * self.freqs.view(1, -1)
+        emb_sin = torch.sin(angles)
+        emb_cos = torch.cos(angles)
+        emb = torch.cat([emb_sin, emb_cos], dim=1)
+        if emb.size(1) < self.dim:
+            # pad to exact dim if odd
+            emb = F.pad(emb, (0, self.dim - emb.size(1)))
+        return emb
+
+class EnhancedMLP(nn.Module):
+    """
+    Enhanced MLP for rectified flow velocity fields with:
+    - sinusoidal time embedding
+    - FiLM-style modulation per block (scale/shift from time embedding)
+    - residual skip connections
+    - zero-init final layer for stable training
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden: int = 256,
+        depth: int = 6,
+        time_embed_dim: int = 128,
+        act: type[nn.Module] = nn.SiLU,
+        dropout: float = 0.0,
+        final_zero_init: bool = True,
+        use_layer_norm: bool = True,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.hidden = int(hidden)
+        self.depth = int(max(1, depth))
+        self.act = act()
+        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.use_layer_norm = bool(use_layer_norm)
+
+        # time embedding -> hidden
+        self.time_emb = SinusoidalTimeEmbedding(time_embed_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embed_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+        # per-block FiLM (scale, shift)
+        self.film = nn.ModuleList([nn.Linear(hidden, 2*hidden) for _ in range(self.depth)])
+
+        # input projection
+        self.input_proj = nn.Linear(self.input_dim, hidden)
+        # blocks
+        self.blocks = nn.ModuleList([nn.Linear(hidden, hidden) for _ in range(self.depth)])
+        self.norms  = nn.ModuleList([nn.LayerNorm(hidden) if self.use_layer_norm else nn.Identity() for _ in range(self.depth)])
+
+        # output head
+        self.output_proj = nn.Linear(hidden, self.output_dim)
+
+        # init
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+        if final_zero_init:
+            nn.init.zeros_(self.output_proj.weight)
+            nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        # x: (B, D), t: (B,1)
+        h = self.input_proj(x)
+        # shared time embedding
+        te = self.time_mlp(self.time_emb(t))
+        for i in range(self.depth):
+            res = h
+            h = self.blocks[i](h)
+            h = self.norms[i](h)
+            # FiLM modulation
+            s, b = self.film[i](te).chunk(2, dim=1)
+            h = h * (1.0 + s) + b
+            h = self.act(h)
+            h = self.dropout(h)
+            h = h + res
+        return self.output_proj(h)
 
 # ------------------------------ Encoders / heads (D-dim) ------------------------------
 class GaussianHead(nn.Module):
@@ -85,13 +199,131 @@ class EncoderX1Only(nn.Module):
         self.head = GaussianHead(D, D, hidden=hidden, depth=depth)
     def forward(self, x1): return self.head(x1)
 
+# --------------------- Enhanced Encoder (Pro) and components ---------------------
+class RFF(nn.Module):
+    def __init__(self, D, n_freq=0, freq_scale=1.0, trainable=False):
+        super().__init__()
+        self.n_freq = int(n_freq)
+        if self.n_freq > 0:
+            B = torch.randn(self.n_freq, D) * float(freq_scale)
+            self.register_parameter("B", nn.Parameter(B, requires_grad=trainable))
+        else:
+            self.register_parameter("B", None)
+
+    def forward(self, x):
+        if self.n_freq <= 0:
+            return x
+        proj = x @ self.B.T
+        s, c = torch.sin(proj), torch.cos(proj)
+        return torch.cat([x, s, c], dim=1)
+
+class GeGLU(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.W = nn.Linear(d_in, 2*d_out)
+    def forward(self, x):
+        a, g = self.W(x).chunk(2, dim=-1)
+        return a * F.gelu(g)
+
+class ResBlock(nn.Module):
+    def __init__(self, d, hidden, dropout=0.0, act=nn.SiLU, use_geglu=True):
+        super().__init__()
+        self.norm = nn.LayerNorm(d)
+        self.ff1  = (GeGLU(d, hidden) if use_geglu else nn.Sequential(
+                        nn.Linear(d, hidden), act()))
+        self.drop = nn.Dropout(dropout)
+        self.ff2  = nn.Linear(hidden, d)
+        nn.init.zeros_(self.ff2.bias)
+        nn.init.normal_(self.ff2.weight, mean=0.0, std=1e-3)
+
+    def forward(self, x):
+        h = self.norm(x)
+        h = self.ff1(h)
+        h = self.drop(h)
+        h = self.ff2(h)
+        return x + h
+
+class OrthoMix(nn.Module):
+    def __init__(self, D, n_householder=4):
+        super().__init__()
+        self.v = nn.Parameter(torch.randn(n_householder, D))
+
+    def forward(self, x):
+        Qx = x
+        for v in self.v:
+            v = F.normalize(v, dim=0, eps=1e-12)
+            Qx = Qx - 2.0 * (Qx @ v.unsqueeze(1)) * v.unsqueeze(0)
+        return Qx
+
+class GaussianHeadPro(nn.Module):
+    def __init__(self, D, width=512, depth=8, dropout=0.0, ff_freqs=16,
+                 ff_scale=1.0, use_geglu=True, residual_mu=True,
+                 ortho_mix=False, n_householder=4,
+                 logvar_min=-10.0, logvar_max=+6.0):
+        super().__init__()
+        self.D = int(D)
+        self.residual_mu = bool(residual_mu)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
+
+        self.rff = RFF(D, n_freq=ff_freqs, freq_scale=ff_scale, trainable=False)
+        feat_dim = D + 2*ff_freqs
+
+        self.mixer = OrthoMix(D, n_householder=n_householder) if ortho_mix else None
+
+        blocks = [nn.Linear(feat_dim, width), nn.SiLU()]
+        for _ in range(depth):
+            blocks.append(ResBlock(width, width, dropout=dropout, use_geglu=use_geglu))
+        self.trunk = nn.Sequential(*blocks)
+
+        self.mu_head     = nn.Linear(width, D)
+        self.logvar_head = nn.Linear(width, D)
+        for m in (self.mu_head, self.logvar_head):
+            nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+
+        self.alpha = nn.Parameter(torch.tensor(0.0)) if self.residual_mu else None
+
+    def forward(self, x):
+        xin = self.mixer(x) if (self.mixer is not None) else x
+        h   = self.rff(xin)
+        h   = self.trunk(h)
+
+        dmu = self.mu_head(h)
+        if self.residual_mu and self.alpha is not None:
+            mu = x + self.alpha.tanh() * dmu
+        else:
+            mu = dmu
+
+        logv = self.logvar_head(h)
+        logv = torch.clamp(logv, self.logvar_min, self.logvar_max)
+        return mu, logv
+
+class EncoderX1OnlyPro(nn.Module):
+    def __init__(self, D=2, width=512, depth=8, dropout=0.05,
+                 ff_freqs=16, ff_scale=1.0, use_geglu=True,
+                 residual_mu=False,       # <--- default to classic VAE-style init
+                 ortho_mix=False, n_householder=4,
+                 logvar_min=-10.0, logvar_max=+6.0):
+
+        super().__init__()
+        self.D = int(D)
+        self.head = GaussianHeadPro(
+            D, width=width, depth=depth, dropout=dropout,
+            ff_freqs=ff_freqs, ff_scale=ff_scale, use_geglu=use_geglu,
+            residual_mu=residual_mu, ortho_mix=ortho_mix, n_householder=n_householder,
+            logvar_min=logvar_min, logvar_max=logvar_max
+        )
+
+    def forward(self, x1):
+        return self.head(x1)
+
 class Velocity(nn.Module):
     """v(x,t) -> R^D (mean-field velocity in data space)."""
     def __init__(self, D=2, hidden=128, depth=4):
         super().__init__()
         self.D = D
-        self.mlp = MLP(D+4, D, hidden=hidden, depth=depth)
-    def forward(self, x, t): return self.mlp(torch.cat([x, t_embed(t)], dim=1))
+        self.net = EnhancedMLP(input_dim=D, output_dim=D, hidden=hidden, depth=depth)
+    def forward(self, x, t): return self.net(x, t)
 
 # -------------------------------- Schedules / frames ----------------------------------
 def lin_sched(a, b, step, total):
@@ -418,6 +650,26 @@ def sample_eight_gaussians(n, radius=4.0, std=0.10, weights=None):
     mu = means[comp]                                             # (n,2)
     return mu + std*torch.randn(n, 2, device=device, dtype=TDTYPE)
 
+
+# --------------------------- NEW: line target ---------------------------
+@torch.no_grad()
+def sample_line(
+    n: int,
+    *,
+    length: float = 6.0,     # total extent along x, centered at 0: x ~ U[-length/2, length/2]
+    fuzz_y: float = 0.02,    # tiny vertical noise -> almost all variance in x
+    fuzz_x: float = 0.0,     # usually 0; set small (e.g. 0.01) if you want to break exact uniformity
+):
+    # uniform x on a long line
+    x = (torch.rand(n, 1, device=device, dtype=TDTYPE) - 0.5) * length
+    # tiny vertical fuzz
+    y = fuzz_y * torch.randn(n, 1, device=device, dtype=TDTYPE)
+
+    if fuzz_x > 0.0:
+        x = x + fuzz_x * torch.randn_like(x)
+    return torch.cat([x, y], dim=1)
+
+
 def sample_rose_knot(
     n,
     k: int = 9,                 # number of petals (odd gives k petals; even gives 2k)
@@ -527,6 +779,7 @@ def _sample_target_2d(n):
     if key in ("8g","8gaussians","eight_gaussians"):    return sample_eight_gaussians(n)
     if key in ("rose_knot","rose","flower"):            return sample_rose_knot(n)
     if key in ("sierpinski","gasket","tri_gasket"):     return sample_sierpinski(n)
+    if key in ("line","long_line","anisotropic_line"):   return sample_line(n)
     return sample_two_moons(n)
 
 @torch.no_grad()
@@ -629,7 +882,7 @@ def plot_crossings_proj(
     pairs_mode="encoder",
     n_pairs=60_000,
     subset_lines=160,
-    subset_strategy="random",
+    subset_strategy="pca",
     line_indices=None,
     plane_mode="scatter",
     bins=220,
@@ -892,6 +1145,7 @@ class AVRCConfig:
     enc_depth:  int = 4
     vel_hidden: int = 128
     vel_depth:  int = 4
+    enc_residual_mu: bool = False
 
     pretrain_steps: int = 10000
     critic_lr: float = 1e-3
@@ -961,7 +1215,7 @@ class AVRCConfig:
     test_rf_hidden: int = 128
     test_rf_depth:  int = 4
     test_rf_log_every: int = 10000
-    test_rf_Ks: tuple = (2,4,8)
+    test_rf_Ks: tuple = (1,2,4,8)
     test_rf_n: int = 80_000
     test_rf_mmd_max_n: int = 8192
     test_rf_bins: int = 200
@@ -983,6 +1237,11 @@ class AVRCConfig:
     viz_disp_pairs: int = 16384
     viz_disp_t_steps: int = 100
     viz_disp_enable: bool = True
+
+
+
+    # --- NEW: temporal jitter amplitude (ε). 0.0 = off (exact baseline) ---
+    jitter_lambda: float = 0.0
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -1028,9 +1287,9 @@ class VelocityXD(nn.Module):
     def __init__(self, D=2, hidden=128, depth=4):
         super().__init__()
         self.D = D
-        self.net = MLP(D + 4, D, hidden=hidden, depth=depth)
+        self.net = EnhancedMLP(input_dim=D, output_dim=D, hidden=hidden, depth=depth)
     def forward(self, x, t):
-        return self.net(torch.cat([x, t_embed(t)], dim=1))
+        return self.net(x, t)
 
 
 @torch.no_grad()
@@ -1131,6 +1390,8 @@ def _plot_rf_probe_grid_proj(
         q = 0.997
         xlim = (np.quantile(X[:,0], 1-q), np.quantile(X[:,0], q)); xlim = [val*1.2 for val in xlim]
         ylim = (np.quantile(X[:,1], 1-q), np.quantile(X[:,1], q)); ylim = [val*1.2 for val in ylim]
+        xlim, ylim = _square_limits(xlim, ylim)
+
         y_edges = np.linspace(xlim[0], xlim[1], bins+1)
         z_edges = np.linspace(ylim[0], ylim[1], bins+1)
         Ht, *_ = np.histogram2d(X[:,0], X[:,1], bins=[y_edges, z_edges], density=True)
@@ -1377,6 +1638,8 @@ def _eval_probe_models_proj(
     q  = 0.997
     xlim = (np.quantile(yx[:,0], 1-q), np.quantile(yx[:,0], q)); xlim = [val * 1.2 for val in xlim]
     ylim = (np.quantile(yx[:,1], 1-q), np.quantile(yx[:,1], q)); ylim = [val * 1.2 for val in ylim]
+    xlim, ylim = _square_limits(xlim, ylim)
+
     y_edges = np.linspace(xlim[0], xlim[1], bins+1)
     z_edges = np.linspace(ylim[0], ylim[1], bins+1)
 
@@ -1455,7 +1718,13 @@ class AVRC:
     def __init__(self, cfg=AVRCConfig()):
         self.cfg = cfg
         D = cfg.D
-        self.Enc = EncoderX1Only(D=D, hidden=cfg.enc_hidden, depth=cfg.enc_depth).to(device)
+        # Switched to enhanced encoder; width/depth map to previous hidden/depth
+        self.Enc = EncoderX1OnlyPro(
+                                  D=D,
+                                  width=cfg.enc_hidden,
+                                  depth=cfg.enc_depth,
+                                  residual_mu=cfg.enc_residual_mu,   # <--- key line
+                              ).to(device)
         self.V   = VelocityXD(D=D,    hidden=cfg.vel_hidden,  depth=cfg.vel_depth).to(device)
         self.V_teacher = VelocityXD(D=D, hidden=cfg.vel_hidden, depth=cfg.vel_depth).to(device)
         self.V_teacher.load_state_dict(self.V.state_dict())
@@ -1485,6 +1754,32 @@ class AVRC:
         print(f'Training on {self.device}')
         self._disp_scale0 = None
         self.round_idx = 0
+
+    
+    @torch.no_grad()
+    def _time_warp(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Input:  t  (B,1) physical time in [0,1].
+        Output: alpha(t;phi), alpha_dot(t;phi) with one random phase per sample.
+        If jitter_lambda == 0, returns (t, ones_like(t)) exactly.
+        """
+        eps = float(getattr(self.cfg, "jitter_lambda", 0.0))
+        if eps <= 0.0:
+            return t, torch.ones_like(t)
+
+        import math
+        two_pi = 2.0 * math.pi
+
+        # one random phase per sample (same shape/device/dtype as t)
+        phi = two_pi * torch.rand_like(t)
+
+        # α(t) = t + (ε / 2π) [ sin(2π t + φ) - sin φ ]
+        alpha = t + (eps / two_pi) * (torch.sin(two_pi * t + phi) - torch.sin(phi))
+        # α̇(t) = 1 + ε cos(2π t + φ)
+        alpha_dot = 1.0 + eps * torch.cos(two_pi * t + phi)
+
+        return alpha, alpha_dot
+
 
     @torch.no_grad()
     def _init_crossings_subset(self):
@@ -1796,90 +2091,113 @@ class AVRC:
             for pt, ps in zip(self.V_teacher.parameters(), self.V.parameters()):
                 pt.data.mul_(self.cfg.ema_decay).add_(ps.data, alpha=(1.0 - self.cfg.ema_decay))
 
-    # ------------------------------ losses ------------------------------------
-    def _critic_loss(self, z0, z1, t, w):
-        zt  = (1.0 - t)*z0 + t*z1               # (B,D)
-        ell = (z1 - z0).detach()                # (B,D)
-        pred= self.V(zt, t)                     # (B,D)
-        r   = pred - ell
-        # Huber on vector residual (use L2 inside / L1 outside, per-sample)
+
+       # ------------------------------ losses ------------------------------------
+    def _critic_loss(self, z0, z1, t, w, alpha: torch.Tensor | None = None,
+                     alpha_dot: torch.Tensor | None = None):
+        """
+        If alpha/alpha_dot are provided, use xt at alpha(t) and label = alpha_dot * (z1 - z0).
+        Otherwise, fall back to the baseline (xt at t, label = z1 - z0).
+        """
+        zcoef = alpha if alpha is not None else t
+        zt    = (1.0 - zcoef) * z0 + zcoef * z1                 # (B,D)
+
+        # label
+        ell = (z1 - z0)
+        if alpha_dot is not None:
+            # critic label has no grads
+            lab = (alpha_dot * ell).detach()
+        else:
+            lab = ell.detach()
+
+        pred = self.V(zt, t)                                    # (B,D) evaluated at physical t
+        r    = pred - lab
+
+        # Huber on vector residual (unchanged)
         r2  = (r**2).sum(dim=1, keepdim=True)
         a   = r.abs().sum(dim=1, keepdim=True)
-        quad= 0.5*r2
-        lin = self.cfg.critic_huber_delta*(a - 0.5*self.cfg.critic_huber_delta)
+        quad= 0.5 * r2
+        lin = self.cfg.critic_huber_delta * (a - 0.5 * self.cfg.critic_huber_delta)
         hub = torch.where(a <= self.cfg.critic_huber_delta, quad, lin)
         return (w * hub).mean()
+
 
     def critic_step(self, B=None):
         B = B or self.cfg.batch
         with torch.no_grad():
             xt1 = sample_target_torch(B)
             mu0, logv0 = self.Enc(xt1)
-            z0 = reparam(mu0, logv0)   # start at encoder agg
-            z1 = xt1                   # end is data
-        #t = torch.distributions.Beta(self.cfg.critic_t_alpha, self.cfg.critic_t_beta).sample((B,1)).to(device=device, dtype=TDTYPE)
-        #w = ((1.0 - t) ** self.cfg.critic_t_gamma).detach(); w = w / (w.mean() + 1e-8)
+            z0 = reparam(mu0, logv0)
+            z1 = xt1
+
         if getattr(self.cfg, "critic_match_rf_midpoints", False):
             K = self.cfg.critic_match_rf_K or self.cfg.recon_k
             idx = torch.randint(0, K, (B,), device=device)
-            t = ((idx + 0.5) / float(K)).view(B,1).type_as(z0)  # exactly RF midpoints
-            w = torch.ones_like(t)                               # no extra weights
+            t = ((idx + 0.5) / float(K)).view(B,1).type_as(z0)
+            w = torch.ones_like(t)
         else:
             t = torch.distributions.Beta(self.cfg.critic_t_alpha, self.cfg.critic_t_beta)\
                 .sample((B,1)).to(device=device, dtype=TDTYPE)
             w = ((1.0 - t) ** self.cfg.critic_t_gamma); w = w / (w.mean() + 1e-8)
-        loss = self._critic_loss(z0, z1, t, w)
+
+        # --- NEW: apply temporal jitter (no-op if jitter_lambda == 0) ---
+        alpha, alpha_dot = self._time_warp(t)
+
+        loss = self._critic_loss(z0, z1, t, w, alpha=alpha, alpha_dot=alpha_dot)
         self.opt_v.zero_grad(set_to_none=True); loss.backward()
         nn.utils.clip_grad_norm_(self.V.parameters(), self.cfg.critic_clip)
         self.opt_v.step()
         self._accumulate_intra_ema()
         return float(loss.item())
 
+
     def organizer_step(self, B=None):
         B = B or self.cfg.batch
         xt1 = sample_target_torch(B)
-        mu0_enc, logv0 = self.Enc(xt1)     # (B,D)
-        z0 = reparam(mu0_enc, logv0)       # start
-        z1 = xt1                            # end
+        mu0_enc, logv0 = self.Enc(xt1)
+        z0 = reparam(mu0_enc, logv0)
+        z1 = xt1
 
-        # K midpoints
+        # K midpoints (physical time grid)
         K = self.cfg.recon_k
         reps = (B + K - 1)//K
-        t_mid = (torch.arange(K, device=device, dtype=TDTYPE) + 0.5)/float(K)
+        t_mid = (torch.arange(K, device=device, dtype=TDTYPE) + 0.5) / float(K)
         t = t_mid.repeat_interleave(reps)[:B].view(B,1)
         w = torch.full_like(t, 1.0/(K*K))
 
-        zt = (1.0 - t)*z0 + t*z1
-        ell= (z1 - z0)
+        # --- NEW: warp ---
+        alpha, alpha_dot = self._time_warp(t)
+
+        # warped state and instantaneous label
+        zt  = (1.0 - alpha) * z0 + alpha * z1        # xt at α(t)
+        ell = (z1 - z0)                              # (no detach; grads flow via z0)
+        St  = alpha_dot * ell                        # instantaneous label α̇(t)ℓ
 
         if self.cfg.unbiased_dispersion:
             mu_t = self.V_teacher(zt, t).detach()
             t0   = torch.zeros_like(t)
-            mu_0 = self.V_teacher(z0, t0).detach()  # <-- detach mu_0
+            mu_0 = self.V_teacher(z0, t0).detach()
 
-            a = ell - mu_t                  # (v_t - ℓ) with a sign flip
-            b = mu_t - mu_0                 # (v_t - v_0), fully detached
+            # Dispersion + alignment (same algebra, ℓ -> St, and teacher is stop-grad)
+            a = St - mu_t
+            b = mu_t - mu_0
 
-            a2     = (a * a).sum(dim=1, keepdim=True)                 # ||v_t - ℓ||^2  (dispersion)
-            b2_log = ((b * b).sum(dim=1, keepdim=True)).detach()      # for logging only (no grads)
-
-            # unbiased proxy for ⟨b, v_t - ℓ⟩; grads flow only via ell (i.e., z0)
-            cross  = (b * (ell - mu_0)).sum(dim=1, keepdim=True)
+            a2     = (a * a).sum(dim=1, keepdim=True)
+            b2_log = ((b * b).sum(dim=1, keepdim=True)).detach()
+            cross  = (b * (St - mu_0)).sum(dim=1, keepdim=True)
 
             denom       = (w.mean() + 1e-12)
             disp_piece  = (w * a2).mean() / denom
             align_piece = (w * (2.0 * cross - b2_log)).mean() / denom
         else:
-            # biased variant has only the dispersion piece available
             with torch.no_grad():
                 v_targ = self.V_teacher(zt, t)
-            diff2 = (v_targ - ell).pow(2).sum(dim=1, keepdim=True)
+            diff2 = (v_targ - St).pow(2).sum(dim=1, keepdim=True)
             disp_piece  = (w * diff2).mean() / (w.mean() + 1e-12)
             align_piece = torch.tensor(0.0, device=zt.device, dtype=zt.dtype)
 
         loss_kl = kl_normal_diag(mu0_enc, logv0)
 
-        # NEW: separate weights
         loss = (self._lam_disp  * disp_piece
               + self._lam_align * align_piece
               + self._lam_kl    * loss_kl)
@@ -1887,20 +2205,12 @@ class AVRC:
         self.opt_enc.zero_grad(set_to_none=True); loss.backward()
         nn.utils.clip_grad_norm_(self.Enc.parameters(), self.cfg.ed_clip)
         self.opt_enc.step()
-        # Apply optional encoder LR decay (default 1.0 = no decay)
-        decay = getattr(self.cfg, "enc_lr_decay", 1.0)
-        post_anneal_idx = self.round_idx - ( self.cfg.rounds - self.cfg.post_anneal_rounds)
-        if decay != 1.0 and post_anneal_idx > 0:
-            for g in self.opt_enc.param_groups:
-                g['lr'] *= decay
-
-        if getattr(self.cfg, "reset_opt_v_every_round", False):
-            self._reset_critic_optimizer()
-
+        ...
         return {'disp': float(disp_piece.item()),
                 'align': float(align_piece.item()),
                 'kl': float(loss_kl.item()),
                 'total': float(loss.item())}
+
 
     # ------------------------------ integration & eval -------------------------
     @torch.no_grad()
@@ -2059,7 +2369,6 @@ class AVRC:
         avg_loss = float(np.mean(losses[-self.cfg.critic_adapt_min:]))
         return avg_loss, steps_used
 
-    # ------------------------------ Pretrain velocity (minor ND fix) ------------------
     def pretrain_velocity(self, steps=None, progress=True):
         steps = self.cfg.pretrain_steps if steps is None else steps
         if steps <= 0:
@@ -2068,11 +2377,15 @@ class AVRC:
         t0 = time.time()
         for it in range(1, steps+1):
             B = self.cfg.batch
-            z0 = sample_source_torch(B, D=self.cfg.D)           # ND
-            z1 = sample_target_torch(B)                         # ND
+            z0 = sample_source_torch(B, D=self.cfg.D)
+            z1 = sample_target_torch(B)
             t  = torch.rand(B,1, device=device, dtype=TDTYPE)
             w  = torch.ones_like(t)
-            loss = self._critic_loss(z0, z1, t, w)
+
+            # --- NEW: warp (no-op if jitter_lambda == 0) ---
+            alpha, alpha_dot = self._time_warp(t)
+
+            loss = self._critic_loss(z0, z1, t, w, alpha=alpha, alpha_dot=alpha_dot)
             self.opt_v.zero_grad(set_to_none=True); loss.backward()
             nn.utils.clip_grad_norm_(self.V.parameters(), self.cfg.critic_clip)
             self.opt_v.step()
@@ -2081,6 +2394,7 @@ class AVRC:
                 print(f"[pretrain v (indep)] {it}/{steps}  loss={float(loss):.4f}  ({time.time()-t0:.1f}s)")
                 t0 = time.time()
         self._commit_intra_ema_to_teacher()
+
 
     # ------------------------------ Public sampler (unchanged API) --------------------
     @torch.no_grad()
@@ -2311,6 +2625,8 @@ def plot_output_heatmaps_proj(
         xlim = [val * 1.2 for val in xlim]
         ylim = ylim or (np.quantile(xt2[:,1], 1-q), np.quantile(xt2[:,1], q))
         ylim = [val * 1.2 for val in ylim]
+        xlim, ylim = _square_limits(xlim, ylim)
+
 
     y_edges = np.linspace(xlim[0], xlim[1], bins+1)
     z_edges = np.linspace(ylim[0], ylim[1], bins+1)
@@ -2375,18 +2691,13 @@ def _sample_in_chunks(sampler, n: int, nfe: int, chunk_n: int):
         done += take
     return torch.cat(outs, dim=0)
 
-@torch.no_grad()
+
 def _plot_heat_grid(
     samples_by_nameK: dict, x_tgt: torch.Tensor,
-    Ks=(2,4,8,16), bins=160, xlim=None, ylim=None, cmap="magma",
+    Ks=(1,2,4,8,16), bins=160, xlim=None, ylim=None, cmap="magma",
     out_dir: str | None = None, prefix: str = "benchnd",
     gamma: float = 0.42, vmax_percentile: float = 99.7
 ):
-    """
-    Draws a grid with rows = K and columns = [Target | model_1 | model_2 | ...],
-    using black background + magma colormap + PowerNorm (gamma) with per-row
-    global brightness normalization including the target histogram (like the probe).
-    """
     import os, numpy as np, matplotlib.pyplot as plt, matplotlib as mpl
     from matplotlib.colors import PowerNorm
 
@@ -2400,18 +2711,19 @@ def _plot_heat_grid(
     if xlim is None or ylim is None:
         q = 0.997
         xlim = xlim or (np.quantile(x_tgt_np[:,0], 1-q), np.quantile(x_tgt_np[:,0], q))
-        xlim = [val* 1.2 for val in xlim]
+        xlim = [val * 1.2 for val in xlim]
         ylim = ylim or (np.quantile(x_tgt_np[:,1], 1-q), np.quantile(x_tgt_np[:,1], q))
-        ylim = [val* 1.2 for val in ylim]
+        ylim = [val * 1.2 for val in ylim]
+
+    # 👉 force square data extent
+    xlim, ylim = _square_limits(xlim, ylim)
 
     # Shared edges
     y_edges = np.linspace(xlim[0], xlim[1], bins+1)
     z_edges = np.linspace(ylim[0], ylim[1], bins+1)
 
-    # Target histogram (reused for all rows)
     Ht, *_ = np.histogram2d(x_tgt_np[:,0], x_tgt_np[:,1], bins=[y_edges, z_edges], density=True)
 
-    # Style: black background, white axes, like probes
     try: plt.close('all')
     except Exception: pass
     mpl.rcdefaults()
@@ -2432,9 +2744,7 @@ def _plot_heat_grid(
         elif C == 1:
             axs = np.array([[ax] for ax in axs])
 
-        # Draw rows
         for r, K in enumerate(Ks):
-            # Collect this row's histograms for brightness normalization (include TARGET)
             row_histos = [Ht.ravel()]
             panels = [("target", Ht)]
 
@@ -2447,7 +2757,6 @@ def _plot_heat_grid(
             vmax = np.percentile(np.concatenate(row_histos), vmax_percentile)
             norm = PowerNorm(gamma=max(1e-3, float(gamma)), vmin=0.0, vmax=max(1e-9, vmax))
 
-            # Plot the row
             for c, (title, H) in enumerate(panels):
                 ax = axs[r, c] if R > 1 else axs[0, c]
                 ax.imshow(
@@ -2455,7 +2764,6 @@ def _plot_heat_grid(
                     extent=[xlim[0], xlim[1], ylim[0], ylim[1]],
                     cmap=cmap, norm=norm, interpolation="bilinear", alpha=1.0, aspect="equal"
                 )
-                # Titles & labels
                 if c == 0:
                     ax.set_title("target", color='w', pad=3)
                 else:
@@ -2480,12 +2788,13 @@ def _plot_heat_grid(
     return saved_path if out_dir is not None else None
 
 
+
 # ----------------------------- Benchmark via projection (REPLACES) -----------------------------
 @torch.no_grad()
 def benchmark_samplers_proj(
     name2sampler: dict,
     P: torch.Tensor,
-    Ks=(2,3,4,6,8,16),
+    Ks=(1,2,4,8),
     n=120_000,
     mmd_max_n=8192,
     plot_hists: bool = True,
@@ -2504,11 +2813,13 @@ def benchmark_samplers_proj(
 
     print(f"\n=== Projected Sampling quality ===  n={n}, Ks={tuple(Ks)}, sw2_L={sw2_L}, sw2_max_n={sw2_max_n}")
 
-    x_tgt = sample_target_torch(n)                        # (n, D)
+    x_tgt = sample_target_torch(n)
     Xt2   = project_nd(x_tgt, P).detach().cpu().numpy()
     q = 0.997
     xlim = (np.quantile(Xt2[:,0], 1-q), np.quantile(Xt2[:,0], q)); xlim = [val*1.2 for val in xlim]
     ylim = (np.quantile(Xt2[:,1], 1-q), np.quantile(Xt2[:,1], q)); ylim = [val*1.2 for val in ylim]
+    xlim, ylim = _square_limits(xlim, ylim)
+
     y_edges = np.linspace(xlim[0], xlim[1], hist_bins+1)
     z_edges = np.linspace(ylim[0], ylim[1], hist_bins+1)
     Ht, *_ = np.histogram2d(Xt2[:,0], Xt2[:,1], bins=[y_edges, z_edges], density=True)
@@ -2611,10 +2922,10 @@ def main1(target="checker", embedding="identity", K=2):
         D=K,                          # <--- ambient train dimension
         init_default='gauss',
         rounds=500,
-        critic_adapt_max=300,
+        critic_adapt_max=500,
         post_anneal_rounds=100,
         batch=4096,
-        pretrain_steps=20000,
+        pretrain_steps=5000,
         recon_k=16, recon_n=8192,
         agg_kl_batch=65536,
         log_every=1,
@@ -2625,9 +2936,10 @@ def main1(target="checker", embedding="identity", K=2):
         lam_align_start=0.0, lam_align_end=1.0,
         enc_lr_decay=.975,
         viz_latent=True,
-        viz_proj_mode="pca",
+        viz_proj_mode="random",
         viz_num_projections=2,
         viz_proj_source="target",
+        jitter_lambda = 0.25
     ))
     avrc.train(progress=True, seed=0)
 
@@ -3480,22 +3792,20 @@ def meta_run_examples(examples: list[tuple[str, str, int]]):
 
 
 if __name__ == "__main__":
-  
-    #main1('checker', embedding = 'sine_wiggle', K = 9)
-    import argparse, ast
 
+    import argparse, ast, sys
     parser = argparse.ArgumentParser(
         description="Run VAE_reflownd meta examples and produce zipped outputs."
     )
     parser.add_argument(
         "--examples",
         type=str,
-        default="[('checker','sine_wiggle',9), ('spiral','rff',9)]",
-        help="Python list of (target, embedding, K) triples. "
-             "Example: \"[('moons','linear',3), ('rings','rff',8)]\". "
-             "Backward-compat: you may pass ['moons','rings'] to use ('identity',2)."
+        default="[('gasket','identity', 2)], [('checker','identity', 2)], [('rings','identity', 2)], [('8g','identity', 2)]",
+        help="Python list of (target, embedding, K) triples."
     )
-    args = parser.parse_args()
+    # In notebooks, sys.argv includes the kernel’s -f flag; ignore unknowns.
+    args, _unknown = parser.parse_known_args()
+    
 
     try:
         raw = ast.literal_eval(args.examples)
@@ -3513,8 +3823,8 @@ if __name__ == "__main__":
             else:
                 raise ValueError
     except Exception:
-        print("[warn] Could not parse --examples; using default [('checker','linear',3)].")
-        triples = [('checker','linear',3)]
+        print("[warn] Could not parse --examples; using default [('gasket','identity',2)].")
+        triples = [('gasket','identity',2)]
 
     meta_run_examples(triples)
 
