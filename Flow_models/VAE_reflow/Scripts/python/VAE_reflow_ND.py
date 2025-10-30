@@ -3801,7 +3801,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--examples",
         type=str,
-        default="[('checker','identity', 2), ('rings','identity', 2), ('8g','identity', 2), ('spiral','identity', 2), ('moon','identity', 2)]",
+        default="[('line', 'identity', 2), ('gasket', 'identity', 3), ('checker','identity', 2), ('rings','sine_wiggle', 2), ('8g','linear', 2), ('spiral','linear', 3), ('moon','sine_wiggle', 3)]",
         help="Python list of (target, embedding, K) triples."
     )
     # In notebooks, sys.argv includes the kernel’s -f flag; ignore unknowns.
