@@ -3800,7 +3800,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--examples",
         type=str,
-        default="[('checker','identity', 2)], ('rings','identity', 2)], ('8g','identity', 2), ('spiral','identity', 2), ('moon','identity', 2)]",
+        default="[('checker','identity', 2), ('rings','identity', 2), ('8g','identity', 2), ('spiral','identity', 2), ('moon','identity', 2)]",
         help="Python list of (target, embedding, K) triples."
     )
     # In notebooks, sys.argv includes the kernel’s -f flag; ignore unknowns.
@@ -3824,7 +3824,7 @@ if __name__ == "__main__":
                 raise ValueError
     except Exception:
         print("[warn] Could not parse --examples; using default [('checker','identity',2)].")
-        triples = [('gasket','identity',2)]
+        triples = [('checker','identity',2)]
 
     meta_run_examples(triples)
 
