@@ -2921,9 +2921,9 @@ def main1(target="checker", embedding="identity", K=2):
     avrc = AVRC(AVRCConfig(
         D=K,                          # <--- ambient train dimension
         init_default='gauss',
-        rounds=500,
-        critic_adapt_max=500,
-        post_anneal_rounds=100,
+        rounds=400,
+        critic_adapt_max=1000,
+        post_anneal_rounds=300,
         batch=4096,
         pretrain_steps=5000,
         recon_k=16, recon_n=8192,
@@ -2936,10 +2936,10 @@ def main1(target="checker", embedding="identity", K=2):
         lam_align_start=0.0, lam_align_end=1.0,
         enc_lr_decay=.975,
         viz_latent=True,
-        viz_proj_mode="random",
+        viz_proj_mode="pca",
         viz_num_projections=2,
         viz_proj_source="target",
-        jitter_lambda = 0.25
+        jitter_lambda = .99
     ))
     avrc.train(progress=True, seed=0)
 
@@ -3800,7 +3800,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--examples",
         type=str,
-        default="[('gasket','identity', 2)], [('checker','identity', 2)], [('rings','identity', 2)], [('8g','identity', 2)]",
+        default="[('checker','identity', 2)], ('rings','identity', 2)], ('8g','identity', 2), ('spiral','identity', 2), ('moon','identity', 2)]",
         help="Python list of (target, embedding, K) triples."
     )
     # In notebooks, sys.argv includes the kernel’s -f flag; ignore unknowns.
@@ -3823,7 +3823,7 @@ if __name__ == "__main__":
             else:
                 raise ValueError
     except Exception:
-        print("[warn] Could not parse --examples; using default [('gasket','identity',2)].")
+        print("[warn] Could not parse --examples; using default [('checker','identity',2)].")
         triples = [('gasket','identity',2)]
 
     meta_run_examples(triples)
