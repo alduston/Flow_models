@@ -880,6 +880,7 @@ TARGET = "moons"  # {"moons","spiral","rings","checker",...,"sierpinski"}
 TARGET_WHITEN = False
 TARGET_MEAN = None          # (1, K)
 TARGET_WHITEN_MAT = None    # (K, K) inverse sqrt of cov
+TARGET_UNWHITEN_MAT = None   # (K, K)   = sqrt, used only for plotting/eval
 
 
 def set_target(name: str):
@@ -941,29 +942,37 @@ def fit_target_whitener(
     k_dim: int | None = None,
     eps: float = 1e-6,
 ):
-    """
-    Draws a large batch of *embedded* target samples and makes them ~N(0, I).
-    After calling this, every subsequent sample_target_torch(...) is whitened.
-    """
-    global TARGET_WHITEN, TARGET_MEAN, TARGET_WHITEN_MAT
+    global TARGET_WHITEN, TARGET_MEAN, TARGET_WHITEN_MAT, TARGET_UNWHITEN_MAT
 
     X = sample_target_torch(
         num,
         embedding_mode=embedding_mode,
         k_dim=k_dim,
-        _skip_whiten=True,   # <-- important: use raw, unwhitened target
+        _skip_whiten=True,          # make sure we fit on the raw embedded target
     )
     m = X.mean(0, keepdim=True)
     Xc = X - m
-    # empirical cov
     C = (Xc.T @ Xc) / (X.shape[0] - 1)
-    # symmetric eig-based inverse sqrt
+
     evals, evecs = torch.linalg.eigh(C)
     inv_sqrt = evecs @ torch.diag((evals.clamp_min(eps)).rsqrt()) @ evecs.T
+    sqrt     = torch.linalg.inv(inv_sqrt)   # <--- this is what we’ll use to unwhiten
 
-    TARGET_MEAN = m
-    TARGET_WHITEN_MAT = inv_sqrt
-    TARGET_WHITEN = True
+    TARGET_MEAN         = m
+    TARGET_WHITEN_MAT   = inv_sqrt
+    TARGET_UNWHITEN_MAT = sqrt
+    TARGET_WHITEN       = True
+
+
+@torch.no_grad()
+def maybe_unwhiten_target(X: torch.Tensor) -> torch.Tensor:
+    if (
+        TARGET_WHITEN
+        and (TARGET_UNWHITEN_MAT is not None)
+        and (TARGET_MEAN is not None)
+    ):
+        return X @ TARGET_UNWHITEN_MAT + TARGET_MEAN
+    return X
 
 
 def make_pairs_random(n):
@@ -1790,8 +1799,10 @@ def _eval_probe_models_proj(
     import os, gc, numpy as np, matplotlib.pyplot as plt, matplotlib as mpl
     from matplotlib.colors import PowerNorm
 
-    x_tgt = sample_target_torch(n).to(device)          # (n, D)
+    x_tgt = sample_target_torch(n).to(device)   # (n, D)
+    x_tgt = maybe_unwhiten_target(x_tgt)        # <--- NEW
     D = x_tgt.size(1)
+
     if P is None:
         # default: random projection if none supplied
         P = choose_projection_pairs(D, num_pairs=1, mode="random")[0]
@@ -1799,11 +1810,13 @@ def _eval_probe_models_proj(
     tbl = {m: {"gauss": {}, "encoder": {}} for m in samplers.keys()}
 
     def _run_one(model_key: str, init: str, K: int):
-        x = samplers[model_key](n, K, init=init, enc=enc)          # (n, D)
-        w2 = sliced_w2(x, x_tgt, L=128, max_n=20_000)              # ND metric
+        x = samplers[model_key](n, K, init=init, enc=enc)  # (n, D)
+        x = maybe_unwhiten_target(x)                       # <--- NEW
+        w2 = sliced_w2(x, x_tgt, L=128, max_n=20_000)
         mmd= mmd_rbf_nd(x, x_tgt, max_n=mmd_max_n)
-        Xp = project_nd(x, P).detach().cpu().numpy()               # for hist only
+        Xp = project_nd(x, P).detach().cpu().numpy()
         return float(w2), float(mmd), Xp
+
 
     yx = project_nd(x_tgt, P).detach().cpu().numpy()
     q  = 0.997
@@ -2786,9 +2799,14 @@ def plot_output_heatmaps_proj(
     from matplotlib.colors import PowerNorm
 
     x_model = avrc_sample_torch(model_or_sampler, n=n, nfe=nfe)
-    xm2 = project_nd(x_model, P).detach().cpu().numpy()
+    x_model = maybe_unwhiten_target(x_model)  # <--- NEW
+
     x_tgt = sample_target_torch(n if target_n is None else target_n)
+    x_tgt = maybe_unwhiten_target(x_tgt)      # <--- NEW
+
+    xm2 = project_nd(x_model, P).detach().cpu().numpy()
     xt2 = project_nd(x_tgt, P).detach().cpu().numpy()
+
 
     if xlim is None or ylim is None:
         q = 0.997
@@ -2985,7 +3003,9 @@ def benchmark_samplers_proj(
     print(f"\n=== Projected Sampling quality ===  n={n}, Ks={tuple(Ks)}, sw2_L={sw2_L}, sw2_max_n={sw2_max_n}")
 
     x_tgt = sample_target_torch(n)
+    x_tgt = maybe_unwhiten_target(x_tgt)          # <--- NEW
     Xt2   = project_nd(x_tgt, P).detach().cpu().numpy()
+
     q = 0.997
     xlim = (np.quantile(Xt2[:,0], 1-q), np.quantile(Xt2[:,0], q)); xlim = [val*1.2 for val in xlim]
     ylim = (np.quantile(Xt2[:,1], 1-q), np.quantile(Xt2[:,1], q)); ylim = [val*1.2 for val in ylim]
@@ -3009,6 +3029,7 @@ def benchmark_samplers_proj(
                 out = avrc_sample_torch_nd(sampler, n=take, nfe=K)   # (take, D)
                 x.append(out); done += take
             X = torch.cat(x, dim=0)
+            X = maybe_unwhiten_target(X)          # <--- NEW
             sw2 = sliced_w2(X, x_tgt, L=sw2_L, max_n=sw2_max_n)
             mmd = mmd_rbf_nd(X, x_tgt, max_n=mmd_max_n)
             results.setdefault(name, {})[K] = (sw2, mmd)
