@@ -1420,9 +1420,7 @@ class AVRCConfig:
 
     # --- NEW: temporal jitter amplitude (ε). 0.0 = off (exact baseline) ---
     jitter_lambda: float = 0.0
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f'CONFIG: jitter = {jitter_lambda}, disp_anneal = {[lam_disp_start, lam_disp_end]}, align_anneal = {[lam_align_start, lam_align_end]}, a_rounds = {rounds - post_anneal_rounds}, rounds = {rounds}')
     
 
 
@@ -3116,12 +3114,19 @@ def main1(target="checker", embedding="identity", K=2):
         embedding_mode=embedding,
         k_dim=K,
     )
+
+
+    rounds, post_anneal_rounds = 400, 200
+    lam_disp_start, lam_disp_end = 1.0, 1.0
+    lam_align_start, lam_align_end = 0.0, 1.0
+    jitter_lambda = 0.0
+
     avrc = AVRC(AVRCConfig(
         D=K,                          # <--- ambient train dimension
         init_default='gauss',
-        rounds=400,
+        rounds=rounds,
         critic_adapt_max=1000,
-        post_anneal_rounds=200,
+        post_anneal_rounds=post_anneal_rounds,
         batch=4096,
         pretrain_steps=5000,
         recon_k=16, recon_n=8192,
@@ -3130,16 +3135,17 @@ def main1(target="checker", embedding="identity", K=2):
         k_plot=5,
         test_rf_every=20,
         viz_camera=(10, -40),
-        lam_disp_start=1.0, lam_disp_end=1.0,
-        lam_align_start=0.0, lam_align_end=1.0,
+        lam_disp_start=lam_disp_start, lam_disp_end=lam_disp_end,
+        lam_align_start=lam_align_start, lam_align_end=lam_align_end,
         enc_lr_decay=.98,
         viz_latent=True,
         viz_proj_mode="pca",
         viz_num_projections=2,
         viz_proj_source="target",
-        jitter_lambda = 0.0
+        jitter_lambda = jitter_lambda
     ))
     avrc.train(progress=True, seed=0)
+    print(f'CONFIG: jitter = {jitter_lambda}, disp_anneal = {[lam_disp_start, lam_disp_end]}, align_anneal = {lam_align_start, lam_align_end}, a_rounds = {rounds - post_anneal_rounds}, rounds = {rounds}')
    
 
     rf_model, rf_sampler = train_rectified_flow_nd(
@@ -3991,6 +3997,8 @@ def meta_run_examples(examples: list[tuple[str, str, int]]):
 
 
 if __name__ == "__main__":
+    #main1(target = 'spiral', embedding = 'linear', K = 4)
+
 
     import argparse, ast, sys
     parser = argparse.ArgumentParser(
@@ -3999,7 +4007,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--examples",
         type=str,
-        default="[('line', 'identity', 2), ('gasket', 'identity', 3), ('checker','identity', 2), ('rings','sine_wiggle', 2), ('8g','linear', 2), ('spiral','linear', 3), ('moon','sine_wiggle', 3)]",
+        default="[('line', 'identity', 2), ('gasket', 'linear', 3), ('checker','sine_wiggle', 4), ('rings','sine_wiggle', 5), ('8g','linear', 6), ('spiral','sine_wiggle', 9), ('moon','linear', 12)]",
         help="Python list of (target, embedding, K) triples."
     )
     # In notebooks, sys.argv includes the kernel’s -f flag; ignore unknowns.
@@ -4026,4 +4034,3 @@ if __name__ == "__main__":
         triples = [('checker','identity',2)]
 
     meta_run_examples(triples)
-
