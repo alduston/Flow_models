@@ -876,6 +876,12 @@ def sample_sierpinski(
 # ---------------------------- TARGET toggle & source ----------------------------
 TARGET = "moons"  # {"moons","spiral","rings","checker",...,"sierpinski"}
 
+# --- NEW: optional global whitening of the *embedded* target ---
+TARGET_WHITEN = False
+TARGET_MEAN = None          # (1, K)
+TARGET_WHITEN_MAT = None    # (K, K) inverse sqrt of cov
+
+
 def set_target(name: str):
     global TARGET
     TARGET = str(name).lower().strip()
@@ -900,7 +906,13 @@ def _sample_target_2d(n):
     return sample_two_moons(n)
 
 @torch.no_grad()
-def sample_target_torch(n, *, embedding_mode: str = None, k_dim: int = None):
+def sample_target_torch(
+    n,
+    *,
+    embedding_mode: str = None,
+    k_dim: int = None,
+    _skip_whiten: bool = False,    # <-- NEW: internal escape hatch
+):
     """
     Sample the intrinsic 2-D target, then embed to R^{k_dim}.
     If embedding_mode/k_dim are None, use globals set by set_embedding(...).
@@ -911,8 +923,48 @@ def sample_target_torch(n, *, embedding_mode: str = None, k_dim: int = None):
 
     X2 = _sample_target_2d(n)  # (n,2) on current device/dtype
     if K == 2 and (mode in ("identity","",None)):
-        return X2
-    return embed_to_k(X2, mode=mode, k_dim=K)
+        X = X2
+    else:
+        X = embed_to_k(X2, mode=mode, k_dim=K)
+
+    # --- NEW: global whitening hook ---
+    if (not _skip_whiten) and TARGET_WHITEN and (TARGET_MEAN is not None) and (TARGET_WHITEN_MAT is not None):
+        X = (X - TARGET_MEAN) @ TARGET_WHITEN_MAT
+
+    return X
+
+@torch.no_grad()
+def fit_target_whitener(
+    num: int = 200_000,
+    *,
+    embedding_mode: str | None = None,
+    k_dim: int | None = None,
+    eps: float = 1e-6,
+):
+    """
+    Draws a large batch of *embedded* target samples and makes them ~N(0, I).
+    After calling this, every subsequent sample_target_torch(...) is whitened.
+    """
+    global TARGET_WHITEN, TARGET_MEAN, TARGET_WHITEN_MAT
+
+    X = sample_target_torch(
+        num,
+        embedding_mode=embedding_mode,
+        k_dim=k_dim,
+        _skip_whiten=True,   # <-- important: use raw, unwhitened target
+    )
+    m = X.mean(0, keepdim=True)
+    Xc = X - m
+    # empirical cov
+    C = (Xc.T @ Xc) / (X.shape[0] - 1)
+    # symmetric eig-based inverse sqrt
+    evals, evecs = torch.linalg.eigh(C)
+    inv_sqrt = evecs @ torch.diag((evals.clamp_min(eps)).rsqrt()) @ evecs.T
+
+    TARGET_MEAN = m
+    TARGET_WHITEN_MAT = inv_sqrt
+    TARGET_WHITEN = True
+
 
 def make_pairs_random(n):
     """
@@ -1361,6 +1413,8 @@ class AVRCConfig:
     jitter_lambda: float = 0.0
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f'CONFIG: jitter = {jitter_lambda}, disp_anneal = {[lam_disp_start, lam_disp_end]}, align_anneal = {[lam_align_start, lam_align_end]}, a_rounds = {rounds - post_anneal_rounds}, rounds = {rounds}')
+    
 
 
 
@@ -3035,12 +3089,18 @@ def main1(target="checker", embedding="identity", K=2):
     set_target(target)
     set_embedding(embedding, K)
 
+
+    fit_target_whitener(
+        num=200_000,
+        embedding_mode=embedding,
+        k_dim=K,
+    )
     avrc = AVRC(AVRCConfig(
         D=K,                          # <--- ambient train dimension
         init_default='gauss',
         rounds=400,
         critic_adapt_max=1000,
-        post_anneal_rounds=300,
+        post_anneal_rounds=200,
         batch=4096,
         pretrain_steps=5000,
         recon_k=16, recon_n=8192,
@@ -3051,15 +3111,15 @@ def main1(target="checker", embedding="identity", K=2):
         viz_camera=(10, -40),
         lam_disp_start=1.0, lam_disp_end=1.0,
         lam_align_start=0.0, lam_align_end=1.0,
-        enc_lr_decay=.975,
+        enc_lr_decay=.98,
         viz_latent=True,
         viz_proj_mode="pca",
         viz_num_projections=2,
         viz_proj_source="target",
-        jitter_lambda = .99
+        jitter_lambda = 0.0
     ))
     avrc.train(progress=True, seed=0)
-    print(f'USING jitter = {jitter_lambda}, disp_anneal = {[lam_disp_start, lam_disp_end]}, align_anneal = {[lam_align_start, lam_align_end]}, a_rounds = {rounds - post_anneal_rounds}, rounds = {rounds}')
+   
 
     rf_model, rf_sampler = train_rectified_flow_nd(
         D=K,                                   # <--- ambient dimension
