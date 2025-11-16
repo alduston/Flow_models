@@ -21,6 +21,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TDTYPE = torch.float32
 
 
+
 def _square_limits(xlim, ylim, c_exp = 1.15):
     """
     Make xlim, ylim square in data coordinates.
@@ -179,17 +180,65 @@ class GaussianHead(nn.Module):
         mu, logvar = h[:, :self.D], h[:, self.D:]
         return mu, logvar
 
-def reparam(mu, logvar):
-    std = torch.exp(0.5*logvar)
+def reparam(mu, logvar, var_floor: float = 0.0):
+    # Σ_eff = exp(logvar) + var_floor  (var_floor is additive variance)
+    s2  = logvar.exp() + float(var_floor)
+    std = torch.sqrt(s2)
     eps = torch.randn_like(std)
-    return mu + std*eps
+    return mu + std * eps
 
-def kl_normal_diag(mu, logvar):
+def kl_normal_diag(mu, logvar, var_floor: float = 0.0):
     """
-    E_x [ KL( N(mu, diag(exp(logvar))) || N(0,I) ) ] averaged over batch.
+    KL( N(mu, diag(exp(logvar)+var_floor)) || N(0, I) ), averaged over batch.
     """
-    elem = mu.pow(2) + logvar.exp() - logvar - 1.0
+    s2      = logvar.exp() + float(var_floor)
+    log_s2  = torch.log(s2)
+    elem    =  (mu).pow(2) + s2 - log_s2 - 1.0
     return 0.5 * torch.mean(elem.sum(dim=1))
+
+def path_kl_normal_diag(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    t: torch.Tensor,
+    alpha: torch.Tensor,
+    var_floor: float = 0.0,
+    kappa_mode: str = "one_minus_t",
+    kappa_min: float = 1e-2,
+    eps: float = 1e-8,
+
+) -> torch.Tensor:
+    B, D = mu.shape
+    device = mu.device
+
+    s2 = logvar.exp() + float(var_floor)          # (B, D)
+    one_minus_alpha = 1.0 - alpha                # (B, 1)
+    s2_t = (one_minus_alpha ** 2) * s2           # (B, D)
+
+    # trace(Sigma_t)
+    trace = s2_t.sum(dim=1)                      # (B,)
+
+    # logdet(Sigma_t) = sum_j log s2_j + 2 D log(1 - alpha)
+    log_s2 = torch.log(s2 + eps)                 # (B, D)
+    logdet_sigma = log_s2.sum(dim=1) + 2.0 * float(D) * torch.log(
+        one_minus_alpha.squeeze(1) + eps
+    )                                            # (B,)
+
+    mu_norm2 = mu.pow(2).sum(dim=1)              # (B,)
+
+    kl_per_sample = 0.5 * (mu_norm2 + trace - logdet_sigma - float(D))  # (B,)
+
+    # kappa(t): default = (1 - t)
+    if kappa_mode == "one_minus_t":
+        kappa = 1.0 - t.squeeze(1)               # (B,)
+    else:
+        kappa = torch.ones_like(t.squeeze(1), device=device)
+
+    kappa = torch.clamp(kappa, min=kappa_min)    # (B,)
+    weighted_kl = (kappa * kl_per_sample).mean()  # scalar
+    kl_per_dim = weighted_kl / float(D)           # normalize by latent dim
+
+    return kl_per_dim
+
 
 class EncoderX1Only(nn.Module):
     """z0 = E(x1) (destination-only encoder) in D dims."""
@@ -387,6 +436,20 @@ def _make_log_stride_rounds(total_rounds: int,
         stride = max(1, int(round(stride * growth)))
     return sorted(set(frames))
 
+# --- NEW: a tiny endpoint decoder that ignores t and maps z→x directly ---
+class EndpointDecoder(nn.Module):
+    def __init__(self, D: int, hidden: int = 512, depth: int = 4, dropout: float = 0.0):
+        super().__init__()
+        layers = [nn.Linear(D, hidden), nn.GELU(), nn.Dropout(dropout)]
+        for _ in range(max(0, depth - 2)):
+            layers += [nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout)]
+        layers += [nn.Linear(hidden, D)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
 
 # ------------------------------ Projection helpers (NEW) ------------------------------
 @torch.no_grad()
@@ -452,8 +515,12 @@ def project_nd(X: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
 EMBEDDING_MODE = "identity"   # {"identity","linear","sine_wiggle","rff","radial"}
 EMBEDDING_DIM  = 2            # target ambient dimension K after embedding
 
-# global cache: (mode, m, k_dim, device, dtype) -> params dict
+# default seed for all embedding randomness when no seed is specified
+DEFAULT_EMBED_SEED = 0
+
+# global cache: (mode, m, k_dim, device, dtype, ..., seed_key) -> params dict
 _EMBED_CACHE: dict[tuple, dict[str, torch.Tensor | None]] = {}
+
 
 def set_embedding(mode: str = "identity", dim: int = 2):
     """
@@ -466,26 +533,45 @@ def set_embedding(mode: str = "identity", dim: int = 2):
     _EMBED_CACHE.clear()   # important: avoid mixing params from old dims/modes
 
 
+# ---------- RNG helper ----------
+def _make_rng(seed: int | None, device) -> torch.Generator:
+    """
+    Create a torch.Generator on the given device, seeded with either:
+      - the provided seed, or
+      - DEFAULT_EMBED_SEED (0) if seed is None.
+
+    This keeps embedding randomness self-contained and reproducible.
+    """
+    if seed is None:
+        seed = DEFAULT_EMBED_SEED
+    g = torch.Generator(device=device)
+    g.manual_seed(int(seed))
+    return g
+
+
 # ---------- linear-algebra helpers ----------
-def _qr_tall(k: int, m: int, *, device, dtype):
+def _qr_tall(k: int, m: int, *, device, dtype, generator: torch.Generator):
     """
     Return Q in R^{k×m} with orthonormal columns (k >= m).
     """
     assert k >= m and k > 0 and m > 0
-    G = torch.randn(k, m, device=device, dtype=dtype)
+    G = torch.randn(k, m, device=device, dtype=dtype, generator=generator)
     Q, _ = torch.linalg.qr(G, mode='reduced')  # Q:(k,m)
     return Q
 
-def _qr_wide(m: int, k: int, *, device, dtype):
+
+def _qr_wide(m: int, k: int, *, device, dtype, generator: torch.Generator):
     """
     Return A in R^{m×k} with orthonormal columns (k <= m).
     """
     assert m >= k and k > 0 and m > 0
-    G = torch.randn(m, k, device=device, dtype=dtype)
+    G = torch.randn(m, k, device=device, dtype=dtype, generator=generator)
     Q, _ = torch.linalg.qr(G, mode='reduced')  # Q:(m,k)
     return Q
 
-def _orthonormal_complement(Q: torch.Tensor, k: int, s: int, *, device, dtype):
+
+def _orthonormal_complement(Q: torch.Tensor, k: int, s: int, *, device, dtype,
+                            generator: torch.Generator):
     """
     Given Q (k×m) with orthonormal cols, return Q_perp (k×s) with orthonormal cols and Q^T Q_perp = 0.
     """
@@ -493,7 +579,7 @@ def _orthonormal_complement(Q: torch.Tensor, k: int, s: int, *, device, dtype):
         return None
     m = Q.shape[1]
     assert Q.shape == (k, m)
-    G = torch.randn(k, s, device=device, dtype=dtype)
+    G = torch.randn(k, s, device=device, dtype=dtype, generator=generator)
     # project G to be orthogonal to span(Q)
     G = G - Q @ (Q.transpose(0,1) @ G)
     Qp, _ = torch.linalg.qr(G, mode='reduced')  # (k,s)
@@ -503,7 +589,7 @@ def _orthonormal_complement(Q: torch.Tensor, k: int, s: int, *, device, dtype):
 # ---------- cache helper ----------
 def _get_cached(key: tuple, builder):
     """
-    key: (mode, m, k_dim, device, dtype, ...)
+    key: (mode, m, k_dim, device, dtype, ..., seed_key)
     builder: () -> dict[str, Tensor]
     """
     if key not in _EMBED_CACHE:
@@ -511,86 +597,106 @@ def _get_cached(key: tuple, builder):
     return _EMBED_CACHE[key]
 
 
-# ---------- linear embedding (deterministic) ----------
+# ---------- linear embedding (deterministic given seed) ----------
 @torch.no_grad()
-def _get_linear_params(m: int, k_dim: int, device, dtype):
-    key = ("linear", m, k_dim, device, dtype)
+def _get_linear_params(m: int, k_dim: int, device, dtype,
+                       seed: int | None = None):
+    seed_key = int(seed) if seed is not None else DEFAULT_EMBED_SEED
+    key = ("linear", m, k_dim, device, dtype, seed_key)
+
     def _build():
         if k_dim > m:
-            Q = _qr_tall(k_dim, m, device=device, dtype=dtype)  # (k,m)
+            gen = _make_rng(seed, device=device)
+            Q = _qr_tall(k_dim, m, device=device, dtype=dtype, generator=gen)  # (k,m)
             return {"Q": Q}
         else:
             return {}  # no params needed
+
     return _get_cached(key, _build)
 
+
 @torch.no_grad()
-def _embed_linear(X: torch.Tensor, k_dim: int) -> torch.Tensor:
+def _embed_linear(X: torch.Tensor, k_dim: int,
+                  seed: int | None = None) -> torch.Tensor:
     """
     Deterministic linear lift/reduce into R^{k_dim}. X: (n,m).
     """
     device, dtype = X.device, X.dtype
     n, m = X.shape
     if k_dim > m:
-        params = _get_linear_params(m, k_dim, device, dtype)
+        params = _get_linear_params(m, k_dim, device, dtype, seed=seed)
         Q = params["Q"]                      # (k,m)
         return X @ Q.transpose(0, 1)         # (n,k)
     else:
         return X[:, :k_dim]
 
 
-# ---------- sine-wiggle embedding (deterministic) ----------
+# ---------- sine-wiggle embedding (deterministic given seed) ----------
 @torch.no_grad()
 def _get_sine_wiggle_params(m: int, k_dim: int, device, dtype,
-                            amp: float = 0.25, freq: float = 1.0):
+                            amp: float = 1.0, freq: float = 2.0,
+                            seed: int | None = None):
     """
     Build (once) and cache the random ingredients for sine-wiggle embedding.
-    Ensures the target is stationary across calls.
+    Ensures the target is stationary across calls (deterministic given seed).
     """
-    key = ("sine_wiggle", m, k_dim, device, dtype, float(amp), float(freq))
+    seed_key = int(seed) if seed is not None else DEFAULT_EMBED_SEED
+    key = ("sine_wiggle", m, k_dim, device, dtype, float(amp), float(freq), seed_key)
+
     def _build():
         params: dict[str, torch.Tensor | None] = {}
+        gen = _make_rng(seed, device=device)
+
         # case 1: lift 2 -> K (K > m)
         if k_dim > m:
-            Q = _qr_tall(k_dim, m, device=device, dtype=dtype)  # (k,m)
+            Q = _qr_tall(k_dim, m, device=device, dtype=dtype, generator=gen)  # (k,m)
             s = k_dim - m                                       # true complement size
             if s > 0:
-                Q_perp = _orthonormal_complement(Q, k_dim, s, device=device, dtype=dtype)  # (k,s)
-                R = torch.randn(s, m, device=device, dtype=dtype) * freq
-                b = 2.0 * math.pi * torch.rand(s, device=device, dtype=dtype)
+                Q_perp = _orthonormal_complement(Q, k_dim, s,
+                                                 device=device, dtype=dtype,
+                                                 generator=gen)  # (k,s)
+                R = torch.randn(s, m, device=device, dtype=dtype, generator=gen) * freq
+                b = 2.0 * math.pi * torch.rand(s, device=device, dtype=dtype, generator=gen)
             else:
                 Q_perp, R, b = None, None, None
             params.update(dict(
                 Q=Q, Q_perp=Q_perp, R=R, b=b,
                 amp=torch.tensor(amp, device=device, dtype=dtype),
             ))
+
         # case 2: same dim (K == m)  <-- your K=2 case
         elif k_dim == m:
             # keep linear part fixed (identity)
             Q = torch.eye(m, device=device, dtype=dtype)
-            R = torch.randn(m, m, device=device, dtype=dtype) * freq
-            b = 2.0 * math.pi * torch.rand(m, device=device, dtype=dtype)
+            R = torch.randn(m, m, device=device, dtype=dtype, generator=gen) * freq
+            b = 2.0 * math.pi * torch.rand(m, device=device, dtype=dtype, generator=gen)
             params.update(dict(
                 Q=Q, Q_perp=None, R=R, b=b,
                 amp=torch.tensor(amp, device=device, dtype=dtype),
             ))
+
         # case 3: reduce (K < m)
         else:
-            A = _qr_wide(m, k_dim, device=device, dtype=dtype)  # (m,k)
-            R = torch.randn(k_dim, m, device=device, dtype=dtype) * freq
-            b = 2.0 * math.pi * torch.rand(k_dim, device=device, dtype=dtype)
+            A = _qr_wide(m, k_dim, device=device, dtype=dtype, generator=gen)  # (m,k)
+            R = torch.randn(k_dim, m, device=device, dtype=dtype, generator=gen) * freq
+            b = 2.0 * math.pi * torch.rand(k_dim, device=device, dtype=dtype, generator=gen)
             params.update(dict(
                 A=A, R=R, b=b,
                 amp=torch.tensor(amp, device=device, dtype=dtype),
             ))
         return params
+
     return _get_cached(key, _build)
+
 
 @torch.no_grad()
 def _embed_sine_wiggle(X: torch.Tensor, k_dim: int,
-                       amp: float = 0.25, freq: float = 1.0) -> torch.Tensor:
+                       amp: float = 1.0, freq: float = 2.0,
+                       seed: int | None = None) -> torch.Tensor:
     device, dtype = X.device, X.dtype
     n, m = X.shape
-    params = _get_sine_wiggle_params(m, k_dim, device, dtype, amp=amp, freq=freq)
+    params = _get_sine_wiggle_params(m, k_dim, device, dtype,
+                                     amp=amp, freq=freq, seed=seed)
 
     # lift
     if k_dim > m:
@@ -628,26 +734,33 @@ def _embed_sine_wiggle(X: torch.Tensor, k_dim: int,
         return Zlin + amp_t * H
 
 
-# ---------- RFF embedding (deterministic) ----------
+# ---------- RFF embedding (deterministic given seed) ----------
 @torch.no_grad()
-def _get_rff_params(m: int, k_dim: int, device, dtype, freq: float):
-    key = ("rff", m, k_dim, device, dtype, float(freq))
+def _get_rff_params(m: int, k_dim: int, device, dtype,
+                    freq: float, seed: int | None = None):
+    seed_key = int(seed) if seed is not None else DEFAULT_EMBED_SEED
+    key = ("rff", m, k_dim, device, dtype, float(freq), seed_key)
+
     def _build():
+        gen = _make_rng(seed, device=device)
         M = max(1, k_dim // 2)
-        W = torch.randn(M, m, device=device, dtype=dtype) * freq  # (M,m)
-        b = 2.0 * math.pi * torch.rand(M, device=device, dtype=dtype)
+        W = torch.randn(M, m, device=device, dtype=dtype, generator=gen) * freq  # (M,m)
+        b = 2.0 * math.pi * torch.rand(M, device=device, dtype=dtype, generator=gen)
         # if we need linear pad later, we can draw once here
         extra = None
         if 2 * M < k_dim:
-            extra = torch.randn(m, k_dim - 2 * M, device=device, dtype=dtype)
+            extra = torch.randn(m, k_dim - 2 * M, device=device, dtype=dtype, generator=gen)
         return {"W": W, "b": b, "extra": extra, "M": M}
+
     return _get_cached(key, _build)
 
+
 @torch.no_grad()
-def _embed_rff(X: torch.Tensor, k_dim: int, freq: float = 1.0) -> torch.Tensor:
+def _embed_rff(X: torch.Tensor, k_dim: int, freq: float = 1.0,
+               seed: int | None = None) -> torch.Tensor:
     device, dtype = X.device, X.dtype
     n, m = X.shape
-    params = _get_rff_params(m, k_dim, device, dtype, freq)
+    params = _get_rff_params(m, k_dim, device, dtype, freq, seed=seed)
     W, b, extra, M = params["W"], params["b"], params["extra"], params["M"]
 
     C = torch.cos(X @ W.transpose(0, 1) + b)  # (n,M)
@@ -663,21 +776,28 @@ def _embed_rff(X: torch.Tensor, k_dim: int, freq: float = 1.0) -> torch.Tensor:
     return Z
 
 
-# ---------- radial embedding (deterministic) ----------
+# ---------- radial embedding (deterministic given seed) ----------
 @torch.no_grad()
-def _get_radial_params(m: int, k_dim: int, device, dtype):
-    key = ("radial", m, k_dim, device, dtype)
+def _get_radial_params(m: int, k_dim: int, device, dtype,
+                       seed: int | None = None):
+    seed_key = int(seed) if seed is not None else DEFAULT_EMBED_SEED
+    key = ("radial", m, k_dim, device, dtype, seed_key)
+
     def _build():
         base = m + 4  # X + r + r^2 + sin r + cos r
         n_extra = max(0, k_dim - base)
         extra_ws = None
         if n_extra > 0:
-            extra_ws = torch.randn(m, n_extra, device=device, dtype=dtype)
+            gen = _make_rng(seed, device=device)
+            extra_ws = torch.randn(m, n_extra, device=device, dtype=dtype, generator=gen)
         return {"extra_ws": extra_ws, "n_extra": n_extra}
+
     return _get_cached(key, _build)
 
+
 @torch.no_grad()
-def _embed_radial(X: torch.Tensor, k_dim: int) -> torch.Tensor:
+def _embed_radial(X: torch.Tensor, k_dim: int,
+                  seed: int | None = None) -> torch.Tensor:
     device, dtype = X.device, X.dtype
     n, m = X.shape
     r = torch.linalg.norm(X, dim=1, keepdim=True)  # (n,1)
@@ -686,7 +806,7 @@ def _embed_radial(X: torch.Tensor, k_dim: int) -> torch.Tensor:
     if Z.shape[1] >= k_dim:
         return Z[:, :k_dim]
 
-    params = _get_radial_params(m, k_dim, device, dtype)
+    params = _get_radial_params(m, k_dim, device, dtype, seed=seed)
     extra_ws, n_extra = params["extra_ws"], params["n_extra"]
     if n_extra > 0:
         extra_feats = (X @ extra_ws) ** 2      # (n, n_extra)
@@ -696,25 +816,31 @@ def _embed_radial(X: torch.Tensor, k_dim: int) -> torch.Tensor:
 
 # ---------- public dispatch ----------
 @torch.no_grad()
-def embed_to_k(X2d: torch.Tensor, mode: str, k_dim: int) -> torch.Tensor:
+def embed_to_k(X2d: torch.Tensor, mode: str, k_dim: int,
+               seed: int | None = None) -> torch.Tensor:
     """
     Dispatch entry: X2d (n,2) --> Z (n,k_dim) according to mode.
-    All modes are now stationary (random parts are cached).
+
+    All modes are stationary and reproducible:
+      - If seed is None: uses DEFAULT_EMBED_SEED (0) for all randomness.
+      - If seed is an int: params are generated deterministically from that seed,
+        and cached separately per seed.
     """
     mode = str(mode).lower().strip()
     if k_dim == 2 and mode in ("identity", "", None):
         return X2d
 
     if mode in ("identity", "linear"):
-        return _embed_linear(X2d, k_dim)
+        return _embed_linear(X2d, k_dim, seed=seed)
     elif mode == "sine_wiggle":
-        return _embed_sine_wiggle(X2d, k_dim, amp=0.25, freq=1.0)
+        return _embed_sine_wiggle(X2d, k_dim, amp=0.5, freq=1.5, seed=seed)
     elif mode == "rff":
-        return _embed_rff(X2d, k_dim, freq=1.0)
+        return _embed_rff(X2d, k_dim, freq=1.0, seed=seed)
     elif mode == "radial":
-        return _embed_radial(X2d, k_dim)
+        return _embed_radial(X2d, k_dim, seed=seed)
     else:
         raise ValueError(f"unknown embedding mode: {mode}")
+
 
 
 
@@ -722,7 +848,7 @@ def embed_to_k(X2d: torch.Tensor, mode: str, k_dim: int) -> torch.Tensor:
 # --------------------------------- nd OT samplers -------------------------------------
 # All return torch.Tensor [n,2] on current device/dtype.
 @torch.no_grad()
-def sample_two_moons(n, gap=0.5, rad=1.0, noise=0.08):
+def sample_two_moons(n, gap=0.5, rad=1.0, noise=0.1):
     n1 = n//2; n2 = n - n1
     u1 = torch.rand(n1, device=device, dtype=TDTYPE) * math.pi
     u2 = torch.rand(n2, device=device, dtype=TDTYPE) * math.pi
@@ -733,7 +859,7 @@ def sample_two_moons(n, gap=0.5, rad=1.0, noise=0.08):
     return X
 
 @torch.no_grad()
-def sample_spiral(n, a=0.5, b=0.25, tmin=0.0, tmax=4.0*math.pi, noise=0.08):
+def sample_spiral(n, a=0.5, b=0.25, tmin=0.0, tmax=4.0*math.pi, noise=0.1):
     t = tmin + (tmax - tmin)*torch.rand(n, device=device, dtype=TDTYPE)
     r = a + b*t
     X = torch.stack([r*torch.cos(t), r*torch.sin(t)], dim=1)
@@ -741,7 +867,7 @@ def sample_spiral(n, a=0.5, b=0.25, tmin=0.0, tmax=4.0*math.pi, noise=0.08):
     return X
 
 @torch.no_grad()
-def sample_rings(n, radii=(1.0, 2.0, 3.0), sigma_r=0.08):
+def sample_rings(n, radii=(1.0, 2.0, 3.0), sigma_r=0.1):
     radii = torch.tensor(radii, device=device, dtype=TDTYPE)
     idx = torch.randint(0, radii.numel(), (n,), device=device)
     R = radii[idx] + sigma_r*torch.randn(n, device=device, dtype=TDTYPE)
@@ -785,7 +911,7 @@ def sample_pinwheel(n, radial_std=0.25, tangential_std=0.05, n_arms=5, rate=0.25
     return X + tang
 
 @torch.no_grad()
-def sample_scurve(n, tmin=-math.pi, tmax=math.pi, noise=0.08):
+def sample_scurve(n, tmin=-math.pi, tmax=math.pi, noise=0.1):
     t = tmin + (tmax - tmin)*torch.rand(n, device=device, dtype=TDTYPE)
     x = t
     y = torch.sin(t) + 0.25*torch.sin(3.0*t)
@@ -1023,7 +1149,6 @@ def make_pairs_random(n):
     return x0, x1, None
 
 
-
 # --------------------------------- Metrics (nd) ---------------------------------------
 @torch.no_grad()
 def mmd_rbf_nd(x: torch.Tensor, y: torch.Tensor, sigma=None, max_n:int = 8192):
@@ -1149,9 +1274,17 @@ def plot_crossings_proj(
                 mu = enc_out
                 logv = torch.zeros_like(mu)
 
+            #
+            # after (encoder branch; honor cfg.latent_var_floor if available)
             eps = torch.randn_like(mu)
-            x_ref = mu + torch.exp(0.5 * logv) * eps   # z0
-            x_tgt = mu                                 # z1
+            floor = 0.0
+            cfg = getattr(model_or_sampler, "cfg", None)
+            if cfg is not None:
+                floor = float(getattr(cfg, "latent_var_floor", 0.0))
+            std   = torch.sqrt(torch.exp(logv) + floor)
+            x_ref = mu + std * eps   # z0 with floor
+            x_tgt = mu               # z1
+
 
     # project to 2D
     Xr = project_nd(x_ref, P).detach().cpu().numpy()
@@ -1405,31 +1538,44 @@ class AVRCConfig:
     dec_dropout: float = 0.05
 
     enc_lr: float = 1e-3
-    dec_lr: float = 5e-4
-    enc_lr_decay: float = .98
-    dec_lr_decay: float = .99
+    dec_lr: float = 1e-3
+    enc_lr_decay: float = .96
+    dec_lr_decay: float = .96
     enc_weight_decay: float = 0.0
     dec_weight_decay: float = 0.0
     grad_clip: float = 1.0
 
-    pretrain_ae_steps: int = 1 #2000
-    pretrain_ae_kl_weight: float = 1.0
     decoder_steps_per_round: int = 25
 
+    # === Encoder input noise for mild denoising ===
+    enc_input_noise_std: float = 0.0   # 0.0 disables noisy views
+
+    # === Two-seed contraction term ===
+    ctr_enable: bool = False             # on/off
+    ctr_kappa: float = 0.05            # margin κ
+    ctr_weight: float = 1e-7        # base λ_ctr (will be annealed)
+    ctr_warmup: int = 0                 # rounds to ramp 0 → ctr_weight
+
+    # Primary loss weights (no align anywhere)
     organizer_recon_weight: float = 1.0
-    organizer_align_weight: float = 0.0
     organizer_kl_weight: float = 1.0
 
+
+    # --- KL regularization mode ---
+    # "full"   -> analytic per-sample KL(q(z|x) || N(0, I)) via mu, logvar
+    kl_mode: str = "full"  # {"full", "path"}
+    path_kl_kappa_mode: str = "one_minus_t"  # currently only option
+    path_kl_eps: float = 1e-8
+
     critic_recon_weight: float = 1.0
-    critic_align_weight: float = 0.0
+
+    cov_floor: float = 1e-4
+    latent_var_floor: float = 1e-4
 
     # how many rounds to ramp 0 → target
     organizer_recon_warmup: int = 0
-    organizer_align_warmup: int = 0  # <- set this to e.g. 500
     organizer_kl_warmup: int = 0
-
     critic_recon_warmup: int = 0
-    critic_align_warmup: int = 0
 
     agg_kl_batch: int = 65536
     target_eval_n: int = 8192
@@ -1462,7 +1608,7 @@ class AVRCConfig:
     test_rf_hidden: int = 128
     test_rf_depth: int = 4
     test_rf_log_every: int = 10000
-    test_rf_Ks: tuple = (2, 3, 4, 6, 8)
+    test_rf_Ks: tuple = (2, 4, 6, 8, 12, 16)
     test_rf_n: int = 80_000
     test_rf_mmd_max_n: int = 8192
     test_rf_bins: int = 200
@@ -1470,6 +1616,33 @@ class AVRCConfig:
     test_rf_seed: int | None = 777
     test_rf_proj_index: int = 0
     run_posthoc_rf: bool = True
+    test_rf_reflow_K: int = 25
+    test_rf_reflow_n_cache: int = 250000
+
+    # RF probe
+    test_rf_every: int = 100
+    test_rf_steps: int = 10000
+    test_rf_batch: int = 2048
+    test_rf_lr: float = 1e-3
+    test_rf_clip: float = 1.0
+    test_rf_hidden: int = 128
+    test_rf_depth: int = 4
+    test_rf_log_every: int = 10000
+    test_rf_Ks: tuple = (2, 3, 4, 5, 6, 10)
+    test_rf_n: int = 80_000
+    test_rf_mmd_max_n: int = 8192
+    test_rf_bins: int = 200
+    test_rf_outdir: str = "rf_snapshots"
+    test_rf_seed: int | None = 777
+    test_rf_proj_index: int = 0
+    run_posthoc_rf: bool = True
+
+    # rf probe sampler config
+    rf_sampler_mode   = "stochastic_annealed"
+    rf_stoch_sigma0   = 0.0      # or 0.05 if you want super gentle
+    rf_stoch_t_cutoff = 0.1      # only on [0, 0.1] of the path
+    rf_stoch_power    = 2.0      # concentrated near 0
+    rf_stoch_min_t    = 1e-4     # fine as-is
 
     # latent viz
     viz_latent: bool = True
@@ -1491,23 +1664,62 @@ class AVRCConfig:
 
     viz_disp_enable: bool = False
 
-    jitter_lambda: float = 0.00
+    jitter_lambda: float = 0.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Time sampling strategy for the decoder
-    time_sampling_gamma: float = 1.0  # shape parameter for Beta(1, gamma)
+    time_sampling_gamma: float = 1.0         # shape parameter for Beta(1, gamma)
     time_sampling_strategy: str = "uniform"  # {"uniform", "t0_only", "fixed"}
-    fixed_time_value: float = 0.5            # used if strategy is "fixed"
+    fixed_time_value: float = 1e-3           # used if strategy is "fixed"
     t0_prob: float = 0.0                     # if > 0, sample t=0 with this probability (mixed with uniform)
+
+    # --- Time curriculum Beta(1, γ(λ)) ---
+    time_curriculum: bool = False
+    time_gamma_min: float = 1e-4
+    time_gamma_power: float = 1.0
+
+    # --- t-dependent reconstruction weighting ---
+    # let σ(t) handle time-weighting once we use gauss_nll
+
+    recon_t_weight_mode: str  = "inv_1mt"
+    #recon_t_weight_mode: str  = "none"
+    recon_t_weight_power: float = -1
+    recon_t_weight_eps: float   = 1e-4
+    recon_t_weight_cap: float   = 0.0
+    recon_t_weight_batchnorm: bool = True
+
+    # --- Gaussian NLL recon with σ(t) schedule ---
+    #recon_loss_type: str = "mse"   # was "gaus_nll"
+    recon_loss_type: str = "gass_nll"   # was "gaus_nll"
+    recon_sigma_max: float = 1.0         # σ(t=0): very noisy recon allowed
+    recon_sigma_min: float = 0.1         # σ(t=1): fairly sharp recon
+    recon_sigma_power: float = 1.0      # shape of decay in (1 - t)
+
 
     log_mmd_max_n: int = 8192
     log_sw2_max_n: int = 4096
 
-    # ---- NEW: loss annealing ----
-    # mode: "linear" or "none"
+    # ---- loss annealing ----
     loss_anneal_mode: str = "linear"
+    joint_train: bool = True
 
+    # --- posthoc endpoint decoder config ---
+    postdec_enabled: bool = True
+    postdec_t_value: float = .95
+    postdec_epochs: int = 400
+    postdec_batch: int = 8192
+    postdec_lr: float = 1e-3
+    postdec_weight_decay: float = 0.0
+    postdec_hidden: int = 512
+    postdec_depth: int = 6
+    postdec_dropout: float = 0.0
+    postdec_use_threshold: float = 0.9
+    postdec_retrain_on_log: bool = False
+    postdec_retrain_on_viz: bool = True
 
+    # per-t endpoint decoder training knobs
+    postdec_t_jitter: float = 0.0
+    postdec_reset_params_each_t: bool = True
 
 
 @torch.no_grad()
@@ -1529,10 +1741,19 @@ def sample_init_points(
         return torch.randn(n, D, device=device, dtype=TDTYPE)
 
     elif mode == "encoder":
-        assert enc is not None, "encoder init requires enc"
-        x1 = sample_target_torch(n)            # expected to output (n, D) when you swap in high-D targets
-        mu, logv, _ = unpack_encoder_output(enc(x1))
-        return reparam(mu, logv)
+          assert enc is not None, "encoder init requires enc"
+          x1 = sample_target_torch(n)
+          mu, logv, _ = unpack_encoder_output(enc(x1))
+          cov_floor = 0.0
+          # Try to read a floor from typical locations if available:
+          if hasattr(enc, "cfg") and hasattr(enc.cfg, "cov_floor"):
+              cov_floor = float(enc.cfg.cov_floor)
+          elif hasattr(enc, "cov_floor"):
+              cov_floor = float(enc.cov_floor)
+          s2  = torch.exp(logv) + cov_floor
+          eps = torch.randn_like(mu)
+          return mu + torch.sqrt(s2) * eps
+
 
     elif mode in ("identity_fuzz", "x_fuzz", "id_fuzz"):
         x1 = sample_target_torch(n)
@@ -1547,7 +1768,7 @@ def sample_init_points(
 # ----------------------------- Dimension-agnostic velocity -----------------------------
 class VelocityXD(nn.Module):
     """v(x,t): R^D × [0,1] → R^D"""
-    def __init__(self, D=2, hidden=128, depth=4):
+    def __init__(self, D=2, hidden=256, depth=6):
         super().__init__()
         self.D = D
         self.net = EnhancedMLP(input_dim=D, output_dim=D, hidden=hidden, depth=depth)
@@ -1592,8 +1813,9 @@ def train_rectified_flow_on_pairs_nd(
 ):
     if seed is not None:
         torch_state = torch.random.get_rng_state()
-        np_state = np.random.get_state()
-        torch.manual_seed(seed); np.random.set_state(np_state)
+        np_state    = np.random.get_state()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     Vx = VelocityXD(D=D, hidden=hidden, depth=depth).to(device)
     opt = torch.optim.Adam(Vx.parameters(), lr=lr, betas=(0.9,0.99), weight_decay=weight_decay)
@@ -1621,7 +1843,8 @@ def train_rectified_flow_on_pairs_nd(
             t0 = time.time()
 
     if seed is not None:
-        torch.random.set_rng_state(torch_state); np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(np_state)
 
     @torch.no_grad()
     def sampler(n: int, nfe: int, init="gauss", enc=None, fuzz_eps=1e-2):
@@ -1632,6 +1855,57 @@ def train_rectified_flow_on_pairs_nd(
             x = x + dt * Vx(x, t)
         return x
     return Vx, sampler
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import hsv_to_rgb
+import torch
+
+
+# ----------------------------------------------------------------------
+# Helpers (same as before, kept here for completeness)
+# ----------------------------------------------------------------------
+
+def plane_color(x: np.ndarray, r_max: float = 3.0) -> np.ndarray:
+    """
+    Color each point in R^2 by a smooth HSV map:
+        hue = angle, saturation ~ radius/r_max, value = 1.
+
+    x: (N,2) numpy array.
+    Returns RGB colors (N,3) in [0,1].
+    """
+    assert x.ndim == 2 and x.shape[1] == 2
+    r = np.linalg.norm(x, axis=1)
+    theta = np.arctan2(x[:, 1], x[:, 0])  # [-pi, pi]
+    h = (theta / (2.0 * np.pi) + 1.0) % 1.0
+    s = np.clip(r / r_max, 0.0, 1.0) ** 0.8
+    v = np.ones_like(r) * 0.95
+    hsv = np.stack([h, s, v], axis=1)
+    rgb = hsv_to_rgb(hsv)
+    return rgb
+
+
+def setup_ax(ax, title: str = ""):
+    ax.set_aspect("equal", "box")
+    ax.set_facecolor("black")
+    ax.set_xlim(-3.2, 3.2)
+    ax.set_ylim(-3.2, 3.2)
+    ax.set_xlabel(r"$\mu_1$")
+    ax.set_ylabel(r"$\mu_2$")
+    ax.set_title(title, color="white")
+    for r in (1.0, 2.0, 3.0):
+        circ = plt.Circle(
+            (0.0, 0.0),
+            r,
+            edgecolor="white",
+            linestyle="--",
+            linewidth=0.8,
+            fill=False,
+            alpha=0.5,
+        )
+        ax.add_patch(circ)
 
 
 
@@ -1736,6 +2010,7 @@ def _plot_rf_probe_grid_proj(
 
 
 
+
 # --------------- Encoder mean scatter via projection + optional density (REPLACES) ---------------
 @torch.no_grad()
 def plot_encoder_means_proj(
@@ -1797,7 +2072,6 @@ def plot_encoder_means_proj(
         fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     return out_path
-
 
 
 
@@ -2027,6 +2301,9 @@ def _eval_rf_decoded_probe_proj(
     import os, gc, numpy as np, matplotlib.pyplot as plt, matplotlib as mpl
     from matplotlib.colors import PowerNorm
 
+    import inspect, os, sys
+
+
     # --- target (explicitly NO whitening) ---
     x_tgt = sample_target_torch(n, _skip_whiten=True).to(device)  # (n,D)
     D = x_tgt.size(1)
@@ -2090,7 +2367,7 @@ def _eval_rf_decoded_probe_proj(
 
         perK_panels[K] = [
             ("target", Ht),                  # col 1
-            ("Enc→Dec (t=1)", H_encdec),     # col 2
+            ("Enc→Dec (t=t_end)", H_encdec),     # col 2
             (f"K={K} — Dec∘V (enc z₀)", H_enc),  # col 3
             (f"K={K} — Dec∘V (N(0,I))", H_g),    # col 4
         ]
@@ -2270,6 +2547,33 @@ def _eval_probe_models_proj(
     gc.collect()
     return tbl
 
+# --- schedules.py (new) OR near the top of train.py ---
+
+import copy
+import math
+from typing import Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import PowerNorm
+
+
+@torch.no_grad()
+def _safe_quantile_range(arr2d: np.ndarray, q: float = 0.997, pad: float = 1.2):
+    xlim = (np.quantile(arr2d[:, 0], 1 - q), np.quantile(arr2d[:, 0], q))
+    ylim = (np.quantile(arr2d[:, 1], 1 - q), np.quantile(arr2d[:, 1], q))
+    return [v * pad for v in xlim], [v * pad for v in ylim]
+
+
+def _reset_params_(m: nn.Module):
+    if hasattr(m, "reset_parameters"):
+        try:
+            m.reset_parameters()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2300,7 +2604,7 @@ class AVRC:
                 ).to(self.device)
 
 
-        # main decoder, trained in critic_step
+        # main decoder
         self.Dec = DecoderXD(
             D=D,
             hidden=cfg.dec_hidden,
@@ -2308,7 +2612,18 @@ class AVRC:
             dropout=cfg.dec_dropout,
         ).to(self.device)
 
-        # EMA / teacher decoder = slow copy of Dec used in organizer_step
+
+        self.Dec_post = EndpointDecoder(
+            D=cfg.D,
+            hidden=cfg.postdec_hidden,
+            depth=cfg.postdec_depth,
+            dropout=cfg.postdec_dropout,
+        ).to(self.device)
+        self.opt_postdec = torch.optim.Adam(
+            self.Dec_post.parameters(), lr=cfg.postdec_lr, weight_decay=cfg.postdec_weight_decay
+        )
+
+        # EMA / teacher decoder = slow copy of Dec
         # so organizer sees a *frozen-but-differentiable* decoder
         self.use_dec_teacher = True
         self.dec_ema = float(getattr(cfg, "dec_ema", 0.995))
@@ -2363,11 +2678,29 @@ class AVRC:
         self._viz_proj_pairs: list[torch.Tensor] = []
         self.round_idx = 0
 
+
+
         print(f"Training Path-VAE on {self.device}")
 
     # ------------------------------------------------------------------
     # time grids (kept for backward compatibility / plotting)
     # ------------------------------------------------------------------
+    def _make_pairs_gauss_to_z1_independent(self):
+        """
+        Naïve independent coupling in latent space:
+          z0 ~ N(0,I),  z1 = μ(x1), with z0 ⟂ z1.
+        """
+        @torch.no_grad()
+        def gen(n: int):
+            # keep latent scale consistent with your latent probe
+            x1 = sample_target_torch(int(n), _skip_whiten=True)
+            mu, logv, z1 = unpack_encoder_output(self.Enc(x1))
+            if z1 is None:
+                z1 = mu
+            z0 = torch.randn_like(z1)
+            return z0, z1
+        return gen
+
 
     def _get_t_grid(self) -> torch.Tensor:
         steps = max(2, int(self.cfg.path_steps))
@@ -2387,7 +2720,8 @@ class AVRC:
         """
         if t_grid is None:
             t_grid = self._get_t_grid()
-        gamma = float(self.cfg.time_sampling_gamma)
+        gamma = float(self._current_time_gamma())
+        #gamma = float(self.cfg.time_sampling_gamma)
         if gamma <= 0.0:
             raise ValueError("time_sampling_gamma must be positive")
         if gamma == 1.0:
@@ -2433,6 +2767,96 @@ class AVRC:
         return alpha, alpha_dot
 
 
+    def _progress_lambda(self) -> float:
+        """Training progress in [0,1] using round granularity."""
+        R = max(1, int(getattr(self.cfg, "rounds", 1)))
+        # self.round_idx is 0 at first round, (R-1) entering final round
+        return min(1.0, float(self.round_idx) / float(max(1, R - 1)))
+
+
+    def _current_time_gamma(self) -> float:
+        """Return γ(λ) for Beta(1, γ) time sampling (curriculum or fixed)."""
+        base = float(self.cfg.time_sampling_gamma)
+        if not getattr(self.cfg, "time_curriculum", False):
+            return base
+        lam = self._progress_lambda()
+        eps = float(getattr(self.cfg, "time_gamma_min", 1e-3))
+        p   = float(getattr(self.cfg, "time_gamma_power", 2.0))
+        # anneal: ε  →  1
+        return 1.0 - (1.0 - eps) * (1.0 - lam) ** p
+
+    def _recon_weight_from_t(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Return per-sample weights w(t) with shape (B,1).
+        Uses physical t (not alpha(t)).
+        """
+        mode = getattr(self.cfg, "recon_t_weight_mode", "none")
+        if mode == "none":
+            return torch.ones_like(t)
+
+        eps   = float(getattr(self.cfg, "recon_t_weight_eps", 1e-3))
+        power = float(getattr(self.cfg, "recon_t_weight_power", 1.0))
+
+        if mode == "inv_1mt":
+            w = torch.clamp(1.0 - t, min=eps).pow(-power)
+        else:
+            # fallback: no weighting
+            w = torch.ones_like(t)
+
+        cap = float(getattr(self.cfg, "recon_t_weight_cap", 0.0))
+        if cap > 0:
+            w = torch.clamp(w, max=cap)
+
+        if bool(getattr(self.cfg, "recon_t_weight_batchnorm", True)):
+            # stabilize overall scale across curricula / batches
+            w = w / (w.mean().clamp_min(1e-12))
+
+        return w
+
+
+    # --- NEW: one-call decode that switches to endpoint decoder near t=1 ---
+    def _decode_any(self, z: torch.Tensor, t_value: float) -> torch.Tensor:
+        thr = float(getattr(self.cfg, "postdec_use_threshold", 0.93))
+        if getattr(self.cfg, "postdec_enabled", True) and (t_value >= thr):
+            return self.Dec_post(z)                    # endpoint decoder (no t)
+        # fallback to path decoder
+        t = torch.full((z.size(0), 1), float(max(t_value, self.t_eps)), device=z.device, dtype=TDTYPE)
+        return self.Dec(z, t)
+
+    # --- NEW: public hook for probes that "decode from latent" at t≈1 ---
+    @torch.no_grad()
+    def _decode_latents_posthoc(self, z: torch.Tensor, t_value: float | None = None) -> torch.Tensor:
+        t_val = 1.0 if t_value is None else float(t_value)
+        return self._decode_any(z, t_val)
+
+    # --- NEW: brief retrain of endpoint decoder on z_t (t≈postdec_t_value) → x₁ ---
+    def _postdec_retrain(self, epochs: int | None = None):
+        if not getattr(self.cfg, "postdec_enabled", True):
+            return
+        steps = int(epochs or self.cfg.postdec_epochs)
+        B     = int(self.cfg.postdec_batch)
+        t_val = float(self.cfg.postdec_t_value)
+        self.Dec_post.train()
+        for _ in range(steps):
+            x1 = sample_target_torch(B).to(self.device)
+            with torch.no_grad():
+                mu, logv, _ = unpack_encoder_output(self.Enc(x1))
+                eps = torch.randn_like(mu)
+
+                std = torch.sqrt(torch.exp(logv) + self.cfg.latent_var_floor)
+                z0 = mu + std * eps
+                zt  = (1.0 - t_val) * z0 + t_val * mu  # “data-conditioned fuzz” via z0
+
+            pred = self.Dec_post(zt)
+            loss = F.mse_loss(pred, x1)
+            self.opt_postdec.zero_grad(set_to_none=True)
+            loss.backward()
+            if self.cfg.grad_clip > 0:
+                nn.utils.clip_grad_norm_(self.Dec_post.parameters(), self.cfg.grad_clip)
+            self.opt_postdec.step()
+        self.Dec_post.eval()
+
+
     @torch.no_grad()
     def _get_viz_logging_batch(self, N: int) -> dict[str, torch.Tensor]:
         """
@@ -2466,7 +2890,6 @@ class AVRC:
             "x_dec_prior": x_dec_prior,
         }
 
-
     # ------------------------------------------------------------------
     # EMA utils
     # ------------------------------------------------------------------
@@ -2484,38 +2907,88 @@ class AVRC:
         for p_t, p in zip(self.Dec_teacher.parameters(), self.Dec.parameters()):
             p_t.data.lerp_(p.data, 1.0 - ema)
 
+    @staticmethod
+    def _remove_spectral_norm_(module: nn.Module):
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                try:
+                    nn.utils.remove_spectral_norm(m)
+                except Exception:
+                    pass  # not spectrally normalized; ignore
+
+    def _sigma_t(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Time-dependent observation std σ(t), large near t=0 (z0 region),
+        small near t=1 (z1 ≈ μ(x) region).
+
+        t: (B,1) in [0,1]
+        returns: (B,1) σ(t)
+        """
+        cfg = self.cfg
+        # make sure we stay in [0,1] numerically
+        t = t.clamp(0.0, 1.0)
+
+        # we want σ(0) = σ_max, σ(1) = σ_min, monotone in (1 - t)
+        one_minus_t = 1.0 - t
+        base = one_minus_t.pow(cfg.recon_sigma_power)
+
+        sigma = cfg.recon_sigma_min + (cfg.recon_sigma_max - cfg.recon_sigma_min) * base
+        # avoid degenerate σ
+        sigma = torch.clamp(sigma, min=1e-6)
+        return sigma
+
+
+
+    def _recon_loss_gauss_nll(self, xhat: torch.Tensor, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Per-sample Gaussian NLL (omitting constant 0.5*D*log(2π)):
+          0.5 * [ ||x - xhat||^2 / σ^2 + D_data * log σ^2 ]
+
+        Returns the *per-dimension* NLL:
+          E[ NLL(x, x̂; σ(t)) ] / D_data
+        so that it is O(1) in the data dimension.
+        """
+        # data dimension (not latent)
+        D_data = x.size(1)
+
+        sigma = self._sigma_t(t).squeeze(1)   # (B,)
+        diff2 = (xhat - x).pow(2).sum(dim=1)  # (B,)
+        invs2 = 1.0 / (sigma * sigma)
+        log_s2 = 2.0 * torch.log(sigma)
+
+        # full NLL per sample, then divide by D_data to get per-dim
+        nll = 0.5 * (diff2 * invs2 + D_data * log_s2)
+        return nll.mean() / float(D_data)
+
     # ------------------------------------------------------------------
     # sampling helpers
     # ------------------------------------------------------------------
     def _sample_time_beta(self, batch_size: int) -> torch.Tensor:
-        """Sample time from Beta(1, gamma) distribution, on device."""
-        gamma = float(self.cfg.time_sampling_gamma)
+        """Sample t ~ Beta(1, γ(λ)) with γ possibly annealed over training."""
+        gamma = float(self._current_time_gamma())
         if gamma <= 0.0:
             raise ValueError("time_sampling_gamma must be positive")
 
-        if abs(gamma - 1.0) < 1e-6:
+        # Uniform endpoint (γ=1)
+        if abs(gamma - 1.0) < 1e-12:
             return torch.rand(batch_size, 1, device=self.device, dtype=TDTYPE)
 
-        a = torch.tensor(1.0, device=self.device, dtype=TDTYPE)
-        b = torch.tensor(gamma, device=self.device, dtype=TDTYPE)
-        dist = torch.distributions.Beta(a, b)
-        t = dist.rsample((batch_size,)).unsqueeze(1)  # (B,1)
+        # Stable transform sampler for Beta(1, γ):  t = 1 - U^(1/γ)
+        u = torch.rand(batch_size, 1, device=self.device, dtype=TDTYPE).clamp_min(1e-12)
+        t = 1.0 - torch.pow(u, 1.0 / gamma)
         return t
 
-    def _sample_batch(
-        self, B: int, requires_grad_encoder: bool
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    def _sample_batch(self, B: int, requires_grad_encoder: bool):
         x1 = sample_target_torch(B)
-        if requires_grad_encoder:
-            mu, logv, z1 = unpack_encoder_output(self.Enc(x1))
-        else:
-            with torch.no_grad():
-                mu, logv, z1 = unpack_encoder_output(self.Enc(x1))
+        mu, logv, z1 = self._encode_pack(x1, requires_grad=requires_grad_encoder, add_noise=True)
         if z1 is None:
             z1 = x1
         eps = torch.randn_like(mu)
-        z0 = mu + torch.exp(0.5 * logv) * eps
+        s2  = torch.exp(logv) + self.cfg.cov_floor
+        z0  = mu + torch.sqrt(s2) * eps
         return x1, mu, logv, z0, z1
+
 
     def _decode_path(
         self, z0: torch.Tensor, z1: torch.Tensor
@@ -2553,114 +3026,71 @@ class AVRC:
         t = torch.full((z.size(0), 1), float(t_value), device=z.device, dtype=TDTYPE)
         return self.Dec(z, t)
 
-    def organizer_step(self, B: int | None = None) -> dict[str, float]:
-        B = B or self.cfg.batch
+    # --- encoder forward with optional input noise ---
+    def _apply_enc(self, x: torch.Tensor, *, requires_grad: bool = True, add_noise: bool = True):
+        sigma = float(getattr(self.cfg, "enc_input_noise_std", 0.0))
+        if add_noise and sigma > 0.0:
+            x = x + sigma * torch.randn_like(x)
+        if requires_grad:
+            return self.Enc(x)
+        else:
+            with torch.no_grad():
+                return self.Enc(x)
 
-        # 1–5: sample x1, encode, sample z0, sample t~Beta, form z_t, eval frozen-but-diff decoder
-        self.Dec.requires_grad_(False)  # frozen-but-differentiable decoder
-        x1, mu, logv, z0, z1 = self._sample_batch(B, requires_grad_encoder=True)
-
-        t = self._sample_time_beta(B)  # (B,1)
-
-        # per-sample warp α(t), α̇(t)  (α̇ not needed in this lightweight organizer)
-        alpha, _ = self._time_warp(t)
-
-        # build warped latent coord z_{α(t)}
-        zt = (1.0 - alpha) * z0 + alpha * z1
-
-        # decode at physical t, but from the warped coord
-        dec = self.Dec_teacher if (self.use_dec_teacher) else self.Dec
-        xhat_t = dec(zt, t)
-        xhat_0 = dec(z0, torch.zeros_like(t))
-
-        # 6. L_disp = || x1 - xhat_t ||^2
-        disp_loss = (x1 - xhat_t).pow(2).sum(dim=1).mean()
-
-        # 7. L_align = 2 < xhat_t - xhat_0, x1 - xhat_0 >
-        diff_t0 = xhat_t - xhat_0          # decoder’s step along path
-        resid_0 = x1 - xhat_0              # residual to data
-        align_loss = 2.0 * (diff_t0 * resid_0).sum(dim=1).mean()
-
-        # 8. L_KL
-        kl_loss = kl_normal_diag(mu, logv)
-
-        # 9. L_enc = λ_disp * L_disp + λ_align * L_align + λ_KL * L_KL
-        total = (
-            self.cfg.organizer_recon_weight * disp_loss
-            + self.cfg.organizer_align_weight * align_loss
-            + self.cfg.organizer_kl_weight * kl_loss
-        )
-        # (PDF’s alg.1 doesn’t have the endpoint term here, so we drop it;
-        #  if you want it, add + cfg.organizer_endpoint_weight * F.mse_loss(xhat_1, x1))
-
-        self.opt_enc.zero_grad(set_to_none=True)
-        total.backward()
-        if self.cfg.grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.Enc.parameters(), self.cfg.grad_clip)
-        self.opt_enc.step()
-        if self.enc_scheduler is not None:
-            self.enc_scheduler.step()
-
-        self.Dec.requires_grad_(True)
-
-        stats = {
-            "recon": float(disp_loss.detach().cpu()),
-            "align": float(align_loss.detach().cpu()),
-            "kl": float(kl_loss.detach().cpu()),
-            "total": float(total.detach().cpu()),
-        }
-        self.history["organizer"].append(stats)
-        return stats
+    def _encode_pack(self, x: torch.Tensor, *, requires_grad: bool = True, add_noise: bool = True):
+        """
+        Returns (mu, logv, z1). Ensures z1=mu if None, mirroring unpack logic.
+        """
+        enc_out = self._apply_enc(x, requires_grad=requires_grad, add_noise=add_noise)
+        mu, logv, z1 = unpack_encoder_output(enc_out)
+        if z1 is None:
+            z1 = mu
+        return mu, logv, z1
 
 
-    def critic_step(self, B: int | None = None) -> dict[str, float]:
-        B = B or self.cfg.batch
+    def _two_seed_contraction_loss(self, x_clean: torch.Tensor):
+        sigma = float(getattr(self.cfg, "enc_input_noise_std", 0.0))
+        kappa = float(getattr(self.cfg, "ctr_kappa", 0.03))
+        device = x_clean.device
 
-        # 1–2: encoder is frozen, we only use it to get the coupling (constants)
-        self.Enc.requires_grad_(False)
+        if sigma <= 0.0:
+            zero = torch.zeros((), device=device, dtype=TDTYPE)
+            return zero, zero
 
-        # 1. sample x̃₁ ~ p_data
-        x1 = sample_target_torch(B)
+        eps_a = torch.randn_like(x_clean) * sigma
+        eps_b = torch.randn_like(x_clean) * sigma
+        xa = x_clean + eps_a
+        xb = x_clean + eps_b
 
-        # 2–3. encode, sample z̃₀ ~ N(μ₀, Σ₀)
-        with torch.no_grad():
-              mu, logv, z1 = unpack_encoder_output(self.Enc(x1))
-              eps = torch.randn_like(mu)
-              z0 = mu + torch.exp(0.5 * logv) * eps
+        mu_a, logv_a, _ = self._encode_pack(xa, requires_grad=True, add_noise=False)
+        mu_b, logv_b, _ = self._encode_pack(xb, requires_grad=True, add_noise=False)
 
-        # 4. sample t (PDF: Unif; here: Beta(1, γ) as you wanted)
-        t   = self._sample_time_beta(B)
-        # time-warped latent coord (no-op if jitter_lambda == 0)
-        alpha, _ = self._time_warp(t)
-        zt  = (1.0 - alpha) * z0 + alpha * z1
-        # still evaluate decoder at the *physical* time t
-        xhat_t = self.Dec(zt, t)
-        recon_loss = F.mse_loss(xhat_t, x1)
+        eps_za = torch.randn_like(mu_a)
+        eps_zb = torch.randn_like(mu_b)
+        s2_a = torch.exp(logv_a) + self.cfg.latent_var_floor
+        s2_b = torch.exp(logv_b) + self.cfg.latent_var_floor
+        z0_a = mu_a + torch.sqrt(s2_a) * eps_za
+        z0_b = mu_b + torch.sqrt(s2_b) * eps_zb
 
-        # 6. update φ
-        total = self.cfg.critic_recon_weight * recon_loss
+        dmu = mu_a - mu_b
+        dz  = z0_a - z0_b
+        inner = (dmu * dz).sum(dim=1)
+        dz2   = dz.pow(2).sum(dim=1)
 
-        self.opt_dec.zero_grad(set_to_none=True)
-        total.backward()
-        if self.cfg.grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.Dec.parameters(), self.cfg.grad_clip)
-        self.opt_dec.step()
-        if self.dec_scheduler is not None:
-            self.dec_scheduler.step()
+        # CHANGED: penalize violations (inner < (1-κ)||dz||^2)
+        margin = (1.0 - kappa) * dz2 - inner
 
-        # keep EMA teacher in sync for the *next* encoder round
-        self._ema_update_teacher()
+        # NEW (optional smoothing via tau; set tau=0 to get ReLU hinge)
+        tau = float(getattr(self.cfg, "ctr_softplus_tau", 0.0))
+        if tau > 0.0:
+            l2seed = (F.softplus(margin / tau) * tau).mean()
+        else:
+            l2seed = F.relu(margin).mean()
 
-        # re-enable encoder for organizer
-        self.Enc.requires_grad_(True)
+        # certificate unchanged (reads high when badly violating)
+        lambda_hat0 = (1.0 - inner / dz2.clamp_min(1e-12)).median()
 
-        stats = {
-            "recon": float(recon_loss.detach().cpu()),
-            "total": float(total.detach().cpu()),
-        }
-        self.history["critic"].append(stats)
-        return stats
-
+        return l2seed, lambda_hat0
 
 
     @torch.no_grad()
@@ -2694,8 +3124,12 @@ class AVRC:
             mu0 = enc_out
             logv0 = torch.zeros_like(mu0)
 
-        z0 = mu0 + torch.exp(0.5 * logv0) * self._viz_eps
-        z1 = mu0  # deterministic latent                                        # deterministic latent target
+
+        std0 = torch.sqrt(torch.exp(logv0) + self.cfg.latent_var_floor)
+        z0 = mu0 + std0 * self._viz_eps
+        #z0 = mu0 + torch.exp(0.5 * logv0) * self._viz_eps
+
+        z1 = mu0  # deterministic latent
 
         P_seed = choose_projection_pairs(
             self.cfg.D,
@@ -2752,7 +3186,7 @@ class AVRC:
         )
         self._viz_ready = True
 
-    
+
     @torch.no_grad()
     def export_latent_path_animation(
         self,
@@ -2949,7 +3383,7 @@ class AVRC:
         out_dir: str = "viz_decoder_path",
         t_list: tuple[float, ...] = (0.7, 0.8, 0.9, 1.0),
         n_line: int = 50,
-        rf_K: int | None = None,
+        rf_K: int = 25,
         trials: int = 10,
         hist_bins: int = 160,
         batch_n: int | None = None,
@@ -3166,6 +3600,294 @@ class AVRC:
         print(f"[decoder-path-benchmark] saved:\n  {line_path}\n  {hist_path}")
 
 
+    def _make_endpoint_decoder(self) -> nn.Module:
+        """
+        Create a fresh endpoint-decoder instance by deep-copying self.Dec_post and
+        resetting parameters. Requires self.Dec_post to exist and be on the right device.
+        """
+        if getattr(self, "Dec_post", None) is None:
+            raise RuntimeError(
+                "Per-t endpoint benchmark requires self.Dec_post (endpoint decoder template)."
+            )
+        model = copy.deepcopy(self.Dec_post).to(self.device)
+        # optional reset unless user forbids
+        if bool(getattr(self.cfg, "postdec_reset_params_each_t", True)):
+            model.apply(_reset_params_)
+        return model
+
+
+    def _train_endpoint_decoder_at_t(self, t_val: float) -> nn.Module:
+        """
+        Lightweight training of an endpoint decoder h_ψ^t : z_t -> x_1 at a specific t.
+        Uses the frozen encoder to synthesize supervision pairs (z_t, x_1).
+        """
+        device = self.device
+        B      = int(getattr(self.cfg, "postdec_batch", 512))
+        steps  = int(getattr(self.cfg, "postdec_epochs", 300))  # "a few hundred"
+        lr     = float(getattr(self.cfg, "postdec_lr", 1e-3))
+        t_jit  = float(getattr(self.cfg, "postdec_t_jitter", 0.0))  # e.g., 0.02
+        grad_clip = float(getattr(self.cfg, "grad_clip", 0.0))
+
+        model = self._make_endpoint_decoder()
+        model.train()
+        opt   = torch.optim.Adam(model.parameters(), lr=lr)
+
+        t_eps = float(getattr(self, "t_eps", 1e-3))
+        for _ in range(steps):
+            x1 = sample_target_torch(B).to(device)
+            with torch.no_grad():
+                mu, logv, _ = unpack_encoder_output(self.Enc(x1))
+                eps = torch.randn_like(mu)
+                z0  = mu + torch.exp(0.5 * logv) * eps
+
+                if t_jit > 0.0:
+                    # uniform jitter in [t_val - t_jit, t_val + t_jit], clamped
+                    t_eff = float(
+                        max(t_eps, min(1.0, t_val + (2.0 * torch.rand(1).item() - 1.0) * t_jit))
+                    )
+                else:
+                    t_eff = float(max(t_eps, min(1.0, t_val)))
+
+                zt = (1.0 - t_eff) * z0 + t_eff * mu
+
+            pred = model(zt)
+            loss = F.mse_loss(pred, x1)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip > 0.0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+
+        model.eval()
+        return model
+
+
+    def export_endpoint_decoder_path_benchmark(
+        self,
+        out_dir: str = "viz_endpoint_decoder_path",
+        t_list: tuple[float, ...] = (0.7, 0.8, 0.9, 1.0),
+        n_line: int = 50,
+        rf_K: int | None = None,
+        trials: int = 10,
+        hist_bins: int = 160,
+        batch_n: int | None = None,
+        tag: str = "",
+    ) -> None:
+          """
+          Post-training benchmark using *per-t endpoint decoders* h_ψ^t instead of the path decoder.
+
+          Exactly mirrors export_decoder_path_benchmark, except:
+            • For every time t in the union of {line grid} ∪ {hist list}, we train a tiny
+              endpoint decoder h_ψ^t on the frozen latent and decode with it (no t input).
+            • 'oracle', 'RF(enc)', and 'RF(gauss)' branches are unchanged except that decoding
+              goes through h_ψ^t(·) rather than D(·, t).
+
+          Training uses cfg.postdec_* knobs: postdec_epochs, postdec_batch, postdec_lr, postdec_t_jitter.
+          """
+          import os
+
+          os.makedirs(out_dir, exist_ok=True)
+
+          v_model = getattr(self, "posthoc_rf_v_model", None)
+          if v_model is None:
+              raise RuntimeError(
+                  "No trained rectified flow found. Run self._run_rf_probe(...) first."
+              )
+
+          device = self.device
+          N = int(batch_n or getattr(self.cfg, "viz_hist_n", 8192))
+
+          # histogram times (coarse)
+          t_hist = [float(t) for t in t_list]
+          nT = len(t_hist)
+
+          # line times (fine)
+          t_line = np.linspace(1.0 / n_line, 1.0, n_line).tolist()  # (0,1]
+
+          # master times we must handle
+          t_all = sorted(set(t_hist) | set(t_line))
+
+          # choose RF K
+          if rf_K is None:
+              if hasattr(self.cfg, "test_rf_Ks") and len(self.cfg.test_rf_Ks) > 0:
+                  rf_K = int(max(self.cfg.test_rf_Ks))
+              else:
+                  rf_K = 32
+
+          # --- 1) Train a small endpoint decoder *for every t* we will evaluate ---
+          dec_at: Dict[float, nn.Module] = {}
+          for t in t_all:
+              dec_at[t] = self._train_endpoint_decoder_at_t(float(t))
+
+          # --- accumulators (line) ---
+          mmd_oracle_line = np.zeros(len(t_line), dtype=np.float64)
+          mmd_rf_enc_line = np.zeros(len(t_line), dtype=np.float64)
+          mmd_rf_gauss_line = np.zeros(len(t_line), dtype=np.float64)
+
+          # --- keep last-trial hists ---
+          last_x1 = None
+          last_oracle_dec_hist = []
+          last_rf_enc_dec_hist = []
+          last_rf_gauss_dec_hist = []
+
+          # helper: Euler RF transport from arbitrary start
+          def _rf_transport_from(start_z: torch.Tensor, t_targets: list[float]) -> dict[float, torch.Tensor]:
+              z = start_z.clone()
+              out_steps: dict[int, torch.Tensor] = {0: z.clone()}
+              max_step = max(int(math.ceil(t * rf_K)) for t in t_targets if t > 0.0)
+              for k in range(1, max_step + 1):
+                  t_step = k / float(rf_K)
+                  t_in = torch.full((N, 1), t_step, device=device, dtype=z.dtype)
+                  v = v_model(z, t_in)
+                  z = z + v / float(rf_K)
+                  out_steps[k] = z.clone()
+              out: dict[float, torch.Tensor] = {}
+              for t in t_targets:
+                  if t <= 0.0:
+                      out[t] = start_z
+                  else:
+                      s = int(round(t * rf_K))
+                      s = max(1, min(s, max_step))
+                      out[t] = out_steps[s]
+              return out
+
+          for tr in range(trials):
+              batch = self._get_viz_logging_batch(N)
+              x1 = batch["x_tgt_enc"].to(device)
+              z0_enc = batch["model_z0"].to(device)
+              mu, logv, _ = unpack_encoder_output(self.Enc(x1))
+              Ddim = x1.size(1)
+
+              # RF from Gaussian
+              z0_gauss = torch.randn(N, Ddim, device=device, dtype=x1.dtype)
+              rf_gauss_latents = _rf_transport_from(z0_gauss, t_all)
+
+              # RF from encoder latent
+              rf_enc_latents = _rf_transport_from(z0_enc, t_all)
+
+              # analytic "oracle" chord latents
+              oracle_latents = {t: (1.0 - t) * z0_enc + t * mu for t in t_all}
+
+              # ---- line MMDs (decode through per-t endpoint decoders) ----
+              for i, t in enumerate(t_line):
+                  dec_t = dec_at[t]
+                  x_oracle = dec_t(oracle_latents[t])
+                  mmd_val = mmd_rbf_nd(x_oracle, x1, max_n=self.cfg.log_mmd_max_n)
+                  mmd_oracle_line[i] += mmd_val
+
+                  x_rf_enc = dec_t(rf_enc_latents[t])
+                  mmd_val = mmd_rbf_nd(x_rf_enc, x1, max_n=self.cfg.log_mmd_max_n)
+                  mmd_rf_enc_line[i] += mmd_val
+
+                  x_rf_gauss = dec_t(rf_gauss_latents[t])
+                  mmd_val = mmd_rbf_nd(x_rf_gauss, x1, max_n=self.cfg.log_mmd_max_n)
+                  mmd_rf_gauss_line[i] += mmd_val
+
+              # ---- hist (keep last trial only) ----
+              last_x1 = x1.detach().cpu()
+              last_oracle_dec_hist = []
+              last_rf_enc_dec_hist = []
+              last_rf_gauss_dec_hist = []
+              for t in t_hist:
+                  dec_t = dec_at[t]
+                  last_oracle_dec_hist.append(dec_t(oracle_latents[t]).detach().cpu())
+                  last_rf_enc_dec_hist.append(dec_t(rf_enc_latents[t]).detach().cpu())
+                  last_rf_gauss_dec_hist.append(dec_t(rf_gauss_latents[t]).detach().cpu())
+
+          # average line mmds
+          mmd_oracle_line /= float(trials)
+          mmd_rf_enc_line /= float(trials)
+          mmd_rf_gauss_line /= float(trials)
+
+          # -------- line plot --------
+          fig = plt.figure(figsize=(5.0, 4.0))
+          plt.plot(t_line, mmd_oracle_line, label="h_t(oracle z_t)")
+          plt.plot(t_line, mmd_rf_enc_line, label="h_t(RF(enc) z_t)")
+          plt.plot(t_line, mmd_rf_gauss_line, label="h_t(RF(gauss) z_t)")
+          plt.xlabel("t")
+          plt.ylabel("MMD to x₁")
+          plt.title("Endpoint decoders vs t (fine)")
+          plt.grid(True, alpha=0.25)
+          plt.legend()
+          line_path = os.path.join(out_dir, f"endpoint_decoder_path_mmd{tag}.png")
+          plt.tight_layout()
+          plt.savefig(line_path, dpi=150)
+          plt.close(fig)
+
+          # -------- hist grid (magma, black bg) --------
+          # projection
+          if getattr(self, "_viz_proj_pairs", None):
+              P = self._viz_proj_pairs[0]
+          else:
+              P = choose_projection_pairs(self.cfg.D, num_pairs=1)[0]
+
+          x1_proj = project_nd(last_x1.to(device), P).detach().cpu().numpy()
+          xlim, ylim = _safe_quantile_range(x1_proj, q=0.997, pad=1.2)
+
+          x_edges = np.linspace(xlim[0], xlim[1], hist_bins + 1)
+          y_edges = np.linspace(ylim[0], ylim[1], hist_bins + 1)
+
+          def _hist2d_proj_tensor(X_cpu: torch.Tensor):
+              Xp = project_nd(X_cpu.to(device), P).detach().cpu().numpy()
+              H, _, _ = np.histogram2d(
+                  Xp[:, 0], Xp[:, 1], bins=[x_edges, y_edges], density=True
+              )
+              return H
+
+          H_x1 = _hist2d_proj_tensor(last_x1)
+          H_oracle = [_hist2d_proj_tensor(tens) for tens in last_oracle_dec_hist]
+          H_rf_enc = [_hist2d_proj_tensor(tens) for tens in last_rf_enc_dec_hist]
+          H_rf_gauss = [_hist2d_proj_tensor(tens) for tens in last_rf_gauss_dec_hist]
+
+          gamma = float(getattr(self.cfg, "viz_hist_gamma", 0.5))
+          vmax_pct = float(getattr(self.cfg, "viz_hist_vmax_percentile", 99.5))
+          all_vals = [H_x1.ravel()]
+          for H in H_oracle + H_rf_enc + H_rf_gauss:
+              all_vals.append(H.ravel())
+          all_vals = np.concatenate(all_vals, axis=0)
+          vmax = np.percentile(all_vals, vmax_pct)
+          norm = PowerNorm(gamma=max(1e-3, gamma), vmin=0.0, vmax=max(vmax, 1e-9))
+
+          ncols = len(t_hist)
+          fig, axes = plt.subplots(
+              nrows=4,
+              ncols=ncols,
+              figsize=(3.0 * ncols, 3.0 * 4),
+              squeeze=False,
+          )
+          fig.patch.set_facecolor("black")
+
+          def _panel(ax, H, title=""):
+              ax.imshow(
+                  H.T,
+                  origin="lower",
+                  extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
+                  cmap="magma",
+                  norm=norm,
+                  interpolation="bilinear",
+                  aspect="equal",
+              )
+              ax.set_xticks([])
+              ax.set_yticks([])
+              ax.set_facecolor("black")
+              if title:
+                  ax.set_title(title, color="w", fontsize=8)
+
+          for j, t in enumerate(t_hist):
+              _panel(axes[0, j], H_x1, f"x₁ (t={t:0.2f})" if j == 0 else f"t={t:0.2f}")
+              _panel(axes[1, j], H_oracle[j], "h_t(oracle)" if j == 0 else "")
+              _panel(axes[2, j], H_rf_enc[j], "h_t(RF enc)" if j == 0 else "")
+              _panel(axes[3, j], H_rf_gauss[j], "h_t(RF gauss)" if j == 0 else "")
+
+          plt.tight_layout()
+          hist_path = os.path.join(out_dir, f"endpoint_decoder_path_hists{tag}.png")
+          plt.savefig(hist_path, dpi=170, bbox_inches="tight", facecolor="black")
+          plt.close(fig)
+
+          print(f"[endpoint-decoder-path-benchmark] saved:\n  {line_path}\n  {hist_path}")
+
+
 
 
     @torch.no_grad()
@@ -3217,57 +3939,97 @@ class AVRC:
                 title=f"Encoder means μ(x) — r={round_idx:05d} — proj {j}",
             )
 
-    @torch.no_grad()
-    def _save_hist_grid_frame(self, round_idx: int, t_path: tuple[float, ...] = (0.0, .5, 0.75, .875, .9375, 1.0)):
+
+    def _save_hist_grid_frame(self, round_idx: int, t_path: tuple[float, ...] = (.4, .6, .7, .8 ,.9, 1.00)):
+        """
+        Save a histogram grid where *each column using a decode at t* is produced by an
+        endpoint decoder h_ψ^t trained *on the fly* for that specific t. No pathwise decoder
+        is used anywhere in this visualization.
+
+        For every t in t_path:
+          1) Train a fresh endpoint decoder h_ψ^t via self._train_endpoint_decoder_at_t(t).
+          2) Build z_t = (1 - t) z0 + t μ(x) from the cached viz batch.
+          3) Decode x_t = h_ψ^t(z_t) and plot histograms.
+
+        The first column of "samples" may include Dec_t≈0(z0(x)) and Dec_t≈0(N(0,I)) by applying
+        the *t≈0* endpoint decoder to z0 and to prior N(0,I) respectively (still endpoint decoding).
+        """
         if not self.cfg.viz_hist:
             return
 
-        import os, numpy as np, matplotlib.pyplot as plt
+        import os, gc
+        import numpy as np
+        import torch
+        import matplotlib.pyplot as plt
         from matplotlib.colors import PowerNorm
 
         os.makedirs(self.cfg.viz_hist_dir, exist_ok=True)
 
+        device    = self.device
         N         = int(self.cfg.viz_hist_n)
         bins      = int(self.cfg.viz_hist_bins)
         gamma     = float(self.cfg.viz_hist_gamma)
         vmax_pct  = float(self.cfg.viz_hist_vmax_percentile)
+        t_eps     = float(getattr(self, "t_eps", 1e-3))
 
-        # base batch (z0 from encoder, decoded-at-0, etc.)
+        # ---------------------------------------------------------------------
+        # 0) Pull the cached visualization batch (keeps targets consistent)
+        # ---------------------------------------------------------------------
+        # Expected keys:
+        #   prior_z      ~ N(0,I)               (N,D)
+        #   model_z0     = μ + σ ⊙ ε            (N,D)  (posterior sample z0)
+        #   x_tgt_enc    = target x batch       (N,D)
+        #   x_tgt_prior  = target x batch (prior stream) (N,D)
         batch = self._get_viz_logging_batch(N)
+        prior_z      = batch["prior_z"].to(device)
+        model_z0     = batch["model_z0"].to(device)
+        x_tgt_enc    = batch["x_tgt_enc"].to(device)
+        x_tgt_prior  = batch["x_tgt_prior"].to(device)
 
-        # tensors on device
-        prior_z      = batch["prior_z"]          # (N,D)   latent target ~ N(0,I)
-        model_z0     = batch["model_z0"]         # (N,D)
-        x_tgt_enc    = batch["x_tgt_enc"]        # (N,D)
-        x_dec_model  = batch["x_dec_model"]      # (N,D) = Dec(z_0, t≈0)
-        x_tgt_prior  = batch["x_tgt_prior"]      # (N,D)
-        x_dec_prior  = batch["x_dec_prior"]      # (N,D) (we now plot at the path t=0 slot)
+        # latent target via encoder mean μ(x)
+        mu_0, _, _ = unpack_encoder_output(self.Enc(x_tgt_enc))
 
-        # --------- latent path using μ_0 from encoder ---------
-        mu_0, _, z1_from_enc = unpack_encoder_output(self.Enc(x_tgt_enc))
+        # ---------------------------------------------------------------------
+        # 1) Train endpoint decoders for each requested t (on the fly)
+        #    Keep a clear mapping so we can display the exact t label the user asked for.
+        # ---------------------------------------------------------------------
+        # Use t_eff to avoid exactly zero during training; but *display* the original t.
+        t_eff_map = {float(t): float(max(t_eps, min(1.0, t))) for t in t_path}
+        dec_at_t: dict[float, torch.nn.Module] = {}
 
-        decoded_path_xy = []
-        for tval in t_path:
-            z_t = (1.0 - tval) * model_z0 + tval * mu_0
-            t_tensor = torch.full(
-                (N, 1),
-                float(tval if tval > 0.0 else self.t_eps),
-                device=self.device,
-                dtype=TDTYPE,
-            )
-            x_dec_t = self.Dec(z_t, t_tensor)
-            decoded_path_xy.append((tval, x_dec_t[:, :2].detach().cpu().numpy()))
+        for t_disp, t_eff in t_eff_map.items():
+            print(f"[viz] training endpoint decoder at t={t_disp:.3f} (eff={t_eff:.3f})")
+            # training routine already jitters internally if configured
+            dec_at_t[t_disp] = self._train_endpoint_decoder_at_t(t_eff)
 
-        # convert to numpy (first 2 dims)
+        # ---------------------------------------------------------------------
+        # 2) Build decoded samples per t using the appropriate endpoint decoder
+        # ---------------------------------------------------------------------
+        decoded_path_xy = []   # list[(t, np.ndarray[N,2])]
+        with torch.no_grad():
+            for t_disp, t_eff in t_eff_map.items():
+                # Construct z_t using cached z0 and μ(x) from the same batch (posterior path)
+                z_t = (1.0 - t_eff) * model_z0 + t_eff * mu_0
+                x_dec_t = dec_at_t[t_disp](z_t)
+                decoded_path_xy.append((t_disp, x_dec_t[:, :2].detach().cpu().numpy()))
+
+            # For the t≈0 panels, decode z0 and prior with the t≈0 endpoint decoder (still endpoint!)
+            dec0 = dec_at_t[min(t_path, key=lambda v: abs(v - 0.0))]
+            x_dec_model_t0 = dec0(model_z0)          # Dec_{t≈0}(z0(x))
+            x_dec_prior_t0 = dec0(prior_z)           # Dec_{t≈0}(N(0,I))
+
+        # ---------------------------------------------------------------------
+        # 3) Convert to numpy for histogramming
+        # ---------------------------------------------------------------------
         prior_z2      = prior_z[:, :2].detach().cpu().numpy()
         model_z0_2    = model_z0[:, :2].detach().cpu().numpy()
         x_tgt_enc_2   = x_tgt_enc[:, :2].detach().cpu().numpy()
-        x_dec_model_2 = x_dec_model[:, :2].detach().cpu().numpy()
         x_tgt_pr_2    = x_tgt_prior[:, :2].detach().cpu().numpy()
-        x_dec_prior_2 = x_dec_prior[:, :2].detach().cpu().numpy()  # NEW: decode of N(0,I) at t≈0
+        x_dec_model_2 = x_dec_model_t0[:, :2].detach().cpu().numpy()
+        x_dec_prior_2 = x_dec_prior_t0[:, :2].detach().cpu().numpy()
 
         # robust square limits
-        all_x = [x_tgt_enc_2, x_tgt_pr_2, model_z0_2, x_dec_model_2]
+        all_x = [x_tgt_enc_2, x_tgt_pr_2, model_z0_2, x_dec_model_2, x_dec_prior_2]
         for _, xy in decoded_path_xy:
             all_x.append(xy)
         all_x = np.concatenate(all_x, axis=0)
@@ -3278,9 +4040,8 @@ class AVRC:
         lo  = np.quantile(all_x[:, 1], 1 - q); hi = np.quantile(all_x[:, 1], q)
         ylim = (lo * 1.2, hi * 1.2)
 
-        def _square_limits(xlim, ylim):
-            lo = min(xlim[0], ylim[0])
-            hi = max(xlim[1], ylim[1])
+        def _square_limits(a, b):
+            lo = min(a[0], b[0]); hi = max(a[1], b[1])
             return (lo, hi), (lo, hi)
 
         xlim, ylim = _square_limits(xlim, ylim)
@@ -3293,27 +4054,30 @@ class AVRC:
             return H
 
         # base hists
-        H_latent_tgt = _hist2d_xy(prior_z2)      # ← the true latent target you wanted
-        H_tgt_enc    = _hist2d_xy(x_tgt_enc_2)   # ambient / encoder target
-        H_tgt_pr     = _hist2d_xy(x_tgt_pr_2)    # target (prior x)
-        H_model_z0   = _hist2d_xy(model_z0_2)
-        H_dec_z0     = _hist2d_xy(x_dec_model_2)
-        H_dec_prior  = _hist2d_xy(x_dec_prior_2)  # NEW
+        H_latent_tgt = _hist2d_xy(prior_z2)     # target in latent space: N(0,I)
+        H_tgt_enc    = _hist2d_xy(x_tgt_enc_2)  # ambient / encoder target
+        H_tgt_pr     = _hist2d_xy(x_tgt_pr_2)   # ambient / prior stream target
+        H_model_z0   = _hist2d_xy(model_z0_2)   # encoder z0(x)
+        H_dec_z0     = _hist2d_xy(x_dec_model_2)  # Dec_{t≈0}(z0(x)) via endpoint at t≈0
+        H_dec_prior  = _hist2d_xy(x_dec_prior_2)  # Dec_{t≈0}(N(0,I)) via endpoint at t≈0
 
-        # decoded path hists
+        # decoded path hists with per-t endpoint decoders
         H_path_list = []
-        for (tval, xy) in decoded_path_xy:
-            H_path_list.append((tval, _hist2d_xy(xy)))
+        for (t_disp, xy) in decoded_path_xy:
+            H_path_list.append((t_disp, _hist2d_xy(xy)))
 
-        # assemble up to 8 sample panels
+        # ---------------------------------------------------------------------
+        # 4) Assemble panels (up to 8 sample panels)
+        # ---------------------------------------------------------------------
         sample_panels: list[tuple[str, np.ndarray]] = []
         sample_panels.append(("encoder z₀(x)", H_model_z0))
-        sample_panels.append(("Dec(z₀(x), t≈0)", H_dec_z0))
-        for (tval, Ht) in H_path_list:
-            if abs(tval) < 1e-8:  # t = 0 slot → show decoded Gaussian instead
-                sample_panels.append(("Dec(N(0,I), t≈0)", H_dec_prior))
+        sample_panels.append(("Dec_{t≈0}(z₀(x))", H_dec_z0))
+        for (t_disp, Ht) in H_path_list:
+            if abs(t_disp) < 1e-8:
+                # t=0 slot: show Dec_{t≈0}(N(0,I)) explicitly
+                sample_panels.append(("Dec_{t≈0}(N(0,I))", H_dec_prior))
             else:
-                sample_panels.append((f"Dec(z_t,t)  t={tval:.2f}", Ht))
+                sample_panels.append((f"Dec_t(z_t)  t={t_disp:.2f}", Ht))
         sample_panels = sample_panels[:8]
 
         # shared vmax
@@ -3324,6 +4088,9 @@ class AVRC:
         vmax = np.percentile(all_vals, vmax_pct)
         norm = PowerNorm(gamma=max(1e-3, gamma), vmin=0.0, vmax=max(vmax, 1e-9))
 
+        # ---------------------------------------------------------------------
+        # 5) Plot grid (unchanged layout, endpoint-only decodes)
+        # ---------------------------------------------------------------------
         R, C = 4, 4
         fig, axs = plt.subplots(R, C, figsize=(12, 14), sharex=True, sharey=True)
         fig.patch.set_facecolor("black")
@@ -3342,7 +4109,7 @@ class AVRC:
             ax.tick_params(color="w", labelcolor="w")
             ax.set_facecolor("black")
 
-        # -------- fill grid --------
+        # --- fill grid ---
         _imshow(axs[0, 0], H_latent_tgt, "target (latent N(0,I))")
         _imshow(axs[0, 2], H_tgt_pr, "target (prior x)")
 
@@ -3370,7 +4137,7 @@ class AVRC:
         for c in range(C):
             axs[R - 1, c].set_xlabel("x", color="w")
 
-        fig.suptitle(f"Hist grids @ round {round_idx}", color="w")
+        fig.suptitle(f"Hist grids @ round {round_idx} (endpoint decoders per t)", color="w")
         fig.tight_layout()
 
         out_path = os.path.join(self.cfg.viz_hist_dir, f"hists_{round_idx:05d}.png")
@@ -3378,12 +4145,147 @@ class AVRC:
         plt.close(fig)
         print(f"[viz] hist grid saved → {out_path}")
 
+        # tidy
+        del x_dec_model_t0, x_dec_prior_t0, decoded_path_xy
+        gc.collect()
+
+
+
+
+
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import hsv_to_rgb
+    import torch
+
+
+    @torch.no_grad()
+    def _save_colored_coupling(
+        self,
+        round_idx: int,
+        n_points: int = 3000,
+        radius_quantile: float = 0.99,
+    ):
+        """
+        Path-VAE coupling plot, standardized by PCA on z1:
+
+          - Build encoder coupling: z0 = mu + sigma*eps, z1 = mu.
+          - For each projection P (D×2):
+              * project z0,z1 -> 2D,
+              * compute PCA on projected z1,
+              * color using PCA-whitened z1 coords,
+              * plot z0 in PCA-rotated (but not scaled) coords.
+
+        This matches the rf_coupling_viz style (same dot size, alpha, rings,
+        dark background) but removes arbitrary rotations / scale differences.
+        """
+        # make sure viz cache is ready (gives us _viz_x1, _viz_eps, _viz_proj_pairs)
+        if not getattr(self, "_viz_ready", False):
+            self._init_crossings_subset()
+
+        os.makedirs(self.cfg.viz_cross_dir, exist_ok=True)
+        device = self._viz_x1.device
+
+        # ----- encoder-defined coupling (z0, z1) -----
+        enc_out = self.Enc(self._viz_x1)
+        if isinstance(enc_out, tuple):
+            if len(enc_out) == 3:
+                mu0, logv0, _ = enc_out
+            elif len(enc_out) == 2:
+                mu0, logv0 = enc_out
+            else:
+                raise ValueError(
+                    f"[save_colored_coupling] unexpected tuple len {len(enc_out)} from Enc(...)"
+                )
+        else:
+            mu0 = enc_out
+            logv0 = torch.zeros_like(mu0)
+
+        std0 = torch.sqrt(torch.exp(logv0) + self.cfg.latent_var_floor)
+        z0_all = mu0 + std0 * self._viz_eps   # (N,D)
+        z1_all = mu0                          # (N,D)
+
+        N = z0_all.size(0)
+        M = min(int(n_points), N)
+
+        # random subset (avoid any ordering bias)
+        rng = np.random.default_rng(self.cfg.viz_seed ^ (round_idx + 0xBEEF))
+        idx_np = rng.choice(N, size=M, replace=False)
+        idx = torch.as_tensor(idx_np, device=device, dtype=torch.long)
+
+        z0 = z0_all[idx]   # (M,D)
+        z1 = z1_all[idx]   # (M,D)
+
+        for j, P in enumerate(self._viz_proj_pairs):
+            # project to 2D
+            z0_2d = project_nd(z0, P).detach().cpu().numpy()  # (M,2)
+            z1_2d = project_nd(z1, P).detach().cpu().numpy()  # (M,2)
+
+            # -------- PCA on z1_2d --------
+            # center
+            mean_z1 = z1_2d.mean(axis=0, keepdims=True)       # (1,2)
+            z1_center = z1_2d - mean_z1                       # (M,2)
+
+            # covariance & eigendecomposition
+            cov = np.cov(z1_center.T, bias=True)              # (2,2)
+            eigvals, eigvecs = np.linalg.eigh(cov)            # eigvecs[:,i] eigenvector
+            order = np.argsort(eigvals)[::-1]                 # sort descending
+            eigvals = eigvals[order]
+            eigvecs = eigvecs[:, order]                       # (2,2), columns = principal axes
+
+            # rotation-only for plotting (no scaling)
+            R = eigvecs                                       # (2,2)
+            z0_rot = (z0_2d) @ R                    # (M,2)
+
+            # whitened coords for COLOR: (rotation + 1/sqrt(lambda) scaling)
+            std = np.sqrt(eigvals + 1e-12)                    # (2,)
+            W = eigvecs / std                                 # columns v_i / std_i, (2,2)
+            z1_color = z1_center @ W                          # (M,2)
+
+            # radius scale for saturation from whitened coords
+            radii = np.linalg.norm(z1_color, axis=1)
+            r_max = np.quantile(radii, radius_quantile)
+            if not np.isfinite(r_max) or r_max < 1e-6:
+                r_max = 1.0
+
+            colors_coupling = plane_color(z1_color, r_max=float(r_max))
+
+            # -------- plot in PCA-rotated coordinates --------
+            plt.style.use("dark_background")
+            fig, ax = plt.subplots(figsize=(6, 6))
+            setup_ax(
+                ax,
+                title=(
+                    f"Gaussian z₀ (colored by μ(x)) — "
+                    f"r={round_idx:05d} — proj {j}"
+                ),
+            )
+            ax.scatter(
+                z0_rot[:, 0],
+                z0_rot[:, 1],
+                c=colors_coupling,
+                s=18,
+                linewidths=0.0,
+                alpha=0.95,
+            )
+            fig.tight_layout()
+
+            out_path = os.path.join(
+                self.cfg.viz_cross_dir,
+                f"colored_coupling_{round_idx:05d}_p{j:02d}.png",
+            )
+            fig.savefig(out_path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+
+            print(f"[viz] colored coupling (PCA-standardized) saved → {out_path}")
+
 
 
     @torch.no_grad()
     def _save_recon_over_time_frame(self, round_idx: int, t_steps: int = 64):
         """
-        Plot 1D curve of  E_{x1, z_t|x1}[ ||Dec(z_t, t) - x1||^2 ]  vs t
+        Plot 1D curve of  E_{x1, z_t|x1}[ ||Dec(z_t, t) - x1||^2 / ||x1||^2 ]  vs t
         and save to viz_crossings3d/recon_t_{round_idx:05d}.png
         """
         import os, numpy as np, matplotlib.pyplot as plt
@@ -3401,7 +4303,7 @@ class AVRC:
         # 2) evaluation times
         t_grid = torch.linspace(0.0, 1.0, steps=t_steps, device=self.device, dtype=TDTYPE)
 
-        errs = []
+        rel_errs = []
         for t in t_grid:
             t_val = float(t)
             z_t = (1.0 - t_val) * z0 + t_val * mu_0          # (N, D)
@@ -3412,26 +4314,30 @@ class AVRC:
                 dtype=TDTYPE,
             )
             x_hat = self.Dec(z_t, t_tensor)                  # (N, D_data)
-            mse_t = (x_hat - x_tgt_enc).pow(2).sum(dim=1).mean().item()
-            errs.append(mse_t)
+
+            # per-sample squared error and squared norm of x
+            num = (x_hat - x_tgt_enc).pow(2).sum(dim=1)      # ||x̂ - x||^2
+            denom = x_tgt_enc.pow(2).sum(dim=1).clamp_min(1e-12)  # ||x||^2, avoid div-by-zero
+            rel_mse_t = (num / denom).mean().item()          # E[ ||x̂ - x||^2 / ||x||^2 ]
+            rel_errs.append(rel_mse_t)
 
         t_np = t_grid.detach().cpu().numpy()
-        e_np = np.array(errs, dtype=np.float64)
+        e_np = np.array(rel_errs, dtype=np.float64)
 
         fig, ax = plt.subplots(figsize=(6.2, 4.2))
         ax.plot(t_np, e_np, marker="o", linewidth=2.0)
         ax.set_xlabel("t", fontsize=11)
-        ax.set_ylabel(r"$\mathbb{E}\,\|D(z_t,t)-x_1\|^2$", fontsize=11)
-        ax.set_title(f"Path recon error vs t  (round {round_idx})", fontsize=11)
+        ax.set_ylabel(r"$\mathbb{E}\,\|D(z_t,t)-x_1\|^2 / \|x_1\|^2$", fontsize=11)
+        ax.set_title(f"Relative path recon error vs t  (round {round_idx})", fontsize=11)
         ax.grid(True, alpha=0.25)
         ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.1)  # standardized y-axis
 
         out_path = os.path.join(out_dir, f"recon_t_{round_idx:05d}.png")
         fig.tight_layout()
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
-        print(f"[viz] recon-over-time saved → {out_path}")
-
+        print(f"[viz] recon-over-time (relative) saved → {out_path}")
 
 
     @torch.no_grad()
@@ -3497,15 +4403,21 @@ class AVRC:
             if z1 is None:
                 z1 = x1
             eps = torch.randn_like(mu)
-            z0 = mu + torch.exp(0.5 * logv) * eps
+            s2  = torch.exp(logv) + self.cfg.cov_floor
+            z0  = mu + torch.sqrt(s2) * eps
             return z0, z1
 
         return gen
 
 
     def _run_rf_probe(self, round_idx: int):
-        import os, math, torch
+        import os, math, time, gc
+        import numpy as np
+        import torch
         import torch.nn.functional as F
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+        from matplotlib.colors import PowerNorm
 
         os.makedirs(self.cfg.test_rf_outdir, exist_ok=True)
 
@@ -3515,65 +4427,117 @@ class AVRC:
         jitter_eps = float(getattr(self.cfg, "jitter_lambda", 0.0))
 
         tag = f"V-on-coupling@r{round_idx:05d}"
+        # --- integrate-and-decode time cap (use endpoint decoder's t) ---
+        t_end = float(getattr(self.cfg, "postdec_t_value", 1.0))
 
         # ------------------------------------------------------------------
-        # 1) TRAIN RF MODEL (two branches: no-jitter vs jittered)
+        # 1) TRAIN RF MODELS
+        #    - v_model      : trained on (z0, z1) from encoder-coupled pairing
+        #    - v_model_indep: trained on naïve independent coupling (z0~N(0,I), z1=μ(x1))
+        #    - v_model_reflow: trained on reflow coupling of v_model_indep
         # ------------------------------------------------------------------
         make_pairs_fn = self._make_pairs_encoder_current()
 
-        if jitter_eps <= 0.0:
-            # --- old, clean RF training on (x0, x1), label = (x1 - x0) ---
-            v_model, _ = train_rectified_flow_on_pairs_nd(
-                make_pairs_fn=make_pairs_fn,
-                D=D,
-                steps=self.cfg.test_rf_steps,
-                batch=self.cfg.test_rf_batch,
-                lr=self.cfg.test_rf_lr,
-                clip=self.cfg.test_rf_clip,
-                hidden=self.cfg.test_rf_hidden,
-                depth=self.cfg.test_rf_depth,
-                log_every=self.cfg.test_rf_log_every,
-                seed=self.cfg.test_rf_seed,
-            )
-        else:
-            # --- jitter-aware training: xt = x_{α(t)}, label = α̇(t)(x1 - x0) ---
-            v_model = VelocityXD(D=D,
-                                hidden=self.cfg.test_rf_hidden,
-                                depth=self.cfg.test_rf_depth).to(enc_device)
-            opt = torch.optim.Adam(
-                v_model.parameters(),
-                lr=self.cfg.test_rf_lr,
-                betas=(0.9, 0.99),
-                weight_decay=0.0,
-            )
-            for it in range(1, self.cfg.test_rf_steps + 1):
-                x0, x1 = make_pairs_fn(self.cfg.test_rf_batch)  # (B,D),(B,D)
-                B = x0.size(0)
-                # physical time
-                t = torch.rand(B, 1, device=enc_device, dtype=TDTYPE)
-                # per-sample warp (no-op if jitter=0, but we are already in jitter>0)
-                alpha, alpha_dot = self._time_warp(t)
-                # warped coordinate and scaled label
-                xt  = (1.0 - alpha) * x0 + alpha * x1
-                ell = alpha_dot * (x1 - x0)
-                pred = v_model(xt, t)
-                loss = F.mse_loss(pred, ell)
-                opt.zero_grad(set_to_none=True); loss.backward()
-                torch.nn.utils.clip_grad_norm_(v_model.parameters(), self.cfg.test_rf_clip)
-                opt.step()
+        print("[probe] Training coupled RF on encoder-current pairing")
+        v_model, _ = train_rectified_flow_on_pairs_nd(
+            make_pairs_fn=make_pairs_fn,
+            D=D,
+            steps=self.cfg.test_rf_steps,
+            batch=self.cfg.test_rf_batch,
+            lr=self.cfg.test_rf_lr,
+            clip=self.cfg.test_rf_clip,
+            hidden=self.cfg.test_rf_hidden,
+            depth=self.cfg.test_rf_depth,
+            log_every=self.cfg.test_rf_log_every,
+            seed=self.cfg.test_rf_seed,
+        )
 
-                if (it % self.cfg.test_rf_log_every) == 0:
-                    # simple NMSE-style monitor
-                    resid2 = (pred - ell).pow(2).sum(dim=1).mean()
-                    base2  = (ell).pow(2).sum(dim=1).mean().clamp_min(1e-8)
-                    nmse   = resid2 / base2
-                    print(f"[fresh-RF-D (jitter)] step {it}/{self.cfg.test_rf_steps} "
-                          f"loss={float(loss):.4f} nmse={float(nmse):.4f}")
+        print("[probe] Training naive RF on independent coupling (z0 ~ N(0,I), z1 = μ(x1))")
+        make_pairs_fn_indep = self._make_pairs_gauss_to_z1_independent()
+        v_model_indep, _ = train_rectified_flow_on_pairs_nd(
+            make_pairs_fn=make_pairs_fn_indep,
+            D=D,
+            steps=self.cfg.test_rf_steps,
+            batch=self.cfg.test_rf_batch,
+            lr=self.cfg.test_rf_lr,
+            clip=self.cfg.test_rf_clip,
+            hidden=self.cfg.test_rf_hidden,
+            depth=self.cfg.test_rf_depth,
+            log_every=self.cfg.test_rf_log_every,
+            seed=self.cfg.test_rf_seed,
+        )
+
+                # ------------------------------------------------------------------
+        # 1c) TRAIN RF ON REFLOW COUPLING (CACHED)
+        #     - Use v_model_indep (naive RF) as the "first" RF
+        #     - Precompute N_cache pairs (tilde z0, z1_hat) where
+        #           tilde z0 ~ N(0,I),
+        #           z1_hat = solution of dz/dt = v_model_indep(z,t)
+        #       integrated from t=0 to t=t_end.
+        #     - During RF training, just resample from this cache.
+        # ------------------------------------------------------------------
+        N_cache = int(getattr(self.cfg, "test_rf_reflow_n_cache", 250_000))
+        K_reflow_pairs = int(getattr(self.cfg, "test_rf_reflow_K", max(self.cfg.test_rf_Ks)))
+
+        print(f"[probe] Precomputing {N_cache} reflow pairs with "
+              f"K={K_reflow_pairs} steps using v_model_indep")
+
+        v_model_indep.eval()
+        rf_device = next(v_model_indep.parameters()).device
+        rf_dtype  = next(v_model_indep.parameters()).dtype
+
+        with torch.no_grad():
+            # base: tilde z0 ~ N(0,I)
+            z0_cache = torch.randn(N_cache, D, device=rf_device, dtype=rf_dtype)
+            z_cache  = z0_cache.clone()
+
+            K  = max(1, K_reflow_pairs)
+            dt = float(t_end) / float(K)
+
+            for k in range(K):
+                t_mid = (k + 0.5) * dt
+                t_in  = torch.full(
+                    (N_cache, 1),
+                    t_mid,
+                    device=rf_device,
+                    dtype=rf_dtype,
+                )
+                v = v_model_indep(z_cache, t_in)
+                z_cache = z_cache + dt * v
+
+            z1_cache = z_cache.detach()  # (N_cache, D)
+
+        @torch.no_grad()
+        def _make_pairs_gauss_to_reflow(n: int):
+            """
+            Fast pair generator:
+              - draw indices into cached (z0, z1_hat) pairs
+              - returns mini-batch with the same marginal as the precomputed coupling
+            """
+            n = int(n)
+            idx = torch.randint(0, N_cache, (n,), device=rf_device)
+            z0 = z0_cache[idx]
+            z1 = z1_cache[idx]
+            return z0, z1
+
+        make_pairs_fn_reflow = _make_pairs_gauss_to_reflow
+
+        print("[probe] Training reflow RF on cached (z0, z1_hat) pairs")
+        v_model_reflow, _ = train_rectified_flow_on_pairs_nd(
+            make_pairs_fn=make_pairs_fn_reflow,
+            D=D,
+            steps=self.cfg.test_rf_steps,
+            batch=self.cfg.test_rf_batch,
+            lr=self.cfg.test_rf_lr,
+            clip=self.cfg.test_rf_clip,
+            hidden=self.cfg.test_rf_hidden,
+            depth=self.cfg.test_rf_depth,
+            log_every=self.cfg.test_rf_log_every,
+            seed=self.cfg.test_rf_seed,
+        )
 
         # ------------------------------------------------------------------
-        # 2) SAMPLERS (ALWAYS THE SAME EULER SAMPLER)
-        #    We integrate over *physical* t: t_k = (k+1)/K, exactly like before.
-        #    The model already encodes the jittered label in its weights.
+        # 2) SAMPLERS (standard Euler integrator)
         # ------------------------------------------------------------------
         @torch.no_grad()
         def _sample_z0(n: int, init: str = "gauss", enc=None):
@@ -3582,43 +4546,200 @@ class AVRC:
             if init == "gauss":
                 return torch.randn(n, D, device=enc_device, dtype=enc_dtype)
             elif init == "encoder":
+                # draw z0 ~ q(z|x1) with the SAME variance floor as in training
                 x = sample_target_torch(n, _skip_whiten=True).to(enc_device)
-                enc_out = enc(x)
-                if isinstance(enc_out, tuple):
-                    mu = enc_out[0]
-                else:
-                    mu = enc_out
-                return mu
+                mu, logv, _ = unpack_encoder_output(enc(x))
+                s2  = torch.exp(logv) + float(self.cfg.cov_floor)
+                eps = torch.randn_like(mu)
+                return mu + torch.sqrt(s2) * eps
             else:
                 raise ValueError(f"unknown init={init}")
 
+
+
+        def _rf_sigma_t(t: torch.Tensor) -> torch.Tensor:
+            """
+            Annealed noise schedule σ(t) that is largest near t=0 and
+            decays to 0 at t >= t_cutoff.
+
+            σ(t) = σ0 * (1 - t / t_c)^γ  for t <= t_c, else 0.
+            """
+            mode = getattr(self.cfg, "rf_sampler_mode", "legacy")
+            if mode != "stochastic_annealed":
+                return torch.zeros_like(t)
+
+            sigma0 = float(getattr(self.cfg, "rf_stoch_sigma0", 0.0))
+            if sigma0 <= 0.0:
+                return torch.zeros_like(t)
+
+            t_cutoff = float(getattr(self.cfg, "rf_stoch_t_cutoff", 0.25))
+            power = float(getattr(self.cfg, "rf_stoch_power", 2.0))
+            if t_cutoff <= 0.0:
+                return torch.zeros_like(t)
+
+            # clamp t into [0, t_cutoff] and apply shape
+            tt = torch.clamp(t, min=0.0, max=t_cutoff)
+            ratio = 1.0 - tt / t_cutoff        # in [0,1]
+            return sigma0 * (ratio.clamp(0.0, 1.0) ** power)
+
+        def _tweedie_score_straight(
+            z: torch.Tensor,
+            t: torch.Tensor,
+            v: torch.Tensor,
+        ) -> torch.Tensor:
+            """
+            Tweedie mapping for straight interpolation:
+                X_t = t X_1 + (1 - t) X_0,  X_0 ~ N(0, I),  X_0 ⟂ X_1
+
+            From the book (Example 11):
+                ∇ log ρ_t(x) = (t v_t(x) - x) / (1 - t).
+
+            We clamp t away from 0 and 1 for numerical stability.
+            """
+            eps = float(getattr(self.cfg, "rf_stoch_min_t", 1e-4))
+            t_clamped = t.clamp(min=eps, max=1.0 - eps)
+            return (t_clamped * v - z) / (1.0 - t_clamped)
+
+
+
+        def _build_samplers_for(v_net):
+            """
+            Build both:
+              - legacy deterministic sampler (pure ODE),
+              - stochastic-annealed sampler (ODE + Langevin on RF marginals),
+            and dispatch between them via cfg.rf_sampler_mode.
+            """
+
+            @torch.no_grad()
+            def v_sampler_X_legacy(n: int, K: int, init: str = "gauss", enc=None):
+                """
+                Original deterministic RF sampler:
+                    z' = v(z,t), integrated from t=0 to t=t_end
+                    via K midpoint Euler steps.
+                """
+                z  = _sample_z0(n, init=init, enc=enc).to(enc_device)
+                K  = max(1, int(K))
+                dt = t_end / float(K)
+                for k in range(K):
+                    t_in = torch.full(
+                        (n, 1),
+                        (k + 0.5) * dt,
+                        device=enc_device,
+                        dtype=z.dtype,
+                    )
+                    v    = v_net(z, t_in)
+                    z    = z + dt * v
+                return z
+
+            @torch.no_grad()
+            def v_sampler_X_stochastic(n: int, K: int, init: str = "gauss", enc=None):
+                """
+                Annealed stochastic sampler:
+                    dZ_t = v(Z_t, t) dt
+                           + σ(t)^2 ∇ log ρ_t(Z_t) dt
+                           + sqrt(2 σ(t)^2) dW_t
+
+                Discretized by Euler–Maruyama with:
+                    σ(t) = rf_stoch_sigma0 * (1 - t / t_c)^γ for t <= t_c, else 0
+                and Tweedie score for straight interpolation:
+                    ∇ log ρ_t(x) = (t v_t(x) - x) / (1 - t).
+                """
+                z  = _sample_z0(n, init=init, enc=enc).to(enc_device)
+                K  = max(1, int(K))
+                dt = t_end / float(K)
+                sqrt_2dt = math.sqrt(2.0 * dt)
+
+                for k in range(K):
+                    t_mid = (k + 0.5) * dt
+                    t_in = torch.full(
+                        (n, 1),
+                        t_mid,
+                        device=enc_device,
+                        dtype=z.dtype,
+                    )
+                    v = v_net(z, t_in)
+                    sigma = _rf_sigma_t(t_in)  # shape (n,1)
+
+                    if torch.all(sigma <= 0):
+                        # no noise / extra drift: fall back to pure ODE step
+                        z = z + dt * v
+                    else:
+                        # Tweedie: score from velocity (straight interpolation case)
+                        score = _tweedie_score_straight(z, t_in, v)  # (n,D)
+
+                        # Extra drift from σ^2 ∇ log ρ_t
+                        drift = v + (sigma ** 2) * score            # broadcast σ^2 over D
+
+                        # Euler–Maruyama noise
+                        noise = torch.randn_like(z) * sqrt_2dt      # (n,D)
+                        z = z + dt * drift + noise * sigma          # σ broadcast
+
+                return z
+
+            @torch.no_grad()
+            def v_sampler_X(n: int, K: int, init: str = "gauss", enc=None):
+                """
+                Public sampler for this v_net, dispatching on cfg.rf_sampler_mode.
+                """
+                mode = getattr(self.cfg, "rf_sampler_mode", "legacy")
+                if mode == "stochastic_annealed":
+                    return v_sampler_X_stochastic(n, K, init=init, enc=enc)
+                else:
+                    return v_sampler_X_legacy(n, K, init=init, enc=enc)
+
+            @torch.no_grad()
+            def decoded_v_sampler_posthoc_X(
+                n: int,
+                K: int,
+                init: str = "gauss",
+                enc=None,
+                *,
+                t_value: float | None = None,
+            ):
+                """
+                Decode at the same endpoint time the sampler integrated to
+                (by default t_end, or a user-provided t_value).
+                """
+                z = v_sampler_X(n, K, init=init, enc=enc)
+                if not hasattr(self, "_decode_latents_posthoc"):
+                    raise AttributeError("decoded_v_sampler_posthoc: self._decode_latents_posthoc not found.")
+                if getattr(self, "Dec_post", None) is None:
+                    raise RuntimeError("decoded_v_sampler_posthoc: Dec_post is None (endpoint decoder not loaded).")
+                return self._decode_latents_posthoc(
+                    z,
+                    t_value=float(t_end if t_value is None else t_value),
+                )
+
+            return v_sampler_X, decoded_v_sampler_posthoc_X
+
+
+        # build samplers
+        v_sampler_cpl,   dec_sampler_cpl   = _build_samplers_for(v_model)         # encoder-coupled RF
+        v_sampler_ind,   dec_sampler_ind   = _build_samplers_for(v_model_indep)   # naive RF (independent coupling)
+        v_sampler_ref,   dec_sampler_ref   = _build_samplers_for(v_model_reflow)  # reflow RF (tilde z0, z1_hat)
+
+
         @torch.no_grad()
         def v_sampler(n: int, K: int, init: str = "gauss", enc=None):
-            """
-            Standard rectified-flow Euler sampler:
-              z_{k+1} = z_k + (1/K) * v_model(z_k, t_k),
-              t_k = (k+1)/K.
-            Even in the jittered case we do NOT re-sample phases; the model
-            has already learned the warped scaling in its weights.
-            """
-            z = _sample_z0(n, init=init, enc=enc).to(enc_device)
-            dt = 1.0 / float(max(K, 1))
-            for k in range(K):
-                t_step = (k + 1) * dt
-                t_in = torch.full((n, 1), t_step, device=enc_device, dtype=z.dtype)
-                v = v_model(z, t_in)
-                z = z + dt * v
-            return z
+            return v_sampler_cpl(n, K, init=init, enc=enc)
 
         @torch.no_grad()
         def decoded_v_sampler(n: int, K: int, init: str = "gauss", enc=None):
-            # K=0 → Enc→Dec baseline when init="encoder"
             z = v_sampler(n, K, init=init, enc=enc)
-            x = self._decode_latents(z, t_value=1.0 - self.t_eps)
-            return x
+            # decode at t_end (not 1 - self.t_eps)
+            return self._decode_latents(z, t_value=t_end)
+
+        @torch.no_grad()
+        def decoded_v_sampler_posthoc(n: int, K: int, init: str = "gauss", enc=None, *, t_value: float | None = None):
+            return dec_sampler_cpl(n, K, init=init, enc=enc, t_value=(t_end if t_value is None else t_value))
+
 
         # ------------------------------------------------------------------
-        # 3) PROJECTION + EVAL (unchanged)
+        # 3) PROJECTION + EVAL — Single combined grid for AMBIENT and LATENT
+        #     Only TWO images are produced:
+        #       • ambient: target vs {Enc→Dec baseline, RF(cpl)/enc, RF(cpl)/gauss, RF(naive)/gauss}
+        #       • latent : μ(x) vs {RF(cpl)/enc, RF(cpl)/gauss, RF(naive)/gauss}
+        #     The NAIVE model is evaluated ONLY with init="gauss".
         # ------------------------------------------------------------------
         P = (
             self._viz_proj_pairs[self.cfg.test_rf_proj_index]
@@ -3626,82 +4747,306 @@ class AVRC:
             else choose_projection_pairs(self.cfg.D, num_pairs=1)[0]
         )
 
-        img = os.path.join(
-            self.cfg.test_rf_outdir,
-            f"v_probe_{round_idx:05d}_p{self.cfg.test_rf_proj_index:02d}.png",
-        )
-        tbl_dec = _eval_rf_decoded_probe_proj(
-            rf_decoded_sampler=decoded_v_sampler,
-            enc=self.Enc,
-            Ks=self.cfg.test_rf_Ks,
-            n=self.cfg.test_rf_n,
-            P=P,
-            out_img=img,
-            tag=tag,
-            bins=self.cfg.test_rf_bins,
-            dec_from_latent=self._decode_latents,
-            dec_t_value=1.0 - self.t_eps,
-        )
+        Ks     = list(self.cfg.test_rf_Ks)
+        n_eval = int(self.cfg.test_rf_n)
+        bins   = int(self.cfg.test_rf_bins)
+        vmax_pct = float(self.cfg.viz_hist_vmax_percentile if hasattr(self.cfg, "viz_hist_vmax_percentile") else 99.7)
+        cmap   = "magma"
+        gamma  = float(self.cfg.viz_hist_gamma if hasattr(self.cfg, "viz_hist_gamma") else 0.42)
 
-        img_lat = os.path.join(
+        # ---------- helpers ----------
+        def _hist2d_from_proj(arr2d, x_edges, y_edges):
+            H, *_ = np.histogram2d(arr2d[:, 0], arr2d[:, 1], bins=[x_edges, y_edges], density=True)
+            return H
+
+        def _proj(tensor_2d):
+            return project_nd(tensor_2d, P).detach().cpu().numpy()
+
+        def _limits_from_target(Y, q=0.997, pad=1.2):
+            xlim = (np.quantile(Y[:, 0], 1 - q), np.quantile(Y[:, 0], q)); xlim = [v * pad for v in xlim]
+            ylim = (np.quantile(Y[:, 1], 1 - q), np.quantile(Y[:, 1], q)); ylim = [v * pad for v in ylim]
+            return _square_limits(xlim, ylim)
+
+        # --- Enc→Dec baseline SHOULD MATCH Dec_t(z_t) ---
+        x_tgt = sample_target_torch(n_eval, _skip_whiten=True).to(enc_device)
+        Xp_tgt = _proj(x_tgt)
+        xlim, ylim = _limits_from_target(Xp_tgt)
+        x_edges = np.linspace(xlim[0], xlim[1], bins + 1)
+        y_edges = np.linspace(ylim[0], ylim[1], bins + 1)
+        H_tgt = _hist2d_from_proj(Xp_tgt, x_edges, y_edges)
+
+        # Enc→Dec baseline (same batch) using endpoint decoder
+        #enc_out = self.Enc(x_tgt)
+        #mu0 = enc_out[0] if isinstance(enc_out, tuple) else enc_out
+        #assert hasattr(self, "_decode_latents_posthoc") and getattr(self, "Dec_post", None) is not None, \
+            #"Endpoint decoder (Dec_post) required for decoded probe."
+        #x_encdec = self._decode_latents_posthoc(mu0, t_value=t_end).to(enc_device)
+        #Xp_encdec = _proj(x_encdec)
+        #H_encdec = _hist2d_from_proj(Xp_encdec, x_edges, y_edges)
+
+        # NEW — build z_t with the SAME z0 sampling as elsewhere, then decode at t_end
+        enc_out = self.Enc(x_tgt)
+        mu0, logv, _ = unpack_encoder_output(enc_out)
+        # variance floor must match _sample_z0
+        s2  = torch.exp(logv) + float(self.cfg.cov_floor)
+        eps = torch.randn_like(mu0)
+        z0  = mu0 + torch.sqrt(s2) * eps
+        z_t = (1.0 - t_end) * z0 + t_end * mu0
+
+        x_encdec = self._decode_latents_posthoc(z_t, t_value=t_end)  # Dec_t(z_t)
+        Xp_encdec = _proj(x_encdec)
+        H_encdec  = _hist2d_from_proj(Xp_encdec, x_edges, y_edges)
+
+        # metrics tables
+        tbl_ambient = {
+            "Enc→Dec (t=t_end)":    {},
+            "V(cpl)→Dec/encoder":   {},
+            "V(cpl)→Dec/gauss":     {},
+            "V(naive)→Dec/gauss":   {},
+            "V(reflow)→Dec/gauss":  {},   # NEW
+        }
+
+        # base metrics for baseline (same for all Ks)
+        base_sw2 = float(sliced_w2(x_encdec, x_tgt, L=128, max_n=20_000))
+        base_mmd = float(mmd_rbf_nd(x_encdec, x_tgt, max_n=self.cfg.test_rf_mmd_max_n))
+        for K in Ks:
+            tbl_ambient["Enc→Dec (t=t_end)"][K] = (base_sw2, base_mmd)
+
+        # collect per-K hist panels and values for global vmax
+        ambient_panels = {}
+        ambient_vals   = {}
+
+        for K in Ks:
+            # coupled RF, init=encoder
+            x_cpl_enc  = dec_sampler_cpl(n_eval, K, init="encoder", enc=self.Enc, t_value=t_end).to(enc_device)
+            Xp_cpl_enc = _proj(x_cpl_enc)
+            H_cpl_enc  = _hist2d_from_proj(Xp_cpl_enc, x_edges, y_edges)
+
+            # coupled RF, init=gauss
+            x_cpl_g   = dec_sampler_cpl(n_eval, K, init="gauss", enc=self.Enc, t_value=t_end).to(enc_device)
+            Xp_cpl_g  = _proj(x_cpl_g)
+            H_cpl_g   = _hist2d_from_proj(Xp_cpl_g, x_edges, y_edges)
+
+            # naive RF, init=gauss ONLY
+            x_naive_g  = dec_sampler_ind(n_eval, K, init="gauss", enc=self.Enc, t_value=t_end).to(enc_device)
+            Xp_naive_g = _proj(x_naive_g)
+            H_naive_g  = _hist2d_from_proj(Xp_naive_g, x_edges, y_edges)
+
+            # reflow RF, init=gauss ONLY
+            x_reflow_g  = dec_sampler_ref(n_eval, K, init="gauss", enc=self.Enc, t_value=t_end).to(enc_device)
+            Xp_reflow_g = _proj(x_reflow_g)
+            H_reflow_g  = _hist2d_from_proj(Xp_reflow_g, x_edges, y_edges)
+
+            ambient_panels[K] = [
+                ("target",                    H_tgt),
+                (f"Enc→Dec (t={t_end:.2f})",  H_encdec),
+                (f"K={K} — V(cpl)/enc",       H_cpl_enc),
+                (f"K={K} — V(cpl)/gauss",     H_cpl_g),
+                (f"K={K} — V(naive)/gauss",   H_naive_g),
+                (f"K={K} — V(reflow)/gauss",  H_reflow_g),
+            ]
+            flat = np.concatenate([
+                H_tgt.ravel(),
+                H_encdec.ravel(),
+                H_cpl_enc.ravel(),
+                H_cpl_g.ravel(),
+                H_naive_g.ravel(),
+                H_reflow_g.ravel(),
+            ])
+            ambient_vals[K] = flat
+
+            # metrics
+            tbl_ambient["V(cpl)→Dec/encoder"][K] = (
+                float(sliced_w2(x_cpl_enc, x_tgt, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(x_cpl_enc, x_tgt, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+            tbl_ambient["V(cpl)→Dec/gauss"][K] = (
+                float(sliced_w2(x_cpl_g, x_tgt, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(x_cpl_g, x_tgt, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+            tbl_ambient["V(naive)→Dec/gauss"][K] = (
+                float(sliced_w2(x_naive_g, x_tgt, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(x_naive_g, x_tgt, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+            tbl_ambient["V(reflow)→Dec/gauss"][K] = (
+                float(sliced_w2(x_reflow_g, x_tgt, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(x_reflow_g, x_tgt, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+
+            # free some memory
+            del x_cpl_enc, x_cpl_g, x_naive_g, x_reflow_g
+
+
+        # ---------- LATENT (compare RF latents to μ(x1)) ----------
+        x_tgt_lat = sample_target_torch(n_eval, _skip_whiten=True).to(enc_device)
+        mu_lat, _, _ = unpack_encoder_output(self.Enc(x_tgt_lat))    # target in latent space
+        Zp_tgt = _proj(mu_lat)
+        xlimL, ylimL = _limits_from_target(Zp_tgt)
+        x_edgesL = np.linspace(xlimL[0], xlimL[1], bins + 1)
+        y_edgesL = np.linspace(ylimL[0], ylimL[1], bins + 1)
+        H_tgt_lat = _hist2d_from_proj(Zp_tgt, x_edgesL, y_edgesL)
+
+        tbl_latent = {
+            "V(cpl)(lat)/encoder": {},
+            "V(cpl)(lat)/gauss":   {},
+            "V(naive)(lat)/gauss": {},
+            "V(reflow)(lat)/gauss": {},   # NEW
+        }
+        latent_panels = {}
+        latent_vals   = {}
+
+        for K in Ks:
+            # coupled RF latent, init=encoder
+            z_cpl_enc   = v_sampler_cpl(n_eval, K, init="encoder", enc=self.Enc)
+            Zp_cpl_enc  = _proj(z_cpl_enc)
+            H_cpl_enc_L = _hist2d_from_proj(Zp_cpl_enc, x_edgesL, y_edgesL)
+
+            # coupled RF latent, init=gauss
+            z_cpl_g   = v_sampler_cpl(n_eval, K, init="gauss", enc=self.Enc)
+            Zp_cpl_g  = _proj(z_cpl_g)
+            H_cpl_g_L = _hist2d_from_proj(Zp_cpl_g, x_edgesL, y_edgesL)
+
+            # naive RF latent, init=gauss ONLY
+            z_naive_g   = v_sampler_ind(n_eval, K, init="gauss", enc=self.Enc)
+            Zp_naive_g  = _proj(z_naive_g)
+            H_naive_g_L = _hist2d_from_proj(Zp_naive_g, x_edgesL, y_edgesL)
+
+            # reflow RF latent, init=gauss ONLY
+            z_reflow_g   = v_sampler_ref(n_eval, K, init="gauss", enc=self.Enc)
+            Zp_reflow_g  = _proj(z_reflow_g)
+            H_reflow_g_L = _hist2d_from_proj(Zp_reflow_g, x_edgesL, y_edgesL)
+
+            latent_panels[K] = [
+                ("latent target μ(x)",          H_tgt_lat),
+                (f"K={K} — V(cpl)(lat)/enc",    H_cpl_enc_L),
+                (f"K={K} — V(cpl)(lat)/gauss",  H_cpl_g_L),
+                (f"K={K} — V(naive)(lat)/gauss", H_naive_g_L),
+                (f"K={K} — V(reflow)(lat)/gauss", H_reflow_g_L),
+            ]
+            flat = np.concatenate([
+                H_tgt_lat.ravel(),
+                H_cpl_enc_L.ravel(),
+                H_cpl_g_L.ravel(),
+                H_naive_g_L.ravel(),
+                H_reflow_g_L.ravel(),
+            ])
+            latent_vals[K] = flat
+
+            # metrics in latent space vs μ(x)
+            tbl_latent["V(cpl)(lat)/encoder"][K] = (
+                float(sliced_w2(z_cpl_enc, mu_lat, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(z_cpl_enc, mu_lat, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+            tbl_latent["V(cpl)(lat)/gauss"][K] = (
+                float(sliced_w2(z_cpl_g, mu_lat, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(z_cpl_g, mu_lat, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+            tbl_latent["V(naive)(lat)/gauss"][K] = (
+                float(sliced_w2(z_naive_g, mu_lat, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(z_naive_g, mu_lat, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+            tbl_latent["V(reflow)(lat)/gauss"][K] = (
+                float(sliced_w2(z_reflow_g, mu_lat, L=128, max_n=20_000)),
+                float(mmd_rbf_nd(z_reflow_g, mu_lat, max_n=self.cfg.test_rf_mmd_max_n)),
+            )
+
+            del z_cpl_enc, z_cpl_g, z_naive_g, z_reflow_g
+
+
+        # ---------- PLOTTING (exactly two grids) ----------
+        def _plot_grid(perK_panels, perK_vals, xlim, ylim, title, out_img, cols, cmap=cmap, gamma=gamma, vmax_pct=vmax_pct):
+            try: plt.close("all")
+            except: pass
+            mpl.rcdefaults()
+            with plt.rc_context({
+                "figure.facecolor": "black",
+                "axes.facecolor":   "black",
+                "savefig.facecolor":"black",
+                "axes.edgecolor":   "white",
+                "axes.labelcolor":  "white",
+                "xtick.color":      "white",
+                "ytick.color":      "white",
+            }):
+                os.makedirs(os.path.dirname(out_img), exist_ok=True)
+                rows = len(Ks)
+                fig, axs = plt.subplots(rows, cols, figsize=(3.0*cols + 1.5, 2.9*rows), sharex=True, sharey=True)
+                if rows == 1:
+                    axs = np.array([axs])
+                for r, K in enumerate(Ks):
+                    vmax = np.percentile(perK_vals[K], vmax_pct)
+                    norm = PowerNorm(gamma=max(1e-3, float(gamma)), vmin=0.0, vmax=max(1e-9, vmax))
+                    for c, (ttl, H) in enumerate(perK_panels[K]):
+                        ax = axs[r, c]
+                        ax.imshow(
+                            H.T, origin="lower",
+                            extent=[xlim[0], xlim[1], ylim[0], ylim[1]],
+                            cmap=cmap, norm=norm, interpolation="bilinear", aspect="equal",
+                        )
+                        ax.set_title(("target" if c==0 else f"K={K} — {ttl}" if "K=" not in ttl else ttl), color="w", pad=3)
+                        if r == rows - 1: ax.set_xlabel("proj x", color="w")
+                        if c == 0:        ax.set_ylabel("proj y", color="w")
+                        ax.tick_params(color="w", labelcolor="w")
+                fig.suptitle(title, y=0.995, color="w")
+                fig.tight_layout()
+                fig.savefig(out_img, dpi=190, bbox_inches="tight", facecolor="black")
+                plt.close(fig)
+
+        # ambient grid: 5 columns
+        img_ambient = os.path.join(
+            self.cfg.test_rf_outdir,
+            f"v_probe_{round_idx:05d}_p{self.cfg.test_rf_proj_index:02d}_ambient.png",
+        )
+        _plot_grid(ambient_panels, ambient_vals, xlim, ylim,
+            tag + f" — histograms (decoded ambient, endpoint decoder t={t_end:.2f})",
+            img_ambient, cols=6)
+
+
+        # latent grid: 4 columns
+        img_latent = os.path.join(
             self.cfg.test_rf_outdir,
             f"v_probe_{round_idx:05d}_p{self.cfg.test_rf_proj_index:02d}_latent.png",
         )
-        tbl_lat = _eval_rf_latent_probe_proj(
-            rf_latent_sampler=v_sampler,
-            enc=self.Enc,
-            Ks=self.cfg.test_rf_Ks,
-            n=self.cfg.test_rf_n,
-            P=P,
-            out_img=img_lat,
-            tag=tag + " (latent)",
-            bins=self.cfg.test_rf_bins,
-        )
+        _plot_grid(latent_panels, latent_vals, xlimL, ylimL,
+                  tag + " — histograms (latent)",
+                  img_latent, cols=5)
 
+        # ---------- STDOUT/TXT TABLES (two clearly separated blocks) ----------
         txt = os.path.join(self.cfg.test_rf_outdir, f"v_probe_{round_idx:05d}.txt")
-
-        encdec    = tbl_dec.get("encdec", {})
-        dec_enc   = tbl_dec.get("rf_dec_enc", {})
-        dec_gauss = tbl_dec.get("rf_dec_gauss", {})
-        lat_enc   = tbl_lat.get("rf_latent_enc", {})
-        lat_gauss = tbl_lat.get("rf_latent_gauss", {})
-
-        Ks = list(self.cfg.test_rf_Ks)
-
         with open(txt, "w") as f:
-            def _out(s: str = ""):
+            def _out(s=""):
                 f.write(s + "\n")
                 print(s)
 
+            def _fmt(x): return f"{x:0.3f}" if math.isfinite(x) else "  nan"
+            def _get(tbl, K): return tbl.get(K, (float("nan"), float("nan")))
+
             _out(f"=== probe: {tag} (jitter={jitter_eps}) ===")
-            head = "model/init     |"
-            for K in Ks:
-                head += f"  K={K:<2}   SW2   MMD"
-            _out(head)
-            _out("-" * len(head))
 
-            def _get(tbl, K):
-                return tbl.get(K, (float("nan"), float("nan")))
-            def _fmt(x):
-                return f"{x:0.3f}" if math.isfinite(x) else "  nan"
-
-            rows = [
-                ("Enc→Dec",        encdec),
-                ("V→Dec/encoder",  dec_enc),
-                ("V→Dec/gauss",    dec_gauss),
-                ("V(lat)/encoder", lat_enc),
-                ("V(lat)/gauss",   lat_gauss),
-            ]
-            for name, tbl in rows:
-                line = f"{name:<14}|"
+            # AMBIENT
+            _out("\n--- AMBIENT (decoded via endpoint decoder @ t=1.0) ---")
+            head = "model/init".ljust(22) + " | " + "  ".join([f"K={K:^3d}  SW2   MMD" for K in Ks])
+            _out(head); _out("-" * len(head))
+            for name in ["Enc→Dec (t=t_end)", "V(cpl)→Dec/encoder", "V(cpl)→Dec/gauss", "V(naive)→Dec/gauss", "V(reflow)→Dec/gauss",]:
+                s = name.ljust(22) + " | "
                 for K in Ks:
-                    sw2, mmd = _get(tbl, K)
-                    line += f"  {_fmt(sw2):>5} {_fmt(mmd):>5}"
-                _out(line)
+                    sw2, mmd = _get(tbl_ambient[name], K)
+                    s += f" {_fmt(sw2):>5} {_fmt(mmd):>5} "
+                _out(s)
 
-        print(f"[probe] saved: {img}, {img_lat} and {txt}")
+            # LATENT
+            _out("\n--- LATENT (compare to μ(x1)) ---")
+            headL = "model/init".ljust(22) + " | " + "  ".join([f"K={K:^3d}  SW2   MMD" for K in Ks])
+            _out(headL); _out("-" * len(headL))
+            for name in ["V(cpl)(lat)/encoder", "V(cpl)(lat)/gauss", "V(naive)(lat)/gauss", "V(reflow)(lat)/gauss",]:
+                s = name.ljust(22) + " | "
+                for K in Ks:
+                    sw2, mmd = _get(tbl_latent[name], K)
+                    s += f" {_fmt(sw2):>5} {_fmt(mmd):>5} "
+                _out(s)
 
-        # keep for post-training benchmarks
+        print(f"[probe] saved: {img_ambient}, {img_latent} and {txt}")
+
+        # keep for post-training benchmarks (use coupled model by default)
         self.posthoc_rf_sampler = decoded_v_sampler
         self.posthoc_rf_latent_sampler = v_sampler
         self.posthoc_rf_v_model = v_model
@@ -3709,50 +5054,130 @@ class AVRC:
 
 
 
+    def joint_step(self, B: int | None = None) -> dict[str, float]:
+        B = B or self.cfg.batch
 
-    # ------------------------------------------------------------------
-    # training loop (your original, just add EMA sync at top)
-    # ------------------------------------------------------------------
-    def pretrain_autoencoder(self, steps: int | None = None, progress: bool = True):
-        steps = self.cfg.pretrain_ae_steps if steps is None else int(steps)
-        if steps <= 0:
-            return
+        # both nets learn; no teacher
+        self.Enc.requires_grad_(True)
+        self.Dec.requires_grad_(True)
 
-        for it in range(1, steps + 1):
-            x1 = sample_target_torch(self.cfg.batch)
-            mu, logv, z1 = unpack_encoder_output(self.Enc(x1))  # z1 == mu
-            eps = torch.randn_like(mu)
-            z0 = mu + torch.exp(0.5 * logv) * eps
+        # sample data and latent reparam with grads (encoder input is noised inside)
+        x1, mu, logv, z0, z1 = self._sample_batch(B, requires_grad_encoder=True)
 
-            # t≈0: decode the noisy latent
-            x_hat_stoch = self._decode_latents(z0, t_value=self.t_eps)
-            # t≈1: decode the *mean* latent (i.e. the endpoint μ(x))
-            x_hat_mean  = self._decode_latents(mu, t_value=1 - self.t_eps)
+        # time + warp
+        t = self._sample_time_beta(B)                 # (B,1)
+        alpha, _ = self._time_warp(t)
+        zt = (1.0 - alpha) * z0 + alpha * z1
 
-            recon      = F.mse_loss(x_hat_stoch, x1)
-            recon_mean = F.mse_loss(x_hat_mean,  x1)
-            kl         = kl_normal_diag(mu, logv)
-            loss       = recon + recon_mean + self.cfg.pretrain_ae_kl_weight * kl
+        # decoder at physical t
+        xhat_t = self.Dec(zt, t)
 
-            self.opt_enc.zero_grad(set_to_none=True)
-            self.opt_dec.zero_grad(set_to_none=True)
-            loss.backward()
-            if self.cfg.grad_clip > 0:
-                nn.utils.clip_grad_norm_(self.Enc.parameters(), self.cfg.grad_clip)
-                nn.utils.clip_grad_norm_(self.Dec.parameters(), self.cfg.grad_clip)
-            self.opt_enc.step()
-            self.opt_dec.step()
+        # --- recon ---
+        if self.cfg.recon_loss_type == "gauss_nll":
+            # already returns per-data-dimension loss
+            recon_loss = self._recon_loss_gauss_nll(xhat_t, x1, t)
+        else:
+            # per-sample squared error summed over data dims
+            per = F.mse_loss(xhat_t, x1, reduction="none").sum(dim=1)  # (B,)
+            w = (self._recon_weight_from_t(t).squeeze(1)
+                if self.cfg.recon_t_weight_mode != "none" else 1.0)
 
-            # keep EMA in lockstep during pretrain
-            self._ema_update_teacher()
+            # normalize by data dimension to get O(1) loss
+            D_data = x1.size(1)
+            recon_loss = (per * w).mean() / float(D_data)
 
-            if progress and (it % 200 == 0 or it == steps):
-                print(
-                    f"[pretrain AE] step {it}/{steps} "
-                    f"recon={float(recon.detach().cpu()):.4f} "
-                    f"recon_mean={float(recon_mean.detach().cpu()):.4f} "
-                    f"kl={float(kl.detach().cpu()):.4f}"
-                )
+
+        # --- KL regularization ---
+        kl_mode = getattr(self.cfg, "kl_mode", "full")
+        D_latent = mu.size(1)
+
+        # full analytic per-dimension KL for q(z0|x) = N(mu, diag(exp(logv)+floor))
+        kl_full_per_dim = kl_normal_diag(
+            mu,
+            logv,
+            var_floor=self.cfg.latent_var_floor,
+        ) / float(D_latent)
+
+        # pathwise KL with Sigma_t = (1 - alpha)^2 Sigma and kappa(t) = (1 - t)
+        kl_path_per_dim = path_kl_normal_diag(
+            mu,
+            logv,
+            t,
+            alpha,
+            var_floor=self.cfg.latent_var_floor,
+            kappa_mode=getattr(self.cfg, "path_kl_kappa_mode", "one_minus_t"),
+            eps=getattr(self.cfg, "path_kl_eps", 1e-8),
+        )
+
+        if kl_mode == "path":
+            kl_loss = kl_path_per_dim
+        else:
+            kl_loss = kl_full_per_dim
+
+        # --- latent debug: are we actually using Σ? ---
+        latent_var = logv.exp()  # (B, D)
+        avg_latent_var = latent_var.mean()
+        min_latent_var = latent_var.min()
+        max_latent_var = latent_var.max()
+
+        z1_mu_diff = z1 - mu
+        z1_mu_mse = (z1_mu_diff ** 2).mean()
+        z1_mu_max = z1_mu_diff.abs().max()
+
+        # --- two-seed contraction @ t≈0 ---
+        ctr_loss = torch.zeros((), device=self.device, dtype=TDTYPE)
+        lambda_hat0 = torch.zeros((), device=self.device, dtype=TDTYPE)
+        if getattr(self.cfg, "ctr_enable", True) and float(getattr(self.cfg, "ctr_weight", 0.0)) > 0.0:
+            ctr_loss, lambda_hat0 = self._two_seed_contraction_loss(x1)
+
+        # --- total ---
+        total = (
+            self.cfg.organizer_recon_weight * recon_loss
+            + self.cfg.organizer_kl_weight * kl_loss
+            + float(getattr(self.cfg, "ctr_weight", 0.0)) * ctr_loss
+        )
+
+        # step BOTH optimizers
+        self.opt_enc.zero_grad(set_to_none=True)
+        self.opt_dec.zero_grad(set_to_none=True)
+        total.backward()
+        if self.cfg.grad_clip > 0:
+            nn.utils.clip_grad_norm_(self.Enc.parameters(), self.cfg.grad_clip)
+            nn.utils.clip_grad_norm_(self.Dec.parameters(), self.cfg.grad_clip)
+        self.opt_enc.step()
+        self.opt_dec.step()
+
+        if self.enc_scheduler is not None:
+            self.enc_scheduler.step()
+        if self.dec_scheduler is not None:
+            self.dec_scheduler.step()
+
+        # keep teacher loosely synced for any probes that rely on it
+        self._ema_update_teacher()
+
+        stats = {
+            "recon": float(recon_loss.detach().cpu()),
+            "ctr": float(ctr_loss.detach().cpu()),
+            "lambda0": float(lambda_hat0.detach().cpu()),
+            # training KL loss (either full-per-dim or path-per-dim, depending on mode)
+            "kl": float(kl_loss.detach().cpu()),
+            "kl_mode": kl_mode,
+            # extra KL monitors
+            "kl_full_per_dim": float(kl_full_per_dim.detach().cpu()),
+            "kl_path_per_dim": float(kl_path_per_dim.detach().cpu()),
+            # latent variance stats
+            "latent_var_mean": float(avg_latent_var.detach().cpu()),
+            "latent_var_min": float(min_latent_var.detach().cpu()),
+            "latent_var_max": float(max_latent_var.detach().cpu()),
+            # how noisy is z1 relative to mu?
+            "z1_mu_mse": float(z1_mu_mse.detach().cpu()),
+            "z1_mu_max": float(z1_mu_max.detach().cpu()),
+            "total": float(total.detach().cpu()),
+        }
+
+        # log under "organizer" for continuity
+        self.history["organizer"].append(stats)
+        return stats
 
     def _anneal_loss_weight(self, target: float, step: int, warmup: int, mode: str = "linear") -> float:
         if warmup <= 0 or mode == "none":
@@ -3767,18 +5192,12 @@ class AVRC:
         seed_everything(seed)
         rounds = rounds or self.cfg.rounds
 
-        self.pretrain_autoencoder(progress=progress)
         self._hard_sync_teacher()
-
         self._init_crossings_subset()
+
         try:
-            self._save_crossings_frame(round_idx=0)
-            if self.cfg.viz_latent:
-                self._save_latent_scatter_frame(round_idx=0)
-                self._save_latent_mu_frame(round_idx=0)
             if self.cfg.viz_hist:
                 self._save_hist_grid_frame(round_idx=0)
-            # NEW
             self._save_recon_over_time_frame(round_idx=0)
         except Exception as exc:
             print(f"[warn] initial viz failed: {exc}")
@@ -3789,12 +5208,6 @@ class AVRC:
                 self.cfg.organizer_recon_weight,
                 r,
                 self.cfg.organizer_recon_warmup,
-                self.cfg.loss_anneal_mode,
-            )
-            oa_align = self._anneal_loss_weight(
-                self.cfg.organizer_align_weight,
-                r,
-                self.cfg.organizer_align_warmup,
                 self.cfg.loss_anneal_mode,
             )
             oa_kl = self._anneal_loss_weight(
@@ -3809,49 +5222,46 @@ class AVRC:
                 self.cfg.critic_recon_warmup,
                 self.cfg.loss_anneal_mode,
             )
-            cr_align = self._anneal_loss_weight(
-                self.cfg.critic_align_weight,
+            # NEW: contraction weight anneal
+            oa_ctr = self._anneal_loss_weight(
+                self.cfg.ctr_weight,
                 r,
-                self.cfg.critic_align_warmup,
+                getattr(self.cfg, "ctr_warmup", 0),
                 self.cfg.loss_anneal_mode,
             )
 
             # ---- temporarily patch cfg so existing step() code keeps working ----
             orig_org_recon = self.cfg.organizer_recon_weight
-            orig_org_align = self.cfg.organizer_align_weight
             orig_org_kl    = self.cfg.organizer_kl_weight
             orig_cr_recon  = self.cfg.critic_recon_weight
-            orig_cr_align  = self.cfg.critic_align_weight
+            orig_ctr_w     = self.cfg.ctr_weight
 
             self.cfg.organizer_recon_weight = oa_recon
-            self.cfg.organizer_align_weight = oa_align
             self.cfg.organizer_kl_weight    = oa_kl
             self.cfg.critic_recon_weight    = cr_recon
-            self.cfg.critic_align_weight    = cr_align
+            self.cfg.ctr_weight             = oa_ctr
 
-            # --------- do training steps as before ----------
-            dec_stats_list = []
+            # ---- perform training step(s) ----
+            joint_stats_list = []
             for _ in range(max(1, int(self.cfg.decoder_steps_per_round))):
-                dec_stats_list.append(self.critic_step())
-            enc_stats = self.organizer_step()
+                joint_stats_list.append(self.joint_step())
+            enc_stats = joint_stats_list[-1]
+            dec_avg = {"recon": enc_stats["recon"], "total": enc_stats["total"]}
 
-            # restore cfg to avoid surprises outside this loop
+
+            # ---- restore cfg to avoid surprises outside this loop ----
             self.cfg.organizer_recon_weight = orig_org_recon
-            self.cfg.organizer_align_weight = orig_org_align
             self.cfg.organizer_kl_weight    = orig_org_kl
             self.cfg.critic_recon_weight    = orig_cr_recon
-            self.cfg.critic_align_weight    = orig_cr_align
+            self.cfg.ctr_weight             = orig_ctr_w
 
-            dec_avg = {
-                key: float(np.mean([stats[key] for stats in dec_stats_list]))
-                for key in dec_stats_list[0].keys()
-            }
             self._record_lr()
 
             if progress and (r % self.cfg.log_every == 0):
                 # ----- extra recon evals along the latent path -----
+                if getattr(self.cfg, "postdec_retrain_on_log", True):
+                    self._postdec_retrain(self.cfg.postdec_epochs)
                 with torch.no_grad():
-                    # use a smaller eval batch than viz_hist_n
                     eval_batch = self._get_viz_logging_batch(self.cfg.target_eval_n)
                     x_tgt  = eval_batch["x_tgt_enc"]      # (N,D)
                     z0     = eval_batch["model_z0"]       # (N,D)
@@ -3866,7 +5276,6 @@ class AVRC:
                             dtype=TDTYPE,
                         )
                         x_dec = self.Dec(z_t, t_tensor)
-                        # MSE to ambient target x_1
                         return torch.mean((x_dec - x_tgt) ** 2).item()
 
                     recon_t0   = _recon_at(0.0)
@@ -3874,37 +5283,55 @@ class AVRC:
                     recon_t75  = _recon_at(0.75)
                     recon_t100 = _recon_at(1.0)
 
+                kl_mode = enc_stats.get("kl_mode", getattr(self.cfg, "kl_mode", "full"))
+                kl_label = "kl_full" if kl_mode == "full" else "kl_path"
+
                 print(
                     f"[{r:05d}] enc: recon {enc_stats['recon']:.4f} "
-                    f"align {enc_stats['align']:.4f} "
-                    f"kl {enc_stats.get('kl', 0.0):.4f} "
+                    f"ctr {enc_stats.get('ctr', 0.0):.4f} "
+                    f"{kl_label} {enc_stats.get('kl', 0.0):.4f} "
+                    f"(full_kl_per_dim={enc_stats.get('kl_full_per_dim', 0.0):.4f}, "
+                    f"path_kl_per_dim={enc_stats.get('kl_path_per_dim', 0.0):.4f}) "
                     f"total {enc_stats['total']:.4f} | "
                     f"dec(avg {self.cfg.decoder_steps_per_round}x): "
                     f"recon {dec_avg['recon']:.4f} total {dec_avg['total']:.4f} | "
                     f"recon@t: 0.00={recon_t0:.4f}, 0.50={recon_t50:.4f}, "
                     f"0.75={recon_t75:.4f}, 1.00={recon_t100:.4f} | "
-                    f"weights → org(recon={oa_recon:.3f}, align={oa_align:.3f}, kl={oa_kl:.3f}) "
-                    f"dec(recon={cr_recon:.3f}, align={cr_align:.3f})"
+                    f"weights → org(recon={oa_recon:.3f}, kl={oa_kl:.3f}, ctr={oa_ctr:.3f}) "
+                    f"dec(recon={cr_recon:.3f})"
                 )
+
+
+                # extra one-line latent debug
+                print(
+                    f"        latent_var: mean={enc_stats.get('latent_var_mean', 0.0):.3e}, "
+                    f"min={enc_stats.get('latent_var_min', 0.0):.3e}, "
+                    f"max={enc_stats.get('latent_var_max', 0.0):.3e} | "
+                    f"z1-mu: mse={enc_stats.get('z1_mu_mse', 0.0):.3e}, "
+                    f"max_abs={enc_stats.get('z1_mu_max', 0.0):.3e}"
+                )
+
 
                 viz_batch = self._get_viz_logging_batch(self.cfg.viz_hist_n)
                 eval_metrics = self._eval_viz_metrics(viz_batch)
                 self.history["metrics"].append({"round": r, **eval_metrics})
 
                 print(
-                    f"        agg-KL≈{eval_metrics['agg_kl']:.4f} "
+                    f"        agg-KL≈{eval_metrics['agg_kl']:.6f} "
                     f"(||μ||≈{eval_metrics['agg_mu_norm']:.3f}, avg var≈{eval_metrics['agg_avg_var']:.3f}) | "
                     f"dec(enc)→data: MMD≈{eval_metrics['mmd_dec_enc']:.4f} SW2≈{eval_metrics['sw2_dec_enc']:.4f} | "
                     f"dec(gauss)→data: MMD≈{eval_metrics['mmd_dec_gauss']:.4f} SW2≈{eval_metrics['sw2_dec_gauss']:.4f}"
                 )
 
-
             if self.cfg.k_plot and r % self.cfg.k_plot == 0:
+                if getattr(self.cfg, "postdec_retrain_on_viz", True):
+                    self._postdec_retrain(self.cfg.postdec_epochs)
                 try:
                     self._save_crossings_frame(round_idx=r)
                     if self.cfg.viz_latent:
                         self._save_latent_scatter_frame(round_idx=r)
                         self._save_latent_mu_frame(round_idx=r)
+                        self._save_colored_coupling(round_idx = r)
                     if self.cfg.viz_hist:
                         self._save_hist_grid_frame(round_idx=r)
                     # NEW
@@ -3976,7 +5403,8 @@ class AVRC:
         if z1 is None:
             z1 = x
         eps = torch.randn_like(mu)
-        z0 = mu + torch.exp(0.5 * logv) * eps
+        s2  = torch.exp(logv) + self.cfg.cov_floor
+        z0  = mu + torch.sqrt(s2) * eps
         return z0, x
 
     @torch.no_grad()
@@ -4055,7 +5483,8 @@ def main1(target="checker", embedding="identity", K=2):
         k_dim=K,
     )
 
-    rounds = 150
+    rounds = 20
+
 
     avrc = AVRC(
         AVRCConfig(
@@ -4063,28 +5492,31 @@ def main1(target="checker", embedding="identity", K=2):
             rounds=rounds,
             batch=4096,
             log_every=1,
-            k_plot=3,
-            test_rf_every = 15,
+            k_plot=10,
+            test_rf_every = 10,
             viz_camera=(10, -40),
             organizer_recon_weight=1.0,
-            organizer_align_weight=0.0,
-            organizer_kl_weight=.6,
-            critic_recon_weight=1.0,
-            critic_align_weight=0.0,
+            organizer_kl_weight=1.0,
+            kl_mode="full",
+            path_kl_kappa_mode="unif",
             viz_latent=True,
             viz_proj_mode="pca",
-            viz_num_projections=2,
+            viz_num_projections=1,
             viz_proj_source="target",
+            time_sampling_gamma = 1.0,
+            jitter_lambda=0.0,
         )
     )
     avrc.train(progress=True, seed=0)
 
-    avrc.export_decoder_path_benchmark(
-        out_dir="viz_decoder_path",
-        t_list=(.75, 0.8 , .85, .9,  1.0),
-        rf_K= 8,
+    # NEW: use endpoint-per-t decoders instead of the path decoder
+    avrc.export_endpoint_decoder_path_benchmark(
+        out_dir="viz_endpoint_decoder_path",
+        t_list=( .80, 0.85, .9,  0.95, 1.00),
+        rf_K=8,
         trials=10,
-        hist_bins=180,
+        n_line=25,
+        hist_bins=120,
         batch_n=avrc.cfg.viz_hist_n if hasattr(avrc.cfg, "viz_hist_n") else 8192,
         tag=f"_{target}_{embedding}_K{K}",
     )
@@ -4093,12 +5525,13 @@ def main1(target="checker", embedding="identity", K=2):
     avrc.export_latent_path_animation(
         out_mp4=f"latent_evolution_{target}_{embedding}_K{K}.mp4",
         frames=120,
-        hist_bins=180,
+        hist_bins=120,
         fps = 30,
         batch_n=avrc.cfg.viz_hist_n if hasattr(avrc.cfg, "viz_hist_n") else 8192,
+        trace_n = 0,
     )
 
 
 if __name__ == "__main__":
     _wipe_work_dirs()
-    main1(target = 'pinwheel', embedding = 'identity', K = 2)
+    main1(target = 'spiral', embedding = 'sine_wiggle', K = 5)
