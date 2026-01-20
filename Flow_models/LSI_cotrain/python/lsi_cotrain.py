@@ -1712,7 +1712,7 @@ def train_vae_cotrained(cfg):
         if len(mu_stats) > 0:
             log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
 
-        if (ep + 1) % eval_freq == 0:
+        if (ep + 1) % eval_freq == 0 or (not ep):
             # Evaluate LSI
             results_lsi = evaluate_current_state(
                 ep + 1,
