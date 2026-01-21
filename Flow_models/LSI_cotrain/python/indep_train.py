@@ -1513,21 +1513,20 @@ def make_dataloaders(batch_size, num_workers):
 
 
 
-def train_vae_cotrained(cfg):
+# =============================================================================
+# TWO-STAGE INDEPENDENT TRAINING: VAE first, then Score Networks
+# =============================================================================
+
+def train_vae_ldms_indep(cfg):
     """
-    Training function supporting both co-training and two-stage modes.
+    Two-stage independent training for baseline comparison:
+    - Stage 1: Train VAE (recon + standard KL + perceptual loss)
+    - Stage 2: Freeze VAE, train LSI and Tweedie score networks independently
     
-    Modes (controlled by cfg["training_mode"]):
-    - "cotrain": Joint VAE + score network training (original behavior)
-    - "two_stage": Train VAE first (recon + standard KL + perceptual), then 
-                   freeze VAE and train score networks (LSI and Tweedie)
-    
-    Changes from original:
-    - Wipes and recreates run_results directory at start
-    - Logs per-epoch losses to a DataFrame
-    - Logs evaluate_current_state results to a DataFrame
-    - Generates visualization suite after training completes
-    - Saves all results to run_results directory
+    Logging notes:
+    - Stage 1 loss records use stage="vae_pretrain" (excluded from main plots)
+    - Stage 2 uses RELATIVE epochs starting from 1 for clean visualization
+    - Tags use "LSI_Diff" and "Ctrl_Diff" for compatibility with plotting suite
     """
     # --- Setup Results Directory ---
     results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"))
@@ -1550,7 +1549,7 @@ def train_vae_cotrained(cfg):
         ckpt_load_dir = cfg.get("ckpt_load_dir", cfg["ckpt_dir"])
         print(f"--> Loading checkpoints from {ckpt_load_dir}...")
         try:
-            vae.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "vae_cotrained.pt"), map_location=device))
+            vae.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "vae_pretrained.pt"), map_location=device))
             print("    Loaded VAE.")
         except Exception as e:
             print(f"    Warning: Could not load VAE ({e})")
@@ -1612,556 +1611,231 @@ def train_vae_cotrained(cfg):
     loss_records = []
     eval_records = []
 
-    # --- Determine Training Mode ---
-    training_mode = cfg.get("training_mode", "cotrain")
+    # ===================================================================
+    # STAGE 1: Train VAE independently
+    # ===================================================================
+    print("=" * 60)
+    print("TWO-STAGE INDEPENDENT TRAINING")
+    print("Stage 1: Train VAE (recon + standard KL + perceptual)")
+    print("Stage 2: Freeze VAE, train score networks (LSI and Tweedie)")
+    print("=" * 60)
     
-    if training_mode == "two_stage":
-        # ===================================================================
-        # TWO-STAGE TRAINING: VAE first, then frozen VAE + score networks
-        # ===================================================================
-        print("=" * 60)
-        print("TWO-STAGE TRAINING MODE")
-        print("Stage 1: Train VAE (recon + standard KL + perceptual)")
-        print("Stage 2: Freeze VAE, train score networks (LSI and Tweedie)")
-        print("=" * 60)
-        
-        # -------------------------------------------------------------------
-        # STAGE 1: Train VAE independently
-        # -------------------------------------------------------------------
-        epochs_vae_stage1 = cfg.get("epochs_vae_stage1", cfg["epochs_vae"])
-        lr_vae_stage1 = cfg.get("lr_vae_stage1", cfg["lr_vae"])
-        kl_w_stage1 = cfg.get("kl_w_stage1", cfg["kl_w"])  # Standard KL weight
-        
-        opt_vae = optim.AdamW(vae.parameters(), lr=lr_vae_stage1, weight_decay=1e-4)
-        
-        print(f"\n--> Stage 1: Training VAE for {epochs_vae_stage1} epochs...")
-        
-        for ep in range(epochs_vae_stage1):
-            vae.train()
-            metrics = {k: 0.0 for k in ["loss", "recon", "kl", "perc"]}
-            mu_stats = []
-            
-            for x, _ in tqdm(train_l, desc=f"VAE Ep {ep+1}", leave=False):
-                x = x.to(device)
-                
-                # --- VAE Forward ---
-                x_rec, mu, logvar = vae(x)
-                if len(mu_stats) < 5: mu_stats.append(mu.detach())
-                
-                # Reconstruction loss
-                recon = F.mse_loss(x_rec, x)
-                
-                # Perceptual loss
-                if LPIPS_AVAILABLE:
-                    x_3c = x.repeat(1, 3, 1, 1)
-                    x_rec_3c = x_rec.repeat(1, 3, 1, 1)
-                    perc = lpips_fn(x_rec_3c, x_3c).mean()
-                else:
-                    perc = torch.tensor(0.0, device=device)
-                
-                # Standard KL divergence (full analytic KL to N(0,I))
-                # KL = -0.5 * sum(1 + log(var) - mu^2 - var)
-                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                
-                # Total VAE loss
-                loss_vae = recon + cfg["perc_w"] * perc + kl_w_stage1 * kl
-                
-                opt_vae.zero_grad()
-                loss_vae.backward()
-                nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
-                opt_vae.step()
-                
-                metrics["loss"] += loss_vae.item()
-                metrics["recon"] += recon.item()
-                metrics["kl"] += kl.item()
-                metrics["perc"] += perc.item()
-            
-            # --- Compute epoch averages and log ---
-            n_batches = len(train_l)
-            epoch_metrics = {
-                "epoch": ep + 1,
-                "stage": "vae_stage1",
-                "loss": metrics["loss"] / n_batches,
-                "recon": metrics["recon"] / n_batches,
-                "kl": metrics["kl"] / n_batches,
-                "score_lsi": 0.0,  # Not training score nets yet
-                "score_control": 0.0,
-                "perc": metrics["perc"] / n_batches,
-            }
-            loss_records.append(epoch_metrics)
-            
-            print(f"VAE Ep {ep+1} | Loss: {epoch_metrics['loss']:.4f} | "
-                  f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | "
-                  f"Perc: {epoch_metrics['perc']:.4f}")
-            
-            if len(mu_stats) > 0:
-                log_latent_stats("VAE_Stage1", torch.cat(mu_stats, 0))
-            
-            # Evaluate VAE reconstruction quality periodically
-            if (ep + 1) % eval_freq == 0:
-                # Evaluate with dummy score network (just for VAE recon metrics)
-                # We'll use a freshly initialized network - metrics won't be meaningful
-                # for generation but will track VAE quality
-                results_vae = evaluate_current_state(
-                    ep + 1,
-                    "VAE_Stage1",
-                    vae,
-                    unet_lsi_ema,  # Placeholder - not trained yet
-                    test_l,
-                    cfg,
-                    device,
-                    lpips_fn,
-                    fixed_noise_bank=fixed_noise_bank,
-                    fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                    fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                    fixed_sw2_theta=fixed_sw2_theta,
-                    results_dir=results_dir,
-                )
-                if results_vae is not None:
-                    results_vae["epoch"] = ep + 1
-                    results_vae["stage"] = "vae_stage1"
-                    results_vae["tag"] = "VAE_Stage1"
-                    eval_records.append(results_vae)
-        
-        # Save VAE checkpoint after stage 1
-        save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_stage1.pt"))
-        print(f"--> Stage 1 complete. VAE saved to {cfg['ckpt_dir']}/vae_stage1.pt")
-        
-        # -------------------------------------------------------------------
-        # STAGE 2: Freeze VAE, train score networks
-        # -------------------------------------------------------------------
-        epochs_score_stage2 = cfg.get("epochs_score_stage2", cfg.get("epochs_refine", 20))
-        lr_score_stage2 = cfg.get("lr_score_stage2", cfg["lr_ldm"])
-        
-        print(f"\n--> Stage 2: Training score networks for {epochs_score_stage2} epochs...")
-        print("    VAE is FROZEN. Training LSI and Tweedie score heads.")
-        
-        # Freeze VAE
-        vae.eval()
-        for p in vae.parameters():
-            p.requires_grad = False
-        
-        # Fresh optimizers for score networks
-        opt_lsi = optim.AdamW(unet_lsi.parameters(), lr=lr_score_stage2, weight_decay=1e-4)
-        opt_control = optim.AdamW(unet_control.parameters(), lr=lr_score_stage2, weight_decay=1e-4)
-        
-        # Track epoch offset for consistent logging
-        epoch_offset = epochs_vae_stage1
-        
-        for ep in range(epochs_score_stage2):
-            unet_lsi.train()
-            unet_control.train()
-            metrics = {k: 0.0 for k in ["score_lsi", "score_control"]}
-            
-            for x, _ in tqdm(train_l, desc=f"Score Ep {ep+1}", leave=False):
-                x = x.to(device)
-                B = x.shape[0]
-                
-                # --- Get frozen VAE outputs ---
-                with torch.no_grad():
-                    _, mu, logvar = vae(x)
-                    z0 = vae.reparameterize(mu, logvar)
-                
-                # Sample diffusion time
-                t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
-                alpha, sigma = get_ou_params(t.view(B, 1, 1, 1))
-                
-                # Forward diffusion
-                noise = torch.randn_like(z0)
-                z_t = alpha * z0 + sigma * noise
-                
-                # --- LSI Score Training ---
-                var_0 = torch.exp(logvar)
-                mu_t = alpha * mu
-                var_t = (alpha ** 2) * var_0 + (sigma ** 2)
-                
-                eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
-                eps_pred_lsi = unet_lsi(z_t, t)
-                score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-                
-                opt_lsi.zero_grad()
-                score_loss_lsi.backward()
-                nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
-                opt_lsi.step()
-                
-                # --- EMA Update (LSI) ---
-                with torch.no_grad():
-                    for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-                
-                # --- Tweedie/DSM Score Training ---
-                eps_pred_control = unet_control(z_t.detach(), t)
-                score_loss_control = F.mse_loss(eps_pred_control, noise)
-                
-                opt_control.zero_grad()
-                score_loss_control.backward()
-                nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
-                opt_control.step()
-                
-                # --- EMA Update (Control) ---
-                with torch.no_grad():
-                    for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-                
-                metrics["score_lsi"] += score_loss_lsi.item()
-                metrics["score_control"] += score_loss_control.item()
-            
-            # --- Log epoch metrics ---
-            n_batches = len(train_l)
-            global_epoch = epoch_offset + ep + 1
-            epoch_metrics = {
-                "epoch": global_epoch,
-                "stage": "score_stage2",
-                "loss": 0.0,  # No joint loss
-                "recon": 0.0,  # VAE frozen
-                "kl": 0.0,
-                "score_lsi": metrics["score_lsi"] / n_batches,
-                "score_control": metrics["score_control"] / n_batches,
-                "perc": 0.0,
-            }
-            loss_records.append(epoch_metrics)
-            
-            print(f"Score Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
-                  f"Ctrl: {epoch_metrics['score_control']:.4f}")
-            
-            # --- Evaluate ---
-            if (ep + 1) % eval_freq == 0:
-                # Evaluate LSI
-                results_lsi = evaluate_current_state(
-                    global_epoch,
-                    "TwoStage_LSI",
-                    vae,
-                    unet_lsi_ema,
-                    test_l,
-                    cfg,
-                    device,
-                    lpips_fn,
-                    fixed_noise_bank=fixed_noise_bank,
-                    fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                    fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                    fixed_sw2_theta=fixed_sw2_theta,
-                    results_dir=results_dir,
-                )
-                if results_lsi is not None:
-                    results_lsi["epoch"] = global_epoch
-                    results_lsi["stage"] = "score_stage2"
-                    results_lsi["tag"] = "TwoStage_LSI"
-                    eval_records.append(results_lsi)
-                
-                # Evaluate Tweedie/Control
-                results_ctrl = evaluate_current_state(
-                    global_epoch,
-                    "TwoStage_Tweedie",
-                    vae,
-                    unet_control_ema,
-                    test_l,
-                    cfg,
-                    device,
-                    lpips_fn,
-                    fixed_noise_bank=fixed_noise_bank,
-                    fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                    fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                    fixed_sw2_theta=fixed_sw2_theta,
-                    results_dir=results_dir,
-                )
-                if results_ctrl is not None:
-                    results_ctrl["epoch"] = global_epoch
-                    results_ctrl["stage"] = "score_stage2"
-                    results_ctrl["tag"] = "TwoStage_Tweedie"
-                    eval_records.append(results_ctrl)
+    epochs_vae = cfg.get("epochs_vae", 4)
+    lr_vae = cfg.get("lr_vae", 2e-4)
+    kl_w = cfg.get("kl_w", 0.01)
     
-    else:
-        # ===================================================================
-        # CO-TRAINING MODE (Original behavior)
-        # ===================================================================
-        print("=" * 60)
-        print("CO-TRAINING MODE")
-        print("Joint VAE + Score Network training with LSI")
-        print("=" * 60)
+    opt_vae = optim.AdamW(vae.parameters(), lr=lr_vae, weight_decay=1e-4)
+    
+    print(f"\n--> Stage 1: Training VAE for {epochs_vae} epochs...")
+    
+    for ep in range(epochs_vae):
+        vae.train()
+        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "perc"]}
+        mu_stats = []
         
-        # --- Asymmetric LR Settings ---
-        score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
-        opt_joint = optim.AdamW([
-            {'params': vae.parameters(), 'lr': cfg["lr_vae"]},
-            {'params': unet_lsi.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae}
-        ], weight_decay=1e-4)
-
-        opt_control = optim.AdamW(unet_control.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
-
-        print("--> Starting Dual Co-training...")
-        for ep in range(cfg["epochs_vae"]):
-            vae.train(); unet_lsi.train(); unet_control.train()
-            metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc"]}
-            mu_stats = []
-
-            for x, _ in tqdm(train_l, desc=f"Ep {ep+1}", leave=False):
-                x = x.to(device)
-                B = x.shape[0]
-
-                # --- VAE & LSI (Joint) ---
-                x_rec, mu, logvar = vae(x)
-                if len(mu_stats) < 5: mu_stats.append(mu.detach())
-
-                recon = F.mse_loss(x_rec, x)
-
-                if LPIPS_AVAILABLE:
-                    x_3c = x.repeat(1, 3, 1, 1)
-                    x_rec_3c = x_rec.repeat(1, 3, 1, 1)
-                    perc = lpips_fn(x_rec_3c, x_3c).mean()
-                else:
-                    perc = torch.tensor(0.0, device=device)
-
-                mod_kl = -0.5 * torch.mean(1 - mu.pow(2) - logvar.exp())
-                kl = mod_kl
-
-                t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
+        for x, _ in tqdm(train_l, desc=f"VAE Ep {ep+1}", leave=False):
+            x = x.to(device)
+            
+            # --- VAE Forward ---
+            x_rec, mu, logvar = vae(x)
+            if len(mu_stats) < 5: mu_stats.append(mu.detach())
+            
+            # Reconstruction loss
+            recon = F.mse_loss(x_rec, x)
+            
+            # Perceptual loss
+            if LPIPS_AVAILABLE:
+                x_3c = x.repeat(1, 3, 1, 1)
+                x_rec_3c = x_rec.repeat(1, 3, 1, 1)
+                perc = lpips_fn(x_rec_3c, x_3c).mean()
+            else:
+                perc = torch.tensor(0.0, device=device)
+            
+            # Standard KL divergence (full analytic KL to N(0,I))
+            # KL = -0.5 * sum(1 + log(var) - mu^2 - var)
+            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            
+            # Total VAE loss
+            loss_vae = recon + cfg["perc_w"] * perc + kl_w * kl_loss
+            
+            opt_vae.zero_grad()
+            loss_vae.backward()
+            nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
+            opt_vae.step()
+            
+            metrics["loss"] += loss_vae.item()
+            metrics["recon"] += recon.item()
+            metrics["kl"] += kl_loss.item()
+            metrics["perc"] += perc.item()
+        
+        # --- Compute epoch averages and log ---
+        n_batches = len(train_l)
+        epoch_metrics = {
+            "epoch": ep + 1,
+            "stage": "vae_pretrain",  # Separate stage name - excluded from main plots
+            "loss": metrics["loss"] / n_batches,
+            "recon": metrics["recon"] / n_batches,
+            "kl": metrics["kl"] / n_batches,
+            "score_lsi": 0.0,
+            "score_control": 0.0,
+            "perc": metrics["perc"] / n_batches,
+        }
+        loss_records.append(epoch_metrics)
+        
+        print(f"VAE Ep {ep+1} | Loss: {epoch_metrics['loss']:.4f} | "
+              f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | "
+              f"Perc: {epoch_metrics['perc']:.4f}")
+        
+        if len(mu_stats) > 0:
+            log_latent_stats("VAE_Pretrain", torch.cat(mu_stats, 0))
+    
+    # Save VAE checkpoint after stage 1
+    save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_pretrained.pt"))
+    print(f"--> Stage 1 complete. VAE saved to {cfg['ckpt_dir']}/vae_pretrained.pt")
+    
+    # ===================================================================
+    # STAGE 2: Freeze VAE, train score networks
+    # ===================================================================
+    epochs_score = cfg.get("epochs_score", 20)
+    lr_score = cfg.get("lr_score", 1e-3)
+    
+    print(f"\n--> Stage 2: Training score networks for {epochs_score} epochs...")
+    print("    VAE is FROZEN. Training LSI and Tweedie score heads.")
+    
+    # Freeze VAE
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad = False
+    
+    # Fresh optimizers for score networks
+    opt_lsi = optim.AdamW(unet_lsi.parameters(), lr=lr_score, weight_decay=1e-4)
+    opt_control = optim.AdamW(unet_control.parameters(), lr=lr_score, weight_decay=1e-4)
+    
+    for ep in range(epochs_score):
+        unet_lsi.train()
+        unet_control.train()
+        metrics = {k: 0.0 for k in ["score_lsi", "score_control"]}
+        
+        for x, _ in tqdm(train_l, desc=f"Score Ep {ep+1}", leave=False):
+            x = x.to(device)
+            B = x.shape[0]
+            
+            # --- Get frozen VAE outputs ---
+            with torch.no_grad():
+                _, mu, logvar = vae(x)
                 z0 = vae.reparameterize(mu, logvar)
-                alpha, sigma = get_ou_params(t.view(B,1,1,1))
-
-                noise = torch.randn_like(z0)
-                z_t = alpha * z0 + sigma * noise
-
-                var_0 = torch.exp(logvar)
-                mu_t = alpha * mu
-                var_t = (alpha**2) * var_0 + (sigma**2)
-
-                eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
-                eps_pred_lsi = unet_lsi(z_t, t)
-                score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-
-                score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
-                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*mod_kl + score_w_vae*score_loss_lsi
-
-                opt_joint.zero_grad()
-                loss_joint.backward()
-                nn.utils.clip_grad_norm_(list(vae.parameters()) + list(unet_lsi.parameters()), 1.0)
-                opt_joint.step()
-
-                # --- EMA Update (LSI) ---
-                with torch.no_grad():
-                    for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-
-                # --- Control (Tweedie/DSM) ---
-                z_t_detached = z_t.detach()
-                eps_pred_control = unet_control(z_t_detached, t)
-                score_loss_control = cfg["score_w"] * F.mse_loss(eps_pred_control, noise)
-
-                opt_control.zero_grad()
-                score_loss_control.backward()
-                nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
-                opt_control.step()
-
-                # --- EMA Update (Control) ---
-                with torch.no_grad():
-                    for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-
-                metrics["loss"] += loss_joint.item()
-                metrics["recon"] += recon.item()
-                metrics["kl"] += mod_kl.item()
-                metrics["score_lsi"] += score_loss_lsi.item()
-                metrics["score_control"] += score_loss_control.item()
-                metrics["perc"] += perc.item()
-
-            # --- Compute epoch averages and log ---
-            n_batches = len(train_l)
-            epoch_metrics = {
-                "epoch": ep + 1,
-                "stage": "cotrain",
-                "loss": metrics["loss"] / n_batches,
-                "recon": metrics["recon"] / n_batches,
-                "kl": metrics["kl"] / n_batches,
-                "score_lsi": metrics["score_lsi"] / n_batches,
-                "score_control": metrics["score_control"] / n_batches,
-                "perc": metrics["perc"] / n_batches,
-            }
-            loss_records.append(epoch_metrics)
-
-            print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | "
-                  f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f}")
-
-            if len(mu_stats) > 0:
-                log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
-
-            if (ep + 1) % eval_freq == 0:
-                # Evaluate LSI
-                results_lsi = evaluate_current_state(
-                    ep + 1,
-                    "LSI_Diff",
-                    vae,
-                    unet_lsi_ema,
-                    test_l,
-                    cfg,
-                    device,
-                    lpips_fn,
-                    fixed_noise_bank=fixed_noise_bank,
-                    fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                    fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                    fixed_sw2_theta=fixed_sw2_theta,
-                    results_dir=results_dir,
-                )
-                if results_lsi is not None:
-                    results_lsi["epoch"] = ep + 1
-                    results_lsi["stage"] = "cotrain"
-                    results_lsi["tag"] = "LSI_Diff"
-                    eval_records.append(results_lsi)
-
-                # Evaluate Control
-                results_ctrl = evaluate_current_state(
-                    ep + 1,
-                    "Ctrl_Diff",
-                    vae,
-                    unet_control_ema,
-                    test_l,
-                    cfg,
-                    device,
-                    lpips_fn,
-                    fixed_noise_bank=fixed_noise_bank,
-                    fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                    fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                    fixed_sw2_theta=fixed_sw2_theta,
-                    results_dir=results_dir,
-                )
-                if results_ctrl is not None:
-                    results_ctrl["epoch"] = ep + 1
-                    results_ctrl["stage"] = "cotrain"
-                    results_ctrl["tag"] = "Ctrl_Diff"
-                    eval_records.append(results_ctrl)
-
-        # ===========================================================================
-        # REFINEMENT STAGE: Freeze VAE, train only score networks
-        # ===========================================================================
-        epochs_refine = cfg.get("epochs_refine", 20)
-        lr_refine = cfg.get("lr_refine", 1e-4)
-
-        if epochs_refine > 0:
-            print(f"\n--> Starting Refinement Stage ({epochs_refine} epochs, lr={lr_refine})...")
-
-            vae.eval()
-            for p in vae.parameters():
-                p.requires_grad = False
-
-            opt_lsi_refine = optim.AdamW(unet_lsi.parameters(), lr=lr_refine, weight_decay=1e-4)
-            opt_control_refine = optim.AdamW(unet_control.parameters(), lr=lr_refine, weight_decay=1e-4)
-
-            for ep in range(epochs_refine):
-                unet_lsi.train(); unet_control.train()
-                metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control"]}
-
-                for x, _ in tqdm(train_l, desc=f"Refine Ep {ep+1}", leave=False):
-                    x = x.to(device)
-                    B = x.shape[0]
-
-                    with torch.no_grad():
-                        _, mu, logvar = vae(x)
-                        z0 = vae.reparameterize(mu, logvar)
-
-                    t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
-                    alpha, sigma = get_ou_params(t.view(B,1,1,1))
-
-                    noise = torch.randn_like(z0)
-                    z_t = alpha * z0 + sigma * noise
-
-                    # --- LSI Score Training ---
-                    var_0 = torch.exp(logvar)
-                    mu_t = alpha * mu
-                    var_t = (alpha**2) * var_0 + (sigma**2)
-
-                    eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
-                    eps_pred_lsi = unet_lsi(z_t, t)
-                    score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-
-                    opt_lsi_refine.zero_grad()
-                    score_loss_lsi.backward()
-                    nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
-                    opt_lsi_refine.step()
-
-                    # --- EMA Update (LSI) ---
-                    with torch.no_grad():
-                        for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
-                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-
-                    # --- Control (Tweedie/DSM) Score Training ---
-                    eps_pred_control = unet_control(z_t.detach(), t)
-                    score_loss_control = F.mse_loss(eps_pred_control, noise)
-
-                    opt_control_refine.zero_grad()
-                    score_loss_control.backward()
-                    nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
-                    opt_control_refine.step()
-
-                    # --- EMA Update (Control) ---
-                    with torch.no_grad():
-                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
-                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-
-                    metrics_refine["score_lsi"] += score_loss_lsi.item()
-                    metrics_refine["score_control"] += score_loss_control.item()
-
-                # --- Log Refinement Epoch ---
-                n_batches = len(train_l)
-                global_epoch = cfg["epochs_vae"] + ep + 1
-                epoch_metrics = {
-                    "epoch": global_epoch,
-                    "stage": "refine",
-                    "loss": 0.0,  # No joint loss in refinement
-                    "recon": 0.0,
-                    "kl": 0.0,
-                    "score_lsi": metrics_refine["score_lsi"] / n_batches,
-                    "score_control": metrics_refine["score_control"] / n_batches,
-                    "perc": 0.0,
-                }
-                loss_records.append(epoch_metrics)
-
-                print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
-                      f"Ctrl: {epoch_metrics['score_control']:.4f}")
-
-                if (ep + 1) % eval_freq == 0:
-                    results_lsi = evaluate_current_state(
-                            global_epoch,
-                            "LSI_Diff_Refine",
-                            vae,
-                            unet_lsi_ema,
-                            test_l,
-                            cfg,
-                            device,
-                            lpips_fn,
-                            fixed_noise_bank=fixed_noise_bank,
-                            fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                            fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                            fixed_sw2_theta=fixed_sw2_theta,
-                            results_dir=results_dir,
-                    )
-                    if results_lsi is not None:
-                        results_lsi["epoch"] = global_epoch
-                        results_lsi["stage"] = "refine"
-                        results_lsi["tag"] = "LSI_Diff_Refine"
-                        eval_records.append(results_lsi)
-
-                    results_ctrl = evaluate_current_state(
-                            global_epoch,
-                            "Ctrl_Diff_Refine",
-                            vae,
-                            unet_control_ema,
-                            test_l,
-                            cfg,
-                            device,
-                            lpips_fn,
-                            fixed_noise_bank=fixed_noise_bank,
-                            fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                            fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                            fixed_sw2_theta=fixed_sw2_theta,
-                            results_dir=results_dir,
-                    )
-                    if results_ctrl is not None:
-                        results_ctrl["epoch"] = global_epoch
-                        results_ctrl["stage"] = "refine"
-                        results_ctrl["tag"] = "Ctrl_Diff_Refine"
-                        eval_records.append(results_ctrl)
+            
+            # Sample diffusion time
+            t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
+            alpha, sigma = get_ou_params(t.view(B, 1, 1, 1))
+            
+            # Forward diffusion
+            noise = torch.randn_like(z0)
+            z_t = alpha * z0 + sigma * noise
+            
+            # --- LSI Score Training ---
+            var_0 = torch.exp(logvar)
+            mu_t = alpha * mu
+            var_t = (alpha ** 2) * var_0 + (sigma ** 2)
+            
+            eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
+            eps_pred_lsi = unet_lsi(z_t, t)
+            score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
+            
+            opt_lsi.zero_grad()
+            score_loss_lsi.backward()
+            nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
+            opt_lsi.step()
+            
+            # --- EMA Update (LSI) ---
+            with torch.no_grad():
+                for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                    p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+            
+            # --- Tweedie/DSM Score Training ---
+            eps_pred_control = unet_control(z_t.detach(), t)
+            score_loss_control = F.mse_loss(eps_pred_control, noise)
+            
+            opt_control.zero_grad()
+            score_loss_control.backward()
+            nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
+            opt_control.step()
+            
+            # --- EMA Update (Control) ---
+            with torch.no_grad():
+                for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                    p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+            
+            metrics["score_lsi"] += score_loss_lsi.item()
+            metrics["score_control"] += score_loss_control.item()
+        
+        # --- Log epoch metrics with RELATIVE epoch numbering (starting from 1) ---
+        n_batches = len(train_l)
+        relative_epoch = ep + 1  # Epochs 1, 2, 3, ... for stage 2
+        
+        epoch_metrics = {
+            "epoch": relative_epoch,  # Use relative epoch for plotting
+            "stage": "score_training",
+            "loss": 0.0,
+            "recon": 0.0,
+            "kl": 0.0,
+            "score_lsi": metrics["score_lsi"] / n_batches,
+            "score_control": metrics["score_control"] / n_batches,
+            "perc": 0.0,
+        }
+        loss_records.append(epoch_metrics)
+        
+        print(f"Score Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+              f"Ctrl: {epoch_metrics['score_control']:.4f}")
+        
+        # --- Evaluate ---
+        if (ep + 1) % eval_freq == 0:
+            # Evaluate LSI - use "LSI_Diff" tag for plotting compatibility
+            results_lsi = evaluate_current_state(
+                relative_epoch,
+                "LSI_Diff",  # Tag for plotting suite compatibility
+                vae,
+                unet_lsi_ema,
+                test_l,
+                cfg,
+                device,
+                lpips_fn,
+                fixed_noise_bank=fixed_noise_bank,
+                fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
+                fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
+                fixed_sw2_theta=fixed_sw2_theta,
+                results_dir=results_dir,
+            )
+            if results_lsi is not None:
+                results_lsi["epoch"] = relative_epoch
+                results_lsi["stage"] = "score_training"
+                results_lsi["tag"] = "LSI_Diff"
+                eval_records.append(results_lsi)
+            
+            # Evaluate Tweedie/Control - use "Ctrl_Diff" tag for plotting compatibility
+            results_ctrl = evaluate_current_state(
+                relative_epoch,
+                "Ctrl_Diff",  # Tag for plotting suite compatibility
+                vae,
+                unet_control_ema,
+                test_l,
+                cfg,
+                device,
+                lpips_fn,
+                fixed_noise_bank=fixed_noise_bank,
+                fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
+                fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
+                fixed_sw2_theta=fixed_sw2_theta,
+                results_dir=results_dir,
+            )
+            if results_ctrl is not None:
+                results_ctrl["epoch"] = relative_epoch
+                results_ctrl["stage"] = "score_training"
+                results_ctrl["tag"] = "Ctrl_Diff"
+                eval_records.append(results_ctrl)
 
     # --- Save Checkpoints ---
-    save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
+    save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_pretrained.pt"))
     save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
     save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
 
@@ -2193,7 +1867,7 @@ def train_vae_cotrained(cfg):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Main
 # ---------------------------------------------------------------------------
 
 import matplotlib.pyplot as plt
@@ -2201,51 +1875,46 @@ import numpy as np
 
 def main():
 
-    # User Config
+    # Config for two-stage independent training
     cfg = {
+        # --- Data & Training ---
         "batch_size": 128,
-        "num_workers": 2,    
-        "score_w": 1.0,      #ignored
-        "epochs_vae": 4,     #ignored
-        "epochs_refine": 20, #ignored
-        "lr_vae": 2e-4,      #ignored
-        "lr_ldm": 1e-3,      #ignored
+        "num_workers": 2,
+        "seed": 42,
+        
+        # --- Architecture ---
         "latent_channels": 2,
-        "kl_w": .01,
+        
+        # --- Stage 1: VAE Training ---
+        "epochs_vae": 4,
+        "lr_vae": 2e-4,
+        "kl_w": 0.01,        # Standard KL weight
         "perc_w": 1.0,
+        
+        # --- Stage 2: Score Network Training ---
+        "epochs_score": 4,
+        "lr_score": 1e-3,
+        
+        # --- Diffusion ---
         "t_min": 5e-5,
         "t_max": 2.5,
-        "ckpt_dir": "checkpoints_mnist_comp",
-        "seed": 42,
+        
+        # --- Evaluation ---
+        "eval_freq": 4,
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
-        "load_from_checkpoint": False,
-        "eval_freq": 4,
         
-        # === Training Mode Selection ===
-        # "cotrain" - Original joint training (LSI co-training)
-        # "two_stage" - Train VAE first, then freeze and train score networks
-        "training_mode": "two_stage",  # Options: "cotrain" or "two_stage"
-        # === Two-Stage Specific Config ===
-        # Stage 1: VAE training
-        "epochs_vae_stage1": 30,       # Epochs for VAE-only training
-        "lr_vae_stage1": 2e-4,        # Learning rate for VAE in stage 1
-        "kl_w_stage1": 0.01,          # Standard KL weight (not modified KL)
-        # Stage 2: Score network training (VAE frozen)
-        "epochs_score_stage2": 120,     # Epochs for score network training
-        "lr_score_stage2": 1e-3,      # Learning rate for score networks
+        # --- Checkpoints ---
+        "ckpt_dir": "checkpoints_twostage",
+        "load_from_checkpoint": False,
     }
 
     seed_everything(cfg["seed"])
     ensure_dir(cfg["ckpt_dir"])
     ensure_dir("samples")
 
-    if cfg["training_mode"] == "two_stage":
-        print("=== Two-Stage Training: VAE then Score Networks ===")
-    else:
-        print("=== Dual Co-Training: LSI vs Control (Tweedie) ===")
-    
-    train_vae_cotrained(cfg)
+    print("=== Two-Stage Independent Training: VAE then Score Networks ===")
+    train_vae_ldms_indep(cfg)
 
 if __name__ == "__main__":
     main()
