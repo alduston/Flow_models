@@ -947,25 +947,6 @@ def evaluate_current_state(
 
 
 
-# ---------------------------------------------------------------------------
-# Data & Training
-# ---------------------------------------------------------------------------
-
-
-
-def make_dataloaders(batch_size, num_workers):
-    tf = transforms.Compose([
-        transforms.Pad(2),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-    train = torchvision.datasets.FashionMNIST("./data", train=True, download=True, transform=tf)
-    test = torchvision.datasets.FashionMNIST("./data", train=False, download=True, transform=tf)
-    tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
-    vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    return tl, vl
-
-
 def setup_run_results_dir(base_dir="run_results"):
     """
     Wipe and recreate the run_results directory at the start of each run.
@@ -1508,6 +1489,23 @@ def save_dataframes(loss_df, eval_df, results_dir):
     print(f"--> Saved loss history to {loss_path}")
     print(f"--> Saved eval metrics to {eval_path}")
 
+# ---------------------------------------------------------------------------
+# Data & Training
+# ---------------------------------------------------------------------------
+
+def make_dataloaders(batch_size, num_workers):
+    tf = transforms.Compose([
+        transforms.Pad(2),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+    train = torchvision.datasets.FashionMNIST("./data", train=True, download=True, transform=tf)
+    test = torchvision.datasets.FashionMNIST("./data", train=False, download=True, transform=tf)
+    tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    return tl, vl
+
+
 
 # =============================================================================
 # MODIFIED TRAINING FUNCTION WITH LOGGING
@@ -1619,7 +1617,7 @@ def train_vae_cotrained(cfg):
     print("--> Starting Dual Co-training...")
     for ep in range(cfg["epochs_vae"]):
         vae.train(); unet_lsi.train(); unet_control.train()
-        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc"]}
+        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc", "stiff"]}
         mu_stats = []
 
         for x, _ in tqdm(train_l, desc=f"Ep {ep+1}", leave=False):
@@ -1657,8 +1655,19 @@ def train_vae_cotrained(cfg):
             eps_pred_lsi = unet_lsi(z_t, t)
             score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
 
+            # --- Stiffness penalty: E[ tr(Sigma_t^{-1}) ] under diagonal Sigma_t = diag(var_t) ---
+            stiff_w = cfg.get("stiff_w", 0.0)
+            if stiff_w > 0.0:
+                inv_var_t = 1.0 / (var_t + 1e-8)  # same shape as var_t
+                # per-sample trace, normalized by number of latent dims for stable scaling
+                stiff_pen = inv_var_t.flatten(1).mean(dim=1).mean()  # scalar
+            else:
+                stiff_pen = torch.tensor(0.0, device=device)
+                
+
             score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
-            loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*mod_kl + score_w_vae*score_loss_lsi
+            loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*mod_kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen
+
 
             opt_joint.zero_grad()
             loss_joint.backward()
@@ -1691,6 +1700,7 @@ def train_vae_cotrained(cfg):
             metrics["score_lsi"] += score_loss_lsi.item()
             metrics["score_control"] += score_loss_control.item()
             metrics["perc"] += perc.item()
+            metrics["stiff"] += stiff_pen.item()
 
         # --- Compute epoch averages and log ---
         n_batches = len(train_l)
@@ -1703,16 +1713,18 @@ def train_vae_cotrained(cfg):
             "score_lsi": metrics["score_lsi"] / n_batches,
             "score_control": metrics["score_control"] / n_batches,
             "perc": metrics["perc"] / n_batches,
+            "stiff": metrics["stiff"] / n_batches,
         }
         loss_records.append(epoch_metrics)
 
         print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | "
-              f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f}")
+              f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
+              f"Stiff: {epoch_metrics['stiff']:.4f}")
 
         if len(mu_stats) > 0:
             log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
 
-        if (ep + 1) % eval_freq == 0 or (not ep):
+        if (ep + 1) % eval_freq == 0:
             # Evaluate LSI
             results_lsi = evaluate_current_state(
                 ep + 1,
@@ -1928,29 +1940,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 def main():
-
     # User Config
     cfg = {
         "batch_size": 128,
         "num_workers": 2,
         "score_w": 1.0,
-        "lr_vae": 2e-4,
-        "lr_ldm": 1e-3,
+        "lr_vae": 1e-3,
+        "lr_ldm": 2e-4,
         "lr_refine": 1e-4,
-        "epochs_vae": 4,
-        "epochs_refine": 2,
+        "epochs_vae": 100,
+        "epochs_refine": 20,
         "latent_channels": 2,
         "kl_w": .01,
-        "score_w_vae": 0.9,
+        "stiff_w": .01,
+        "score_w_vae": 1.0,
         "perc_w": 1.0,
-        "t_min": 5e-5,
-        "t_max": 2.5,
+        "t_min": 2e-5,
+        "t_max": 2.0,
         "ckpt_dir": "checkpoints_mnist_comp",
         "seed": 42,
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 2,
+        "eval_freq": 10,
     }
 
     seed_everything(cfg["seed"])
