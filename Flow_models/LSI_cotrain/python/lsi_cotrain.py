@@ -1948,12 +1948,12 @@ def main():
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
         "lr_refine": 1e-4,
-        "epochs_vae": 100,
-        "epochs_refine": 20,
+        "epochs_vae": 80,
+        "epochs_refine": 10,
         "latent_channels": 2,
         "kl_w": .01,
-        "stiff_w": .01,
-        "score_w_vae": 1.0,
+        "stiff_w": 1e-4,
+        "score_w_vae": .5,
         "perc_w": 1.0,
         "t_min": 2e-5,
         "t_max": 2.0,
@@ -1962,7 +1962,7 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 10,
+        "eval_freq": 5,
     }
 
     seed_everything(cfg["seed"])
