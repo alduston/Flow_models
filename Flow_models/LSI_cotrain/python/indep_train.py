@@ -819,7 +819,7 @@ def evaluate_current_state(
     configs = [("VAE_Rec_eps", 0, "Recon (posterior z)")]
     if unet is not None:
         configs.extend([
-            #("heun_sde", 20, "Baseline (Heun)"),
+            ("heun_sde", 20, "Baseline (Heun)"),
             ("rk4_ode",  10, "Smoothness (RK4)"),
         ])
 
@@ -1886,21 +1886,21 @@ def main():
         "latent_channels": 2,
         
         # --- Stage 1: VAE Training ---
-        "epochs_vae": 4,
+        "epochs_vae": 30,
         "lr_vae": 2e-4,
         "kl_w": 0.01,        # Standard KL weight
         "perc_w": 1.0,
         
         # --- Stage 2: Score Network Training ---
-        "epochs_score": 4,
+        "epochs_score": 120,
         "lr_score": 1e-3,
         
         # --- Diffusion ---
-        "t_min": 5e-5,
-        "t_max": 2.5,
+        "t_min": 2e-5,
+        "t_max": 2.0,
         
         # --- Evaluation ---
-        "eval_freq": 4,
+        "eval_freq": 10,
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         
