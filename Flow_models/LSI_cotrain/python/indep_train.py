@@ -41,6 +41,16 @@ except ImportError:
     print("Warning: torchmetrics not available, FID will be -1")
 
 # ---------------------------------------------------------------------------
+# Dataset Configuration
+# ---------------------------------------------------------------------------
+DATASET_INFO = {
+    "MNIST": {"class": torchvision.datasets.MNIST, "num_classes": 10},
+    "FMNIST": {"class": torchvision.datasets.FashionMNIST, "num_classes": 10},
+    "EMNIST": {"class": torchvision.datasets.EMNIST, "num_classes": 47, "split": "balanced"},
+    "KMNIST": {"class": torchvision.datasets.KMNIST, "num_classes": 10},
+}
+
+# ---------------------------------------------------------------------------
 # Utils
 # ---------------------------------------------------------------------------
 
@@ -62,9 +72,40 @@ def ensure_parent(path: str) -> None:
     if parent:
         ensure_dir(parent)
 
+import os
+import shutil
+from datetime import datetime
+
+
 def save_checkpoint(state: Dict[str, Any], path: str) -> None:
     ensure_parent(path)
     torch.save(state, path)
+
+def zip_results_dir(results_dir: str, zip_path: str | None = None) -> str:
+    """
+    Zips the entire results_dir into a .zip file.
+    Returns the path to the created zip.
+    """
+    results_dir = os.path.abspath(results_dir)
+
+    if zip_path is None:
+        parent = os.path.dirname(results_dir)
+        base = os.path.basename(results_dir.rstrip(os.sep))
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_path = os.path.join(parent, f"{base}_{stamp}.zip")
+    else:
+        zip_path = os.path.abspath(zip_path)
+        if not zip_path.endswith(".zip"):
+            zip_path += ".zip"
+
+    # shutil.make_archive wants a path without ".zip"
+    zip_base = zip_path[:-4]
+
+    # Create the zip. This includes everything under results_dir.
+    shutil.make_archive(zip_base, "zip", root_dir=results_dir)
+
+    return zip_path
+
 
 def make_group_norm(num_channels: int, num_groups: int = 16) -> nn.GroupNorm:
     best = min(num_groups, num_channels)
@@ -197,6 +238,106 @@ def log_latent_stats(name, z):
         std_mean = z.std(0).mean().item()
         max_val = z.abs().max().item()
         print(f"  [{name}] Latent Stats | Mean Norm: {mean_norm:.4f} | Avg Std: {std_mean:.4f} | Max: {max_val:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# LeNet Feature Extractor for FID (non-FMNIST datasets)
+# ---------------------------------------------------------------------------
+
+class LeNetFeatureExtractor(nn.Module):
+    """
+    LeNet-style CNN classifier for FID feature extraction on grayscale datasets.
+    Feature dimension: 256 (penultimate layer)
+    """
+    def __init__(self, num_classes: int = 10, feature_dim: int = 256):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(0.25)
+        self.fc1 = nn.Linear(128 * 4 * 4, feature_dim)
+        self.bn_fc = nn.BatchNorm1d(feature_dim)
+        self.fc2 = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        features = self.extract_features(x)
+        return self.fc2(features)
+
+    def extract_features(self, x):
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = self.dropout(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.bn_fc(self.fc1(x)))
+        return x
+
+
+def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, checkpoint_path=None):
+    """Train LeNet classifier for FID feature extraction."""
+    model = LeNetFeatureExtractor(num_classes=num_classes).to(device)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"  Loading FID classifier from {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        model.eval()
+        return model
+
+    print(f"  Training FID classifier ({epochs} epochs)...")
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(epochs):
+        correct, total = 0, 0
+        for x, y in tqdm(train_loader, desc=f"  FID Clf Ep {epoch+1}/{epochs}", leave=False):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            _, predicted = logits.max(1)
+            total += y.size(0)
+            correct += predicted.eq(y).sum().item()
+        print(f"    Epoch {epoch+1}: Acc={100.*correct/total:.2f}%")
+
+    if checkpoint_path:
+        ensure_parent(checkpoint_path)
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"  Saved FID classifier to {checkpoint_path}")
+
+    model.eval()
+    return model
+
+
+def get_fid_model(dataset_key, train_loader, num_classes, device, ckpt_dir="checkpoints"):
+    """Get appropriate FID model: Inception for FMNIST, LeNet for others."""
+    if dataset_key == "FMNIST":
+        print("--> Using Inception features for FID (FMNIST)")
+        return None, False
+
+    print(f"--> Training LeNet classifier for FID ({dataset_key})")
+    checkpoint_path = os.path.join(ckpt_dir, f"fid_classifier_{dataset_key.lower()}.pt")
+    model = train_fid_classifier(train_loader, num_classes, device, epochs=10, checkpoint_path=checkpoint_path)
+    return model, True
+
+
+def extract_lenet_features(images, device, batch_size, lenet_model):
+    """Extract features using trained LeNet classifier."""
+    lenet_model.eval()
+    features_list = []
+    with torch.no_grad():
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size].to(device)
+            feat = lenet_model.extract_features(batch)
+            features_list.append(feat.cpu())
+    return torch.cat(features_list, 0), lenet_model
 
 # ---------------------------------------------------------------------------
 # Models
@@ -713,6 +854,8 @@ def evaluate_current_state(
     fixed_posterior_eps_bank_B=None,
     fixed_sw2_theta=None,
     results_dir=None,
+    fid_model=None,
+    use_lenet_fid=False,
 ):
     """
     Full MNIST test-set evaluation (uses `loader` directly).
@@ -801,10 +944,15 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Pre-compute shared quantities
     # -----------------------------------------------------------------------
-    print("  Extracting Inception features...")
-    real_features, inception_model = extract_inception_features(
-        real_imgs, device, batch_size=cfg.get("fid_batch_size", bs)
-    )
+    print("  Extracting features for FID...")
+    if use_lenet_fid:
+        real_features, fid_model = extract_lenet_features(
+            real_imgs, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+        )
+    else:
+        real_features, fid_model = extract_inception_features(
+            real_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+        )
     real_features = real_features.to(device)
 
     # LSI gap (computed once, applies to all diffusion methods)
@@ -873,10 +1021,14 @@ def evaluate_current_state(
                 lsi_gap = lsi_gap_unet
 
         # Compute image metrics
-        fake_features, inception_model = extract_inception_features(
-            fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs),
-            inception_model=inception_model
-        )
+        if use_lenet_fid:
+            fake_features, fid_model = extract_lenet_features(
+                fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+            )
+        else:
+            fake_features, fid_model = extract_inception_features(
+                fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+            )
         fake_features = fake_features.to(device)
 
         fid = compute_fid_from_features(real_features, fake_features)
@@ -952,19 +1104,14 @@ def evaluate_current_state(
 # ---------------------------------------------------------------------------
 
 
-def setup_run_results_dir(base_dir="run_results"):
-    """
-    Wipe and recreate the run_results directory at the start of each run.
-
-    Args:
-        base_dir: Path to the results directory
-
-    Returns:
-        Path to the created directory
-    """
-    if os.path.exists(base_dir):
-        shutil.rmtree(base_dir)
-        print(f"--> Removed existing {base_dir} directory")
+def setup_run_results_dir(base_dir="run_results", wipe=True, preserve_checkpoints=True):
+    if os.path.exists(base_dir) and wipe:
+        if preserve_checkpoints:
+            # delete everything except checkpoints
+            for sub in ["plots", "samples", "dataframes"]:
+                shutil.rmtree(os.path.join(base_dir, sub), ignore_errors=True)
+        else:
+            shutil.rmtree(base_dir)
 
     os.makedirs(base_dir, exist_ok=True)
     os.makedirs(os.path.join(base_dir, "plots"), exist_ok=True)
@@ -972,8 +1119,8 @@ def setup_run_results_dir(base_dir="run_results"):
     os.makedirs(os.path.join(base_dir, "dataframes"), exist_ok=True)
     os.makedirs(os.path.join(base_dir, "checkpoints"), exist_ok=True)
 
-    print(f"--> Created fresh {base_dir} directory structure")
     return base_dir
+
 
 
 def plot_vae_recon_loss(loss_df, save_path):
@@ -1499,17 +1646,33 @@ def save_dataframes(loss_df, eval_df, results_dir):
 # MODIFIED TRAINING FUNCTION WITH TWO-STAGE AND CO-TRAINING MODES
 # =============================================================================
 
-def make_dataloaders(batch_size, num_workers):
+def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
+    """Create dataloaders for specified dataset."""
+    if dataset_key not in DATASET_INFO:
+        raise ValueError(f"Unknown dataset: {dataset_key}. Choose from {list(DATASET_INFO.keys())}")
+
+    info = DATASET_INFO[dataset_key]
+    dataset_cls = info["class"]
+    num_classes = info["num_classes"]
+
     tf = transforms.Compose([
         transforms.Pad(2),
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
     ])
-    train = torchvision.datasets.FashionMNIST("./data", train=True, download=True, transform=tf)
-    test = torchvision.datasets.FashionMNIST("./data", train=False, download=True, transform=tf)
+
+    if dataset_key == "EMNIST":
+        train = dataset_cls("./data", split=info["split"], train=True, download=True, transform=tf)
+        test = dataset_cls("./data", split=info["split"], train=False, download=True, transform=tf)
+    else:
+        train = dataset_cls("./data", train=True, download=True, transform=tf)
+        test = dataset_cls("./data", train=False, download=True, transform=tf)
+
     tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
     vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    return tl, vl
+
+    print(f"--> Loaded {dataset_key}: {len(train)} train, {len(test)} test, {num_classes} classes")
+    return tl, vl, num_classes
 
 
 
@@ -1522,20 +1685,26 @@ def train_vae_ldms_indep(cfg):
     Two-stage independent training for baseline comparison:
     - Stage 1: Train VAE (recon + standard KL + perceptual loss)
     - Stage 2: Freeze VAE, train LSI and Tweedie score networks independently
-    
+
     Logging notes:
     - Stage 1 loss records use stage="vae_pretrain" (excluded from main plots)
     - Stage 2 uses RELATIVE epochs starting from 1 for clean visualization
     - Tags use "LSI_Diff" and "Ctrl_Diff" for compatibility with plotting suite
     """
     # --- Setup Results Directory ---
-    results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"))
-    
+    results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"),
+                                   wipe=True, preserve_checkpoints=True)
+
+
     # Update checkpoint directory to be within results
     cfg["ckpt_dir"] = os.path.join(results_dir, "checkpoints")
-    
+
     device = default_device()
-    train_l, test_l = make_dataloaders(cfg["batch_size"], cfg["num_workers"])
+    dataset_key = cfg.get("dataset", "FMNIST")
+    train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
+
+    # Get FID model (Inception for FMNIST, LeNet for others)
+    fid_model, use_lenet_fid = get_fid_model(dataset_key, train_l, num_classes, device, cfg["ckpt_dir"])
 
     vae = VAE(latent_channels=cfg["latent_channels"]).to(device)
     eval_freq = cfg.get("eval_freq", 10)
@@ -1619,30 +1788,30 @@ def train_vae_ldms_indep(cfg):
     print("Stage 1: Train VAE (recon + standard KL + perceptual)")
     print("Stage 2: Freeze VAE, train score networks (LSI and Tweedie)")
     print("=" * 60)
-    
+
     epochs_vae = cfg.get("epochs_vae", 4)
     lr_vae = cfg.get("lr_vae", 2e-4)
     kl_w = cfg.get("kl_w", 0.01)
-    
+
     opt_vae = optim.AdamW(vae.parameters(), lr=lr_vae, weight_decay=1e-4)
-    
+
     print(f"\n--> Stage 1: Training VAE for {epochs_vae} epochs...")
-    
+
     for ep in range(epochs_vae):
         vae.train()
         metrics = {k: 0.0 for k in ["loss", "recon", "kl", "perc"]}
         mu_stats = []
-        
+
         for x, _ in tqdm(train_l, desc=f"VAE Ep {ep+1}", leave=False):
             x = x.to(device)
-            
+
             # --- VAE Forward ---
             x_rec, mu, logvar = vae(x)
             if len(mu_stats) < 5: mu_stats.append(mu.detach())
-            
+
             # Reconstruction loss
             recon = F.mse_loss(x_rec, x)
-            
+
             # Perceptual loss
             if LPIPS_AVAILABLE:
                 x_3c = x.repeat(1, 3, 1, 1)
@@ -1650,24 +1819,24 @@ def train_vae_ldms_indep(cfg):
                 perc = lpips_fn(x_rec_3c, x_3c).mean()
             else:
                 perc = torch.tensor(0.0, device=device)
-            
+
             # Standard KL divergence (full analytic KL to N(0,I))
             # KL = -0.5 * sum(1 + log(var) - mu^2 - var)
             kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            
+
             # Total VAE loss
             loss_vae = recon + cfg["perc_w"] * perc + kl_w * kl_loss
-            
+
             opt_vae.zero_grad()
             loss_vae.backward()
             nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
             opt_vae.step()
-            
+
             metrics["loss"] += loss_vae.item()
             metrics["recon"] += recon.item()
             metrics["kl"] += kl_loss.item()
             metrics["perc"] += perc.item()
-        
+
         # --- Compute epoch averages and log ---
         n_batches = len(train_l)
         epoch_metrics = {
@@ -1681,98 +1850,98 @@ def train_vae_ldms_indep(cfg):
             "perc": metrics["perc"] / n_batches,
         }
         loss_records.append(epoch_metrics)
-        
+
         print(f"VAE Ep {ep+1} | Loss: {epoch_metrics['loss']:.4f} | "
               f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | "
               f"Perc: {epoch_metrics['perc']:.4f}")
-        
+
         if len(mu_stats) > 0:
             log_latent_stats("VAE_Pretrain", torch.cat(mu_stats, 0))
-    
+
     # Save VAE checkpoint after stage 1
     save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_pretrained.pt"))
     print(f"--> Stage 1 complete. VAE saved to {cfg['ckpt_dir']}/vae_pretrained.pt")
-    
+
     # ===================================================================
     # STAGE 2: Freeze VAE, train score networks
     # ===================================================================
     epochs_score = cfg.get("epochs_score", 20)
     lr_score = cfg.get("lr_score", 1e-3)
-    
+
     print(f"\n--> Stage 2: Training score networks for {epochs_score} epochs...")
     print("    VAE is FROZEN. Training LSI and Tweedie score heads.")
-    
+
     # Freeze VAE
     vae.eval()
     for p in vae.parameters():
         p.requires_grad = False
-    
+
     # Fresh optimizers for score networks
     opt_lsi = optim.AdamW(unet_lsi.parameters(), lr=lr_score, weight_decay=1e-4)
     opt_control = optim.AdamW(unet_control.parameters(), lr=lr_score, weight_decay=1e-4)
-    
+
     for ep in range(epochs_score):
         unet_lsi.train()
         unet_control.train()
         metrics = {k: 0.0 for k in ["score_lsi", "score_control"]}
-        
+
         for x, _ in tqdm(train_l, desc=f"Score Ep {ep+1}", leave=False):
             x = x.to(device)
             B = x.shape[0]
-            
+
             # --- Get frozen VAE outputs ---
             with torch.no_grad():
                 _, mu, logvar = vae(x)
                 z0 = vae.reparameterize(mu, logvar)
-            
+
             # Sample diffusion time
             t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
             alpha, sigma = get_ou_params(t.view(B, 1, 1, 1))
-            
+
             # Forward diffusion
             noise = torch.randn_like(z0)
             z_t = alpha * z0 + sigma * noise
-            
+
             # --- LSI Score Training ---
             var_0 = torch.exp(logvar)
             mu_t = alpha * mu
             var_t = (alpha ** 2) * var_0 + (sigma ** 2)
-            
+
             eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
             eps_pred_lsi = unet_lsi(z_t, t)
             score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-            
+
             opt_lsi.zero_grad()
             score_loss_lsi.backward()
             nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
             opt_lsi.step()
-            
+
             # --- EMA Update (LSI) ---
             with torch.no_grad():
                 for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
                     p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-            
+
             # --- Tweedie/DSM Score Training ---
             eps_pred_control = unet_control(z_t.detach(), t)
             score_loss_control = F.mse_loss(eps_pred_control, noise)
-            
+
             opt_control.zero_grad()
             score_loss_control.backward()
             nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
             opt_control.step()
-            
+
             # --- EMA Update (Control) ---
             with torch.no_grad():
                 for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
                     p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
-            
+
             metrics["score_lsi"] += score_loss_lsi.item()
             metrics["score_control"] += score_loss_control.item()
-        
+
         # --- Log epoch metrics with RELATIVE epoch numbering (starting from 1) ---
         n_batches = len(train_l)
         relative_epoch = ep + 1  # Epochs 1, 2, 3, ... for stage 2
-        
+
         epoch_metrics = {
             "epoch": relative_epoch,  # Use relative epoch for plotting
             "stage": "score_training",
@@ -1784,10 +1953,10 @@ def train_vae_ldms_indep(cfg):
             "perc": 0.0,
         }
         loss_records.append(epoch_metrics)
-        
+
         print(f"Score Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
               f"Ctrl: {epoch_metrics['score_control']:.4f}")
-        
+
         # --- Evaluate ---
         if (ep + 1) % eval_freq == 0:
             # Evaluate LSI - use "LSI_Diff" tag for plotting compatibility
@@ -1805,13 +1974,15 @@ def train_vae_ldms_indep(cfg):
                 fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
                 fixed_sw2_theta=fixed_sw2_theta,
                 results_dir=results_dir,
+                fid_model=fid_model,
+                use_lenet_fid=use_lenet_fid,
             )
             if results_lsi is not None:
                 results_lsi["epoch"] = relative_epoch
                 results_lsi["stage"] = "score_training"
                 results_lsi["tag"] = "LSI_Diff"
                 eval_records.append(results_lsi)
-            
+
             # Evaluate Tweedie/Control - use "Ctrl_Diff" tag for plotting compatibility
             results_ctrl = evaluate_current_state(
                 relative_epoch,
@@ -1827,6 +1998,8 @@ def train_vae_ldms_indep(cfg):
                 fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
                 fixed_sw2_theta=fixed_sw2_theta,
                 results_dir=results_dir,
+                fid_model=fid_model,
+                use_lenet_fid=use_lenet_fid,
             )
             if results_ctrl is not None:
                 results_ctrl["epoch"] = relative_epoch
@@ -1859,6 +2032,10 @@ def train_vae_ldms_indep(cfg):
             f.write(f"{k}: {v}\n")
     print(f"--> Saved configuration to {cfg_path}")
 
+    # --- ZIP the entire results directory (DEFAULT) ---
+    zip_path = zip_results_dir(results_dir)
+    print(f"--> Zipped results to: {zip_path}")
+
     print(f"\n{'='*60}")
     print(f"Training complete! All results saved to: {results_dir}")
     print(f"{'='*60}")
@@ -1878,32 +2055,33 @@ def main():
     # Config for two-stage independent training
     cfg = {
         # --- Data & Training ---
+        "dataset": "MNIST",
         "batch_size": 128,
         "num_workers": 2,
         "seed": 42,
-        
+
         # --- Architecture ---
         "latent_channels": 2,
-        
+
         # --- Stage 1: VAE Training ---
         "epochs_vae": 30,
         "lr_vae": 2e-4,
         "kl_w": 0.01,        # Standard KL weight
         "perc_w": 1.0,
-        
+
         # --- Stage 2: Score Network Training ---
         "epochs_score": 120,
         "lr_score": 1e-3,
-        
+
         # --- Diffusion ---
         "t_min": 2e-5,
         "t_max": 2.0,
-        
+
         # --- Evaluation ---
         "eval_freq": 10,
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
-        
+
         # --- Checkpoints ---
         "ckpt_dir": "checkpoints_twostage",
         "load_from_checkpoint": False,
