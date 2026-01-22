@@ -162,35 +162,6 @@ def compute_diversity(imgs: torch.Tensor, lpips_fn: Any) -> float:
 
     return dist.mean().item()
 
-def evaluate_fid(real_loader, generated_imgs, device, batch_size=128):
-    if not TORCHMETRICS_AVAILABLE:
-        return -1.0
-
-    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-
-    def to_01(x):
-        # assumes x is in [-1, 1]
-        x = (x * 0.5) + 0.5
-        return x.clamp(0.0, 1.0)
-
-    # Real stats
-    for batch, _ in real_loader:
-        batch = batch.to(device).float()
-        if batch.shape[1] == 1:
-            batch = batch.repeat(1, 3, 1, 1)
-        fid.update(to_01(batch), real=True)
-
-    # Fake stats
-    n = generated_imgs.shape[0]
-    for i in range(0, n, batch_size):
-        batch = generated_imgs[i:i+batch_size].to(device).float()
-        if batch.shape[1] == 1:
-            batch = batch.repeat(1, 3, 1, 1)
-        fid.update(to_01(batch), real=False)
-
-    return fid.compute().item()
-
-
 def log_latent_stats(name, z):
     with torch.no_grad():
         mean_norm = z.mean(0).norm().item()
