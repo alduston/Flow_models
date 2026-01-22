@@ -19,6 +19,17 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+# Dataset Configuration
+# ---------------------------------------------------------------------------
+DATASET_INFO = {
+    "MNIST": {"class": torchvision.datasets.MNIST, "num_classes": 10},
+    "FMNIST": {"class": torchvision.datasets.FashionMNIST, "num_classes": 10},
+    "EMNIST": {"class": torchvision.datasets.EMNIST, "num_classes": 47, "split": "balanced"},
+    "KMNIST": {"class": torchvision.datasets.KMNIST, "num_classes": 10},
+}
+
+
+# ---------------------------------------------------------------------------
 # Imports & Checks
 # ---------------------------------------------------------------------------
 try:
@@ -65,6 +76,35 @@ def ensure_parent(path: str) -> None:
 def save_checkpoint(state: Dict[str, Any], path: str) -> None:
     ensure_parent(path)
     torch.save(state, path)
+
+import os
+import shutil
+from datetime import datetime
+
+def zip_results_dir(results_dir: str, zip_path: str | None = None) -> str:
+    """
+    Zips the entire results_dir into a .zip file.
+    Returns the path to the created zip.
+    """
+    results_dir = os.path.abspath(results_dir)
+
+    if zip_path is None:
+        parent = os.path.dirname(results_dir)
+        base = os.path.basename(results_dir.rstrip(os.sep))
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_path = os.path.join(parent, f"{base}_{stamp}.zip")
+    else:
+        zip_path = os.path.abspath(zip_path)
+        if not zip_path.endswith(".zip"):
+            zip_path += ".zip"
+
+    # shutil.make_archive wants a path without ".zip"
+    zip_base = zip_path[:-4]
+
+    # Create the zip. This includes everything under results_dir.
+    shutil.make_archive(zip_base, "zip", root_dir=results_dir)
+
+    return zip_path
 
 def make_group_norm(num_channels: int, num_groups: int = 16) -> nn.GroupNorm:
     best = min(num_groups, num_channels)
@@ -172,6 +212,105 @@ def log_latent_stats(name, z):
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LeNet Feature Extractor for FID (non-FMNIST datasets)
+# ---------------------------------------------------------------------------
+
+class LeNetFeatureExtractor(nn.Module):
+    """
+    LeNet-style CNN classifier for FID feature extraction on grayscale datasets.
+    Feature dimension: 256 (penultimate layer)
+    """
+    def __init__(self, num_classes: int = 10, feature_dim: int = 256):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(0.25)
+        self.fc1 = nn.Linear(128 * 4 * 4, feature_dim)
+        self.bn_fc = nn.BatchNorm1d(feature_dim)
+        self.fc2 = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        features = self.extract_features(x)
+        return self.fc2(features)
+
+    def extract_features(self, x):
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = self.dropout(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.bn_fc(self.fc1(x)))
+        return x
+
+
+def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, checkpoint_path=None):
+    """Train LeNet classifier for FID feature extraction."""
+    model = LeNetFeatureExtractor(num_classes=num_classes).to(device)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"  Loading FID classifier from {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        model.eval()
+        return model
+
+    print(f"  Training FID classifier ({epochs} epochs)...")
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(epochs):
+        correct, total = 0, 0
+        for x, y in tqdm(train_loader, desc=f"  FID Clf Ep {epoch+1}/{epochs}", leave=False):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            _, predicted = logits.max(1)
+            total += y.size(0)
+            correct += predicted.eq(y).sum().item()
+        print(f"    Epoch {epoch+1}: Acc={100.*correct/total:.2f}%")
+
+    if checkpoint_path:
+        ensure_parent(checkpoint_path)
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"  Saved FID classifier to {checkpoint_path}")
+
+    model.eval()
+    return model
+
+
+def get_fid_model(dataset_key, train_loader, num_classes, device, ckpt_dir="checkpoints"):
+    """Get appropriate FID model: Inception for FMNIST, LeNet for others."""
+    if dataset_key == "FMNIST":
+        print("--> Using Inception features for FID (FMNIST)")
+        return None, False
+
+    print(f"--> Training LeNet classifier for FID ({dataset_key})")
+    checkpoint_path = os.path.join(ckpt_dir, f"fid_classifier_{dataset_key.lower()}.pt")
+    model = train_fid_classifier(train_loader, num_classes, device, epochs=10, checkpoint_path=checkpoint_path)
+    return model, True
+
+
+def extract_lenet_features(images, device, batch_size, lenet_model):
+    """Extract features using trained LeNet classifier."""
+    lenet_model.eval()
+    features_list = []
+    with torch.no_grad():
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size].to(device)
+            feat = lenet_model.extract_features(batch)
+            features_list.append(feat.cpu())
+    return torch.cat(features_list, 0), lenet_model
 
 
 import matplotlib.pyplot as plt
@@ -684,6 +823,8 @@ def evaluate_current_state(
     fixed_posterior_eps_bank_B=None,
     fixed_sw2_theta=None,
     results_dir=None,
+    fid_model=None,
+    use_lenet_fid=False,
 ):
     """
     Full MNIST test-set evaluation (uses `loader` directly).
@@ -772,10 +913,15 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Pre-compute shared quantities
     # -----------------------------------------------------------------------
-    print("  Extracting Inception features...")
-    real_features, inception_model = extract_inception_features(
-        real_imgs, device, batch_size=cfg.get("fid_batch_size", bs)
-    )
+    print("  Extracting features for FID...")
+    if use_lenet_fid:
+        real_features, fid_model = extract_lenet_features(
+            real_imgs, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+        )
+    else:
+        real_features, fid_model = extract_inception_features(
+            real_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+        )
     real_features = real_features.to(device)
 
     # LSI gap (computed once, applies to all diffusion methods)
@@ -844,10 +990,14 @@ def evaluate_current_state(
                 lsi_gap = lsi_gap_unet
 
         # Compute image metrics
-        fake_features, inception_model = extract_inception_features(
-            fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs),
-            inception_model=inception_model
-        )
+        if use_lenet_fid:
+            fake_features, fid_model = extract_lenet_features(
+                fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+            )
+        else:
+            fake_features, fid_model = extract_inception_features(
+                fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+            )
         fake_features = fake_features.to(device)
 
         fid = compute_fid_from_features(real_features, fake_features)
@@ -918,28 +1068,23 @@ def evaluate_current_state(
 
 
 
-def setup_run_results_dir(base_dir="run_results"):
-    """
-    Wipe and recreate the run_results directory at the start of each run.
-    
-    Args:
-        base_dir: Path to the results directory
-        
-    Returns:
-        Path to the created directory
-    """
-    if os.path.exists(base_dir):
-        shutil.rmtree(base_dir)
-        print(f"--> Removed existing {base_dir} directory")
-    
+def setup_run_results_dir(base_dir="run_results", wipe=True, preserve_checkpoints=True):
+    if os.path.exists(base_dir) and wipe:
+        if preserve_checkpoints:
+            # delete everything except checkpoints
+            for sub in ["plots", "samples", "dataframes"]:
+                shutil.rmtree(os.path.join(base_dir, sub), ignore_errors=True)
+        else:
+            shutil.rmtree(base_dir)
+
     os.makedirs(base_dir, exist_ok=True)
     os.makedirs(os.path.join(base_dir, "plots"), exist_ok=True)
     os.makedirs(os.path.join(base_dir, "samples"), exist_ok=True)
     os.makedirs(os.path.join(base_dir, "dataframes"), exist_ok=True)
     os.makedirs(os.path.join(base_dir, "checkpoints"), exist_ok=True)
-    
-    print(f"--> Created fresh {base_dir} directory structure")
+
     return base_dir
+
 
 
 def plot_vae_recon_loss(loss_df, save_path):
@@ -1464,18 +1609,33 @@ def save_dataframes(loss_df, eval_df, results_dir):
 # Data & Training
 # ---------------------------------------------------------------------------
 
-def make_dataloaders(batch_size, num_workers):
+def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
+    """Create dataloaders for specified dataset."""
+    if dataset_key not in DATASET_INFO:
+        raise ValueError(f"Unknown dataset: {dataset_key}. Choose from {list(DATASET_INFO.keys())}")
+
+    info = DATASET_INFO[dataset_key]
+    dataset_cls = info["class"]
+    num_classes = info["num_classes"]
+
     tf = transforms.Compose([
         transforms.Pad(2),
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
     ])
-    train = torchvision.datasets.FashionMNIST("./data", train=True, download=True, transform=tf)
-    test = torchvision.datasets.FashionMNIST("./data", train=False, download=True, transform=tf)
+
+    if dataset_key == "EMNIST":
+        train = dataset_cls("./data", split=info["split"], train=True, download=True, transform=tf)
+        test = dataset_cls("./data", split=info["split"], train=False, download=True, transform=tf)
+    else:
+        train = dataset_cls("./data", train=True, download=True, transform=tf)
+        test = dataset_cls("./data", train=False, download=True, transform=tf)
+
     tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
     vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    return tl, vl
 
+    print(f"--> Loaded {dataset_key}: {len(train)} train, {len(test)} test, {num_classes} classes")
+    return tl, vl, num_classes
 
 
 # =============================================================================
@@ -1494,13 +1654,18 @@ def train_vae_cotrained(cfg):
     - Saves all results to run_results directory
     """
     # --- Setup Results Directory ---
-    results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"))
+    results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"),
+                                   wipe=True, preserve_checkpoints=True)
     
     # Update checkpoint directory to be within results
     cfg["ckpt_dir"] = os.path.join(results_dir, "checkpoints")
     
     device = default_device()
-    train_l, test_l = make_dataloaders(cfg["batch_size"], cfg["num_workers"])
+    dataset_key = cfg.get("dataset", "FMNIST")
+    train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
+
+    # Get FID model (Inception for FMNIST, LeNet for others)
+    fid_model, use_lenet_fid = get_fid_model(dataset_key, train_l, num_classes, device, cfg["ckpt_dir"])
 
     vae = VAE(latent_channels=cfg["latent_channels"]).to(device)
     eval_freq = cfg.get("eval_freq", 10)
@@ -1711,6 +1876,8 @@ def train_vae_cotrained(cfg):
                 fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
                 fixed_sw2_theta=fixed_sw2_theta,
                 results_dir=results_dir,
+                fid_model=fid_model,
+                use_lenet_fid=use_lenet_fid,
             )
             if results_lsi is not None:
                 results_lsi["epoch"] = ep + 1
@@ -1733,6 +1900,8 @@ def train_vae_cotrained(cfg):
                 fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
                 fixed_sw2_theta=fixed_sw2_theta,
                 results_dir=results_dir,
+                fid_model=fid_model,
+                use_lenet_fid=use_lenet_fid,
             )
             if results_ctrl is not None:
                 results_ctrl["epoch"] = ep + 1
@@ -1843,6 +2012,8 @@ def train_vae_cotrained(cfg):
                         fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
                         fixed_sw2_theta=fixed_sw2_theta,
                         results_dir=results_dir,
+                        fid_model=fid_model,
+                        use_lenet_fid=use_lenet_fid,
                 )
                 if results_lsi is not None:
                     results_lsi["epoch"] = global_epoch
@@ -1864,6 +2035,8 @@ def train_vae_cotrained(cfg):
                         fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
                         fixed_sw2_theta=fixed_sw2_theta,
                         results_dir=results_dir,
+                        fid_model=fid_model,
+                        use_lenet_fid=use_lenet_fid,
                 )
                 if results_ctrl is not None:
                     results_ctrl["epoch"] = global_epoch
@@ -1896,6 +2069,11 @@ def train_vae_cotrained(cfg):
             f.write(f"{k}: {v}\n")
     print(f"--> Saved configuration to {cfg_path}")
 
+
+    # --- ZIP the entire results directory (DEFAULT) ---
+    zip_path = zip_results_dir(results_dir)
+    print(f"--> Zipped results to: {zip_path}")
+
     print(f"\n{'='*60}")
     print(f"Training complete! All results saved to: {results_dir}")
     print(f"{'='*60}")
@@ -1913,6 +2091,7 @@ import numpy as np
 def main():
     # User Config
     cfg = {
+        "dataset": "MNIST",
         "batch_size": 128,
         "num_workers": 2,
         "score_w": 1.0,
@@ -1933,7 +2112,7 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 5,
+        "eval_freq": 10,
     }
 
     seed_everything(cfg["seed"])
