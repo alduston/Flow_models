@@ -493,7 +493,7 @@ class ResBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class UniversalSampler:
-    def __init__(self, method="heun_sde", num_steps=20, t_min=1e-4, t_max=3.0):
+    def __init__(self, method="heun_sde", num_steps=20, t_min=2e-5, t_max=2.0):
         self.num_steps = num_steps
         self.t_min = t_min
         self.t_max = t_max
@@ -504,8 +504,16 @@ class UniversalSampler:
         t_vec = t.expand(B)
         eps_pred = unet(x, t_vec)
         _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
-        inv_sigma = 1.0 / (sigma + 1e-8)
+        inv_sigma = 1.0 / (sigma + 1e-10)
         return -x + inv_sigma * eps_pred
+
+    def get_rev_sde_drift(self, x, t, unet):
+        B = x.shape[0]
+        t_vec = t.expand(B)
+        eps_pred = unet(x, t_vec)
+        _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-8)
+        return -x + 2.0 * inv_sigma * eps_pred
 
     def step_euler_ode(self, x, t_curr, t_next, unet):
         dt = t_next - t_curr
@@ -524,26 +532,45 @@ class UniversalSampler:
 
         return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
-    def step_heun_sde(self, x, t_curr, t_next, unet):
+    def step_heun_ode(self, x, t_curr, t_next, unet):
         B = x.shape[0]
         dt = t_next - t_curr
 
         t_vec = t_curr.expand(B)
         eps_pred = unet(x, t_vec)
         _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
-        d_curr = -x + (1.0 / (sigma + 1e-8)) * eps_pred
+        d_curr = -x + (1.0 / (sigma + 1e-10)) * eps_pred
         x_proposed = x + dt * d_curr
 
         if t_next > self.t_min:
             t_next_vec = t_next.expand(B)
             eps_next = unet(x_proposed, t_next_vec)
             _, sigma_next = get_ou_params(t_next_vec.view(B, 1, 1, 1))
-            d_next = -x_proposed + (1.0 / (sigma_next + 1e-8)) * eps_next
+            d_next = -x_proposed + (1.0 / (sigma_next + 1e-10)) * eps_next
             x = x + 0.5 * dt * (d_curr + d_next)
         else:
             x = x_proposed
 
         return x
+
+        # ---- New: stochastic Heun predictor-corrector for reverse-time SDE ----
+    def step_heun_sde(self, x, t_curr, t_next, unet, generator=None):
+        B = x.shape[0]
+        dt = t_next - t_curr                         # negative
+        dt_abs = torch.abs(dt).clamp_min(1e-12)       # scalar tensor
+        # dW ~ N(0, dt_abs I), and G = sqrt(2)
+        if generator is None:
+            noise = torch.randn_like(x)
+        else:
+            noise = torch.randn(x.shape, device=x.device, generator=generator)
+        dW = torch.sqrt(2.0 * dt_abs) * noise
+
+        b_curr = self.get_rev_sde_drift(x, t_curr, unet)
+        x_hat = x + dt * b_curr + dW
+
+        b_next = self.get_rev_sde_drift(x_hat, t_next, unet)
+        x_new = x + 0.5 * dt * (b_curr + b_next) + dW
+        return x_new
 
     def sample(self, unet, shape=None, device=None, x_init=None, generator=None):
         unet.eval()
@@ -571,9 +598,12 @@ class UniversalSampler:
                 x = self.step_rk4_ode(x, t_curr, t_next, unet)
             elif self.method == "euler_ode":
                 x = self.step_euler_ode(x, t_curr, t_next, unet)
+            elif self.method == "heun_ode":
+                x = self.step_heun_ode(x, t_curr, t_next, unet)
+            elif self.method == "heun_sde":
+                x = self.step_heun_sde(x, t_curr, t_next, unet, generator=generator)
             else:
-                x = self.step_heun_sde(x, t_curr, t_next, unet)
-
+                raise ValueError(f"Unknown sampling method: {self.method}")
         return x
 
 
@@ -1387,6 +1417,9 @@ def train_vae_cotrained(cfg):
               f"KL: {epoch_metrics['kl']:.4f} | LSI: {epoch_metrics['score_lsi']:.4f} | "
               f"Ctrl: {epoch_metrics['score_control']:.4f}")
 
+        if len(mu_stats) > 0:
+            log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
+
         if (ep + 1) % eval_freq == 0:
             results_lsi = evaluate_current_state(
                 ep + 1,
@@ -1591,11 +1624,11 @@ def main():
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
         "lr_refine": 1e-4,
-        "epochs_vae": 100,
-        "epochs_refine": 10,
+        "epochs_vae": 180,
+        "epochs_refine": 30,
         "latent_channels": 4,  # Bumped from 2 to 4 for CIFAR's RGB complexity
-        "kl_w": .01,
-        "stiff_w": 1e-3,
+        "kl_w": .007,
+        "stiff_w": 5e-4,
         "score_w_vae": 0.4,
         "perc_w": 1.0,
         "t_min": 2e-5,
@@ -1605,7 +1638,7 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 5,
+        "eval_freq": 15,
     }
 
     seed_everything(cfg["seed"])
