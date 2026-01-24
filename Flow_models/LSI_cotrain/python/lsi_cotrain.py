@@ -602,7 +602,11 @@ class VAE(nn.Module):
     def encode(self, x):
         h = self.enc_conv_in(x)
         for block in self.enc_blocks: h = block(h)
-        return self.mu(h), self.logvar(h)
+        mu = self.mu(h)
+        logvar = self.logvar(h)
+        # [NEW] Apply BN to the means to fix the scale
+        mu = self.bn_mu(mu)
+        return mu, logvar
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
