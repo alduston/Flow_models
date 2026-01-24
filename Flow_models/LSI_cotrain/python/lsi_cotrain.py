@@ -604,8 +604,9 @@ class VAE(nn.Module):
         for block in self.enc_blocks: h = block(h)
         mu = self.mu(h)
         logvar = self.logvar(h)
-        # [NEW] Apply BN to the means to fix the scale
-        mu = self.bn_mu(mu)
+        # [NEW] Conditional Apply
+        if self.use_bn:
+            mu = self.bn_mu(mu)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
