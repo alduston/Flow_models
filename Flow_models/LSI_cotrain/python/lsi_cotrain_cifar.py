@@ -352,6 +352,7 @@ class VAE(nn.Module):
     def __init__(self, latent_channels: int = 4, base_ch: int = 32, in_channels: int = 3, use_norm: bool = False):
         super().__init__()
         # Encoder: 32x32 -> 16x16 -> 8x8
+        self.use_norm = use_norm
         self.enc_conv_in = nn.Conv2d(in_channels, base_ch, 3, 1, 1)
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(VAEResBlock(base_ch, base_ch), nn.Conv2d(base_ch, base_ch*2, 3, 2, 1)),       # 32->16
