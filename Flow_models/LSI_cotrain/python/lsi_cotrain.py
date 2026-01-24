@@ -571,7 +571,7 @@ def compute_lsi_gap(score_net, encoder_mus, encoder_logvars, cfg, device,
     return total_lsi_gap / total_count if total_count > 0 else 0.0
 
 class VAE(nn.Module):
-    def __init__(self, latent_channels: int = 4, base_ch: int = 32):
+    def __init__(self, latent_channels: int = 4, base_ch: int = 32, use_bn: bool = False):
         super().__init__()
         # Encoder
         self.enc_conv_in = nn.Conv2d(1, base_ch, 3, 1, 1)
@@ -582,6 +582,11 @@ class VAE(nn.Module):
         ])
         self.mu = nn.Conv2d(base_ch*4, latent_channels, 1)
         self.logvar = nn.Conv2d(base_ch*4, latent_channels, 1)
+
+        # [NEW] Conditional Batch Norm initialization
+        if self.use_bn:
+            # affine=False is critical to enforce the unit constraints hard
+            self.bn_mu = nn.BatchNorm2d(latent_channels, affine=False)
 
         # Decoder
         self.dec_conv_in = nn.Conv2d(latent_channels, base_ch*4, 1)
@@ -1673,7 +1678,8 @@ def train_vae_cotrained(cfg):
     # Get FID model (Inception for FMNIST, LeNet for others)
     fid_model, use_lenet_fid = get_fid_model(dataset_key, train_l, num_classes, device, cfg["ckpt_dir"])
 
-    vae = VAE(latent_channels=cfg["latent_channels"]).to(device)
+    #vae = VAE(latent_channels=cfg["latent_channels"]).to(device)
+    vae = VAE(latent_channels=cfg["latent_channels"], use_bn=cfg.get("use_batch_norm", False)).to(device)
     eval_freq = cfg.get("eval_freq", 10)
 
     # --- Online Models ---
@@ -2139,6 +2145,7 @@ def main():
         "batch_size": 128,
         "num_workers": 2,
         "cotrain_head": "lsi",
+        "use_batch_norm": True,
         "use_mod_kl": True,
         "score_w": 1.0,
         "lr_vae": 1e-3,
