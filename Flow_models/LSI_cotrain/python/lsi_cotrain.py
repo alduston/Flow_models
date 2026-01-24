@@ -2160,7 +2160,7 @@ import numpy as np
 def main():
     # User Config
     cfg = {
-        "dataset": "FNIST",
+        "dataset": "FMNIST",
         "batch_size": 128,
         "num_workers": 2,
         "cotrain_head": "lsi",
