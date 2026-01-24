@@ -349,7 +349,7 @@ class VAE(nn.Module):
     VAE for CIFAR-10 (32x32x3).
     Downsamples 32 -> 16 -> 8, so latent is 8x8 spatial.
     """
-    def __init__(self, latent_channels: int = 4, base_ch: int = 32, in_channels: int = 3):
+    def __init__(self, latent_channels: int = 4, base_ch: int = 32, in_channels: int = 3, use_bn: bool = False):
         super().__init__()
         # Encoder: 32x32 -> 16x16 -> 8x8
         self.enc_conv_in = nn.Conv2d(in_channels, base_ch, 3, 1, 1)
@@ -360,6 +360,11 @@ class VAE(nn.Module):
         ])
         self.mu = nn.Conv2d(base_ch*4, latent_channels, 1)
         self.logvar = nn.Conv2d(base_ch*4, latent_channels, 1)
+        
+        # [NEW] Conditional Batch Norm initialization
+        if self.use_bn:
+            # affine=False is critical to enforce the unit constraints hard
+            self.bn_mu = nn.BatchNorm2d(latent_channels, affine=False)
 
         # Decoder: 8x8 -> 16x16 -> 32x32
         self.dec_conv_in = nn.Conv2d(latent_channels, base_ch*4, 1)
@@ -372,10 +377,16 @@ class VAE(nn.Module):
             nn.GroupNorm(16, base_ch), nn.SiLU(), nn.Conv2d(base_ch, in_channels, 3, 1, 1)
         )
 
+    
     def encode(self, x):
         h = self.enc_conv_in(x)
         for block in self.enc_blocks: h = block(h)
-        return self.mu(h), self.logvar(h)
+        mu = self.mu(h)
+        logvar = self.logvar(h)
+        # [NEW] Conditional Apply
+        if self.use_bn:
+            mu = self.bn_mu(mu)
+        return mu, logvar
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -1241,7 +1252,8 @@ def train_vae_cotrained(cfg):
     train_l, test_l = make_dataloaders(cfg["batch_size"], cfg["num_workers"])
 
     # VAE for CIFAR-10: 3 input channels
-    vae = VAE(latent_channels=cfg["latent_channels"], in_channels=3).to(device)
+    # vae = VAE(latent_channels=cfg["latent_channels"], in_channels=3).to(device)
+    vae = VAE(latent_channels=cfg["latent_channels"], use_bn=cfg.get("use_batch_norm", False)).to(device)
     eval_freq = cfg.get("eval_freq", 10)
 
     unet_lsi = UNetModel(in_channels=cfg["latent_channels"]).to(device)
@@ -1620,15 +1632,16 @@ def main():
     cfg = {
         "batch_size": 128,
         "num_workers": 2,
+        "use_batch_norm": True,
         "score_w": 1.0,
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
-        "lr_refine": 1e-4,
-        "epochs_vae": 180,
-        "epochs_refine": 30,
+        "lr_refine": 7e-5,
+        "epochs_vae": 300,
+        "epochs_refine": 50,
         "latent_channels": 4,  # Bumped from 2 to 4 for CIFAR's RGB complexity
-        "kl_w": .007,
-        "stiff_w": 5e-4,
+        "kl_w": 1e-4,
+        "stiff_w": 1e-4,
         "score_w_vae": 0.4,
         "perc_w": 1.0,
         "t_min": 2e-5,
