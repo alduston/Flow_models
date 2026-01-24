@@ -440,7 +440,8 @@ class TimeEmbedding(nn.Module):
         return self.mlp(emb)
 
 class UNetModel(nn.Module):
-    def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 4), num_res_blocks=2):
+    def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 6),
+                 num_res_blocks=3, attn_levels=(1,)):   # <--- NEW
         super().__init__()
         self.time_embed = TimeEmbedding(base_channels)
         self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
@@ -453,22 +454,36 @@ class UNetModel(nn.Module):
                 self.downs.append(ResBlock(ch, out_ch, base_channels*4))
                 ch = out_ch
                 chs.append(ch)
+
+            # <--- NEW: attention at selected resolutions
+            if i in attn_levels:
+                self.downs.append(AttentionBlock(ch))
+                chs.append(ch)
+
             if i != len(channel_mults)-1:
                 self.downs.append(nn.Conv2d(ch, ch, 3, 2, 1))
                 chs.append(ch)
         self.mid = nn.ModuleList([
-            ResBlock(ch, ch, base_channels*4), AttentionBlock(ch), ResBlock(ch, ch, base_channels*4)
+            ResBlock(ch, ch, base_channels*4),
+            AttentionBlock(ch),
+            ResBlock(ch, ch, base_channels*4)
         ])
         self.ups = nn.ModuleList()
         for i, mult in reversed(list(enumerate(channel_mults))):
             out_ch = base_channels * mult
             for _ in range(num_res_blocks + 1):
                 skip = chs.pop()
-                self.ups.append(ResBlock(ch+skip, out_ch, base_channels*4))
+                self.ups.append(ResBlock(ch + skip, out_ch, base_channels*4))
                 ch = out_ch
+            # <--- NEW: mirror attention on the way up (optional but usually helps)
+            if i in attn_levels:
+                self.ups.append(AttentionBlock(ch))
             if i != 0:
-                self.ups.append(nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(ch, ch, 3, 1, 1)))
-        self.out = nn.Sequential(make_group_norm(ch), nn.SiLU(), nn.Conv2d(ch, in_channels, 3, 1, 1))
+                self.ups.append(nn.Sequential(nn.Upsample(scale_factor=2),
+                                              nn.Conv2d(ch, ch, 3, 1, 1)))
+        self.out = nn.Sequential(make_group_norm(ch), nn.SiLU(),
+                                 nn.Conv2d(ch, in_channels, 3, 1, 1))
+
     def forward(self, x, t):
         emb = self.time_embed(t)
         h = self.head(x)
@@ -1637,9 +1652,9 @@ def main():
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
         "lr_refine": 7e-5,
-        "epochs_vae": 300,
-        "epochs_refine": 50,
-        "latent_channels": 4,  # Bumped from 2 to 4 for CIFAR's RGB complexity
+        "epochs_vae": 600,
+        "epochs_refine": 100,
+        "latent_channels": 6,  # Bumped from 2 to 4 for CIFAR's RGB complexity
         "kl_w": 1e-4,
         "stiff_w": 1e-4,
         "score_w_vae": 0.4,
