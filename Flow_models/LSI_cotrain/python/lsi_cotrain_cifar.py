@@ -349,7 +349,7 @@ class VAE(nn.Module):
     VAE for CIFAR-10 (32x32x3).
     Downsamples 32 -> 16 -> 8, so latent is 8x8 spatial.
     """
-    def __init__(self, latent_channels: int = 4, base_ch: int = 32, in_channels: int = 3, use_bn: bool = False):
+    def __init__(self, latent_channels: int = 4, base_ch: int = 32, in_channels: int = 3, use_norm: bool = False):
         super().__init__()
         # Encoder: 32x32 -> 16x16 -> 8x8
         self.enc_conv_in = nn.Conv2d(in_channels, base_ch, 3, 1, 1)
@@ -361,10 +361,11 @@ class VAE(nn.Module):
         self.mu = nn.Conv2d(base_ch*4, latent_channels, 1)
         self.logvar = nn.Conv2d(base_ch*4, latent_channels, 1)
         
-        # [NEW] Conditional Batch Norm initialization
-        if self.use_bn:
+        # [NEW] Conditional Group Norm (num_groups=1 is Spatial LayerNorm)
+        if self.use_norm:
             # affine=False is critical to enforce the unit constraints hard
-            self.bn_mu = nn.BatchNorm2d(latent_channels, affine=False)
+            self.gn_mu = nn.GroupNorm(num_groups=1, num_channels=latent_channels, affine=False)
+
 
         # Decoder: 8x8 -> 16x16 -> 32x32
         self.dec_conv_in = nn.Conv2d(latent_channels, base_ch*4, 1)
@@ -384,8 +385,8 @@ class VAE(nn.Module):
         mu = self.mu(h)
         logvar = self.logvar(h)
         # [NEW] Conditional Apply
-        if self.use_bn:
-            mu = self.bn_mu(mu)
+        if self.use_norm:
+            mu = self.gn_mu(mu)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
@@ -438,7 +439,8 @@ class TimeEmbedding(nn.Module):
         args = t[:, None] * freqs[None, :]
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return self.mlp(emb)
-
+        
+'''
 class UNetModel(nn.Module):
     def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 6),
                  num_res_blocks=3, attn_levels=(1,)):   # <--- NEW
@@ -454,7 +456,6 @@ class UNetModel(nn.Module):
                 self.downs.append(ResBlock(ch, out_ch, base_channels*4))
                 ch = out_ch
                 chs.append(ch)
-
             # <--- NEW: attention at selected resolutions
             if i in attn_levels:
                 self.downs.append(AttentionBlock(ch))
@@ -513,7 +514,97 @@ class ResBlock(nn.Module):
         h = self.block1(x)
         h = h + self.time_proj(t_emb)[:, :, None, None]
         return self.block2(h) + self.skip(x)
+'''
 
+class UNetModel(nn.Module):
+    def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 4), num_res_blocks=2):
+        super().__init__()
+        self.time_embed = TimeEmbedding(base_channels)
+        self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
+        self.downs = nn.ModuleList()
+        
+        ch = base_channels
+        chs = [ch]
+        # Downsampling
+        for i, mult in enumerate(channel_mults):
+            out_ch = base_channels * mult
+            for _ in range(num_res_blocks):
+                self.downs.append(ResBlock(ch, out_ch, base_channels * 4))
+                ch = out_ch
+                chs.append(ch)
+            if i != len(channel_mults) - 1:
+                self.downs.append(nn.Conv2d(ch, ch, 3, 2, 1))
+                chs.append(ch)        
+        # Middle
+        self.mid = nn.ModuleList([
+            ResBlock(ch, ch, base_channels * 4),
+            AttentionBlock(ch),
+            ResBlock(ch, ch, base_channels * 4)
+        ])
+        # Upsampling
+        self.ups = nn.ModuleList()
+        for i, mult in reversed(list(enumerate(channel_mults))):
+            out_ch = base_channels * mult
+            for _ in range(num_res_blocks + 1):
+                skip = chs.pop()
+                self.ups.append(ResBlock(ch + skip, out_ch, base_channels * 4))
+                ch = out_ch
+            if i != 0:
+                self.ups.append(nn.Sequential(
+                    nn.Upsample(scale_factor=2),
+                    nn.Conv2d(ch, ch, 3, 1, 1)
+                ))
+        self.out = nn.Sequential(
+            make_group_norm(ch),
+            nn.SiLU(),
+            nn.Conv2d(ch, in_channels, 3, 1, 1)
+        )
+
+    def forward(self, x, t):
+        emb = self.time_embed(t)
+        h = self.head(x)
+        hs = [h]
+        for layer in self.downs:
+            if isinstance(layer, ResBlock):
+                h = layer(h, emb)
+            else:
+                h = layer(h)
+            hs.append(h)     
+        for layer in self.mid:
+            if isinstance(layer, ResBlock):
+                h = layer(h, emb)
+            else:
+                h = layer(h)        
+        for layer in self.ups:
+            if isinstance(layer, ResBlock):
+                h = torch.cat([h, hs.pop()], dim=1)
+                h = layer(h, emb)
+            else:
+                h = layer(h)
+        return self.out(h)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_dim):
+        super().__init__()
+        self.block1 = nn.Sequential(
+            make_group_norm(in_ch),
+            nn.SiLU(),
+            nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        )
+        self.time_proj = nn.Linear(t_dim, out_ch)
+        self.block2 = nn.Sequential(
+            make_group_norm(out_ch),
+            nn.SiLU(),
+            nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        )
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x, t_emb):
+        h = self.block1(x)
+        h = h + self.time_proj(t_emb)[:, :, None, None]
+        return self.block2(h) + self.skip(x)
+        
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
@@ -723,7 +814,7 @@ def evaluate_current_state(
     configs = [("VAE_Rec_eps", 0, "Recon (posterior z)")]
     if unet is not None:
         configs.extend([
-            ("heun_sde", 20, "Baseline (Heun)"),
+            ("heun_ode", 20, "Baseline (Heun)"),
             ("rk4_ode",  10, "Smoothness (RK4)"),
         ])
 
@@ -1268,7 +1359,7 @@ def train_vae_cotrained(cfg):
 
     # VAE for CIFAR-10: 3 input channels
     # vae = VAE(latent_channels=cfg["latent_channels"], in_channels=3).to(device)
-    vae = VAE(latent_channels=cfg["latent_channels"], use_bn=cfg.get("use_batch_norm", False)).to(device)
+    vae = VAE(latent_channels=cfg["latent_channels"], use_norm=cfg.get("use_latent_norm", False)).to(device)
     eval_freq = cfg.get("eval_freq", 10)
 
     unet_lsi = UNetModel(in_channels=cfg["latent_channels"]).to(device)
@@ -1366,8 +1457,21 @@ def train_vae_cotrained(cfg):
             else:
                 perc = torch.tensor(0.0, device=device)
 
-            mod_kl = -0.5 * torch.mean(1 - mu.pow(2) - logvar.exp())
-            kl = mod_kl
+            # [NEW] Flexible KL Regularization Selector
+            reg_type = cfg.get("kl_reg_type", "mod") # 'normal', 'mod', or 'norm'
+
+            if reg_type == "normal":
+                # Standard VAE KL: N(0,1) target
+                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            elif reg_type == "mod":
+                # Modified KL: Energy/Trace control (No per-sample isotropy)
+                kl = -0.5 * torch.mean(1 - mu.pow(2) - logvar.exp())    
+            elif reg_type == "norm":
+                # Variance Anchor: Only penalize logvar deviation (for use with GroupNorm)
+                # Target logvar=0 (std=1). 0.1 is the spring constant.
+                kl = 0.1 * torch.mean(logvar.pow(2))
+            else:
+                raise ValueError(f"Unknown kl_reg_type: {reg_type}")
 
             t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
             z0 = vae.reparameterize(mu, logvar)
@@ -1393,7 +1497,7 @@ def train_vae_cotrained(cfg):
                 
 
             score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
-            loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*mod_kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen
+            loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen
 
 
             opt_joint.zero_grad()
@@ -1420,7 +1524,7 @@ def train_vae_cotrained(cfg):
 
             metrics["loss"] += loss_joint.item()
             metrics["recon"] += recon.item()
-            metrics["kl"] += mod_kl.item()
+            metrics["kl"] += kl.item()
             metrics["score_lsi"] += score_loss_lsi.item()
             metrics["score_control"] += (score_loss_control.item() / cfg["score_w"])
             metrics["perc"] += perc.item()
@@ -1647,14 +1751,15 @@ def main():
     cfg = {
         "batch_size": 128,
         "num_workers": 2,
-        "use_batch_norm": True,
+        "use_latent_norm": True,
+        "kl_reg_type": "norm",
         "score_w": 1.0,
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
         "lr_refine": 7e-5,
-        "epochs_vae": 600,
+        "epochs_vae": 300,
         "epochs_refine": 100,
-        "latent_channels": 6,  # Bumped from 2 to 4 for CIFAR's RGB complexity
+        "latent_channels": 4,  # Bumped from 2 to 4 for CIFAR's RGB complexity
         "kl_w": 1e-4,
         "stiff_w": 1e-4,
         "score_w_vae": 0.4,
@@ -1666,7 +1771,7 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 15,
+        "eval_freq": 10,
     }
 
     seed_everything(cfg["seed"])
