@@ -571,9 +571,10 @@ def compute_lsi_gap(score_net, encoder_mus, encoder_logvars, cfg, device,
     return total_lsi_gap / total_count if total_count > 0 else 0.0
 
 class VAE(nn.Module):
-    def __init__(self, latent_channels: int = 4, base_ch: int = 32, use_bn: bool = False):
+    def __init__(self, latent_channels: int = 4, base_ch: int = 32, use_norm: bool = False):
         super().__init__()
         # Encoder
+        self.use_norm = use_norm
         self.enc_conv_in = nn.Conv2d(1, base_ch, 3, 1, 1)
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(VAEResBlock(base_ch, base_ch), nn.Conv2d(base_ch, base_ch*2, 3, 2, 1)),
@@ -583,10 +584,10 @@ class VAE(nn.Module):
         self.mu = nn.Conv2d(base_ch*4, latent_channels, 1)
         self.logvar = nn.Conv2d(base_ch*4, latent_channels, 1)
 
-        # [NEW] Conditional Batch Norm initialization
-        if self.use_bn:
+        # [NEW] Conditional Group Norm (num_groups=1 is Spatial LayerNorm)
+        if self.use_norm:
             # affine=False is critical to enforce the unit constraints hard
-            self.bn_mu = nn.BatchNorm2d(latent_channels, affine=False)
+            self.gn_mu = nn.GroupNorm(num_groups=1, num_channels=latent_channels, affine=False)
 
         # Decoder
         self.dec_conv_in = nn.Conv2d(latent_channels, base_ch*4, 1)
@@ -605,8 +606,8 @@ class VAE(nn.Module):
         mu = self.mu(h)
         logvar = self.logvar(h)
         # [NEW] Conditional Apply
-        if self.use_bn:
-            mu = self.bn_mu(mu)
+        if self.use_norm:
+            mu = self.gn_mu(mu)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
@@ -659,6 +660,7 @@ class TimeEmbedding(nn.Module):
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return self.mlp(emb)
 
+
 class UNetModel(nn.Module):
     def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 4), num_res_blocks=2):
         super().__init__()
@@ -689,6 +691,7 @@ class UNetModel(nn.Module):
             if i != 0:
                 self.ups.append(nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(ch, ch, 3, 1, 1)))
         self.out = nn.Sequential(make_group_norm(ch), nn.SiLU(), nn.Conv2d(ch, in_channels, 3, 1, 1))
+
     def forward(self, x, t):
         emb = self.time_embed(t)
         h = self.head(x)
@@ -706,6 +709,7 @@ class UNetModel(nn.Module):
                 h = layer(h, emb)
             else: h = layer(h)
         return self.out(h)
+
 
 class ResBlock(nn.Module):
     def __init__(self, in_ch, out_ch, t_dim):
@@ -860,7 +864,7 @@ def evaluate_current_state(
     fid_model=None,
     use_lenet_fid=False,
 ):
-    
+
     print(f"\n--- Evaluation: {prefix} @ Ep {epoch_idx} ---")
     vae.eval()
     if unet is not None:
@@ -952,7 +956,7 @@ def evaluate_current_state(
     configs = [("VAE_Rec_eps", 0, "Recon (posterior z)")]
     if unet is not None:
         configs.extend([
-            ("heun_sde", 20, "Baseline (Heun)"),
+            ("heun_ode", 20, "Baseline (Heun)"),
             ("rk4_ode",  10, "Smoothness (RK4)"),
         ])
 
@@ -1683,8 +1687,7 @@ def train_vae_cotrained(cfg):
     # Get FID model (Inception for FMNIST, LeNet for others)
     fid_model, use_lenet_fid = get_fid_model(dataset_key, train_l, num_classes, device, cfg["ckpt_dir"])
 
-    #vae = VAE(latent_channels=cfg["latent_channels"]).to(device)
-    vae = VAE(latent_channels=cfg["latent_channels"], use_bn=cfg.get("use_batch_norm", False)).to(device)
+    vae = VAE(latent_channels=cfg["latent_channels"], use_norm=cfg.get("use_latent_norm", False)).to(device)
     eval_freq = cfg.get("eval_freq", 10)
 
     # --- Online Models ---
@@ -1798,13 +1801,24 @@ def train_vae_cotrained(cfg):
             else:
                 perc = torch.tensor(0.0, device=device)
 
-            mod_kl = -0.5 * torch.mean(1 - mu.pow(2) - logvar.exp())
-            normal_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            # [NEW] Flexible KL Regularization Selector
+            reg_type = cfg.get("kl_reg_type", "mod") # 'normal', 'mod', or 'norm'
 
-            if cfg.get("use_mod_kl", True):
-                kl = mod_kl
+            if reg_type == "normal":
+                # Standard VAE KL: N(0,1) target
+                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                
+            elif reg_type == "mod":
+                # Modified KL: Energy/Trace control (No per-sample isotropy)
+                kl = -0.5 * torch.mean(1 - mu.pow(2) - logvar.exp())
+                
+            elif reg_type == "norm":
+                # Variance Anchor: Only penalize logvar deviation (for use with GroupNorm)
+                # Target logvar=0 (std=1). 0.1 is the spring constant.
+                kl = 0.1 * torch.mean(logvar.pow(2))
+                
             else:
-                kl = normal_kl
+                raise ValueError(f"Unknown kl_reg_type: {reg_type}")
 
             t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
             z0 = vae.reparameterize(mu, logvar)
@@ -2146,12 +2160,12 @@ import numpy as np
 def main():
     # User Config
     cfg = {
-        "dataset": "MNIST",
+        "dataset": "FNIST",
         "batch_size": 128,
         "num_workers": 2,
         "cotrain_head": "lsi",
-        "use_batch_norm": True,
-        "use_mod_kl": True,
+        "use_latent_norm": True,
+        "kl_reg_type": "norm",
         "score_w": 1.0,
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
@@ -2159,8 +2173,8 @@ def main():
         "epochs_vae": 100,
         "epochs_refine": 20,
         "latent_channels": 2,
-        "kl_w": .01,
-        "stiff_w": 0.0,
+        "kl_w": 1e-4,
+        "stiff_w": 1e-4,
         "score_w_vae": .4,
         "perc_w": 1.0,
         "t_min": 2e-5,
@@ -2170,7 +2184,7 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 10,
+        "eval_freq": 5,
         "ema_decay": 0.999,
     }
 
