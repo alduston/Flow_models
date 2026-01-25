@@ -1768,9 +1768,9 @@ def main():
         "epochs_vae": 300,
         "epochs_refine": 100,
         "latent_channels": 4,  # Bumped from 2 to 4 for CIFAR's RGB complexity
-        "kl_w": 6e-4,
+        "kl_w": 1e-3,
         "stiff_w": 1e-4,
-        "score_w_vae": 0.45,
+        "score_w_vae": 0.5,
         "perc_w": 1.0,
         "t_min": 2e-5,
         "t_max": 2.0,
