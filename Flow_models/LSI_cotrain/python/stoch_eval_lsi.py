@@ -11,6 +11,31 @@ import math
 import torch
 from torchvision import utils as tv_utils
 
+
+# ---------------------------------------------------------------------------
+# Imports & Checks
+# ---------------------------------------------------------------------------
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs): return iterable
+
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("Warning: lpips not available, perceptual loss/metrics will be skipped")
+
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    TORCHMETRICS_AVAILABLE = True
+except ImportError:
+    TORCHMETRICS_AVAILABLE = False
+    print("Warning: torchmetrics not available, FID will be -1")
+
+
+
 # ===========================================================================
 # Imports from lsi_cotrain.py (batch_norm_lsi.py)
 # ===========================================================================
