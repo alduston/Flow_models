@@ -443,7 +443,7 @@ class TimeEmbedding(nn.Module):
         return self.mlp(emb)
         
 
-class UNetModel(nn.Module):
+class NewUNetModel(nn.Module):
     def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 6),
                  num_res_blocks=3, attn_levels=(1,)):   # <--- NEW
         super().__init__()
@@ -512,7 +512,7 @@ class UNetModel(nn.Module):
             else: h = layer(h)
         return self.out(h)
 
-class ResBlock(nn.Module):
+class NewResBlock(nn.Module):
     def __init__(self, in_ch, out_ch, t_dim):
         super().__init__()
         self.block1 = nn.Sequential(make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1))
@@ -524,8 +524,9 @@ class ResBlock(nn.Module):
         h = h + self.time_proj(t_emb)[:, :, None, None]
         return self.block2(h) + self.skip(x)
 
-class OldUNetModel(nn.Module):
-    def __init__(self, in_channels=4, base_channels=64, channel_mults=(1, 2), num_res_blocks=2):
+
+class UNetModel(nn.Module):
+    def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 4), num_res_blocks=2):
         super().__init__()
         self.time_embed = TimeEmbedding(base_channels)
         self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
@@ -592,7 +593,7 @@ class OldUNetModel(nn.Module):
         return self.out(h)
 
 
-class OldResBlock(nn.Module):
+class ResBlock(nn.Module):
     def __init__(self, in_ch, out_ch, t_dim):
         super().__init__()
         self.block1 = nn.Sequential(
