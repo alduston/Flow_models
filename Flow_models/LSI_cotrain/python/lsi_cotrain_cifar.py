@@ -445,7 +445,7 @@ class TimeEmbedding(nn.Module):
 
 class NewUNetModel(nn.Module):
     def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 6),
-                 num_res_blocks=3, attn_levels=(1,)):   # <--- NEW
+                 num_res_blocks=2, attn_levels=(1,)):   # <--- NEW
         super().__init__()
         self.time_embed = TimeEmbedding(base_channels)
         self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
