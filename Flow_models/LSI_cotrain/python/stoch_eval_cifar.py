@@ -418,7 +418,12 @@ def run_stoch_eval_from_checkpoints(
     _, test_l = make_dataloaders(cfg["batch_size"], cfg.get("num_workers", 2))
 
     # models
-    vae = VAE(latent_channels=cfg["latent_channels"], in_channels=3).to(device)
+
+    if cfg.get("grey", False):
+        vae = VAE(latent_channels=cfg["latent_channels"], in_channels=1).to(device)
+    else:
+        vae = VAE(latent_channels=cfg["latent_channels"], in_channels=3).to(device)
+        
     unet_lsi = UNetModel(in_channels=cfg["latent_channels"]).to(device)
     unet_ctrl = UNetModel(in_channels=cfg["latent_channels"]).to(device)
 
@@ -520,6 +525,7 @@ def main():
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
         "eval_freq": 10,
+        "grey": False,
     }
   # --------- run it ----------
   # Assumes your checkpoints are in ./checkpoints_cifar_compt/{vae_cotrained.pt, unet_lsi.pt, unet_control.pt}
