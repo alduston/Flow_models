@@ -420,9 +420,9 @@ def run_stoch_eval_from_checkpoints(
     # models
 
     if cfg.get("grey", False):
-        vae = VAE(latent_channels=cfg["latent_channels"], in_channels=1).to(device)
+        vae = VAE(latent_channels=cfg["latent_channels"], in_channels=1, use_norm=cfg.get("use_latent_norm", False)).to(device)
     else:
-        vae = VAE(latent_channels=cfg["latent_channels"], in_channels=3).to(device)
+        vae = VAE(latent_channels=cfg["latent_channels"], in_channels=3,  use_norm=cfg.get("use_latent_norm", False)).to(device)
         
     unet_lsi = UNetModel(in_channels=cfg["latent_channels"]).to(device)
     unet_ctrl = UNetModel(in_channels=cfg["latent_channels"]).to(device)
