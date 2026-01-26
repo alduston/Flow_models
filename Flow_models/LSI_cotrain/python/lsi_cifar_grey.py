@@ -441,10 +441,10 @@ class TimeEmbedding(nn.Module):
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         return self.mlp(emb)
         
-'''
+
 class UNetModel(nn.Module):
     def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 6),
-                 num_res_blocks=3, attn_levels=(1,)):   # <--- NEW
+                 num_res_blocks=2, attn_levels=(1,)):   # <--- NEW
         super().__init__()
         self.time_embed = TimeEmbedding(base_channels)
         self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
@@ -458,9 +458,9 @@ class UNetModel(nn.Module):
                 ch = out_ch
                 chs.append(ch)
             # <--- NEW: attention at selected resolutions
+            # Note: AttentionBlock does NOT add to chs - it doesn't create a skip connection
             if i in attn_levels:
                 self.downs.append(AttentionBlock(ch))
-                chs.append(ch)
 
             if i != len(channel_mults)-1:
                 self.downs.append(nn.Conv2d(ch, ch, 3, 2, 1))
@@ -491,9 +491,16 @@ class UNetModel(nn.Module):
         h = self.head(x)
         hs = [h]
         for layer in self.downs:
-            if isinstance(layer, ResBlock): h = layer(h, emb)
-            else: h = layer(h)
-            hs.append(h)
+            if isinstance(layer, ResBlock):
+                h = layer(h, emb)
+                hs.append(h)
+            elif isinstance(layer, AttentionBlock):
+                # Attention blocks don't create skip connections
+                h = layer(h)
+            else:
+                # Downsampling conv
+                h = layer(h)
+                hs.append(h)
         for layer in self.mid:
             if isinstance(layer, ResBlock): h = layer(h, emb)
             else: h = layer(h)
@@ -515,8 +522,8 @@ class ResBlock(nn.Module):
         h = self.block1(x)
         h = h + self.time_proj(t_emb)[:, :, None, None]
         return self.block2(h) + self.skip(x)
-'''
 
+'''
 class UNetModel(nn.Module):
     def __init__(self, in_channels=4, base_channels=32, channel_mults=(1, 2, 4), num_res_blocks=2):
         super().__init__()
@@ -609,7 +616,7 @@ class ResBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
-
+'''
 class UniversalSampler:
     def __init__(self, method="heun_sde", num_steps=20, t_min=2e-5, t_max=2.0):
         self.num_steps = num_steps
