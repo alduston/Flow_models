@@ -523,15 +523,21 @@ def main():
   # --------- run it ----------
   # Assumes your checkpoints are in ./checkpoints_cifar_compt/{vae_cotrained.pt, unet_lsi.pt, unet_control.pt}
   stoch_results = run_stoch_eval_from_checkpoints(
-      ckpt_dir="./checkpoints_cifar_comp",
-      epoch_label=999,                # just a label for filenames/logs
-      results_dir="stoch_eval_results",
-      also_run_baselines=True,       # set True to also compute rk4_ode@10 in the same run
-      cfg = cfg,
-      train_mode = 'indep'            # 'cotrained' or 'indep'
-  )
+        ckpt_dir="./run_results/checkpoints",
+        epoch_label=999,                # just a label for filenames/logs
+        results_dir="stoch_eval_results",
+        also_run_baselines=True,        # set True to also compute rk4_ode@10 in the same run
+        cfg=cfg,
+        train_mode='cotrained',         # 'cotrained' or 'indep'
+    )
 
-  stoch_results
+    print("\n" + "="*60)
+    print("STOCHASTIC EVALUATION RESULTS SUMMARY")
+    print("="*60)
+    for key, val in stoch_results.items():
+        print(f"\n{key.upper()}:")
+        for metric, value in val.items():
+            print(f"  {metric}: {value:.6f}")
 
 if __name__ == "__main__":
     main()
