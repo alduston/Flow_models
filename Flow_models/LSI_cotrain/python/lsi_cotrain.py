@@ -1836,16 +1836,7 @@ def train_vae_cotrained(cfg):
             eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
             eps_pred_lsi = unet_lsi(z_t, t)
             
-            if cfg.get("self_norm_score", False):
-                # Self-normalized score loss in score-space, but keep eps-head parameterization
-                # Convert eps <-> score using s = -(1/sigma) * eps, so ratio is unchanged.
-                s_pred_lsi = -(eps_pred_lsi / (sigma + 1e-8))
-                s_tgt_lsi  = -(eps_target_lsi / (sigma + 1e-8))
-                num = torch.norm(s_pred_lsi - s_tgt_lsi, p=2)
-                den = torch.norm(s_pred_lsi, p=2) + 1e-8
-                score_loss_lsi = num / den
-            else:
-                score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
+            score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
             
             eps_pred_control = unet_control(z_t, t)
             score_loss_control = F.mse_loss(eps_pred_control, noise)
@@ -2177,7 +2168,6 @@ def main():
         "num_workers": 2,
         "cotrain_head": "lsi",
         "use_latent_norm": True,
-        "self_norm_score": True,
         "kl_reg_type": "norm",
         "score_w": 1.0,
         "lr_vae": 1e-3,
