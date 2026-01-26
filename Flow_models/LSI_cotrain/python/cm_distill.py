@@ -15,7 +15,7 @@ Expected checkpoint structure:
     indep_trained_nets/vae_indep.pt
     indep_trained_nets/unet_control_indep.pt
 """
-
+from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
