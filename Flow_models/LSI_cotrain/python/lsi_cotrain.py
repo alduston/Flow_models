@@ -1816,7 +1816,13 @@ def train_vae_cotrained(cfg):
             elif reg_type == "norm":
                 # Variance Anchor: Only penalize logvar deviation (for use with GroupNorm)
                 # Target logvar=0 (std=1). 0.1 is the spring constant.
-                kl = 0.1 * torch.mean(logvar.pow(2))
+                kl = torch.mean(logvar.pow(2))
+
+            elif reg_type == "vol":
+                # Volume-preserving regularization: -λ·𝔼[log det Σ]
+                logvar_clamped = torch.clamp(logvar, min=-10.0)  # σ² ≥ exp(-10) ≈ 4.5e-5
+                log_det = torch.sum(logvar_clamped, dim=[1, 2, 3])  # [B] vector
+                kl = - torch.mean(log_det)
                 
             else:
                 raise ValueError(f"Unknown kl_reg_type: {reg_type}")
