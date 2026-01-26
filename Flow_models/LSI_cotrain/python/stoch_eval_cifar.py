@@ -56,7 +56,6 @@ from lsi_cotrain_cifar import (
     
     # Feature extraction
     extract_inception_features,
-    train_fid_classifier,
     
     # Models
     VAE,
@@ -497,28 +496,30 @@ def run_stoch_eval_from_checkpoints(
     return {"vae": res_vae, "lsi": res_lsi, "ctrl": res_ctrl}
 
 def main():
-  cfg = {
+      cfg = {
         "batch_size": 128,
         "num_workers": 2,
+        "use_latent_norm": True,
+        "kl_reg_type": "norm",
         "score_w": 1.0,
         "lr_vae": 1e-3,
-        "lr_ldm": 1e-4,
-        "lr_refine": 4e-5,
-        "epochs_vae": 100,
-        "epochs_refine": 10,
-        "latent_channels": 4,  # Bumped from 2 to 4 for CIFAR's RGB complexity
-        "kl_w": .01,
+        "lr_ldm": 2e-4,
+        "lr_refine": 7e-5,
+        "epochs_vae": 300,
+        "epochs_refine": 100,
+        "latent_channels": 4,  # Keeping 4 channels even for grayscale to test capacity
+        "kl_w": 1e-4,
         "stiff_w": 1e-4,
-        "score_w_vae": 0.33,
+        "score_w_vae": 0.4,
         "perc_w": 1.0,
         "t_min": 2e-5,
         "t_max": 2.0,
-        "ckpt_dir": "checkpoints_cifar_comp",
+        "ckpt_dir": "checkpoints_cifar_grayscale",
         "seed": 42,
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 5,
+        "eval_freq": 10,
     }
   # --------- run it ----------
   # Assumes your checkpoints are in ./checkpoints_cifar_compt/{vae_cotrained.pt, unet_lsi.pt, unet_control.pt}
