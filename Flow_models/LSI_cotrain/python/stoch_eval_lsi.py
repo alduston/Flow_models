@@ -612,3 +612,8 @@ def main():
 
     return stoch_results
 
+
+
+if __name__ == "__main__":
+    main()
+    
