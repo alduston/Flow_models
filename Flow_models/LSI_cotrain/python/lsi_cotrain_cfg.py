@@ -758,6 +758,20 @@ class UNetModel(nn.Module):
         return self.out(h)
 
 
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_dim):
+        super().__init__()
+        self.block1 = nn.Sequential(make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1))
+        self.time_proj = nn.Linear(t_dim, out_ch)
+        self.block2 = nn.Sequential(make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1))
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    def forward(self, x, t_emb):
+        h = self.block1(x)
+        h = h + self.time_proj(t_emb)[:, :, None, None]
+        return self.block2(h) + self.skip(x)
+        
+
 class UniversalSampler:
     def __init__(self, method: str = "heun_sde", num_steps: int = 20, t_min: float = 2e-5, t_max: float = 2.0):
         self.num_steps = num_steps
