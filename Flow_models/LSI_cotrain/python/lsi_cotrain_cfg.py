@@ -1186,10 +1186,13 @@ def evaluate_current_state(
         if fixed_noise_bank is not None:
             noise_bank_all = fixed_noise_bank[sample_indices]
 
+        cond_results_by_label: Dict[int, Any] = {}
+
         for y0 in eval_class_labels:
-            mask = (real_labels == int(y0))
+            y0 = int(y0)
+            mask = (real_labels == y0)
             n_y = int(mask.sum().item())
-            output_dict[f"n_real_y{int(y0)}"] = n_y
+            output_dict[f"n_real_y{y0}"] = n_y
             if n_y < 2:
                 print(f"    Skipping y={y0}: only {n_y} samples")
                 continue
@@ -1203,25 +1206,38 @@ def evaluate_current_state(
             else:
                 noise_bank_y = None
 
+            rows = []
+
             # Only diffusion methods for conditional eval
             for method, steps, desc in [("heun_ode", 20, "Baseline (Heun)"), ("rk4_ode", 10, "Smoothness (RK4)")]:
                 for g_scale in [0.0, cfg_eval_scale]:
                     tag = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
+                    mode = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
+
                     sampler = UniversalSampler(method=method, num_steps=steps,
                                                t_min=cfg["t_min"], t_max=cfg["t_max"])
                     fake_latents_list, fake_imgs_list = [], []
 
                     for i in range(0, n_y, bs):
                         batch_sz = min(bs, n_y - i)
-                        y_batch = torch.full((batch_sz,), int(y0), device=device, dtype=torch.long)
+                        y_batch = torch.full((batch_sz,), y0, device=device, dtype=torch.long)
 
                         if noise_bank_y is not None:
                             xT = noise_bank_y[i:i + batch_sz].to(device)
-                            z_gen = sampler.sample(unet, x_init=xT, y=y_batch,
-                                                   cfg_scale=(None if g_scale <= 0.0 else float(g_scale)))
+                            z_gen = sampler.sample(
+                                unet,
+                                x_init=xT,
+                                y=y_batch,
+                                cfg_scale=(None if g_scale <= 0.0 else float(g_scale)),
+                            )
                         else:
-                            z_gen = sampler.sample(unet, shape=(batch_sz, *latent_shape), device=device, y=y_batch,
-                                                   cfg_scale=(None if g_scale <= 0.0 else float(g_scale)))
+                            z_gen = sampler.sample(
+                                unet,
+                                shape=(batch_sz, *latent_shape),
+                                device=device,
+                                y=y_batch,
+                                cfg_scale=(None if g_scale <= 0.0 else float(g_scale)),
+                            )
 
                         fake_latents_list.append(z_gen.cpu())
                         fake_imgs_list.append(vae.decode(z_gen).cpu())
@@ -1253,9 +1269,19 @@ def evaluate_current_state(
                     w2_y = compute_sw2(real_flat_A_y, fake_flat_y, n_projections=sw2_nproj, theta=fixed_sw2_theta)
                     div_y = compute_diversity(fake_imgs.to(device), lpips_fn) if LPIPS_AVAILABLE else 0.0
 
+                    rows.append({
+                        "config": f"{method}@{steps}",
+                        "mode": mode,
+                        "desc": desc,
+                        "fid": float(fid_y),
+                        "kid": float(kid_y),
+                        "w2": float(w2_y),
+                        "div": float(div_y),
+                    })
+
                     # Log with suffixes to avoid breaking existing plots
                     steps_str = str(steps)
-                    suffix = f"_y{int(y0)}_{tag}"
+                    suffix = f"_y{y0}_{tag}"
                     if method == "rk4_ode":
                         output_dict[f"fid_rk4_{steps_str}{suffix}"] = fid_y
                         output_dict[f"kid_rk4_{steps_str}{suffix}"] = kid_y
@@ -1271,15 +1297,37 @@ def evaluate_current_state(
                     if results_dir is not None:
                         samples_dir = os.path.join(results_dir, "samples")
                         os.makedirs(samples_dir, exist_ok=True)
-                        save_path = os.path.join(samples_dir, f"{prefix}_{method}_{steps}_y{int(y0)}_{tag}_ep{epoch_idx}.png")
+                        save_path = os.path.join(samples_dir, f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
                     else:
-                        save_path = os.path.join("samples", f"{prefix}_{method}_{steps}_y{int(y0)}_{tag}_ep{epoch_idx}.png")
+                        save_path = os.path.join("samples", f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
                     panel = fake_imgs[:16] if fake_imgs.shape[0] >= 16 else fake_imgs
                     tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
+
+            cond_results_by_label[y0] = rows
+
+        # Print conditional results (mirrors the unconditional sweep printout)
+        if cond_results_by_label:
+            print(f"  >>> Conditional Sweep Results [{prefix}] <<<")
+            for y0 in sorted(cond_results_by_label.keys()):
+                rows = cond_results_by_label[y0]
+                if not rows:
+                    continue
+                n_y = int(output_dict.get(f"n_real_y{y0}", 0))
+                print(f"  [y={y0}] (n_real={n_y})")
+                print(f"  {'Config':<15} | {'Mode':<8} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8}")
+                print("  " + "-" * 96)
+                for r in rows:
+                    print(
+                        f"  {r['config']:<15} | {r['mode']:<8} | {r['desc']:<20} | "
+                        f"{r['fid']:<8.2f} | {r['kid']:<10.4f} | {r['w2']:<10.6f} | {r['div']:<8.4f}"
+                    )
+                print("  " + "-" * 96)
+            print("")
 
         print("  Conditional eval complete. (Metrics stored with suffix: _yK_cond / _yK_cfgS)\n")
 
     return output_dict
+
 
 
 def setup_run_results_dir(base_dir="run_results", wipe=True, preserve_checkpoints=True):
