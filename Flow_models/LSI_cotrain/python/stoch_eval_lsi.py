@@ -78,6 +78,7 @@ from torchvision import utils as tv_utils
 # ------------------------------------------------------------
 # New sampler (does NOT overwrite your existing UniversalSampler)
 # ------------------------------------------------------------
+'''
 class UniversalSamplerV2:
     """
     Adds a true stochastic reverse-time SDE sampler:
@@ -188,6 +189,157 @@ class UniversalSamplerV2:
                 raise ValueError(f"Unknown method={self.method}")
 
         return x
+'''
+
+class UniversalSamplerV2:
+    """
+    Adds a true stochastic reverse-time SDE sampler:
+      - method = "heun_pc_stoch": stochastic Heun predictor-corrector (strong order ~1 for additive noise)
+    Keeps existing ODE methods for convenience.
+    
+    Optional extra_step: After sampling terminates, take a small gradient ascent step
+    in the score direction at a small time t_extra. This may help move samples closer
+    to data modes where the encoder provides better supervision.
+    """
+    def __init__(self, method="heun_pc_stoch", num_steps=20, t_min=1e-4, t_max=3.0,
+                 extra_step=False, t_extra=5e-5, extra_step_size=1e-2):
+        self.num_steps = int(num_steps)
+        self.t_min = float(t_min)
+        self.t_max = float(t_max)
+        self.method = str(method)
+        
+        # Extra step parameters
+        self.extra_step = bool(extra_step)
+        self.t_extra = float(t_extra)
+        self.extra_step_size = float(extra_step_size)
+
+    # ---- ODE drift (probability-flow) ----
+    def get_ode_derivative(self, x, t, unet):
+        B = x.shape[0]
+        t_vec = t.expand(B)
+        eps_pred = unet(x, t_vec)  # epsilon-pred network
+        _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-8)
+        # probability-flow ODE drift for OU
+        return -x + inv_sigma * eps_pred
+
+    # ---- Reverse-time SDE drift ----
+    def get_rev_sde_drift(self, x, t, unet):
+        """
+        Forward OU: dx = -x dt + sqrt(2) dW
+        Reverse-time SDE drift: b_rev = f - g^2 * score = -x - 2*score
+        With epsilon parameterization: score = -(1/sigma) * eps  =>  -2*score = + 2*(1/sigma)*eps
+        Hence b_rev = -x + 2*(1/sigma)*eps_pred.
+        """
+        B = x.shape[0]
+        t_vec = t.expand(B)
+        eps_pred = unet(x, t_vec)
+        _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-8)
+        return -x + 2.0 * inv_sigma * eps_pred
+
+    def get_score(self, x, t, unet):
+        """
+        Compute score = nabla_x log p_t(x) from epsilon prediction.
+        score = -(1/sigma) * eps_pred
+        """
+        B = x.shape[0]
+        t_vec = t.expand(B)
+        eps_pred = unet(x, t_vec)
+        _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-8)
+        return -inv_sigma * eps_pred
+
+    def step_euler_ode(self, x, t_curr, t_next, unet):
+        dt = t_next - t_curr
+        d_curr = self.get_ode_derivative(x, t_curr, unet)
+        return x + dt * d_curr
+
+    def step_rk4_ode(self, x, t_curr, t_next, unet):
+        dt = t_next - t_curr
+        half_dt = dt * 0.5
+        t_half = t_curr + half_dt
+
+        k1 = self.get_ode_derivative(x, t_curr, unet)
+        k2 = self.get_ode_derivative(x + half_dt * k1, t_half, unet)
+        k3 = self.get_ode_derivative(x + half_dt * k2, t_half, unet)
+        k4 = self.get_ode_derivative(x + dt * k3, t_next, unet)
+        return x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+    # ---- New: stochastic Heun predictor-corrector for reverse-time SDE ----
+    def step_heun_pc_stoch(self, x, t_curr, t_next, unet, generator=None):
+        """
+        Stochastic Heun / PC scheme for additive noise SDE:
+          x_hat = x + dt*b(x,t) + G*dW
+          x_new = x + 0.5*dt*(b(x,t) + b(x_hat,t_next)) + G*dW
+        Uses SAME noise increment dW in predictor and corrector.
+
+        Here: G = sqrt(2) I (OU diffusion); dt is negative since we integrate t_max -> t_min.
+        """
+        dt = t_next - t_curr                         # negative
+        dt_abs = torch.abs(dt).clamp_min(1e-12)       # scalar tensor
+        # dW ~ N(0, dt_abs I), and G = sqrt(2)
+        if generator is None:
+            noise = torch.randn_like(x)
+        else:
+            noise = torch.randn(x.shape, device=x.device, generator=generator)
+        dW = torch.sqrt(2.0 * dt_abs) * noise
+
+        b_curr = self.get_rev_sde_drift(x, t_curr, unet)
+        x_hat = x + dt * b_curr + dW
+
+        b_next = self.get_rev_sde_drift(x_hat, t_next, unet)
+        x_new = x + 0.5 * dt * (b_curr + b_next) + dW
+        return x_new
+
+    def apply_extra_step(self, x, unet):
+        """
+        Take a small gradient ascent step in the score direction at t_extra.
+        This is: x_new = x + eps * score(x, t_extra)
+        
+        Motivation: CSEM/LSI models characterize the score better near t=0,
+        so a small step toward the modes may improve sample quality.
+        """
+        t_extra_tensor = torch.tensor(self.t_extra, device=x.device)
+        score = self.get_score(x, t_extra_tensor, unet)
+        return x + self.extra_step_size * score
+
+    def sample(self, unet, shape=None, device=None, x_init=None, generator=None):
+        unet.eval()
+        if x_init is None:
+            assert shape is not None and device is not None
+            x = torch.randn(shape, device=device, generator=generator)
+        else:
+            x = x_init
+        device = x.device
+
+        # same log time grid as your current sampler
+        ts = torch.logspace(
+            math.log10(self.t_max),
+            math.log10(self.t_min),
+            self.num_steps + 1,
+            device=device
+        )
+
+        for i in range(self.num_steps):
+            t_curr = ts[i]
+            t_next = ts[i + 1]
+
+            if self.method == "rk4_ode":
+                x = self.step_rk4_ode(x, t_curr, t_next, unet)
+            elif self.method == "euler_ode":
+                x = self.step_euler_ode(x, t_curr, t_next, unet)
+            elif self.method == "heun_pc_stoch":
+                x = self.step_heun_pc_stoch(x, t_curr, t_next, unet, generator=generator)
+            else:
+                raise ValueError(f"Unknown method={self.method}")
+
+        # Optional: gradient ascent step toward data modes
+        if self.extra_step:
+            x = self.apply_extra_step(x, unet)
+
+        return x
+
 
 
 # ------------------------------------------------------------
