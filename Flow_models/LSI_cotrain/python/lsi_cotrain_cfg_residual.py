@@ -2234,8 +2234,8 @@ def train_vae_cotrained_cond(cfg):
             # --- Conditional geometry correction (ResidualGaussianAdapter) ---
             # For all *existing* losses, we treat the residual as part of the geometry, but we do NOT
             # allow those losses to update the residual parameters (detach residual outputs here).
-            with torch.no_grad():
-                mu_r, logvar_r = residual_adapter(mu_base.detach(), logvar_base.detach(), y_in)
+            #with torch.no_grad():
+            mu_r, logvar_r = residual_adapter(mu_base.detach(), logvar_base.detach(), y_in)
             mu = mu_base + mu_r
             logvar = logvar_base + logvar_r
             logvar = torch.clamp(logvar, min=-30.0, max=20.0)
@@ -2351,29 +2351,48 @@ def train_vae_cotrained_cond(cfg):
                 nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
             opt_tracking.step()
 
-            # --- Class Alignment Loss (L_align, K=1) ---
+            align_K = int(getattr(cfg, "align_K", 1))
+            align_K = max(1, align_K)
+            # --- Class Alignment Loss (L_align, K=align_K) ---
             # Update ONLY residual_adapter parameters. (VAE/UNets are not in the `inputs=` list.)
             loss_align = torch.tensor(0.0, device=device)
             if align_w > 0.0 and (align_classifier is not None):
                 cond_mask = (y_in != null_label)
                 if cond_mask.any():
                     opt_residual.zero_grad(set_to_none=True)
-
+            
                     # NOTE: mu_base/logvar_base are detached so L_align does not update the VAE encoder.
                     mu_r_a, logvar_r_a = residual_adapter(mu_base.detach(), logvar_base.detach(), y_in)
                     mu_a = mu_base.detach() + mu_r_a
                     logvar_a = torch.clamp(logvar_base.detach() + logvar_r_a, min=-30.0, max=20.0)
-
-                    z_a = vae.reparameterize(mu_a, logvar_a)
-                    x_a = vae.decode(z_a)
-
-                    logits = align_classifier(x_a)
-                    loss_align = F.cross_entropy(logits[cond_mask], y[cond_mask])
+            
+                    # Vectorized K-sample reparameterization: z ~ N(mu_a, diag(exp(logvar_a)))
+                    B = mu_a.shape[0]
+                    std_a = torch.exp(0.5 * logvar_a)
+            
+                    # eps: (K, B, ...)
+                    eps = torch.randn((align_K,) + std_a.shape, device=device)
+                    z_a = mu_a.unsqueeze(0) + std_a.unsqueeze(0) * eps  # (K, B, ...)
+            
+                    # Flatten for decode/classify
+                    z_a_flat = z_a.reshape((align_K * B,) + z_a.shape[2:])
+                    x_a_flat = vae.decode(z_a_flat)  # (K*B, ...)
+                    logits_flat = align_classifier(x_a_flat)  # (K*B, n_classes)
+            
+                    # Compute CE over only conditioned items, averaged over K
+                    logits = logits_flat.view(align_K, B, -1)  # (K, B, n_classes)
+                    y_t = y  # (B,)
+            
+                    logits_c = logits[:, cond_mask, :].reshape(-1, logits.shape[-1])  # (K*Bc, C)
+                    y_c = y_t[cond_mask].repeat(align_K)                               # (K*Bc,)
+            
+                    loss_align = F.cross_entropy(logits_c, y_c)
                     loss_align = align_w * loss_align
-
+            
                     torch.autograd.backward(loss_align, inputs=list(residual_adapter.parameters()))
                     nn.utils.clip_grad_norm_(residual_adapter.parameters(), 1.0)
                     opt_residual.step()
+
 
             # --- EMA Update (tracking head) ---
             with torch.no_grad():
@@ -2700,6 +2719,8 @@ def main():
         "epochs_refine": 20,
         "latent_channels": 2,
         "kl_w": 1e-4,
+        "align_w": 1e-2,
+        "align_K": 2,
         "stiff_w": 1e-4,
         "score_w_vae": .4,
         "perc_w": 1.0,
