@@ -1197,10 +1197,20 @@ def evaluate_current_state(
                 print(f"    Skipping y={y0}: only {n_y} samples")
                 continue
 
+            # Same-class reals
             real_features_y = real_features[mask]
+            real_imgs_y = real_imgs[mask]  # CPU tensor, [-1,1]
             real_latents_A_y = real_latents_A[mask]
             real_flat_A_y = real_latents_A_y.view(n_y, -1).to(device)
 
+            # For posterior-floor SW2 in class case
+            if fixed_posterior_eps_bank_B is not None:
+                real_latents_B_y = real_latents_B[mask]
+                real_flat_B_y = real_latents_B_y.view(n_y, -1).to(device)
+            else:
+                real_flat_B_y = None
+
+            # Fixed noise bank aligned to dataset order, then class-filtered
             if noise_bank_all is not None:
                 noise_bank_y = noise_bank_all[mask]
             else:
@@ -1208,14 +1218,87 @@ def evaluate_current_state(
 
             rows = []
 
-            # Only diffusion methods for conditional eval
+            # ---------------------------------------------------------------
+            # NEW: Class-conditional VAE recon metrics (encode->reparam->decode)
+            # ---------------------------------------------------------------
+            with torch.no_grad():
+                fake_imgs_recon_y = torch.cat([
+                    vae.decode(real_latents_A_y[i:i + bs].to(device)).cpu()
+                    for i in range(0, n_y, bs)
+                ], 0)
+
+            # Feature extraction for recon
+            if use_lenet_fid:
+                fake_features_recon_y, fid_model = extract_lenet_features(
+                    fake_imgs_recon_y, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+                )
+            else:
+                fake_features_recon_y, fid_model = extract_inception_features(
+                    fake_imgs_recon_y, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+                )
+            fake_features_recon_y = fake_features_recon_y.to(device)
+
+            fid_recon_y = compute_fid_from_features(real_features_y, fake_features_recon_y)
+
+            subset_size = min(1000, real_features_y.shape[0], fake_features_recon_y.shape[0])
+            if subset_size < 2:
+                kid_recon_y = -1.0
+            else:
+                kid_recon_y = compute_kid(real_features_y, fake_features_recon_y, num_subsets=50, subset_size=subset_size)
+
+            # SW2 posterior floor, restricted to class
+            if real_flat_B_y is not None:
+                w2_recon_y = compute_sw2(real_flat_A_y, real_flat_B_y, n_projections=sw2_nproj, theta=fixed_sw2_theta)
+            else:
+                perm = torch.randperm(real_flat_A_y.size(0), device=device)
+                half = max(1, real_flat_A_y.size(0) // 2)
+                w2_recon_y = compute_sw2(
+                    real_flat_A_y[perm[:half]],
+                    real_flat_A_y[perm[half:2 * half]],
+                    n_projections=sw2_nproj,
+                    theta=fixed_sw2_theta,
+                )
+
+            div_recon_y = compute_diversity(fake_imgs_recon_y.to(device), lpips_fn) if LPIPS_AVAILABLE else 0.0
+
+            rows.append({
+                "config": "VAE_Rec_eps@0",
+                "mode": "recon",
+                "desc": "Recon (posterior z)",
+                "fid": float(fid_recon_y),
+                "kid": float(kid_recon_y),
+                "w2": float(w2_recon_y),
+                "div": float(div_recon_y),
+            })
+
+            # Log recon metrics per class (so existing unconditional keys remain unchanged)
+            output_dict[f"fid_vae_recon_y{y0}"] = fid_recon_y
+            output_dict[f"kid_vae_recon_y{y0}"] = kid_recon_y
+            output_dict[f"sw2_vae_recon_y{y0}"] = w2_recon_y
+            output_dict[f"div_vae_recon_y{y0}"] = div_recon_y
+
+            # Optionally save a recon panel for the class
+            if results_dir is not None:
+                samples_dir = os.path.join(results_dir, "samples")
+                os.makedirs(samples_dir, exist_ok=True)
+                save_path = os.path.join(samples_dir, f"{prefix}_VAE_Rec_eps_0_y{y0}_ep{epoch_idx}.png")
+                panel = fake_imgs_recon_y[:16] if fake_imgs_recon_y.shape[0] >= 16 else fake_imgs_recon_y
+                tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
+
+            # ---------------------------------------------------------------
+            # Diffusion conditional + CFG methods
+            # ---------------------------------------------------------------
             for method, steps, desc in [("heun_ode", 20, "Baseline (Heun)"), ("rk4_ode", 10, "Smoothness (RK4)")]:
                 for g_scale in [0.0, cfg_eval_scale]:
                     tag = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
                     mode = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
 
-                    sampler = UniversalSampler(method=method, num_steps=steps,
-                                               t_min=cfg["t_min"], t_max=cfg["t_max"])
+                    sampler = UniversalSampler(
+                        method=method,
+                        num_steps=steps,
+                        t_min=cfg["t_min"],
+                        t_max=cfg["t_max"],
+                    )
                     fake_latents_list, fake_imgs_list = [], []
 
                     for i in range(0, n_y, bs):
@@ -1258,7 +1341,6 @@ def evaluate_current_state(
 
                     fid_y = compute_fid_from_features(real_features_y, fake_features_y)
 
-                    # KID: be careful with tiny class subsets
                     subset_size = min(1000, real_features_y.shape[0], fake_features_y.shape[0])
                     if subset_size < 2:
                         kid_y = -1.0
@@ -1324,7 +1406,8 @@ def evaluate_current_state(
                 print("  " + "-" * 96)
             print("")
 
-        print("  Conditional eval complete. (Metrics stored with suffix: _yK_cond / _yK_cfgS)\n")
+        print("  Conditional eval complete. (Metrics stored with suffix: _yK_cond / _yK_cfgS; "
+              "and recon metrics as fid_vae_recon_yK, etc.)\n")
 
     return output_dict
 
