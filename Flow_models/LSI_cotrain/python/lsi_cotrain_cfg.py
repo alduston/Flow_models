@@ -292,7 +292,7 @@ def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, 
 
 def get_fid_model(dataset_key, train_loader, num_classes, device, ckpt_dir="checkpoints"):
     """Get appropriate FID model: Inception for FMNIST, LeNet for others."""
-    if dataset_key == "FMNIST":
+    if dataset_key == "cifar":
         print("--> Using Inception features for FID (FMNIST)")
         return None, False
 
