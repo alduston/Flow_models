@@ -2724,7 +2724,7 @@ def main():
     ensure_dir("samples")
 
     print("=== Dual Co-Training: LSI vs Control (Tweedie) ===")
-    train_vae_cotrained(cfg)
+    train_vae_cotrained_cond(cfg)
 
 if __name__ == "__main__":
   main()
