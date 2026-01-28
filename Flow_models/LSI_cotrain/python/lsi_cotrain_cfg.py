@@ -1987,7 +1987,7 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
 # MODIFIED TRAINING FUNCTION WITH LOGGING
 # =============================================================================
 
-def train_vae_cotrained(cfg):
+def train_vae_cotrained_cond(cfg):
     """
     Modified co-training function with DataFrame logging and visualization.
 
