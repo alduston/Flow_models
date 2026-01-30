@@ -1426,6 +1426,57 @@ def evaluate_fid(
 
     return fid.compute().item()
 
+def _fid_uint8_from_minus1_1(x: torch.Tensor) -> torch.Tensor:
+    # x: float in [-1, 1]
+    return ((x * 0.5 + 0.5) * 255.0).clamp(0, 255).to(torch.uint8)
+
+def _make_fid_metric(device: str):
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+    except Exception:
+        return None
+    return FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+
+@torch.no_grad()
+def evaluate_vae_recon_fid(
+    vae,
+    dataloader,
+    num_samples: int = 10000,
+    fid_batch_size: int = 32,
+    device: str = "cuda",
+    deterministic: bool = False,  # False => z ~ N(mu_x, Sigma_x); True => z = mu_x
+):
+    vae.eval()
+    fid = _make_fid_metric(device)
+    if fid is None:
+        print("torchmetrics not available. Install with: pip install torchmetrics[image]")
+        return None
+
+    seen = 0
+    for images, _ in dataloader:
+        if seen >= num_samples:
+            break
+        images = images.to(device)
+
+        for i in range(0, images.shape[0], fid_batch_size):
+            if seen >= num_samples:
+                break
+            x = images[i:i + fid_batch_size]
+            if seen + x.shape[0] > num_samples:
+                x = x[:(num_samples - seen)]
+
+            # Real
+            fid.update(_fid_uint8_from_minus1_1(x), real=True)
+
+            # Recon: z is sampled unless deterministic=True
+            z = vae.get_latent(x, deterministic=deterministic)
+            xhat = vae.decode_latent(z).clamp(-1.0, 1.0)
+            fid.update(_fid_uint8_from_minus1_1(xhat), real=False)
+
+            seen += x.shape[0]
+
+    return float(fid.compute().item())
+    
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -1482,6 +1533,24 @@ def main():
         save_dir='./checkpoints/vae',
         device=device,
     )
+
+    print("\n" + "-"*50)
+    print("Evaluating VAE reconstruction FID (posterior samples)")
+    print("-"*50)
+    
+    recon_fid = evaluate_vae_recon_fid(
+        vae=vae,
+        dataloader=test_loader,
+        num_samples=10000,
+        fid_batch_size=32,   # drop to 16/8 if you still see OOM
+        device=device,
+        deterministic=False, # IMPORTANT: posterior samples
+    )
+    print(f"VAE Recon FID (sample z): {recon_fid:.2f}" if recon_fid is not None else "Recon FID not computed")
+    
+    # optional reference: mean-code recon
+    recon_fid_mu = evaluate_vae_recon_fid(vae, test_loader, 10000, 32, device, deterministic=True)
+    print(f"VAE Recon FID (mean mu):  {recon_fid_mu:.2f}" if recon_fid_mu is not None else "")
 
     # ================
     # Stage 2: Train Diffusion
