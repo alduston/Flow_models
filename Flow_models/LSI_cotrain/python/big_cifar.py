@@ -977,7 +977,7 @@ class GaussianDiffusion(nn.Module):
         batch_size = shape[0]
         x = torch.randn(shape, device=device)
         
-        for t in tqdm(reversed(range(self.timesteps)), desc='DDPM Sampling', total=self.timesteps):
+        for t in reversed(range(self.timesteps)):
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
             x = self.p_sample(x, t_batch, y, cfg_scale)
             
@@ -995,7 +995,7 @@ class GaussianDiffusion(nn.Module):
         
         x = torch.randn(shape, device=device)
         
-        for i, t in tqdm(enumerate(timesteps), desc='DDIM Sampling', total=len(timesteps)):
+        for i, t in enumerate(timesteps):
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
             
             # Predict noise
@@ -1252,10 +1252,13 @@ def train_vae(
 def train_diffusion(
     ldm: LatentDiffusion,
     train_loader: DataLoader,
+    test_loader: DataLoader = None,
     num_epochs: int = 500,
     lr: float = 1e-4,
     save_dir: str = './checkpoints',
     device: str = 'cuda',
+    eval_every: int = 50,
+    fid_num_samples: int = 10000,
 ):
     """Train the diffusion model (with frozen VAE)."""
     os.makedirs(save_dir, exist_ok=True)
@@ -1304,25 +1307,45 @@ def train_diffusion(
             global_step += 1
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-        # Save and sample
-        if (epoch + 1) % 50 == 0 or epoch == num_epochs - 1:
+        
+        # Evaluate FID every eval_every epochs
+        if (epoch + 1) % eval_every == 0:
+            # Apply EMA weights for evaluation
             ema.apply_shadow()
+            
+            # Save checkpoint
             torch.save({
                 'diffusion_state_dict': ldm.diffusion.model.state_dict(),
                 'epoch': epoch,
                 'global_step': global_step,
             }, f'{save_dir}/diffusion_epoch_{epoch+1}.pt')
             
-            # Generate samples
+            # Evaluate FID
+            if test_loader is not None:
+                fid_score = evaluate_fid(
+                    ldm, test_loader, 
+                    num_samples=fid_num_samples, 
+                    batch_size=128, 
+                    device=device
+                )
+                print(f"Epoch {epoch+1}: FID = {fid_score:.2f}")
+            
+            # Generate and save sample images
             ldm.eval()
             with torch.no_grad():
-                # Sample with each class
                 labels = torch.arange(10, device=device).repeat(5)[:16]
                 samples = ldm.sample(16, y=labels, cfg_scale=2.0, ddim_steps=50, device=device)
                 save_image(samples * 0.5 + 0.5, f'{save_dir}/samples_epoch_{epoch+1}.png', nrow=8)
+            
+            # Restore original weights for continued training
             ema.restore()
             
+    # Final evaluation with EMA
+    ema.apply_shadow()
+    if test_loader is not None:
+        final_fid = evaluate_fid(ldm, test_loader, num_samples=fid_num_samples, batch_size=128, device=device)
+        print(f"Final FID: {final_fid:.2f}")
+    
     return ldm
 
 # ============================================================================
@@ -1352,25 +1375,23 @@ def calculate_fid(real_images, fake_images, device='cuda'):
         return None
 
 @torch.no_grad()
-def evaluate_fid(ldm, dataloader, num_samples=50000, batch_size=128, device='cuda'):
+def evaluate_fid(ldm, dataloader, num_samples=10000, batch_size=128, device='cuda', verbose=False):
     """Evaluate FID on CIFAR-10."""
     ldm.eval()
     
     # Collect real images
-    print("Collecting real images...")
     real_images = []
-    for images, _ in tqdm(dataloader, desc="Real images"):
+    for images, _ in dataloader:
         real_images.append(images)
         if len(real_images) * batch_size >= num_samples:
             break
     real_images = torch.cat(real_images)[:num_samples].to(device)
     
     # Generate fake images
-    print("Generating fake images...")
     fake_images = []
     num_batches = (num_samples + batch_size - 1) // batch_size
     
-    for i in tqdm(range(num_batches), desc="Fake images"):
+    for i in range(num_batches):
         current_batch = min(batch_size, num_samples - i * batch_size)
         labels = torch.randint(0, 10, (current_batch,), device=device)
         samples = ldm.sample(current_batch, y=labels, cfg_scale=2.0, ddim_steps=50, device=device)
@@ -1380,7 +1401,6 @@ def evaluate_fid(ldm, dataloader, num_samples=50000, batch_size=128, device='cud
     
     # Calculate FID
     fid_score = calculate_fid(real_images, fake_images, device)
-    print(f"FID Score: {fid_score}")
     
     return fid_score
 
@@ -1426,7 +1446,7 @@ def main():
         disc_weight=0.5,
         disc_start_step=30000,  # Start discriminator after 30k steps
         use_lpips=True,
-        use_disc=False,
+        use_disc=True,
     )
     
     print(f"VAE parameters: {sum(p.numel() for p in vae.parameters()):,}")
@@ -1471,23 +1491,16 @@ def main():
     ldm = train_diffusion(
         ldm=ldm,
         train_loader=train_loader,
+        test_loader=test_loader,
         num_epochs=diffusion_epochs,
         lr=1e-4,
         save_dir='./checkpoints/diffusion',
         device=device,
+        eval_every=50,
+        fid_num_samples=10000,
     )
     
-    # ================
-    # Evaluate
-    # ================
-    print("\n" + "="*50)
-    print("Evaluating FID")
-    print("="*50)
-    
-    fid = evaluate_fid(ldm, test_loader, num_samples=10000, batch_size=128, device=device)
-    print(f"Final FID: {fid}")
-    
-    return ldm, fid
+    return ldm
 
 if __name__ == '__main__':
     main()
