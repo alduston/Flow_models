@@ -83,7 +83,7 @@ class SelfAttention(nn.Module):
         attn = F.softmax(attn, dim=-1)
 
         out = torch.einsum('bhnm,bhdm->bhdn', attn, v)
-        out = out.view(b, c, h, w)
+        out = out.contiguous().view(b, c, h, w)
 
         return x + self.proj_out(out)
 
@@ -109,7 +109,7 @@ class LinearAttention(nn.Module):
 
         context = torch.einsum('bhdn,bhen->bhde', k, v)
         out = torch.einsum('bhde,bhdn->bhen', context, q)
-        out = out.view(b, -1, h, w)
+        out = out.contiguous().view(b, c, h, w)
 
         return self.to_out(out) + x
 
