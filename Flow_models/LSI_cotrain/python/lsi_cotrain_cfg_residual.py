@@ -23,10 +23,11 @@ import pandas as pd
 # Dataset Configuration
 # ---------------------------------------------------------------------------
 DATASET_INFO = {
-    "MNIST": {"class": torchvision.datasets.MNIST, "num_classes": 10},
-    "FMNIST": {"class": torchvision.datasets.FashionMNIST, "num_classes": 10},
-    "EMNIST": {"class": torchvision.datasets.EMNIST, "num_classes": 47, "split": "balanced"},
-    "KMNIST": {"class": torchvision.datasets.KMNIST, "num_classes": 10},
+    "MNIST": {"class": torchvision.datasets.MNIST, "num_classes": 10, "img_size": 28},
+    "FMNIST": {"class": torchvision.datasets.FashionMNIST, "num_classes": 10, "img_size": 28},
+    "EMNIST": {"class": torchvision.datasets.EMNIST, "num_classes": 47, "split": "balanced", "img_size": 28},
+    "KMNIST": {"class": torchvision.datasets.KMNIST, "num_classes": 10, "img_size": 28},
+    "GCIFAR": {"class": torchvision.datasets.CIFAR10, "num_classes": 10, "img_size": 32, "grayscale": True},
 }
 
 
@@ -223,7 +224,7 @@ class LeNetFeatureExtractor(nn.Module):
     LeNet-style CNN classifier for FID feature extraction on grayscale datasets.
     Feature dimension: 256 (penultimate layer)
     """
-    def __init__(self, num_classes: int = 10, feature_dim: int = 256):
+    def __init__(self, num_classes: int = 10, feature_dim: int = 256, img_size: int = 28):
         super().__init__()
         self.feature_dim = feature_dim
         self.conv1 = nn.Conv2d(1, 32, kernel_size=5, padding=2)
@@ -234,7 +235,11 @@ class LeNetFeatureExtractor(nn.Module):
         self.bn3 = nn.BatchNorm2d(128)
         self.pool = nn.MaxPool2d(2, 2)
         self.dropout = nn.Dropout(0.25)
-        self.fc1 = nn.Linear(128 * 4 * 4, feature_dim)
+        # After 3 pooling layers: img_size -> img_size//2 -> img_size//4 -> img_size//8
+        # For img_size=28 (padded to 32): 32->16->8->4, so 4x4
+        # For img_size=32: 32->16->8->4, so 4x4
+        final_spatial = img_size // 8
+        self.fc1 = nn.Linear(128 * final_spatial * final_spatial, feature_dim)
         self.bn_fc = nn.BatchNorm1d(feature_dim)
         self.fc2 = nn.Linear(feature_dim, num_classes)
 
@@ -252,9 +257,9 @@ class LeNetFeatureExtractor(nn.Module):
         return x
 
 
-def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, checkpoint_path=None):
+def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, checkpoint_path=None, img_size=32):
     """Train LeNet classifier for FID feature extraction."""
-    model = LeNetFeatureExtractor(num_classes=num_classes).to(device)
+    model = LeNetFeatureExtractor(num_classes=num_classes, img_size=img_size).to(device)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"  Loading FID classifier from {checkpoint_path}")
@@ -291,14 +296,19 @@ def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, 
 
 
 def get_fid_model(dataset_key, train_loader, num_classes, device, ckpt_dir="checkpoints"):
-    """Get appropriate FID model: Inception for FMNIST, LeNet for others."""
-    if dataset_key == "cifar":
-        print("--> Using Inception features for FID (FMNIST)")
+    """Get appropriate FID model: Inception for FMNIST/GCIFAR, LeNet for others."""
+    if dataset_key in ("FMNIST", "GCIFAR"):
+        print(f"--> Using Inception features for FID ({dataset_key})")
         return None, False
 
+    # Get img_size from dataset info (default 32 for padded 28x28 datasets)
+    img_size = DATASET_INFO.get(dataset_key, {}).get("img_size", 28)
+    # For datasets that get padded (28->32), use 32 for the classifier
+    effective_img_size = 32 if img_size == 28 else img_size
+    
     print(f"--> Training LeNet classifier for FID ({dataset_key})")
     checkpoint_path = os.path.join(ckpt_dir, f"fid_classifier_{dataset_key.lower()}.pt")
-    model = train_fid_classifier(train_loader, num_classes, device, epochs=10, checkpoint_path=checkpoint_path)
+    model = train_fid_classifier(train_loader, num_classes, device, epochs=10, checkpoint_path=checkpoint_path, img_size=effective_img_size)
     return model, True
 
 
@@ -573,11 +583,15 @@ def compute_lsi_gap(
     return total_lsi_gap / total_count if total_count > 0 else 0.0
 
 class VAE(nn.Module):
-    def __init__(self, latent_channels: int = 4, base_ch: int = 32, use_norm: bool = False):
+    def __init__(self, latent_channels: int = 4, base_ch: int = 32, use_norm: bool = False, img_size: int = 28):
         super().__init__()
         # Encoder
         self.use_norm = use_norm
+        self.img_size = img_size
         self.enc_conv_in = nn.Conv2d(1, base_ch, 3, 1, 1)
+        
+        # For 28x28 (padded to 32): 32->16->8, latent is 8x8
+        # For 32x32: 32->16->8, latent is 8x8
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(VAEResBlock(base_ch, base_ch), nn.Conv2d(base_ch, base_ch*2, 3, 2, 1)),
             nn.Sequential(VAEResBlock(base_ch*2, base_ch*2), nn.Conv2d(base_ch*2, base_ch*4, 3, 2, 1)),
@@ -1012,7 +1026,10 @@ def evaluate_current_state(
 
     target_count = len(loader.dataset)
     bs = cfg["batch_size"]
-    latent_shape = (cfg["latent_channels"], 8, 8)
+    # Compute latent spatial size from img_size (default 32 for backward compat)
+    img_size = cfg.get("img_size", 32)
+    latent_spatial = img_size // 4
+    latent_shape = (cfg["latent_channels"], latent_spatial, latent_spatial)
     sw2_nproj = int(cfg.get("sw2_n_projections", 1000))
 
     # Validate banks
@@ -2030,12 +2047,24 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
     info = DATASET_INFO[dataset_key]
     dataset_cls = info["class"]
     num_classes = info["num_classes"]
+    img_size = info.get("img_size", 28)
+    is_grayscale_cifar = info.get("grayscale", False)
 
-    tf = transforms.Compose([
-        transforms.Pad(2),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
+    # Build transforms based on dataset
+    if dataset_key == "GCIFAR":
+        # CIFAR-10 grayscale: 32x32, no padding needed
+        tf = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+    else:
+        # MNIST-family datasets: 28x28, pad to 32x32
+        tf = transforms.Compose([
+            transforms.Pad(2),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
 
     if dataset_key == "EMNIST":
         train = dataset_cls("./data", split=info["split"], train=True, download=True, transform=tf)
@@ -2047,7 +2076,7 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
     tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
     vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    print(f"--> Loaded {dataset_key}: {len(train)} train, {len(test)} test, {num_classes} classes")
+    print(f"--> Loaded {dataset_key}: {len(train)} train, {len(test)} test, {num_classes} classes, img_size={img_size}")
     return tl, vl, num_classes
 
 
@@ -2077,11 +2106,17 @@ def train_vae_cotrained_cond(cfg):
     dataset_key = cfg.get("dataset", "FMNIST")
     train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
     cfg["num_classes"] = num_classes  # for CFG label embedding / eval
+    
+    # Get image size from dataset info (for model initialization)
+    img_size = DATASET_INFO.get(dataset_key, {}).get("img_size", 28)
+    # Effective size after padding (28->32 for MNIST-family, 32 for GCIFAR)
+    effective_img_size = 32 if img_size == 28 else img_size
+    cfg["img_size"] = effective_img_size  # store for later use
 
-    # Get FID model (Inception for FMNIST, LeNet for others)
+    # Get FID model (Inception for FMNIST/GCIFAR, LeNet for others)
     fid_model, use_lenet_fid = get_fid_model(dataset_key, train_l, num_classes, device, cfg["ckpt_dir"])
 
-    vae = VAE(latent_channels=cfg["latent_channels"], use_norm=cfg.get("use_latent_norm", False)).to(device)
+    vae = VAE(latent_channels=cfg["latent_channels"], use_norm=cfg.get("use_latent_norm", False), img_size=effective_img_size).to(device)
     eval_freq = cfg.get("eval_freq", 10)
 
     # --- Online Models ---
@@ -2178,9 +2213,11 @@ def train_vae_cotrained_cond(cfg):
     lpips_fn = lpips.LPIPS(net='vgg').to(device) if LPIPS_AVAILABLE else None
 
     # --- Fixed Evaluation Banks ---
+    # Latent spatial size: img_size // 4 (two 2x downsampling in encoder)
+    latent_spatial = effective_img_size // 4
     if cfg.get("use_fixed_eval_banks", True):
         N_test = len(test_l.dataset)
-        latent_shape = (cfg["latent_channels"], 8, 8)
+        latent_shape = (cfg["latent_channels"], latent_spatial, latent_spatial)
         seed = int(cfg.get("seed", 0))
 
         g_noise = torch.Generator(device="cpu").manual_seed(seed + 12345)
@@ -2191,7 +2228,7 @@ def train_vae_cotrained_cond(cfg):
         fixed_posterior_eps_bank_A = torch.randn((N_test, *latent_shape), generator=g_postA)
         fixed_posterior_eps_bank_B = torch.randn((N_test, *latent_shape), generator=g_postB)
 
-        D = cfg["latent_channels"] * 8 * 8
+        D = cfg["latent_channels"] * latent_spatial * latent_spatial
         K = int(cfg.get("sw2_n_projections", 1000))
         g_theta = torch.Generator(device="cpu").manual_seed(seed + 22222)
         theta = torch.randn((D, K), generator=g_theta)
