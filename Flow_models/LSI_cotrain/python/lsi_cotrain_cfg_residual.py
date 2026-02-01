@@ -1164,6 +1164,7 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Unconditional evaluation sweep
     # -----------------------------------------------------------------------
+    cfg_eval_scale = float(cfg.get("cfg_eval_scale", 2.0))
     for scfg in configs:
         method = scfg["method"]
         steps = int(scfg.get("steps", 0))
@@ -1203,11 +1204,14 @@ def evaluate_current_state(
                     if use_rand_token and rand_token_bank_all is not None:
                         y_batch = rand_token_bank_all[i:i + batch_sz].to(device)
 
+                    g_scale = cfg_eval_scale if use_rand_token else None
                     if noise_bank_all is not None:
                         xT = noise_bank_all[i:i + batch_sz].to(device)
-                        z_gen = sampler.sample(unet, x_init=xT, y=y_batch, cfg_scale=None)
+                        #z_gen = sampler.sample(unet, x_init=xT, y=y_batch, cfg_scale=None)
+                        z_gen = sampler.sample(unet, x_init=xT, y=y_batch, cfg_scale=g_scale)
                     else:
-                        z_gen = sampler.sample(unet, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=None)
+                        #z_gen = sampler.sample(unet, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=None)
+                        z_gen = sampler.sample(unet, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
 
                     fake_latents_list.append(z_gen.cpu())
                     fake_imgs_list.append(vae.decode(z_gen).cpu())
@@ -2787,8 +2791,8 @@ def main():
         "epochs_refine": 20,
         "latent_channels": 2,
         "kl_w": 1e-4,
-        "align_w": 1e-2,
-        "align_K": 2,
+        "align_w": 0.0,
+        "align_K": 1,
         "stiff_w": 1e-4,
         "score_w_vae": .4,
         "perc_w": 1.0,
@@ -2803,8 +2807,8 @@ def main():
         "ema_decay": 0.999,
         # --- Classifier-Free Guidance (CFG) ---
         "cfg_label_dropout": 0.1,      # Bernoulli drop prob for class-conditioning during training
-        "cfg_eval_scale": 3.0,         # guidance scale for conditional eval
-        "eval_class_labels": [2],      # e.g. evaluate conditional generation for class "2" (set [] to disable)
+        "cfg_eval_scale": 2.0,         # guidance scale for conditional eval
+        "eval_class_labels": [],      # e.g. evaluate conditional generation for class "2" (set [] to disable)
 
     }
 
