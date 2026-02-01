@@ -1135,7 +1135,9 @@ def evaluate_current_state(
             {"method": "rk4_ode",  "steps": 10, "desc": "Smoothness (RK4)", "use_rand_token": False},
             # Conditional-sampling probe that preserves unconditional FID statistics:
             # draw a *non-null* class token uniformly at random (fixed bank for comparability).
+            {"method": "heun_ode",  "steps": 20, "desc": "RandToken (Heun)", "use_rand_token": True},
             {"method": "rk4_ode",  "steps": 10, "desc": "RandToken (RK4)", "use_rand_token": True},
+            
         ])
 
     results = []
