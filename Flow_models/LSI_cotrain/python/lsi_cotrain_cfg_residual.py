@@ -614,8 +614,10 @@ def compute_lsi_gap(
     num_samples = min(num_samples, n_data)
     sample_indices = torch.randperm(n_data)[:num_samples]
 
-    t_min, t_max = cfg["t_min"], cfg["t_max"]
-    time_grid = torch.linspace(t_min, t_max, num_time_points, device=device)
+    # Discrete schedule grid (matches training)
+    noise_sched = make_ddpm_schedule(cfg, device)
+    T = int(noise_sched["T"].item())
+    t_idx_grid = torch.linspace(0, T - 1, num_time_points, device=device).long()
 
     total_lsi_gap = 0.0
     total_count = 0
@@ -640,9 +642,11 @@ def compute_lsi_gap(
             eps_0 = torch.randn_like(batch_mu)
             z0 = batch_mu + batch_std * eps_0
 
-            for t_val in time_grid:
-                t = t_val.expand(bsz)
-                alpha, sigma = get_ou_params(t.view(bsz, 1, 1, 1))
+            for t_idx in t_idx_grid:
+                t_idx_vec = t_idx.expand(bsz).to(torch.long)
+                t = t_idx_to_time(t_idx_vec, cfg, T)
+                alpha = extract_schedule(noise_sched["sqrt_alphas_cumprod"], t_idx_vec, z0.shape)
+                sigma = extract_schedule(noise_sched["sqrt_one_minus_alphas_cumprod"], t_idx_vec, z0.shape)
 
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
