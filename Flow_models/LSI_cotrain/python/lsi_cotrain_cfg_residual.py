@@ -129,6 +129,86 @@ def get_ou_params(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     sigma = torch.sqrt(1.0 - torch.exp(-2.0 * t) + 1e-8)
     return alpha, sigma
 
+
+# ---------------------------------------------------------------------------
+# Discrete VP / DDPM noise schedule utilities (cosine/linear)
+# ---------------------------------------------------------------------------
+
+def extract_schedule(a: torch.Tensor, t_idx: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
+    """Extract 1D schedule values at indices t_idx and reshape for broadcast to x_shape."""
+    # a: [T], t_idx: [B] long
+    out = a.gather(0, t_idx).float()
+    return out.view(-1, *([1] * (len(x_shape) - 1)))
+
+def make_beta_schedule(
+    schedule: str,
+    num_timesteps: int,
+    beta_start: float = 1e-4,
+    beta_end: float = 2e-2,
+    cosine_s: float = 0.008,
+) -> torch.Tensor:
+    """Return betas[t] for a discrete VP/DDPM schedule.
+
+    - 'cosine' matches the Improved DDPM cosine ᾱ(t) schedule (Nichol & Dhariwal).
+    - 'linear' is a simple linear beta schedule.
+    """
+    schedule = str(schedule).lower()
+    if num_timesteps < 1:
+        raise ValueError("num_timesteps must be >= 1")
+
+    if schedule == "linear":
+        betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
+        return betas.clamp(1e-8, 0.999)
+
+    if schedule == "cosine":
+        # Build ᾱ for t in {0..T}
+        steps = num_timesteps + 1
+        t = torch.linspace(0, num_timesteps, steps, dtype=torch.float32) / num_timesteps
+        alphas_cumprod = torch.cos(((t + cosine_s) / (1 + cosine_s)) * math.pi / 2) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        # Convert ᾱ to betas
+        betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return betas.clamp(1e-8, 0.999)
+
+    raise ValueError(f"Unknown noise_schedule: {schedule}")
+
+def make_ddpm_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+    """Precompute a discrete VP/DDPM schedule on `device`."""
+    T = int(cfg.get("num_train_timesteps", 1000))
+    schedule_name = cfg.get("noise_schedule", "cosine")
+    beta_start = float(cfg.get("beta_start", 1e-4))
+    beta_end = float(cfg.get("beta_end", 2e-2))
+    cosine_s = float(cfg.get("cosine_s", 0.008))
+
+    betas = make_beta_schedule(
+        schedule=schedule_name,
+        num_timesteps=T,
+        beta_start=beta_start,
+        beta_end=beta_end,
+        cosine_s=cosine_s,
+    ).to(device)
+
+    alphas = (1.0 - betas).to(device)
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+    return {
+        "T": torch.tensor(T, device=device, dtype=torch.long),
+        "betas": betas,
+        "alphas": alphas,
+        "alphas_cumprod": alphas_cumprod,
+        "sqrt_alphas_cumprod": torch.sqrt(alphas_cumprod),
+        "sqrt_one_minus_alphas_cumprod": torch.sqrt(1.0 - alphas_cumprod),
+    }
+
+def t_idx_to_time(t_idx: torch.Tensor, cfg: Dict[str, Any], T: int) -> torch.Tensor:
+    """Map discrete indices t_idx in [0, T-1] to a continuous scalar used ONLY for time embedding."""
+    t_min = float(cfg.get("t_min", 2e-5))
+    t_max = float(cfg.get("t_max", 2.0))
+    if T <= 1:
+        return torch.full_like(t_idx.float(), t_max)
+    frac = t_idx.float() / float(T - 1)
+    return t_min + frac * (t_max - t_min)
+
 # ---------------------------------------------------------------------------
 # Metrics: SW2, MMD, FID, Diversity
 # ---------------------------------------------------------------------------
