@@ -1,3 +1,4 @@
+from torch._higher_order_ops import out_dtype
 from __future__ import annotations
 import math
 import os
@@ -172,32 +173,36 @@ def make_beta_schedule(
 
     raise ValueError(f"Unknown noise_schedule: {schedule}")
 
-def make_ddpm_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
-    """Precompute a discrete VP/DDPM schedule on `device`."""
+def make_ou_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+    """
+    Precompute a discrete OU schedule:
+      - T discrete times spanning [t_min, t_max]
+      - alpha(t), sigma(t) from get_ou_params
+    Choose log-spaced times so uniform index sampling approximates log-uniform t sampling.
+    """
     T = int(cfg.get("num_train_timesteps", 1000))
-    schedule_name = cfg.get("noise_schedule", "cosine")
-    beta_start = float(cfg.get("beta_start", 1e-4))
-    beta_end = float(cfg.get("beta_end", 2e-2))
-    cosine_s = float(cfg.get("cosine_s", 0.008))
+    t_min = float(cfg.get("t_min", 2e-5))
+    t_max = float(cfg.get("t_max", 2.0))
 
-    betas = make_beta_schedule(
-        schedule=schedule_name,
-        num_timesteps=T,
-        beta_start=beta_start,
-        beta_end=beta_end,
-        cosine_s=cosine_s,
-    ).to(device)
+    # log-spaced grid from t_min -> t_max (monotone increasing)
+    times = torch.logspace(
+        math.log10(t_min),
+        math.log10(t_max),
+        T,
+        device=device,
+        dtype=torch.float32,
+    )
 
-    alphas = (1.0 - betas).to(device)
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    # get OU params on the grid; squeeze to [T]
+    a, s = get_ou_params(times.view(T, 1, 1, 1))
+    alpha = a.view(T).float()
+    sigma = s.view(T).float()
 
     return {
         "T": torch.tensor(T, device=device, dtype=torch.long),
-        "betas": betas,
-        "alphas": alphas,
-        "alphas_cumprod": alphas_cumprod,
-        "sqrt_alphas_cumprod": torch.sqrt(alphas_cumprod),
-        "sqrt_one_minus_alphas_cumprod": torch.sqrt(1.0 - alphas_cumprod),
+        "times": times,   # [T]
+        "alpha": alpha,   # [T]
+        "sigma": sigma,   # [T]
     }
 
 def t_idx_to_time(t_idx: torch.Tensor, cfg: Dict[str, Any], T: int) -> torch.Tensor:
@@ -583,27 +588,6 @@ def compute_lsi_gap(
     num_time_points: int = 50,
     batch_size: int = 128,
 ):
-    """
-    Compute LSI gap metric in score parameterization.
-
-    LSI Gap = E_{x, t, z_t|x} || s_theta(z_t, t, y) - s_LSI(z_t, t; x) ||^2
-
-    where s_LSI = -Sigma_t(x)^{-1} (z_t - mu_t(x))
-
-    The network is eps-parameterized: eps_pred = -sigma_t * s_theta
-    So we convert: || s_theta - s_LSI ||^2 = (1/sigma_t^2) || eps_pred - eps_LSI ||^2
-
-    Notes for classifier-free conditioning:
-      - If labels is provided, we pass y=labels into the network.
-      - If labels is None, we pass y=None (unconditional branch).
-
-    Args:
-        score_net: eps-parameterized score network, signature unet(z_t, t, y=None)
-        encoder_mus: [N, C, H, W]
-        encoder_logvars: [N, C, H, W]
-        labels: [N] int64 labels (optional)
-        num_classes: number of classes (optional; only used for validation)
-    """
     if score_net is None:
         return 0.0
 
@@ -613,13 +597,16 @@ def compute_lsi_gap(
     if labels is not None:
         assert labels.shape[0] == n_data, "labels must align with encoder_mus/logvars"
 
-    num_samples = min(num_samples, n_data)
-    sample_indices = torch.randperm(n_data)[:num_samples]
+    num_samples = min(int(num_samples), int(n_data))
+    sample_indices = torch.randperm(n_data, device="cpu")[:num_samples]
 
-    # Discrete schedule grid (matches training)
-    noise_sched = make_ddpm_schedule(cfg, device)
-    T = int(noise_sched["T"].item())
-    t_idx_grid = torch.linspace(0, T - 1, num_time_points, device=device).long()
+    # --- Discrete OU schedule ---
+    ou_sched = make_ou_schedule(cfg, device)
+    T = int(ou_sched["T"].item())
+
+    # Choose a fixed grid of discrete indices
+    # Use round() so endpoints are included and avoid repeated zeros from long-cast.
+    t_idx_grid = torch.linspace(0, T - 1, int(num_time_points), device=device).round().long()
 
     total_lsi_gap = 0.0
     total_count = 0
@@ -629,11 +616,13 @@ def compute_lsi_gap(
             batch_indices = sample_indices[i:i + batch_size]
             batch_mu = encoder_mus[batch_indices].to(device)
             batch_logvar = encoder_logvars[batch_indices].to(device)
+
             batch_var = torch.exp(batch_logvar)
             batch_std = torch.exp(0.5 * batch_logvar)
 
             bsz = batch_mu.shape[0]
 
+            # Labels for CFG-conditional nets
             y_batch = None
             if labels is not None:
                 y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
@@ -641,32 +630,47 @@ def compute_lsi_gap(
                     if (y_batch.min() < 0) or (y_batch.max() >= num_classes):
                         raise ValueError("labels out of range for num_classes")
 
+            # Sample z0 ~ q(z0 | x) using the encoder Gaussian
             eps_0 = torch.randn_like(batch_mu)
             z0 = batch_mu + batch_std * eps_0
 
-            for t_idx in t_idx_grid:
-                t_idx_vec = t_idx.expand(bsz).to(torch.long)
-                t = t_idx_to_time(t_idx_vec, cfg, T)
-                alpha = extract_schedule(noise_sched["sqrt_alphas_cumprod"], t_idx_vec, z0.shape)
-                sigma = extract_schedule(noise_sched["sqrt_one_minus_alphas_cumprod"], t_idx_vec, z0.shape)
+            # Evaluate gap across timepoints
+            for t_idx_scalar in t_idx_grid:
+                # Expand scalar index to [bsz]
+                t_idx = t_idx_scalar.expand(bsz)
 
+                # time embedding: actual OU time at this index, expanded to [bsz]
+                t_val = ou_sched["times"].gather(0, t_idx_scalar.view(1)).view(1)  # [1]
+                t = t_val.expand(bsz).float()  # [bsz]
+
+                # OU alpha/sigma at this index, broadcast to z0 shape
+                alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)  # [bsz,1,1,1]
+                sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)  # [bsz,1,1,1]
+
+                # Forward diffuse z0 -> z_t
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
 
+                # Conditional moments under encoder Gaussian pushed through OU
                 mu_t = alpha * batch_mu
                 var_t = (alpha ** 2) * batch_var + (sigma ** 2)
 
+                # LSI target in eps-parameterization
                 eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
+
+                # Model prediction
                 eps_pred = score_net(z_t, t, y_batch)
 
+                # Weighted squared error (your gap definition)
                 sigma_sq = sigma ** 2 + 1e-8
                 eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))
+                score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
 
                 total_lsi_gap += score_gap_per_sample.sum().item()
                 total_count += bsz
 
     return total_lsi_gap / total_count if total_count > 0 else 0.0
+
 
 '''
 class VAE(nn.Module):
@@ -1165,70 +1169,70 @@ class UniversalSampler:
             self._ddpm_schedule = make_ddpm_schedule(self.schedule_cfg, device)
         return self._ddpm_schedule
 
+
     def step_ddim(
         self,
         x: torch.Tensor,
-        t_idx_vec: torch.Tensor,
-        t_prev_idx_vec: torch.Tensor | None,
+        t_curr: torch.Tensor,          # scalar tensor on device
+        t_next: torch.Tensor,          # scalar tensor on device (smaller than t_curr)
         unet,
         y: torch.Tensor | None = None,
         cfg_scale: float | None = None,
         generator=None,
     ) -> torch.Tensor:
-        """One DDIM step x_t -> x_{t_prev} (eta=0 gives deterministic DDIM)."""
-        device = x.device
-        sched = self._get_ddpm_schedule(device)
-        T = int(sched["T"].item())
-    
-        # CRITICAL FIX: Map discrete timestep indices to continuous OU time that matches training
-        # Use the SNR (alpha/sigma ratio) to recover the equivalent OU time
-        alpha_cumprod_t = extract_schedule(sched["alphas_cumprod"], t_idx_vec, x.shape)
-        # For OU process: alpha = exp(-t), sigma^2 = 1 - exp(-2t)
-        # So: alpha^2 / (alpha^2 + sigma^2) = alpha^2 (since alpha^2 + sigma^2 = 1 in VP)
-        # We can recover t from alpha_cumprod: t = -log(sqrt(alpha_cumprod))
-        t_vec = -0.5 * torch.log(alpha_cumprod_t.view(-1) + 1e-8)
-        t_vec = t_vec.clamp(min=self.schedule_cfg["t_min"], max=self.schedule_cfg["t_max"])
-    
-        # predict eps at x_t (supports CFG via y/cfg_scale)
+        """
+        OU-DDIM step: one UNet call at t_curr, update to t_next using OU (alpha(t), sigma(t)).
+        Deterministic when ddim_eta=0.
+        """
+        B = x.shape[0]
+
+        # UNet eval time is exactly the OU time (no clamping, no index mapping)
+        t_vec = t_curr.expand(B)
         eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
-    
-        # extract ᾱ_t, ᾱ_{t_prev} (these are correct as-is)
-        a_t = alpha_cumprod_t
-        sqrt_a_t = torch.sqrt(a_t)
-        sqrt_one_minus_a_t = torch.sqrt(1.0 - a_t)
-    
-        # x0 prediction
-        x0_pred = (x - sqrt_one_minus_a_t * eps_pred) / (sqrt_a_t + 1e-8)
-    
-        if t_prev_idx_vec is None:
+
+        alpha_t, sigma_t = get_ou_params(t_vec.view(B, 1, 1, 1))
+        alpha_t = alpha_t.to(x.dtype)
+        sigma_t = sigma_t.to(x.dtype)
+
+        # x0 prediction under OU parameterization
+        x0_pred = (x - sigma_t * eps_pred) / (alpha_t + 1e-8)
+
+        # If we're at (or below) the terminal noise level, return the denoised prediction
+        if (t_next <= self.t_min).item():
             return x0_pred
-    
-        a_prev = extract_schedule(sched["alphas_cumprod"], t_prev_idx_vec, x.shape)
-        sqrt_a_prev = torch.sqrt(a_prev)
-    
-        eta = self.ddim_eta
+
+        t_next_vec = t_next.expand(B)
+        alpha_next, sigma_next = get_ou_params(t_next_vec.view(B, 1, 1, 1))
+        alpha_next = alpha_next.to(x.dtype)
+        sigma_next = sigma_next.to(x.dtype)
+
+        # DDIM-style stochasticity using a(t) = alpha(t)^2
+        a_t = alpha_t ** 2
+        a_next = alpha_next ** 2
+
+        eta = float(self.ddim_eta)
         if eta <= 0.0:
-            sigma = torch.zeros_like(a_prev)
+            sigma_ddim = torch.zeros_like(sigma_next)
         else:
-            # DDIM stochasticity
-            sigma = eta * torch.sqrt(
-                ((1.0 - a_prev) / (1.0 - a_t)).clamp_min(0.0)
-                * (1.0 - (a_t / a_prev)).clamp_min(0.0)
-            )
-    
-        # direction term
-        dir_xt = torch.sqrt((1.0 - a_prev - sigma ** 2).clamp_min(0.0)) * eps_pred
-    
+            # same algebra as DDIM, but with continuous a(t)
+            denom = (1.0 - a_t).clamp_min(1e-12)
+            term1 = ((1.0 - a_next) / denom).clamp_min(0.0)
+            term2 = (1.0 - (a_t / (a_next + 1e-12))).clamp_min(0.0)
+            sigma_ddim = eta * torch.sqrt(term1 * term2)
+
+        # direction coefficient
+        dir_coeff = torch.sqrt((1.0 - a_next - sigma_ddim ** 2).clamp_min(0.0))
+
         if eta > 0.0:
             if generator is None:
                 noise = torch.randn_like(x)
             else:
-                noise = torch.randn(x.shape, device=device, generator=generator)
-            x_prev = sqrt_a_prev * x0_pred + dir_xt + sigma * noise
+                noise = torch.randn(x.shape, device=x.device, generator=generator)
+            x_next = alpha_next * x0_pred + dir_coeff * eps_pred + sigma_ddim * noise
         else:
-            x_prev = sqrt_a_prev * x0_pred + dir_xt
-    
-        return x_prev
+            x_next = alpha_next * x0_pred + dir_coeff * eps_pred
+
+        return x_next
 
     def sample(
         self,
@@ -1249,37 +1253,30 @@ class UniversalSampler:
             x = x_init
         device = x.device
 
+
         # --- Discrete DDIM path ---
         if self.method == "ddim":
-            sched = self._get_ddpm_schedule(device)
-            T = int(sched["T"].item())
+            # Use the same OU log-universe schedule as the ODE/SDE solvers
+            ts = torch.logspace(
+                math.log10(self.t_max),
+                math.log10(self.t_min),
+                self.num_steps + 1,
+                device=device
+            )
 
-            if self.num_steps < 1:
-                return x
-
-            # Use rounded indices to avoid accidental duplicates after long-cast.
-            timesteps = torch.linspace(0, T - 1, self.num_steps, device=device).round().long().flip(0)
-
-            B = x.shape[0]
-            for i in range(timesteps.numel()):
-                t_i = timesteps[i]
-                t_idx_vec = t_i.expand(B)
-
-                if i == timesteps.numel() - 1:
-                    t_prev_idx_vec = None
-                else:
-                    t_prev = timesteps[i + 1]
-                    t_prev_idx_vec = t_prev.expand(B)
-
+            for i in range(self.num_steps):
+                t_curr = ts[i]
+                t_next = ts[i + 1]
                 x = self.step_ddim(
                     x,
-                    t_idx_vec=t_idx_vec,
-                    t_prev_idx_vec=t_prev_idx_vec,
+                    t_curr=t_curr,
+                    t_next=t_next,
                     unet=unet,
                     y=y,
                     cfg_scale=cfg_scale,
                     generator=generator,
                 )
+
             return x
 
         # --- Continuous OU samplers (existing path) ---
@@ -1452,7 +1449,7 @@ def evaluate_current_state(
             # draw a *non-null* class token uniformly at random (fixed bank for comparability).
             {"method": "heun_ode",  "steps": 20, "desc": "RandToken (Heun)", "use_rand_token": True},
             {"method": "rk4_ode",  "steps": 10, "desc": "RandToken (RK4)", "use_rand_token": True},
-            #"method": "ddim", "steps": 50, "desc": "DDIM 50 (eta=0)", "use_rand_token": True},
+            {"method": "ddim", "steps": 50, "desc": "RandToken (DDIM)", "use_rand_token": True},
         ])
 
     results = []
@@ -2462,8 +2459,13 @@ def train_vae_cotrained_cond(cfg):
     device = default_device()
     # --- Discrete diffusion schedule (train + sampling) ---
     # This switches training from continuous log-uniform OU times to discrete VP/DDPM timesteps.
-    noise_sched = make_ddpm_schedule(cfg, device)
-    T = int(noise_sched["T"].item())
+
+
+    # --- Discrete OU schedule (optional) ---
+    # For use_ddim_times: discretize OU times (log-spaced) and use OU alpha/sigma.
+    ou_sched = make_ou_schedule(cfg, device)
+    T = int(ou_sched["T"].item())
+    noise_sched = ou_sched
 
     dataset_key = cfg.get("dataset", "FMNIST")
     train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
@@ -2650,11 +2652,16 @@ def train_vae_cotrained_cond(cfg):
             t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
             alpha, sigma = get_ou_params(t.view(B,1,1,1))
 
+
             if use_ddim_times:
                 t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
-                t = t_idx_to_time(t_idx, cfg, T)  # [B] float for time embedding
-                alpha = extract_schedule(noise_sched["sqrt_alphas_cumprod"], t_idx, z0.shape)
-                sigma = extract_schedule(noise_sched["sqrt_one_minus_alphas_cumprod"], t_idx, z0.shape)
+
+                # time embedding = actual OU time on the discrete grid
+                t = ou_sched["times"].gather(0, t_idx).float()  # [B]
+
+                # alpha/sigma = OU alpha(t), sigma(t) on the same grid
+                alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
 
 
             noise = torch.randn_like(z0)
@@ -2863,9 +2870,14 @@ def train_vae_cotrained_cond(cfg):
 
                 if use_ddim_times:
                     t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
-                    t = t_idx_to_time(t_idx, cfg, T)  # [B] float for time embedding
-                    alpha = extract_schedule(noise_sched["sqrt_alphas_cumprod"], t_idx, z0.shape)
-                    sigma = extract_schedule(noise_sched["sqrt_one_minus_alphas_cumprod"], t_idx, z0.shape)
+
+                    # time embedding = actual OU time on the discrete grid
+                    t = ou_sched["times"].gather(0, t_idx).float()  # [B]
+
+                    # alpha/sigma = OU alpha(t), sigma(t) on the same grid
+                    alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                    sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+                
 
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
@@ -3022,14 +3034,14 @@ def main():
         "num_workers": 2,
         "cotrain_head": "lsi",
         "use_latent_norm": True,
-        "use_ddim_times": False,
+        "use_ddim_times": True,
         "kl_reg_type": "norm",
         "score_w": 1.0,
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
         "lr_refine": 7e-5,
         "epochs_vae": 200,
-        "epochs_refine": 50,
+        "epochs_refine": 40,
         "latent_channels": 3,
         "kl_w": 1e-4,
         "use_cond_encoder": True,  # if False: encoder ignores labels (exact old behavior)
@@ -3044,7 +3056,7 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 25,
+        "eval_freq": 10,
         "ema_decay": 0.999,
         # --- Classifier-Free Guidance (CFG) ---
         "cfg_label_dropout": 0.25,      # Bernoulli drop prob for class-conditioning during training
@@ -3066,5 +3078,8 @@ def main():
     print("=== Dual Co-Training: LSI vs Control (Tweedie) ===")
     train_vae_cotrained_cond(cfg)
 
+
 if __name__ == "__main__":
-  main()
+    main()
+
+
