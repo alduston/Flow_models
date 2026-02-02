@@ -855,11 +855,24 @@ class ResBlock(nn.Module):
         
 
 class UniversalSampler:
-    def __init__(self, method: str = "heun_sde", num_steps: int = 20, t_min: float = 2e-5, t_max: float = 2.0):
-        self.num_steps = num_steps
-        self.t_min = t_min
-        self.t_max = t_max
-        self.method = method
+    def __init__(
+        self,
+        method: str = "heun_sde",
+        num_steps: int = 20,
+        t_min: float = 2e-5,
+        t_max: float = 2.0,
+        schedule_cfg: Dict[str, Any] | None = None,
+        ddim_eta: float = 0.0,
+    ):
+        self.num_steps = int(num_steps)
+        self.t_min = float(t_min)
+        self.t_max = float(t_max)
+        self.method = str(method).lower()
+
+        # For discrete samplers (DDIM), we need the same schedule used in training.
+        self.schedule_cfg = schedule_cfg
+        self.ddim_eta = float(ddim_eta)
+        self._ddpm_schedule: Dict[str, torch.Tensor] | None = None
 
     @staticmethod
     def _predict_eps(
@@ -877,6 +890,8 @@ class UniversalSampler:
         eps_uncond = unet(x, t_vec, None)
         eps_cond = unet(x, t_vec, y)
         return eps_uncond + float(cfg_scale) * (eps_cond - eps_uncond)
+
+    # ------------------------- Continuous-time OU samplers -------------------------
 
     def get_ode_derivative(self, x, t, unet, y=None, cfg_scale=None):
         B = x.shape[0]
@@ -929,6 +944,171 @@ class UniversalSampler:
             x = x + 0.5 * dt * (d_curr + d_next)
         else:
             x = x_proposed
+
+        return x
+
+    def step_heun_sde(self, x, t_curr, t_next, unet, y=None, cfg_scale=None, generator=None):
+        B = x.shape[0]
+        dt = t_next - t_curr
+        dt_abs = torch.abs(dt).clamp_min(1e-12)
+
+        if generator is None:
+            noise = torch.randn_like(x)
+        else:
+            noise = torch.randn(x.shape, device=x.device, generator=generator)
+        dW = torch.sqrt(2.0 * dt_abs) * noise
+
+        b_curr = self.get_rev_sde_drift(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        x_hat = x + dt * b_curr + dW
+
+        b_next = self.get_rev_sde_drift(x_hat, t_next, unet, y=y, cfg_scale=cfg_scale)
+        x_new = x + 0.5 * dt * (b_curr + b_next) + dW
+        return x_new
+
+    # ------------------------- Discrete DDIM sampler -------------------------
+
+    def _get_ddpm_schedule(self, device: torch.device) -> Dict[str, torch.Tensor]:
+        if self._ddpm_schedule is None or self._ddpm_schedule["betas"].device != device:
+            if self.schedule_cfg is None:
+                raise ValueError("DDIM sampling requires schedule_cfg (pass the same cfg used for training).")
+            self._ddpm_schedule = make_ddpm_schedule(self.schedule_cfg, device)
+        return self._ddpm_schedule
+
+    def step_ddim(
+        self,
+        x: torch.Tensor,
+        t_idx_vec: torch.Tensor,
+        t_prev_idx_vec: torch.Tensor | None,
+        unet,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+        generator=None,
+    ) -> torch.Tensor:
+        """One DDIM step x_t -> x_{t_prev} (eta=0 gives deterministic DDIM)."""
+        device = x.device
+        sched = self._get_ddpm_schedule(device)
+        T = int(sched["T"].item())
+
+        # time embedding scalar (monotone, matches training)
+        t_vec = t_idx_to_time(t_idx_vec, self.schedule_cfg, T)
+
+        # predict eps at x_t
+        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+
+        # extract ᾱ_t, ᾱ_{t_prev}
+        a_t = extract_schedule(sched["alphas_cumprod"], t_idx_vec, x.shape)
+        sqrt_a_t = torch.sqrt(a_t)
+        sqrt_one_minus_a_t = torch.sqrt(1.0 - a_t)
+
+        # x0 prediction
+        x0_pred = (x - sqrt_one_minus_a_t * eps_pred) / (sqrt_a_t + 1e-8)
+
+        if t_prev_idx_vec is None:
+            return x0_pred
+
+        a_prev = extract_schedule(sched["alphas_cumprod"], t_prev_idx_vec, x.shape)
+        sqrt_a_prev = torch.sqrt(a_prev)
+
+        eta = self.ddim_eta
+        if eta <= 0.0:
+            sigma = torch.zeros_like(a_prev)
+        else:
+            # DDIM stochasticity (matches DDIM paper / diffusers implementation)
+            sigma = eta * torch.sqrt(
+                ((1.0 - a_prev) / (1.0 - a_t)).clamp_min(0.0)
+                * (1.0 - (a_t / a_prev)).clamp_min(0.0)
+            )
+
+        # direction term
+        dir_xt = torch.sqrt((1.0 - a_prev - sigma ** 2).clamp_min(0.0)) * eps_pred
+
+        if eta > 0.0:
+            if generator is None:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.randn(x.shape, device=device, generator=generator)
+            x_prev = sqrt_a_prev * x0_pred + dir_xt + sigma * noise
+        else:
+            x_prev = sqrt_a_prev * x0_pred + dir_xt
+
+        return x_prev
+
+    def sample(
+        self,
+        unet,
+        shape=None,
+        device=None,
+        x_init=None,
+        generator=None,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ):
+        unet.eval()
+
+        if x_init is None:
+            assert shape is not None and device is not None
+            x = torch.randn(shape, device=device, generator=generator)
+            device = x.device
+        else:
+            x = x_init
+            device = x.device
+
+        # --- Discrete DDIM path ---
+        if self.method == "ddim":
+            sched = self._get_ddpm_schedule(device)
+            T = int(sched["T"].item())
+
+            if self.num_steps < 1:
+                return x
+
+            # inference indices from T-1 down to 0 (len = num_steps)
+            timesteps = torch.linspace(T - 1, 0, self.num_steps, device=device).long()
+
+            B = x.shape[0]
+            for i in range(timesteps.numel()):
+                t_i = timesteps[i]
+                t_idx_vec = t_i.expand(B).to(torch.long)
+
+                if i == timesteps.numel() - 1:
+                    t_prev_idx_vec = None
+                else:
+                    t_prev = timesteps[i + 1]
+                    t_prev_idx_vec = t_prev.expand(B).to(torch.long)
+
+                x = self.step_ddim(
+                    x,
+                    t_idx_vec=t_idx_vec,
+                    t_prev_idx_vec=t_prev_idx_vec,
+                    unet=unet,
+                    y=y,
+                    cfg_scale=cfg_scale,
+                    generator=generator,
+                )
+
+            return x
+
+        # --- Continuous OU samplers (existing path) ---
+        ts = torch.logspace(
+            math.log10(self.t_max),
+            math.log10(self.t_min),
+            self.num_steps + 1,
+            device=device
+        )
+
+        for i in range(self.num_steps):
+            t_curr = ts[i]
+            t_next = ts[i + 1]
+
+            if self.method == "rk4_ode":
+                x = self.step_rk4_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "euler_ode":
+                x = self.step_euler_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "heun_ode":
+                x = self.step_heun_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "heun_sde":
+                x = self.step_heun_sde(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale, generator=generator)
+            else:
+                raise ValueError(f"Unknown sampling method: {self.method}")
 
         return x
 
@@ -1133,11 +1313,12 @@ def evaluate_current_state(
         configs.extend([
             {"method": "heun_ode", "steps": 20, "desc": "Baseline (Heun)", "use_rand_token": False},
             {"method": "rk4_ode",  "steps": 10, "desc": "Smoothness (RK4)", "use_rand_token": False},
+            {"method": "ddim", "steps": 50, "DDIM 50 (eta=0)", "use_rand_token": False},
             # Conditional-sampling probe that preserves unconditional FID statistics:
             # draw a *non-null* class token uniformly at random (fixed bank for comparability).
             {"method": "heun_ode",  "steps": 20, "desc": "RandToken (Heun)", "use_rand_token": True},
             {"method": "rk4_ode",  "steps": 10, "desc": "RandToken (RK4)", "use_rand_token": True},
-            
+            {"method": "ddim", "steps": 50, "DDIM 50 (eta=0)", "use_rand_token": True},
         ])
 
     results = []
@@ -2134,6 +2315,11 @@ def train_vae_cotrained_cond(cfg):
     cfg["ckpt_dir"] = os.path.join(results_dir, "checkpoints")
 
     device = default_device()
+    # --- Discrete diffusion schedule (train + sampling) ---
+    # This switches training from continuous log-uniform OU times to discrete VP/DDPM timesteps.
+    noise_sched = make_ddpm_schedule(cfg, device)
+    T = int(noise_sched["T"].item())
+
     dataset_key = cfg.get("dataset", "FMNIST")
     train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
     cfg["num_classes"] = num_classes  # for CFG label embedding / eval
@@ -2341,8 +2527,14 @@ def train_vae_cotrained_cond(cfg):
             else:
                 raise ValueError(f"Unknown kl_reg_type: {reg_type}")
 
-            t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
-            alpha, sigma = get_ou_params(t.view(B,1,1,1))
+            #t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
+            #alpha, sigma = get_ou_params(t.view(B,1,1,1))
+
+            # Discrete timestep training (VP/DDPM schedule)
+            t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
+            t = t_idx_to_time(t_idx, cfg, T)  # [B] float for time embedding
+            alpha = extract_schedule(noise_sched["sqrt_alphas_cumprod"], t_idx, z0.shape)
+            sigma = extract_schedule(noise_sched["sqrt_one_minus_alphas_cumprod"], t_idx, z0.shape)
             
             noise = torch.randn_like(z0)
             z_t = alpha * z0 + sigma * noise
@@ -2541,8 +2733,14 @@ def train_vae_cotrained_cond(cfg):
                     logvar = torch.clamp(logvar_base + logvar_r, min=-30.0, max=20.0)
                     z0 = vae.reparameterize(mu, logvar)
 
-                t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
-                alpha, sigma = get_ou_params(t.view(B,1,1,1))
+                #t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
+                #alpha, sigma = get_ou_params(t.view(B,1,1,1))
+
+                # Discrete timestep training (VP/DDPM schedule)
+                t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
+                t = t_idx_to_time(t_idx, cfg, T)  # [B] float for time embedding
+                alpha = extract_schedule(noise_sched["sqrt_alphas_cumprod"], t_idx, z0.shape)
+                sigma = extract_schedule(noise_sched["sqrt_one_minus_alphas_cumprod"], t_idx, z0.shape)
 
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
@@ -2725,6 +2923,13 @@ def main():
         "cfg_label_dropout": 0.25,      # Bernoulli drop prob for class-conditioning during training
         "cfg_eval_scale": 2.0,         # guidance scale for conditional eval
         "eval_class_labels": [],      # e.g. evaluate conditional generation for class "2" (set [] to disable)
+        # --- Updates for discrete noise schedule ---
+        "num_train_timesteps": 1000,
+        "noise_schedule": "cosine",     # "cosine" (best default for CIFAR-10), or "linear"
+        "beta_start": 1e-4,             # used only if noise_schedule="linear"
+        "beta_end": 2e-2,               # used only if noise_schedule="linear"
+        "cosine_s": 0.008,              # used only if noise_schedule="cosine"
+        "ddim_eta": 0.0,                # 0.0 = deterministic DDIM (usually best for FID)
     }
 
     seed_everything(cfg["seed"])
