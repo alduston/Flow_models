@@ -1179,40 +1179,46 @@ class UniversalSampler:
         device = x.device
         sched = self._get_ddpm_schedule(device)
         T = int(sched["T"].item())
-
-        # time embedding scalar (monotone, matches training)
-        t_vec = t_idx_to_time(t_idx_vec, self.schedule_cfg, T)
-
+    
+        # CRITICAL FIX: Map discrete timestep indices to continuous OU time that matches training
+        # Use the SNR (alpha/sigma ratio) to recover the equivalent OU time
+        alpha_cumprod_t = extract_schedule(sched["alphas_cumprod"], t_idx_vec, x.shape)
+        # For OU process: alpha = exp(-t), sigma^2 = 1 - exp(-2t)
+        # So: alpha^2 / (alpha^2 + sigma^2) = alpha^2 (since alpha^2 + sigma^2 = 1 in VP)
+        # We can recover t from alpha_cumprod: t = -log(sqrt(alpha_cumprod))
+        t_vec = -0.5 * torch.log(alpha_cumprod_t.view(-1) + 1e-8)
+        t_vec = t_vec.clamp(min=self.schedule_cfg["t_min"], max=self.schedule_cfg["t_max"])
+    
         # predict eps at x_t (supports CFG via y/cfg_scale)
         eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
-
-        # extract ᾱ_t, ᾱ_{t_prev}
-        a_t = extract_schedule(sched["alphas_cumprod"], t_idx_vec, x.shape)
+    
+        # extract ᾱ_t, ᾱ_{t_prev} (these are correct as-is)
+        a_t = alpha_cumprod_t
         sqrt_a_t = torch.sqrt(a_t)
         sqrt_one_minus_a_t = torch.sqrt(1.0 - a_t)
-
+    
         # x0 prediction
         x0_pred = (x - sqrt_one_minus_a_t * eps_pred) / (sqrt_a_t + 1e-8)
-
+    
         if t_prev_idx_vec is None:
             return x0_pred
-
+    
         a_prev = extract_schedule(sched["alphas_cumprod"], t_prev_idx_vec, x.shape)
         sqrt_a_prev = torch.sqrt(a_prev)
-
+    
         eta = self.ddim_eta
         if eta <= 0.0:
             sigma = torch.zeros_like(a_prev)
         else:
-            # DDIM stochasticity (matches DDIM paper / diffusers implementation)
+            # DDIM stochasticity
             sigma = eta * torch.sqrt(
                 ((1.0 - a_prev) / (1.0 - a_t)).clamp_min(0.0)
                 * (1.0 - (a_t / a_prev)).clamp_min(0.0)
             )
-
+    
         # direction term
         dir_xt = torch.sqrt((1.0 - a_prev - sigma ** 2).clamp_min(0.0)) * eps_pred
-
+    
         if eta > 0.0:
             if generator is None:
                 noise = torch.randn_like(x)
@@ -1221,7 +1227,7 @@ class UniversalSampler:
             x_prev = sqrt_a_prev * x0_pred + dir_xt + sigma * noise
         else:
             x_prev = sqrt_a_prev * x0_pred + dir_xt
-
+    
         return x_prev
 
     def sample(
@@ -3011,7 +3017,7 @@ import numpy as np
 def main():
     # User Config
     cfg = {
-        "dataset": "MNIST",
+        "dataset": "FMNIST",
         "batch_size": 128,
         "num_workers": 2,
         "cotrain_head": "lsi",
@@ -3023,7 +3029,7 @@ def main():
         "lr_ldm": 2e-4,
         "lr_refine": 7e-5,
         "epochs_vae": 200,
-        "epochs_refine": 40,
+        "epochs_refine": 50,
         "latent_channels": 3,
         "kl_w": 1e-4,
         "use_cond_encoder": True,  # if False: encoder ignores labels (exact old behavior)
@@ -3038,7 +3044,7 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 20,
+        "eval_freq": 25,
         "ema_decay": 0.999,
         # --- Classifier-Free Guidance (CFG) ---
         "cfg_label_dropout": 0.25,      # Bernoulli drop prob for class-conditioning during training
