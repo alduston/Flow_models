@@ -2115,10 +2115,6 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
     return tl, vl, num_classes
 
 
-# =============================================================================
-# MODIFIED TRAINING FUNCTION WITH LOGGING
-# =============================================================================
-
 def train_vae_cotrained_cond(cfg):
     """
     Modified co-training function with DataFrame logging and visualization.
@@ -2227,23 +2223,18 @@ def train_vae_cotrained_cond(cfg):
     if cotrain_head == "lsi":
         opt_joint = optim.AdamW([
             {'params': vae.parameters(), 'lr': cfg["lr_vae"]},
-            {'params': unet_lsi.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae}
+            {'params': unet_lsi.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae},
+            {'params': residual_adapter.parameters(), 'lr': cfg.get("lr_residual", cfg["lr_vae"])}
         ], weight_decay=1e-4)
         opt_tracking = optim.AdamW(unet_control.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
     else:  # cotrain_head == "control"
         opt_joint = optim.AdamW([
             {'params': vae.parameters(), 'lr': cfg["lr_vae"]},
-            {'params': unet_control.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae}
+            {'params': unet_control.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae},
+            {'params': residual_adapter.parameters(), 'lr': cfg.get("lr_residual", cfg["lr_vae"])}
         ], weight_decay=1e-4)
         opt_tracking = optim.AdamW(unet_lsi.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
 
-    
-    # --- Residual Adapter Optimizer (trained ONLY via L_align) ---
-    opt_residual = optim.AdamW(
-        residual_adapter.parameters(),
-        lr=float(cfg.get("lr_residual", cfg["lr_vae"])),
-        weight_decay=float(cfg.get("wd_residual", 1e-4)),
-    )
 
     lpips_fn = lpips.LPIPS(net='vgg').to(device) if LPIPS_AVAILABLE else None
 
@@ -2282,7 +2273,7 @@ def train_vae_cotrained_cond(cfg):
     print("--> Starting Dual Co-training...")
     for ep in range(cfg["epochs_vae"]):
         vae.train(); unet_lsi.train(); unet_control.train()
-        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc", "stiff", "align"]}
+        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc", "stiff"]}
         mu_stats = []
 
         for x, y in tqdm(train_l, desc=f"Ep {ep+1}", leave=False):
@@ -2304,10 +2295,8 @@ def train_vae_cotrained_cond(cfg):
             mu_base, logvar_base = vae.encode(x)
 
             # --- Conditional geometry correction (ResidualGaussianAdapter) ---
-            # For all *existing* losses, we treat the residual as part of the geometry, but we do NOT
-            # allow those losses to update the residual parameters (detach residual outputs here).
-            #with torch.no_grad():
-            mu_r, logvar_r = residual_adapter(mu_base.detach(), logvar_base.detach(), y_in)
+            # Residual heads now participate in recon/KL losses (no detach)
+            mu_r, logvar_r = residual_adapter(mu_base, logvar_base, y_in)
             mu = mu_base + mu_r
             logvar = logvar_base + logvar_r
             logvar = torch.clamp(logvar, min=-30.0, max=20.0)
@@ -2423,49 +2412,6 @@ def train_vae_cotrained_cond(cfg):
                 nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
             opt_tracking.step()
 
-            align_K = int(getattr(cfg, "align_K", 1))
-            align_K = max(1, align_K)
-            # --- Class Alignment Loss (L_align, K=align_K) ---
-            # Update ONLY residual_adapter parameters. (VAE/UNets are not in the `inputs=` list.)
-            loss_align = torch.tensor(0.0, device=device)
-            if align_w > 0.0 and (align_classifier is not None):
-                cond_mask = (y_in != null_label)
-                if cond_mask.any():
-                    opt_residual.zero_grad(set_to_none=True)
-            
-                    # NOTE: mu_base/logvar_base are detached so L_align does not update the VAE encoder.
-                    mu_r_a, logvar_r_a = residual_adapter(mu_base.detach(), logvar_base.detach(), y_in)
-                    mu_a = mu_base.detach() + mu_r_a
-                    logvar_a = torch.clamp(logvar_base.detach() + logvar_r_a, min=-30.0, max=20.0)
-            
-                    # Vectorized K-sample reparameterization: z ~ N(mu_a, diag(exp(logvar_a)))
-                    B = mu_a.shape[0]
-                    std_a = torch.exp(0.5 * logvar_a)
-            
-                    # eps: (K, B, ...)
-                    eps = torch.randn((align_K,) + std_a.shape, device=device)
-                    z_a = mu_a.unsqueeze(0) + std_a.unsqueeze(0) * eps  # (K, B, ...)
-            
-                    # Flatten for decode/classify
-                    z_a_flat = z_a.reshape((align_K * B,) + z_a.shape[2:])
-                    x_a_flat = vae.decode(z_a_flat)  # (K*B, ...)
-                    logits_flat = align_classifier(x_a_flat)  # (K*B, n_classes)
-            
-                    # Compute CE over only conditioned items, averaged over K
-                    logits = logits_flat.view(align_K, B, -1)  # (K, B, n_classes)
-                    y_t = y  # (B,)
-            
-                    logits_c = logits[:, cond_mask, :].reshape(-1, logits.shape[-1])  # (K*Bc, C)
-                    y_c = y_t[cond_mask].repeat(align_K)                               # (K*Bc,)
-            
-                    loss_align = F.cross_entropy(logits_c, y_c)
-                    loss_align = align_w * loss_align
-            
-                    torch.autograd.backward(loss_align, inputs=list(residual_adapter.parameters()))
-                    nn.utils.clip_grad_norm_(residual_adapter.parameters(), 1.0)
-                    opt_residual.step()
-
-
             # --- EMA Update (tracking head) ---
             with torch.no_grad():
                 if cotrain_head == "lsi":
@@ -2482,7 +2428,6 @@ def train_vae_cotrained_cond(cfg):
             metrics["score_control"] += score_loss_control.item()
             metrics["perc"] += perc.item()
             metrics["stiff"] += stiff_pen.item()
-            metrics["align"] += float(loss_align.detach())
 
         # --- Compute epoch averages and log ---
         n_batches = len(train_l)
@@ -2496,7 +2441,6 @@ def train_vae_cotrained_cond(cfg):
             "score_control": metrics["score_control"] / n_batches,
             "perc": metrics["perc"] / n_batches,
             "stiff": metrics["stiff"] / n_batches,
-            "align": metrics["align"] / n_batches,
         }
         loss_records.append(epoch_metrics)
 
@@ -2574,7 +2518,7 @@ def train_vae_cotrained_cond(cfg):
 
         for ep in range(epochs_refine):
             unet_lsi.train(); unet_control.train()
-            metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control", "align"]}
+            metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control"]}
 
             for x, y in tqdm(train_l, desc=f"Refine Ep {ep+1}", leave=False):
                 x = x.to(device)
@@ -2631,30 +2575,6 @@ def train_vae_cotrained_cond(cfg):
                 nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
                 opt_control_refine.step()
 
-                # --- Class Alignment Loss (L_align, K=1) ---
-                loss_align = torch.tensor(0.0, device=device)
-                if align_w > 0.0 and (align_classifier is not None):
-                    cond_mask = (y_in != null_label)
-                    if cond_mask.any():
-                        opt_residual.zero_grad(set_to_none=True)
-
-                        mu_r_a, logvar_r_a = residual_adapter(mu_base, logvar_base, y_in)
-                        mu_a = mu_base + mu_r_a
-                        logvar_a = torch.clamp(logvar_base + logvar_r_a, min=-30.0, max=20.0)
-
-                        z_a = vae.reparameterize(mu_a, logvar_a)
-                        x_a = vae.decode(z_a)
-
-                        logits = align_classifier(x_a)
-                        loss_align = F.cross_entropy(logits[cond_mask], y[cond_mask])
-                        loss_align = align_w * loss_align
-
-                        torch.autograd.backward(loss_align, inputs=list(residual_adapter.parameters()))
-                        nn.utils.clip_grad_norm_(residual_adapter.parameters(), 1.0)
-                        opt_residual.step()
-
-                        metrics_refine["align"] += float(loss_align.detach())
-
                 # --- EMA Update (Control) ---
                 with torch.no_grad():
                     for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
@@ -2674,7 +2594,6 @@ def train_vae_cotrained_cond(cfg):
                 "kl": 0.0,
                 "score_lsi": metrics_refine["score_lsi"] / n_batches,
                 "score_control": metrics_refine["score_control"] / n_batches,
-                "align": metrics_refine["align"] / n_batches,
                 "perc": 0.0,
             }
             loss_records.append(epoch_metrics)
@@ -2765,8 +2684,7 @@ def train_vae_cotrained_cond(cfg):
     print(f"{'='*60}")
 
     return loss_df, eval_df
-
-
+    
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -2787,12 +2705,10 @@ def main():
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
         "lr_refine": 7e-5,
-        "epochs_vae": 100,
-        "epochs_refine": 20,
-        "latent_channels": 2,
+        "epochs_vae": 200,
+        "epochs_refine": 50,
+        "latent_channels": 3,
         "kl_w": 1e-4,
-        "align_w": 0.0,
-        "align_K": 1,
         "stiff_w": 1e-4,
         "score_w_vae": .4,
         "perc_w": 1.0,
@@ -2803,13 +2719,12 @@ def main():
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "load_from_checkpoint": False,
-        "eval_freq": 5,
+        "eval_freq": 25,
         "ema_decay": 0.999,
         # --- Classifier-Free Guidance (CFG) ---
-        "cfg_label_dropout": 0.1,      # Bernoulli drop prob for class-conditioning during training
+        "cfg_label_dropout": 0.25,      # Bernoulli drop prob for class-conditioning during training
         "cfg_eval_scale": 2.0,         # guidance scale for conditional eval
         "eval_class_labels": [],      # e.g. evaluate conditional generation for class "2" (set [] to disable)
-
     }
 
     seed_everything(cfg["seed"])
