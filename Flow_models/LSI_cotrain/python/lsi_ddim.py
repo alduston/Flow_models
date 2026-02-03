@@ -1624,11 +1624,11 @@ def evaluate_current_state(
     ]
     if unet is not None:
          configs.extend([
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG0", "use_rand_token": True, "cfg_level": 0},
-            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG1", "use_rand_token": True, "cfg_level": 1},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG1.5", "use_rand_token": True, "cfg_level": 1.5},
-            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG2", "use_rand_token": True, "cfg_level": 2.0}, 
-            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG3", "use_rand_token": True, "cfg_level": 3.0}, 
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0}, 
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0}, 
         ])
 
     results = []
