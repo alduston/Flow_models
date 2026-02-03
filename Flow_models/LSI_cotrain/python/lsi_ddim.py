@@ -4,7 +4,7 @@ import math
 import os
 import random
 import numpy as np
-from typing import Any, Dict, Tuple 
+from typing import Any, Dict, Tuple
 
 import torch
 from torch import nn, optim
@@ -1623,12 +1623,12 @@ def evaluate_current_state(
         {"method": "VAE_Rec_eps", "steps": 0, "desc": "Recon (posterior z)", "use_rand_token": False},
     ]
     if unet is not None:
-        configs.extend([
+         configs.extend([
             {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG0", "use_rand_token": True, "cfg_level": 0},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG1", "use_rand_token": True, "cfg_level": 1},
+            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG1", "use_rand_token": True, "cfg_level": 1},
             {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG1.5", "use_rand_token": True, "cfg_level": 1.5},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG2", "use_rand_token": True, "cfg_level": 2.0}, 
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG3", "use_rand_token": True, "cfg_level": 3.0}, 
+            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG2", "use_rand_token": True, "cfg_level": 2.0}, 
+            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4) CFG3", "use_rand_token": True, "cfg_level": 3.0}, 
         ])
 
     results = []
@@ -2077,12 +2077,16 @@ def discover_metric_columns(eval_df, metric_prefix):
         metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap'
     
     Returns:
-        List of column names matching the pattern, e.g., 
-        ['fid_rk4_20_randtok', 'fid_heun_20', 'fid_ddim_50_randtok_cfg2.0']
+        List of column names matching the pattern, excluding vae_recon variants
     """
-    pattern = re.compile(rf'^{metric_prefix}_(?!vae_recon)')  # exclude vae_recon variants
+    if metric_prefix == 'lsi_gap':
+        # lsi_gap columns look like: lsi_gap_rk4_20_randtok
+        pattern = re.compile(r'^lsi_gap_')
+    else:
+        # Other columns look like: fid_rk4_20_randtok (exclude fid_vae_recon)
+        pattern = re.compile(rf'^{metric_prefix}_(?!vae_recon)')
+    
     return [col for col in eval_df.columns if pattern.match(col)]
-
 
 def parse_metric_column(col_name):
     """
@@ -2091,24 +2095,26 @@ def parse_metric_column(col_name):
     Examples:
         'fid_rk4_10' -> {'metric': 'fid', 'method': 'rk4', 'steps': '10', 'suffix': ''}
         'fid_rk4_20_randtok' -> {'metric': 'fid', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
-        'kid_heun_20_randtok_cfg2.0' -> {'metric': 'kid', 'method': 'heun', 'steps': '20', 'suffix': '_randtok_cfg2.0'}
+        'lsi_gap_rk4_20_randtok' -> {'metric': 'lsi_gap', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
     """
     parts = col_name.split('_')
-    metric = parts[0]  # fid, kid, sw2, div, lsi (note: lsi_gap has underscore)
     
-    # Handle lsi_gap specially
-    if metric == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
+    # Handle lsi_gap specially (has underscore in metric name)
+    if parts[0] == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
         metric = 'lsi_gap'
-        parts = [metric] + parts[2:]  # Rejoin and skip 'gap'
+        remaining = parts[2:]  # Skip 'lsi' and 'gap'
+    else:
+        metric = parts[0]
+        remaining = parts[1:]
     
-    if len(parts) < 3:
-        return None  # Not a valid metric column
+    if len(remaining) < 2:
+        return None  # Not a valid metric column (e.g., fid_vae_recon)
     
-    method = parts[1]  # rk4, heun, ddim, euler, etc.
-    steps = parts[2]   # 10, 20, 50, etc.
+    method = remaining[0]  # rk4, heun, ddim, euler, etc.
+    steps = remaining[1]   # 10, 20, 50, etc.
     
     # Everything after method_steps is the suffix
-    suffix = '_'.join(parts[3:]) if len(parts) > 3 else ''
+    suffix = '_'.join(remaining[2:]) if len(remaining) > 2 else ''
     if suffix:
         suffix = '_' + suffix
     
@@ -2220,12 +2226,13 @@ def plot_gap_metric(eval_df, metric_col, metric_name, title, save_path):
                     label=f"{metric_name.upper()} Gap (Tweedie - LSI)")
             
             ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.7)
-            ax.fill_between(merged["epoch"], 0, merged["gap"],
-                            where=merged["gap"] > 0, alpha=0.3, color="green",
-                            label="LSI Better")
-            ax.fill_between(merged["epoch"], 0, merged["gap"],
-                            where=merged["gap"] < 0, alpha=0.3, color="red",
-                            label="Tweedie Better")
+            if len(merged) > 0:
+                ax.fill_between(merged["epoch"], 0, merged["gap"],
+                                where=merged["gap"] > 0, alpha=0.3, color="green",
+                                label="LSI Better")
+                ax.fill_between(merged["epoch"], 0, merged["gap"],
+                                where=merged["gap"] < 0, alpha=0.3, color="red",
+                                label="Tweedie Better")
     
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel(f"{metric_name.upper()} Gap (Tweedie - LSI)", fontsize=12)
@@ -2243,24 +2250,26 @@ def plot_gap_metric(eval_df, metric_col, metric_name, title, save_path):
 def format_config_label(method, steps, suffix):
     """Create a human-readable label for a sampler configuration."""
     method_names = {
-        'rk4': 'RK4 ODE',
-        'heun': 'Heun ODE', 
-        'euler': 'Euler ODE',
+        'rk4': 'RK4',
+        'heun': 'Heun', 
+        'euler': 'Euler',
         'ddim': 'DDIM',
     }
-    base = f"{method_names.get(method, method.upper())} {steps} steps"
+    base = f"{method_names.get(method, method.upper())} {steps} Steps"
     
     if suffix:
         # Parse suffix for human readability
-        if '_randtok' in suffix:
-            base += " (RandTok"
-            if '_cfg' in suffix:
-                cfg_match = re.search(r'_cfg([\d.]+)', suffix)
+        suffix_clean = suffix.lstrip('_')
+        if 'randtok' in suffix_clean:
+            parts = []
+            if 'cfg' in suffix_clean:
+                cfg_match = re.search(r'cfg([\d.]+)', suffix_clean)
                 if cfg_match:
-                    base += f", CFG={cfg_match.group(1)}"
-            base += ")"
-        elif '_cfg' in suffix:
-            cfg_match = re.search(r'_cfg([\d.]+)', suffix)
+                    parts.append(f"CFG={cfg_match.group(1)}")
+            parts.insert(0, "RandTok")
+            base += f" ({', '.join(parts)})"
+        elif 'cfg' in suffix_clean:
+            cfg_match = re.search(r'cfg([\d.]+)', suffix_clean)
             if cfg_match:
                 base += f" (CFG={cfg_match.group(1)})"
     
@@ -2270,31 +2279,32 @@ def format_config_label(method, steps, suffix):
 def generate_all_visualizations(loss_df, eval_df, results_dir):
     """
     Generate visualization plots dynamically based on available metrics.
-    
-    This replaces the hardcoded version that expected specific column names.
     """
     plots_dir = os.path.join(results_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
     
-    # Discover all metric groups
-    metric_groups = get_metric_groups(eval_df)
+    print("\n--> Generating visualization suite...")
     
-    if not metric_groups:
-        print("--> Warning: No metric columns found in eval_df. Skipping metric plots.")
-        # Still generate loss plots
-        plot_idx = 1
-        plot_vae_recon_loss(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_vae_recon_loss.png"))
-        plot_idx += 1
-        plot_score_losses(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_score_losses.png"))
-        print(f"--> Visualization suite complete ({plot_idx} plots generated)!")
-        return
+    # Discover all available metric columns
+    metric_groups = {}
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+        cols = discover_metric_columns(eval_df, metric_type)
+        for col in cols:
+            parsed = parse_metric_column(col)
+            if parsed is None:
+                continue
+            
+            key = (parsed['method'], parsed['steps'], parsed['suffix'])
+            if key not in metric_groups:
+                metric_groups[key] = {}
+            metric_groups[key][metric_type] = col
     
-    print(f"\n--> Generating visualization suite...")
-    print(f"    Found {len(metric_groups)} sampler configurations:")
-    for (method, steps, suffix) in sorted(metric_groups.keys()):
-        label = format_config_label(method, steps, suffix)
-        metrics_available = list(metric_groups[(method, steps, suffix)].keys())
-        print(f"      - {label}: {metrics_available}")
+    if metric_groups:
+        print(f"    Found {len(metric_groups)} sampler configuration(s):")
+        for (method, steps, suffix) in sorted(metric_groups.keys()):
+            label = format_config_label(method, steps, suffix)
+            available = list(metric_groups[(method, steps, suffix)].keys())
+            print(f"      - {label}: {available}")
     
     plot_idx = 1
     
@@ -2304,11 +2314,16 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
     plot_score_losses(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_score_losses.png"))
     plot_idx += 1
     
+    if not metric_groups:
+        print("--> Warning: No metric columns found. Skipping eval metric plots.")
+        print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
+        return
+    
     # --- Metric plots for each sampler configuration ---
     for (method, steps, suffix) in sorted(metric_groups.keys()):
         group = metric_groups[(method, steps, suffix)]
         config_label = format_config_label(method, steps, suffix)
-        config_tag = f"{method}_{steps}{suffix}"  # For filenames
+        config_tag = f"{method}_{steps}{suffix}".replace('.', '_')
         
         # FID plot
         if 'fid' in group:
@@ -2334,7 +2349,7 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
         if 'sw2' in group:
             plot_generic_metric(
                 eval_df, group['sw2'], 'sw2', 'SW2 (log scale)',
-                f"Sliced-Wasserstein-2 Comparison ({config_label})",
+                f"Sliced-Wasserstein-2 ({config_label})",
                 os.path.join(plots_dir, f"{plot_idx:02d}_sw2_{config_tag}.png"),
                 use_log=True, include_vae_recon=True
             )
@@ -2352,15 +2367,14 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
         # LSI Gap Metric plot
         if 'lsi_gap' in group:
             plot_generic_metric(
-                eval_df, group['lsi_gap'], 'lsi_gap', 'LSI Gap Metric (lower = better)',
-                f"LSI Gap Metric: Score Alignment ({config_label})",
+                eval_df, group['lsi_gap'], 'lsi_gap', 'LSI Gap (lower = better)',
+                f"LSI Gap Metric ({config_label})",
                 os.path.join(plots_dir, f"{plot_idx:02d}_lsi_gap_{config_tag}.png"),
                 use_log=False, include_vae_recon=False
             )
             plot_idx += 1
     
     print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
-
 
 def plot_vae_recon_loss(loss_df, save_path):
     """Plot VAE reconstruction loss (cotrain epochs only)."""
@@ -2408,66 +2422,71 @@ def plot_score_losses(loss_df, save_path):
     print(f"    Saved: {save_path}")
 
 
-# ===========================================================================
-# COMPARISON PLOTTING (for cotrain vs indep experiments)
-# ===========================================================================
-
 def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_dir):
     """
-    Generate 4-way comparison plots dynamically based on available metrics.
-    
-    This replaces the hardcoded version that expected specific column names.
+    Generate all comparison plots (4-way: cotrain vs indep, LSI vs Tweedie)
+    dynamically based on available metric columns.
     """
     plots_dir = os.path.join(results_dir, "comparison_plots")
     os.makedirs(plots_dir, exist_ok=True)
     
     print("\n--> Generating comparison visualization suite...")
     
-    # Discover metrics from both dataframes (they should have the same columns)
-    metric_groups_cotrain = get_metric_groups(eval_df_cotrain)
-    metric_groups_indep = get_metric_groups(eval_df_indep)
+    # Discover all available metric columns from both dataframes
+    all_columns = set(eval_df_cotrain.columns) | set(eval_df_indep.columns)
     
-    # Use union of available configurations
-    all_configs = set(metric_groups_cotrain.keys()) | set(metric_groups_indep.keys())
+    # Group columns by (method, steps, suffix)
+    metric_groups = {}
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+        cols = discover_metric_columns(eval_df_cotrain, metric_type)
+        cols.extend(discover_metric_columns(eval_df_indep, metric_type))
+        cols = list(set(cols))  # Remove duplicates
+        
+        for col in cols:
+            parsed = parse_metric_column(col)
+            if parsed is None:
+                continue
+            
+            key = (parsed['method'], parsed['steps'], parsed['suffix'])
+            if key not in metric_groups:
+                metric_groups[key] = {}
+            metric_groups[key][metric_type] = col
     
-    if not all_configs:
+    if not metric_groups:
         print("--> Warning: No metric columns found. Skipping comparison plots.")
         return
     
-    print(f"    Found {len(all_configs)} sampler configurations to compare")
+    print(f"    Found {len(metric_groups)} sampler configuration(s) to compare:")
+    for (method, steps, suffix) in sorted(metric_groups.keys()):
+        label = format_config_label(method, steps, suffix)
+        available = list(metric_groups[(method, steps, suffix)].keys())
+        print(f"      - {label}: {available}")
     
+    # Generate plots
     plot_idx = 1
+    ylabel_map = {
+        'fid': 'FID',
+        'kid': 'KID', 
+        'sw2': 'SW2 (log scale)',
+        'lsi_gap': 'LSI Gap (lower=better)',
+    }
     
-    for (method, steps, suffix) in sorted(all_configs):
+    for (method, steps, suffix) in sorted(metric_groups.keys()):
+        group = metric_groups[(method, steps, suffix)]
         config_label = format_config_label(method, steps, suffix)
-        config_tag = f"{method}_{steps}{suffix}"
-        
-        # Get available metrics for this config (from either df)
-        metrics_cotrain = metric_groups_cotrain.get((method, steps, suffix), {})
-        metrics_indep = metric_groups_indep.get((method, steps, suffix), {})
-        all_metrics = set(metrics_cotrain.keys()) | set(metrics_indep.keys())
+        config_tag = f"{method}_{steps}{suffix}".replace('.', '_')  # Safe filename
         
         for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
-            if metric_type not in all_metrics:
+            if metric_type not in group:
                 continue
             
-            metric_col = metrics_cotrain.get(metric_type) or metrics_indep.get(metric_type)
+            metric_col = group[metric_type]
             use_log = (metric_type == 'sw2')
-            
-            ylabel_map = {
-                'fid': 'FID',
-                'kid': 'KID', 
-                'sw2': 'SW2 (log scale)',
-                'lsi_gap': 'LSI Gap (lower=better)',
-            }
-            
-            save_path = os.path.join(plots_dir, f"{plot_idx:02d}_comparison_{metric_type}_{config_tag}.png")
+            ylabel = ylabel_map[metric_type]
             title = f"Co-trained vs Independent: {metric_type.upper()} ({config_label})"
+            save_path = os.path.join(plots_dir, f"{plot_idx:02d}_comparison_{metric_type}_{config_tag}.png")
             
-            plot_comparison_metric(
-                eval_df_cotrain, eval_df_indep,
-                metric_col, ylabel_map[metric_type], title, save_path, use_log
-            )
+            plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log)
             plot_idx += 1
     
     print(f"--> Comparison visualization suite complete ({plot_idx - 1} plots generated)!")
@@ -3215,38 +3234,6 @@ def train_vae_cotrained_cond(cfg):
 # ---------------------------------------------------------------------------
 
 
-
-def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_dir):
-    """
-    Generate all comparison plots (4-way: cotrain vs indep, LSI vs Tweedie)
-    for all relevant sampling modes.
-    """
-    plots_dir = os.path.join(results_dir, "comparison_plots")
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    print("\n--> Generating comparison visualization suite...")
-    
-    # Define all metrics to plot
-    metrics = [
-        # (metric_col, ylabel, title_suffix, use_log)
-        ("fid_rk4_10", "FID", "FID (RK4 10 Steps)", False),
-        ("fid_heun_20", "FID", "FID (Heun 20 Steps)", False),
-        ("kid_rk4_10", "KID", "KID (RK4 10 Steps)", False),
-        ("kid_heun_20", "KID", "KID (Heun 20 Steps)", False),
-        ("sw2_rk4_10", "SW2 (log scale)", "SW2 (RK4 10 Steps)", True),
-        ("sw2_heun_20", "SW2 (log scale)", "SW2 (Heun 20 Steps)", True),
-        ("lsi_gap_rk4_10", "LSI Gap (lower=better)", "LSI Gap Metric (RK4 10 Steps)", False),
-        ("lsi_gap_heun_20", "LSI Gap (lower=better)", "LSI Gap Metric (Heun 20 Steps)", False),
-    ]
-    
-    for i, (metric_col, ylabel, title_suffix, use_log) in enumerate(metrics, 1):
-        save_path = os.path.join(plots_dir, f"{i:02d}_comparison_{metric_col}.png")
-        title = f"Co-trained vs Independent: {title_suffix}"
-        plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log)
-    
-    print(f"--> Comparison visualization suite complete ({len(metrics)} plots generated)!")
-
-
 def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
     """
     Run both co-trained and independent training experiments,
@@ -3352,8 +3339,6 @@ def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
     }
 
 # --- END NEW FUNCTIONS ---
-
-# --- START REPLACEMENT main() ---
 def main():
     """
     Main function that runs co-trained vs independent comparison experiment.
@@ -3390,6 +3375,8 @@ def main():
         "t_min": 2e-5,
         "t_max": 2.0,
         "num_train_timesteps": 1000,
+
+        # --- Not use ----
         "noise_schedule": "cosine",
         "beta_start": 1e-4,
         "beta_end": 2e-2,
