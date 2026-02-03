@@ -1788,7 +1788,7 @@ def evaluate_current_state(
             output_dict["kid_vae_recon"] = r["kid"]
             output_dict["sw2_vae_recon"] = r["w2"]
             output_dict["div_vae_recon"] = r["div"]
-        eelif "rk4" in config.lower():
+        elif "rk4" in config.lower():
             # Extract everything after @ (e.g., "20_randtok_cfg1.5")
             after_at = config.split("@")[1] if "@" in config else "10"
             col_suffix = after_at.replace(".", "_")  # dots to underscores for column names
