@@ -1624,14 +1624,11 @@ def evaluate_current_state(
     ]
     if unet is not None:
         configs.extend([
-            {"method": "heun_ode", "steps": 20, "desc": "Baseline (Heun)", "use_rand_token": False},
-            {"method": "rk4_ode",  "steps": 10, "desc": "Smoothness (RK4)", "use_rand_token": False},
-            {"method": "ddim", "steps": 50, "desc": "DDIM 50 (eta=0)", "use_rand_token": False},
-            # Conditional-sampling probe that preserves unconditional FID statistics:
-            # draw a *non-null* class token uniformly at random (fixed bank for comparability).
-            {"method": "heun_ode",  "steps": 20, "desc": "RandToken (Heun)", "use_rand_token": True},
-            {"method": "rk4_ode",  "steps": 10, "desc": "RandToken (RK4)", "use_rand_token": True},
-            {"method": "ddim", "steps": 50, "desc": "RandToken (DDIM)", "use_rand_token": True},
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
+            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
+            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
+            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0}, 
+            #{"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0}, 
         ])
 
     results = []
@@ -2056,26 +2053,332 @@ def setup_run_results_dir(base_dir="run_results", wipe=True, preserve_checkpoint
 
 
 
-def plot_vae_recon_loss(loss_df, save_path):
+# ===========================================================================
+# REFACTORED PLOTTING FUNCTIONS
+# ===========================================================================
+# These functions dynamically discover available metrics from the DataFrame
+# instead of hardcoding column names like "fid_rk4_10" or "fid_heun_20".
+#
+# Replace your existing plotting functions with these.
+# ===========================================================================
+
+import os
+import re
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def discover_metric_columns(eval_df, metric_prefix):
     """
-    Plot I: Epoch vs VAE reconstruction loss (cotrain epochs only, not refinement)
+    Discover all columns matching a metric prefix pattern.
+    
+    Args:
+        eval_df: DataFrame with evaluation metrics
+        metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap'
+    
+    Returns:
+        List of column names matching the pattern, e.g., 
+        ['fid_rk4_20_randtok', 'fid_heun_20', 'fid_ddim_50_randtok_cfg2.0']
+    """
+    pattern = re.compile(rf'^{metric_prefix}_(?!vae_recon)')  # exclude vae_recon variants
+    return [col for col in eval_df.columns if pattern.match(col)]
+
+
+def parse_metric_column(col_name):
+    """
+    Parse a metric column name into its components.
+    
+    Examples:
+        'fid_rk4_10' -> {'metric': 'fid', 'method': 'rk4', 'steps': '10', 'suffix': ''}
+        'fid_rk4_20_randtok' -> {'metric': 'fid', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
+        'kid_heun_20_randtok_cfg2.0' -> {'metric': 'kid', 'method': 'heun', 'steps': '20', 'suffix': '_randtok_cfg2.0'}
+    """
+    parts = col_name.split('_')
+    metric = parts[0]  # fid, kid, sw2, div, lsi (note: lsi_gap has underscore)
+    
+    # Handle lsi_gap specially
+    if metric == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
+        metric = 'lsi_gap'
+        parts = [metric] + parts[2:]  # Rejoin and skip 'gap'
+    
+    if len(parts) < 3:
+        return None  # Not a valid metric column
+    
+    method = parts[1]  # rk4, heun, ddim, euler, etc.
+    steps = parts[2]   # 10, 20, 50, etc.
+    
+    # Everything after method_steps is the suffix
+    suffix = '_'.join(parts[3:]) if len(parts) > 3 else ''
+    if suffix:
+        suffix = '_' + suffix
+    
+    return {
+        'metric': metric,
+        'method': method,
+        'steps': steps,
+        'suffix': suffix,
+        'full_name': col_name,
+    }
+
+
+def get_metric_groups(eval_df):
+    """
+    Group all metric columns by (method, steps, suffix) for systematic plotting.
+    
+    Returns:
+        Dict mapping (method, steps, suffix) -> dict of metric columns
+        e.g., {('rk4', '20', '_randtok'): {'fid': 'fid_rk4_20_randtok', 'kid': 'kid_rk4_20_randtok', ...}}
+    """
+    groups = {}
+    
+    for metric_type in ['fid', 'kid', 'sw2', 'div', 'lsi_gap']:
+        cols = discover_metric_columns(eval_df, metric_type)
+        for col in cols:
+            parsed = parse_metric_column(col)
+            if parsed is None:
+                continue
+            
+            key = (parsed['method'], parsed['steps'], parsed['suffix'])
+            if key not in groups:
+                groups[key] = {}
+            groups[key][metric_type] = col
+    
+    return groups
+
+
+def plot_generic_metric(eval_df, metric_col, metric_name, ylabel, title, save_path, 
+                        use_log=False, include_vae_recon=True):
+    """
+    Generic plotting function for any metric column.
+    Plots LSI vs Tweedie (blue vs red) with optional VAE recon baseline.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
+    
+    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
+    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
+    
+    # VAE recon baseline (if available and requested)
+    vae_recon_col = f"{metric_name}_vae_recon"
+    if include_vae_recon and vae_recon_col in lsi_df.columns and not lsi_df[vae_recon_col].isna().all():
+        ax.plot(lsi_df["epoch"], lsi_df[vae_recon_col],
+                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
+                label=f"VAE Recon {metric_name.upper()}")
+    
+    # LSI metric
+    if metric_col in lsi_df.columns and not lsi_df[metric_col].isna().all():
+        ax.plot(lsi_df["epoch"], lsi_df[metric_col],
+                color="blue", linewidth=2, marker='o', markersize=4,
+                label=f"LSI {metric_name.upper()}")
+    
+    # Tweedie metric
+    if metric_col in ctrl_df.columns and not ctrl_df[metric_col].isna().all():
+        ax.plot(ctrl_df["epoch"], ctrl_df[metric_col],
+                color="red", linewidth=2, marker='s', markersize=4,
+                label=f"Tweedie {metric_name.upper()}")
+    
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+    if use_log:
+        ax.set_yscale("log")
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
+    ax.set_xlim(left=0)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
 
-    # Filter to cotrain stage only (VAE is frozen during refinement)
+
+def plot_gap_metric(eval_df, metric_col, metric_name, title, save_path):
+    """
+    Plot the gap between Tweedie and LSI for a given metric.
+    Positive gap = LSI is better.
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)].copy()
+    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)].copy()
+    
+    if len(lsi_df) > 0 and len(ctrl_df) > 0 and metric_col in lsi_df.columns and metric_col in ctrl_df.columns:
+        # Merge on epoch
+        merged = pd.merge(
+            lsi_df[["epoch", metric_col]],
+            ctrl_df[["epoch", metric_col]],
+            on="epoch",
+            suffixes=("_lsi", "_ctrl")
+        )
+        
+        lsi_col = f"{metric_col}_lsi"
+        ctrl_col = f"{metric_col}_ctrl"
+        
+        if lsi_col in merged.columns and ctrl_col in merged.columns:
+            merged["gap"] = merged[ctrl_col] - merged[lsi_col]
+            ax.plot(merged["epoch"], merged["gap"],
+                    color="purple", linewidth=2, marker='o', markersize=4,
+                    label=f"{metric_name.upper()} Gap (Tweedie - LSI)")
+            
+            ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.7)
+            ax.fill_between(merged["epoch"], 0, merged["gap"],
+                            where=merged["gap"] > 0, alpha=0.3, color="green",
+                            label="LSI Better")
+            ax.fill_between(merged["epoch"], 0, merged["gap"],
+                            where=merged["gap"] < 0, alpha=0.3, color="red",
+                            label="Tweedie Better")
+    
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(f"{metric_name.upper()} Gap (Tweedie - LSI)", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
+
+
+def format_config_label(method, steps, suffix):
+    """Create a human-readable label for a sampler configuration."""
+    method_names = {
+        'rk4': 'RK4 ODE',
+        'heun': 'Heun ODE', 
+        'euler': 'Euler ODE',
+        'ddim': 'DDIM',
+    }
+    base = f"{method_names.get(method, method.upper())} {steps} steps"
+    
+    if suffix:
+        # Parse suffix for human readability
+        if '_randtok' in suffix:
+            base += " (RandTok"
+            if '_cfg' in suffix:
+                cfg_match = re.search(r'_cfg([\d.]+)', suffix)
+                if cfg_match:
+                    base += f", CFG={cfg_match.group(1)}"
+            base += ")"
+        elif '_cfg' in suffix:
+            cfg_match = re.search(r'_cfg([\d.]+)', suffix)
+            if cfg_match:
+                base += f" (CFG={cfg_match.group(1)})"
+    
+    return base
+
+
+def generate_all_visualizations(loss_df, eval_df, results_dir):
+    """
+    Generate visualization plots dynamically based on available metrics.
+    
+    This replaces the hardcoded version that expected specific column names.
+    """
+    plots_dir = os.path.join(results_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Discover all metric groups
+    metric_groups = get_metric_groups(eval_df)
+    
+    if not metric_groups:
+        print("--> Warning: No metric columns found in eval_df. Skipping metric plots.")
+        # Still generate loss plots
+        plot_idx = 1
+        plot_vae_recon_loss(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_vae_recon_loss.png"))
+        plot_idx += 1
+        plot_score_losses(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_score_losses.png"))
+        print(f"--> Visualization suite complete ({plot_idx} plots generated)!")
+        return
+    
+    print(f"\n--> Generating visualization suite...")
+    print(f"    Found {len(metric_groups)} sampler configurations:")
+    for (method, steps, suffix) in sorted(metric_groups.keys()):
+        label = format_config_label(method, steps, suffix)
+        metrics_available = list(metric_groups[(method, steps, suffix)].keys())
+        print(f"      - {label}: {metrics_available}")
+    
+    plot_idx = 1
+    
+    # --- Loss plots (always generate these) ---
+    plot_vae_recon_loss(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_vae_recon_loss.png"))
+    plot_idx += 1
+    plot_score_losses(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_score_losses.png"))
+    plot_idx += 1
+    
+    # --- Metric plots for each sampler configuration ---
+    for (method, steps, suffix) in sorted(metric_groups.keys()):
+        group = metric_groups[(method, steps, suffix)]
+        config_label = format_config_label(method, steps, suffix)
+        config_tag = f"{method}_{steps}{suffix}"  # For filenames
+        
+        # FID plot
+        if 'fid' in group:
+            plot_generic_metric(
+                eval_df, group['fid'], 'fid', 'FID',
+                f"FID Comparison ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_fid_{config_tag}.png"),
+                use_log=False, include_vae_recon=True
+            )
+            plot_idx += 1
+        
+        # KID plot
+        if 'kid' in group:
+            plot_generic_metric(
+                eval_df, group['kid'], 'kid', 'KID',
+                f"KID Comparison ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_kid_{config_tag}.png"),
+                use_log=False, include_vae_recon=True
+            )
+            plot_idx += 1
+        
+        # SW2 plot (log scale)
+        if 'sw2' in group:
+            plot_generic_metric(
+                eval_df, group['sw2'], 'sw2', 'SW2 (log scale)',
+                f"Sliced-Wasserstein-2 Comparison ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_sw2_{config_tag}.png"),
+                use_log=True, include_vae_recon=True
+            )
+            plot_idx += 1
+        
+        # FID Gap plot
+        if 'fid' in group:
+            plot_gap_metric(
+                eval_df, group['fid'], 'fid',
+                f"LSI Advantage: FID Gap ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_fid_gap_{config_tag}.png")
+            )
+            plot_idx += 1
+        
+        # LSI Gap Metric plot
+        if 'lsi_gap' in group:
+            plot_generic_metric(
+                eval_df, group['lsi_gap'], 'lsi_gap', 'LSI Gap Metric (lower = better)',
+                f"LSI Gap Metric: Score Alignment ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_lsi_gap_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+    
+    print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
+
+
+def plot_vae_recon_loss(loss_df, save_path):
+    """Plot VAE reconstruction loss (cotrain epochs only)."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
     cotrain_df = loss_df[loss_df["stage"] == "cotrain"]
-
+    
     if len(cotrain_df) > 0:
         ax.plot(cotrain_df["epoch"], cotrain_df["recon"],
                 color="black", linewidth=2, marker='o', markersize=4)
-
+    
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel("Reconstruction Loss (MSE)", fontsize=12)
     ax.set_title("VAE Reconstruction Loss (Co-training Phase)", fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
-
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -2083,17 +2386,14 @@ def plot_vae_recon_loss(loss_df, save_path):
 
 
 def plot_score_losses(loss_df, save_path):
-    """
-    Plot II: Epoch vs LSI loss & Tweedie loss (two curves, LSI blue, Tweedie red)
-    Uses log scale for y-axis.
-    """
+    """Plot LSI vs Tweedie score losses (log scale)."""
     fig, ax = plt.subplots(figsize=(10, 6))
-
+    
     ax.plot(loss_df["epoch"], loss_df["score_lsi"],
             color="blue", linewidth=2, marker='o', markersize=4, label="LSI Score Loss")
     ax.plot(loss_df["epoch"], loss_df["score_control"],
             color="red", linewidth=2, marker='s', markersize=4, label="Tweedie Score Loss")
-
+    
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel("Score Loss (MSE, log scale)", fontsize=12)
     ax.set_title("Score Network Losses: LSI vs Tweedie", fontsize=14)
@@ -2101,462 +2401,134 @@ def plot_score_losses(loss_df, save_path):
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which='both')
     ax.set_xlim(left=0)
-
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"    Saved: {save_path}")
 
 
-def plot_fid_rk4(eval_df, save_path):
+# ===========================================================================
+# COMPARISON PLOTTING (for cotrain vs indep experiments)
+# ===========================================================================
+
+def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_dir):
     """
-    Plot I (eval): Epoch vs FID (RK4 10 steps)
-    - VAE recon FID: dashed black
-    - LSI net FID: blue
-    - Tweedie net FID: red
+    Generate 4-way comparison plots dynamically based on available metrics.
+    
+    This replaces the hardcoded version that expected specific column names.
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    plots_dir = os.path.join(results_dir, "comparison_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    print("\n--> Generating comparison visualization suite...")
+    
+    # Discover metrics from both dataframes (they should have the same columns)
+    metric_groups_cotrain = get_metric_groups(eval_df_cotrain)
+    metric_groups_indep = get_metric_groups(eval_df_indep)
+    
+    # Use union of available configurations
+    all_configs = set(metric_groups_cotrain.keys()) | set(metric_groups_indep.keys())
+    
+    if not all_configs:
+        print("--> Warning: No metric columns found. Skipping comparison plots.")
+        return
+    
+    print(f"    Found {len(all_configs)} sampler configurations to compare")
+    
+    plot_idx = 1
+    
+    for (method, steps, suffix) in sorted(all_configs):
+        config_label = format_config_label(method, steps, suffix)
+        config_tag = f"{method}_{steps}{suffix}"
+        
+        # Get available metrics for this config (from either df)
+        metrics_cotrain = metric_groups_cotrain.get((method, steps, suffix), {})
+        metrics_indep = metric_groups_indep.get((method, steps, suffix), {})
+        all_metrics = set(metrics_cotrain.keys()) | set(metrics_indep.keys())
+        
+        for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+            if metric_type not in all_metrics:
+                continue
+            
+            metric_col = metrics_cotrain.get(metric_type) or metrics_indep.get(metric_type)
+            use_log = (metric_type == 'sw2')
+            
+            ylabel_map = {
+                'fid': 'FID',
+                'kid': 'KID', 
+                'sw2': 'SW2 (log scale)',
+                'lsi_gap': 'LSI Gap (lower=better)',
+            }
+            
+            save_path = os.path.join(plots_dir, f"{plot_idx:02d}_comparison_{metric_type}_{config_tag}.png")
+            title = f"Co-trained vs Independent: {metric_type.upper()} ({config_label})"
+            
+            plot_comparison_metric(
+                eval_df_cotrain, eval_df_indep,
+                metric_col, ylabel_map[metric_type], title, save_path, use_log
+            )
+            plot_idx += 1
+    
+    print(f"--> Comparison visualization suite complete ({plot_idx - 1} plots generated)!")
 
-    # Filter for LSI and Control runs
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
 
-    # VAE recon FID (take from LSI runs, they share the same VAE)
-    if "fid_vae_recon" in lsi_df.columns and not lsi_df["fid_vae_recon"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["fid_vae_recon"],
-                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
-                label="VAE Recon FID")
+import matplotlib.pyplot as plt
+import numpy as np
 
-    # LSI FID (RK4 10 steps)
-    if "fid_rk4_10" in lsi_df.columns and not lsi_df["fid_rk4_10"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["fid_rk4_10"],
+def plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log=False):
+    """
+    4-way comparison plot for any metric.
+    - Solid blue: Co-trained LSI
+    - Solid red: Co-trained Tweedie  
+    - Dashed blue: Independent LSI
+    - Dashed red: Independent Tweedie
+    """
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Co-trained data
+    lsi_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("LSI", case=False)]
+    ctrl_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("Ctrl", case=False)]
+    
+    # Independent data
+    lsi_indep = eval_df_indep[eval_df_indep["tag"].str.contains("LSI", case=False)]
+    ctrl_indep = eval_df_indep[eval_df_indep["tag"].str.contains("Ctrl", case=False)]
+    
+    # Plot Co-trained (solid lines)
+    if metric_col in lsi_cotrain.columns and not lsi_cotrain[metric_col].isna().all():
+        ax.plot(lsi_cotrain["epoch"], lsi_cotrain[metric_col],
                 color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI FID (RK4 10)")
-
-    # Tweedie FID (RK4 10 steps)
-    if "fid_rk4_10" in ctrl_df.columns and not ctrl_df["fid_rk4_10"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["fid_rk4_10"],
+                linestyle="-", label="Co-trained LSI")
+    
+    if metric_col in ctrl_cotrain.columns and not ctrl_cotrain[metric_col].isna().all():
+        ax.plot(ctrl_cotrain["epoch"], ctrl_cotrain[metric_col],
                 color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie FID (RK4 10)")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("FID", fontsize=12)
-    ax.set_title("FID Comparison (RK4 10 Steps)", fontsize=14)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_fid_heun(eval_df, save_path):
-    """
-    Plot II (eval): Epoch vs FID (Heun PC 20 steps)
-    - VAE recon FID: dashed black
-    - LSI net FID: blue
-    - Tweedie net FID: red
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
-
-    if "fid_vae_recon" in lsi_df.columns and not lsi_df["fid_vae_recon"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["fid_vae_recon"],
-                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
-                label="VAE Recon FID")
-
-    if "fid_heun_20" in lsi_df.columns and not lsi_df["fid_heun_20"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["fid_heun_20"],
+                linestyle="-", label="Co-trained Tweedie")
+    
+    # Plot Independent (dashed lines)
+    if metric_col in lsi_indep.columns and not lsi_indep[metric_col].isna().all():
+        ax.plot(lsi_indep["epoch"], lsi_indep[metric_col],
                 color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI FID (Heun 20)")
-
-    if "fid_heun_20" in ctrl_df.columns and not ctrl_df["fid_heun_20"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["fid_heun_20"],
+                linestyle="--", label="Independent LSI")
+    
+    if metric_col in ctrl_indep.columns and not ctrl_indep[metric_col].isna().all():
+        ax.plot(ctrl_indep["epoch"], ctrl_indep[metric_col],
                 color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie FID (Heun 20)")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("FID", fontsize=12)
-    ax.set_title("FID Comparison (Heun PC 20 Steps)", fontsize=14)
+                linestyle="--", label="Independent Tweedie")
+    
+    ax.set_xlabel("LDM Training Epoch", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+    if use_log:
+        ax.set_yscale("log")
     ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
     ax.set_xlim(left=0)
-
+    
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"    Saved: {save_path}")
-
-
-def plot_kid_rk4(eval_df, save_path):
-    """
-    Plot III: Same as FID RK4 but for KID
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
-
-    if "kid_vae_recon" in lsi_df.columns and not lsi_df["kid_vae_recon"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["kid_vae_recon"],
-                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
-                label="VAE Recon KID")
-
-    if "kid_rk4_10" in lsi_df.columns and not lsi_df["kid_rk4_10"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["kid_rk4_10"],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI KID (RK4 10)")
-
-    if "kid_rk4_10" in ctrl_df.columns and not ctrl_df["kid_rk4_10"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["kid_rk4_10"],
-                color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie KID (RK4 10)")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("KID", fontsize=12)
-    ax.set_title("KID Comparison (RK4 10 Steps)", fontsize=14)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_kid_heun(eval_df, save_path):
-    """
-    Plot IV: Same as FID Heun but for KID
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
-
-    if "kid_vae_recon" in lsi_df.columns and not lsi_df["kid_vae_recon"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["kid_vae_recon"],
-                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
-                label="VAE Recon KID")
-
-    if "kid_heun_20" in lsi_df.columns and not lsi_df["kid_heun_20"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["kid_heun_20"],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI KID (Heun 20)")
-
-    if "kid_heun_20" in ctrl_df.columns and not ctrl_df["kid_heun_20"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["kid_heun_20"],
-                color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie KID (Heun 20)")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("KID", fontsize=12)
-    ax.set_title("KID Comparison (Heun PC 20 Steps)", fontsize=14)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_sw2_rk4(eval_df, save_path):
-    """
-    Plot V: Same as FID RK4 but for SW2 (log scale)
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
-
-    if "sw2_vae_recon" in lsi_df.columns and not lsi_df["sw2_vae_recon"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["sw2_vae_recon"],
-                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
-                label="VAE Recon SW2")
-
-    if "sw2_rk4_10" in lsi_df.columns and not lsi_df["sw2_rk4_10"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["sw2_rk4_10"],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI SW2 (RK4 10)")
-
-    if "sw2_rk4_10" in ctrl_df.columns and not ctrl_df["sw2_rk4_10"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["sw2_rk4_10"],
-                color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie SW2 (RK4 10)")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("SW2 (log scale)", fontsize=12)
-    ax.set_title("Sliced-Wasserstein-2 Comparison (RK4 10 Steps)", fontsize=14)
-    ax.set_yscale("log")
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3, which='both')
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_sw2_heun(eval_df, save_path):
-    """
-    Plot VI: Same as FID Heun but for SW2 (log scale)
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
-
-    if "sw2_vae_recon" in lsi_df.columns and not lsi_df["sw2_vae_recon"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["sw2_vae_recon"],
-                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
-                label="VAE Recon SW2")
-
-    if "sw2_heun_20" in lsi_df.columns and not lsi_df["sw2_heun_20"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["sw2_heun_20"],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI SW2 (Heun 20)")
-
-    if "sw2_heun_20" in ctrl_df.columns and not ctrl_df["sw2_heun_20"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["sw2_heun_20"],
-                color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie SW2 (Heun 20)")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("SW2 (log scale)", fontsize=12)
-    ax.set_title("Sliced-Wasserstein-2 Comparison (Heun PC 20 Steps)", fontsize=14)
-    ax.set_yscale("log")
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3, which='both')
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_fid_gap_rk4(eval_df, save_path):
-    """
-    Plot IX: FID Gap (RK4 10 steps) - Score nets only, no VAE
-    FID Gap = Tweedie FID - LSI FID (positive = LSI is better)
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)].copy()
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)].copy()
-
-    # Merge on epoch to compute gap
-    if len(lsi_df) > 0 and len(ctrl_df) > 0:
-        merged = pd.merge(
-            lsi_df[["epoch", "fid_rk4_10", "kid_rk4_10", "sw2_rk4_10"]],
-            ctrl_df[["epoch", "fid_rk4_10", "kid_rk4_10", "sw2_rk4_10"]],
-            on="epoch",
-            suffixes=("_lsi", "_ctrl")
-        )
-
-        # Gap = Tweedie - LSI (positive means LSI is better)
-        if "fid_rk4_10_lsi" in merged.columns and "fid_rk4_10_ctrl" in merged.columns:
-            merged["fid_gap"] = merged["fid_rk4_10_ctrl"] - merged["fid_rk4_10_lsi"]
-            ax.plot(merged["epoch"], merged["fid_gap"],
-                    color="purple", linewidth=2, marker='o', markersize=4,
-                    label="FID Gap (Tweedie - LSI)")
-
-        ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.7)
-        ax.fill_between(merged["epoch"], 0, merged["fid_gap"],
-                        where=merged["fid_gap"] > 0, alpha=0.3, color="green",
-                        label="LSI Better")
-        ax.fill_between(merged["epoch"], 0, merged["fid_gap"],
-                        where=merged["fid_gap"] < 0, alpha=0.3, color="red",
-                        label="Tweedie Better")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("FID Gap (Tweedie - LSI)", fontsize=12)
-    ax.set_title("LSI Advantage: FID Gap (RK4 10 Steps)", fontsize=14)
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_fid_gap_heun(eval_df, save_path):
-    """
-    Plot X: FID Gap (Heun PC 20 steps) - Score nets only, no VAE
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)].copy()
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)].copy()
-
-    if len(lsi_df) > 0 and len(ctrl_df) > 0:
-        merged = pd.merge(
-            lsi_df[["epoch", "fid_heun_20", "kid_heun_20", "sw2_heun_20"]],
-            ctrl_df[["epoch", "fid_heun_20", "kid_heun_20", "sw2_heun_20"]],
-            on="epoch",
-            suffixes=("_lsi", "_ctrl")
-        )
-
-        if "fid_heun_20_lsi" in merged.columns and "fid_heun_20_ctrl" in merged.columns:
-            merged["fid_gap"] = merged["fid_heun_20_ctrl"] - merged["fid_heun_20_lsi"]
-            ax.plot(merged["epoch"], merged["fid_gap"],
-                    color="purple", linewidth=2, marker='o', markersize=4,
-                    label="FID Gap (Tweedie - LSI)")
-
-        ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.7)
-        ax.fill_between(merged["epoch"], 0, merged["fid_gap"],
-                        where=merged["fid_gap"] > 0, alpha=0.3, color="green",
-                        label="LSI Better")
-        ax.fill_between(merged["epoch"], 0, merged["fid_gap"],
-                        where=merged["fid_gap"] < 0, alpha=0.3, color="red",
-                        label="Tweedie Better")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("FID Gap (Tweedie - LSI)", fontsize=12)
-    ax.set_title("LSI Advantage: FID Gap (Heun PC 20 Steps)", fontsize=14)
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_lsi_gap_metric_rk4(eval_df, save_path):
-    """
-    Plot XI: LSI Gap Metric (RK4 10 steps)
-    This is the actual LSI gap metric from compute_lsi_gap:
-    E_{x, t, z_t|x} || s_theta(z_t, t) - s_LSI(z_t, t; x) ||^2
-    Lower is better (means score network matches LSI target better).
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)].copy()
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)].copy()
-
-    # Plot LSI gap metric for both networks
-    if "lsi_gap_rk4_10" in lsi_df.columns and not lsi_df["lsi_gap_rk4_10"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["lsi_gap_rk4_10"],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI Net - LSI Gap Metric")
-
-    if "lsi_gap_rk4_10" in ctrl_df.columns and not ctrl_df["lsi_gap_rk4_10"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["lsi_gap_rk4_10"],
-                color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie Net - LSI Gap Metric")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("LSI Gap Metric (lower = better)", fontsize=12)
-    ax.set_title("LSI Gap Metric: Score Network Alignment (RK4 10 Steps)", fontsize=14)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def plot_lsi_gap_metric_heun(eval_df, save_path):
-    """
-    Plot XII: LSI Gap Metric (Heun PC 20 steps)
-    This is the actual LSI gap metric from compute_lsi_gap:
-    E_{x, t, z_t|x} || s_theta(z_t, t) - s_LSI(z_t, t; x) ||^2
-    Lower is better (means score network matches LSI target better).
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)].copy()
-    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)].copy()
-
-    # Plot LSI gap metric for both networks
-    if "lsi_gap_heun_20" in lsi_df.columns and not lsi_df["lsi_gap_heun_20"].isna().all():
-        ax.plot(lsi_df["epoch"], lsi_df["lsi_gap_heun_20"],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                label="LSI Net - LSI Gap Metric")
-
-    if "lsi_gap_heun_20" in ctrl_df.columns and not ctrl_df["lsi_gap_heun_20"].isna().all():
-        ax.plot(ctrl_df["epoch"], ctrl_df["lsi_gap_heun_20"],
-                color="red", linewidth=2, marker='s', markersize=4,
-                label="Tweedie Net - LSI Gap Metric")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("LSI Gap Metric (lower = better)", fontsize=12)
-    ax.set_title("LSI Gap Metric: Score Network Alignment (Heun PC 20 Steps)", fontsize=14)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
-
-def generate_all_visualizations(loss_df, eval_df, results_dir):
-    """
-    Generate all 12 visualization plots and save to the plots directory.
-
-    Args:
-        loss_df: DataFrame with per-epoch loss values
-        eval_df: DataFrame with evaluation metrics from evaluate_current_state
-        results_dir: Base directory for saving results
-
-    Plots generated:
-        Loss plots (2):
-            01: VAE reconstruction loss (cotrain only)
-            02: Score losses LSI vs Tweedie (log scale)
-
-        Eval metric plots (10):
-            03: FID comparison (RK4 10 steps)
-            04: FID comparison (Heun PC 20 steps)
-            05: KID comparison (RK4 10 steps)
-            06: KID comparison (Heun PC 20 steps)
-            07: SW2 comparison (RK4 10 steps, log scale)
-            08: SW2 comparison (Heun PC 20 steps, log scale)
-            09: FID Gap (RK4 10 steps) - Tweedie minus LSI
-            10: FID Gap (Heun PC 20 steps) - Tweedie minus LSI
-            11: LSI Gap Metric (RK4 10 steps) - actual score alignment metric
-            12: LSI Gap Metric (Heun PC 20 steps) - actual score alignment metric
-    """
-    plots_dir = os.path.join(results_dir, "plots")
-    print("\n--> Generating visualization suite (12 plots)...")
-
-    # Loss plots (2)
-    plot_vae_recon_loss(loss_df, os.path.join(plots_dir, "01_vae_recon_loss.png"))
-    plot_score_losses(loss_df, os.path.join(plots_dir, "02_score_losses.png"))
-
-    # Evaluation metric plots - FID/KID/SW2 (6)
-    plot_fid_rk4(eval_df, os.path.join(plots_dir, "03_fid_rk4_10.png"))
-    plot_fid_heun(eval_df, os.path.join(plots_dir, "04_fid_heun_20.png"))
-    plot_kid_rk4(eval_df, os.path.join(plots_dir, "05_kid_rk4_10.png"))
-    plot_kid_heun(eval_df, os.path.join(plots_dir, "06_kid_heun_20.png"))
-    plot_sw2_rk4(eval_df, os.path.join(plots_dir, "07_sw2_rk4_10.png"))
-    plot_sw2_heun(eval_df, os.path.join(plots_dir, "08_sw2_heun_20.png"))
-
-    # FID Gap plots (2) - difference in FID between methods
-    plot_fid_gap_rk4(eval_df, os.path.join(plots_dir, "09_fid_gap_rk4_10.png"))
-    plot_fid_gap_heun(eval_df, os.path.join(plots_dir, "10_fid_gap_heun_20.png"))
-
-    # LSI Gap Metric plots (2) - actual score alignment metric from compute_lsi_gap
-    plot_lsi_gap_metric_rk4(eval_df, os.path.join(plots_dir, "11_lsi_gap_metric_rk4_10.png"))
-    plot_lsi_gap_metric_heun(eval_df, os.path.join(plots_dir, "12_lsi_gap_metric_heun_20.png"))
-
-    print("--> Visualization suite complete (12 plots generated)!")
 
 
 def save_dataframes(loss_df, eval_df, results_dir):
@@ -3243,63 +3215,6 @@ def train_vae_cotrained_cond(cfg):
 # ---------------------------------------------------------------------------
 
 
-import matplotlib.pyplot as plt
-import numpy as np
-
-def plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log=False):
-    """
-    Generic 4-way comparison plot for any metric.
-    - Solid blue: Co-trained LSI
-    - Solid red: Co-trained Tweedie  
-    - Dashed blue: Independent LSI
-    - Dashed red: Independent Tweedie
-    """
-    fig, ax = plt.subplots(figsize=(12, 7))
-    
-    # Co-trained data (combine cotrain + refine stages)
-    lsi_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("LSI", case=False)]
-    ctrl_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("Ctrl", case=False)]
-    
-    # Independent data (refine stage only, since cotrain has no LDM)
-    lsi_indep = eval_df_indep[eval_df_indep["tag"].str.contains("LSI", case=False)]
-    ctrl_indep = eval_df_indep[eval_df_indep["tag"].str.contains("Ctrl", case=False)]
-    
-    # Plot Co-trained (solid lines)
-    if metric_col in lsi_cotrain.columns and not lsi_cotrain[metric_col].isna().all():
-        ax.plot(lsi_cotrain["epoch"], lsi_cotrain[metric_col],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                linestyle="-", label="Co-trained LSI")
-    
-    if metric_col in ctrl_cotrain.columns and not ctrl_cotrain[metric_col].isna().all():
-        ax.plot(ctrl_cotrain["epoch"], ctrl_cotrain[metric_col],
-                color="red", linewidth=2, marker='s', markersize=4,
-                linestyle="-", label="Co-trained Tweedie")
-    
-    # Plot Independent (dashed lines)
-    if metric_col in lsi_indep.columns and not lsi_indep[metric_col].isna().all():
-        ax.plot(lsi_indep["epoch"], lsi_indep[metric_col],
-                color="blue", linewidth=2, marker='o', markersize=4,
-                linestyle="--", label="Independent LSI")
-    
-    if metric_col in ctrl_indep.columns and not ctrl_indep[metric_col].isna().all():
-        ax.plot(ctrl_indep["epoch"], ctrl_indep[metric_col],
-                color="red", linewidth=2, marker='s', markersize=4,
-                linestyle="--", label="Independent Tweedie")
-
-    ax.set_xlabel("LDM Training Epoch", fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title, fontsize=14)
-    if use_log:
-        ax.set_yscale("log")
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
-    ax.set_xlim(left=0)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"    Saved: {save_path}")
-
 
 def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_dir):
     """
@@ -3454,18 +3369,17 @@ def main():
     # === SHARED CONFIG (base settings for both experiments) ===
     cfg_shared = {
         # --- Dataset ---
-        "dataset": "FMNIST",
+        "dataset": "GCIFAR",
         "batch_size": 128,
         "num_workers": 2,
         
         # --- Model Architecture ---
-        "latent_channels": 3,
+        "latent_channels": 5,
         "cond_emb_dim": 64,
         
         # --- Learning Rates ---
-        "lr_vae": 1e-3,
-        "lr_ldm": 2e-4,
-        "lr_refine": 2e-4,
+        "lr_vae": 5e-4,
+        "lr_ldm": 1e-4,
         
         # --- KL and perceptual weights ---
         "kl_w": 1e-4,
@@ -3506,8 +3420,9 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 200,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 50,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 400,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
+        "lr_refine": 2e-5,
         
         # Co-training specific settings
         "freeze_score_in_cotrain": False,  # Normal co-training
@@ -3530,7 +3445,8 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 50,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 250,       # LDM training on frozen VAE
+        "epochs_refine": 500,       # LDM training on frozen VAE
+        "lr_refine": 1e-4,
         
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
@@ -3577,5 +3493,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
