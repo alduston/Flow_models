@@ -2637,6 +2637,8 @@ def train_vae_cotrained_cond(cfg):
     # Update checkpoint directory to be within results
     cfg["ckpt_dir"] = os.path.join(results_dir, "checkpoints")
     eval_freq = cfg.get("eval_freq", 10)
+    eval_freq_cotrain = cfg.get("eval_freq_cotrain", eval_freq)  # ADD THIS
+    eval_freq_refine = cfg.get("eval_freq_refine", eval_freq)    # ADD THIS
 
     device = default_device()
     # --- Discrete diffusion schedule (train + sampling) ---
