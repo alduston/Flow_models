@@ -1655,14 +1655,25 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Unconditional evaluation sweep
     # -----------------------------------------------------------------------
+   
     cfg_eval_scale = float(cfg.get("cfg_eval_scale", 2.0))
     for scfg in configs:
         method = scfg["method"]
         steps = int(scfg.get("steps", 0))
         desc = scfg.get("desc", "")
         use_rand_token = bool(scfg.get("use_rand_token", False))
-        config_suffix = "_randtok" if use_rand_token else ""
+        cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
+        
+        # Build suffix for naming - include cfg_level if present
+        if use_rand_token:
+            if cfg_level is not None:
+                config_suffix = f"_randtok_cfg{cfg_level}"
+            else:
+                config_suffix = "_randtok"
+        else:
+            config_suffix = ""
         config_name = f"{method}@{steps}{config_suffix}"
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1705,7 +1716,7 @@ def evaluate_current_state(
                     if use_rand_token and rand_token_bank_all is not None:
                         y_batch = rand_token_bank_all[i:i + batch_sz].to(device)
 
-                    g_scale = cfg_eval_scale if use_rand_token else None
+                    g_scale = cfg_level if use_rand_token and cfg_level is not None else None
                     if noise_bank_all is not None:
                         xT = noise_bank_all[i:i + batch_sz].to(device)
                         #z_gen = sampler.sample(unet, x_init=xT, y=y_batch, cfg_scale=None)
@@ -1777,11 +1788,10 @@ def evaluate_current_state(
             output_dict["kid_vae_recon"] = r["kid"]
             output_dict["sw2_vae_recon"] = r["w2"]
             output_dict["div_vae_recon"] = r["div"]
-        elif "rk4" in config.lower():
-            # Extract steps and full suffix from config string like "rk4_ode@20_randtok_cfg1.5"
+        eelif "rk4" in config.lower():
+            # Extract everything after @ (e.g., "20_randtok_cfg1.5")
             after_at = config.split("@")[1] if "@" in config else "10"
-            # Sanitize for column names (replace dots with underscores)
-            col_suffix = after_at.replace(".", "_")
+            col_suffix = after_at.replace(".", "_")  # dots to underscores for column names
             output_dict[f"fid_rk4_{col_suffix}"] = r["fid"]
             output_dict[f"kid_rk4_{col_suffix}"] = r["kid"]
             output_dict[f"sw2_rk4_{col_suffix}"] = r["w2"]
