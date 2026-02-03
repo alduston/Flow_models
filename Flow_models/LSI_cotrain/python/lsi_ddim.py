@@ -2715,18 +2715,28 @@ def train_vae_cotrained_cond(cfg):
     # --- Asymmetric LR Settings ---
     score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
     cotrain_head = cfg.get("cotrain_head", "lsi")
-    if cotrain_head == "lsi":
-        opt_joint = optim.AdamW([
-            {'params': vae.parameters(), 'lr': cfg["lr_vae"]},
-            {'params': unet_lsi.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae},
-        ], weight_decay=1e-4)
-        opt_tracking = optim.AdamW(unet_control.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
-    else:  # cotrain_head == "control"
-        opt_joint = optim.AdamW([
-            {'params': vae.parameters(), 'lr': cfg["lr_vae"]},
-            {'params': unet_control.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae},
-        ], weight_decay=1e-4)
-        opt_tracking = optim.AdamW(unet_lsi.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
+    freeze_score_in_cotrain = cfg.get("freeze_score_in_cotrain", False)
+    
+    if freeze_score_in_cotrain:
+        # Independent mode: VAE-only optimizer during cotrain phase
+        # Score networks will only be trained during refine phase
+        opt_joint = optim.AdamW(vae.parameters(), lr=cfg["lr_vae"], weight_decay=1e-4)
+        opt_tracking = None  # No tracking optimizer needed
+        print("--> Independent mode: Score networks FROZEN during cotrain phase")
+    else:
+        # Standard co-training mode
+        if cotrain_head == "lsi":
+            opt_joint = optim.AdamW([
+                {'params': vae.parameters(), 'lr': cfg["lr_vae"]},
+                {'params': unet_lsi.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae if score_w_vae > 0 else 0.0},
+            ], weight_decay=1e-4)
+            opt_tracking = optim.AdamW(unet_control.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
+        else:  # cotrain_head == "control"
+            opt_joint = optim.AdamW([
+                {'params': vae.parameters(), 'lr': cfg["lr_vae"]},
+                {'params': unet_control.parameters(), 'lr': cfg["lr_ldm"]/score_w_vae if score_w_vae > 0 else 0.0},
+            ], weight_decay=1e-4)
+            opt_tracking = optim.AdamW(unet_lsi.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
 
     lpips_fn = lpips.LPIPS(net='vgg').to(device) if LPIPS_AVAILABLE else None
 
@@ -2853,75 +2863,89 @@ def train_vae_cotrained_cond(cfg):
             mu_t = alpha * mu
             var_t = (alpha**2) * var_0 + (sigma**2)
             
-            # --- Compute both score losses ---
+            # --- Compute both score losses (for logging, even if frozen) ---
             eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
-            eps_pred_lsi = unet_lsi(z_t, t, y_in)
             
-            score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-            
-            eps_pred_control = unet_control(z_t, t, y_in)
-            score_loss_control = F.mse_loss(eps_pred_control, noise)
-
+            if freeze_score_in_cotrain:
+                # In independent mode, don't compute score predictions during cotrain
+                # Just log zeros for score losses
+                score_loss_lsi = torch.tensor(0.0, device=device)
+                score_loss_control = torch.tensor(0.0, device=device)
+            else:
+                eps_pred_lsi = unet_lsi(z_t, t, y_in)
+                score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
+                
+                eps_pred_control = unet_control(z_t, t, y_in)
+                score_loss_control = F.mse_loss(eps_pred_control, noise)
 
             # --- Stiffness penalty ---
             stiff_w = cfg.get("stiff_w", 0.0)
-            if stiff_w > 0.0:
+            if stiff_w > 0.0 and not freeze_score_in_cotrain:
                 inv_var_t = 1.0 / (var_t + 1e-8)
                 stiff_pen = inv_var_t.flatten(1).mean(dim=1).mean()
             else:
                 stiff_pen = torch.tensor(0.0, device=device)
 
-            # --- Joint loss (co-train selected head with VAE) ---
-            score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
-            if cotrain_head == "lsi":
-                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen
-            else:  # cotrain_head == "control"
-                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen
+            # --- Joint loss ---
+            if freeze_score_in_cotrain:
+                # Independent mode: VAE-only loss (no score, no stiffness)
+                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl
+            else:
+                # Co-training mode: include score loss
+                score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
+                if cotrain_head == "lsi":
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen
+                else:  # cotrain_head == "control"
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen
 
             opt_joint.zero_grad()
             loss_joint.backward()
-            if cotrain_head == "lsi":
+            if freeze_score_in_cotrain:
+                nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
+            elif cotrain_head == "lsi":
                 nn.utils.clip_grad_norm_(list(vae.parameters()) + list(unet_lsi.parameters()), 1.0)
             else:
                 nn.utils.clip_grad_norm_(list(vae.parameters()) + list(unet_control.parameters()), 1.0)
             opt_joint.step()
 
-            # --- EMA Update (co-trained head) ---
-            with torch.no_grad():
+            # --- EMA Update and Tracking (only if not frozen) ---
+            if not freeze_score_in_cotrain:
+                # --- EMA Update (co-trained head) ---
+                with torch.no_grad():
+                    if cotrain_head == "lsi":
+                        for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    else:
+                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+
+                # --- Tracking head (trains on detached latents) ---
+                z_t_detached = z_t.detach()
                 if cotrain_head == "lsi":
-                    for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    # Control tracks
+                    eps_pred_control_tracking = unet_control(z_t_detached, t, y_in)
+                    tracking_loss = cfg["score_w"] * F.mse_loss(eps_pred_control_tracking, noise)
                 else:
-                    for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    # LSI tracks
+                    eps_pred_lsi_tracking = unet_lsi(z_t_detached, t, y_in)
+                    tracking_loss = cfg["score_w"] * F.mse_loss(eps_pred_lsi_tracking, eps_target_lsi.detach())
 
-            # --- Tracking head (trains on detached latents) ---
-            z_t_detached = z_t.detach()
-            if cotrain_head == "lsi":
-                # Control tracks
-                eps_pred_control_tracking = unet_control(z_t_detached, t, y_in)
-                tracking_loss = cfg["score_w"] * F.mse_loss(eps_pred_control_tracking, noise)
-            else:
-                # LSI tracks
-                eps_pred_lsi_tracking = unet_lsi(z_t_detached, t, y_in)
-                tracking_loss = cfg["score_w"] * F.mse_loss(eps_pred_lsi_tracking, eps_target_lsi.detach())
-
-            opt_tracking.zero_grad()
-            tracking_loss.backward()
-            if cotrain_head == "lsi":
-                nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
-            else:
-                nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
-            opt_tracking.step()
-
-            # --- EMA Update (tracking head) ---
-            with torch.no_grad():
+                opt_tracking.zero_grad()
+                tracking_loss.backward()
                 if cotrain_head == "lsi":
-                    for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
                 else:
-                    for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
+                opt_tracking.step()
+
+                # --- EMA Update (tracking head) ---
+                with torch.no_grad():
+                    if cotrain_head == "lsi":
+                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    else:
+                        for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
             metrics["loss"] += loss_joint.item()
             metrics["recon"] += recon.item()
@@ -2953,10 +2977,16 @@ def train_vae_cotrained_cond(cfg):
         if len(mu_stats) > 0:
             log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
 
-        if (ep + 1) % eval_freq == 0:
+        # --- Evaluation (skip if score frozen - no LDM to evaluate) ---
+        should_eval_cotrain = (not freeze_score_in_cotrain) and ((ep + 1) % eval_freq_cotrain == 0)
+        
+        if should_eval_cotrain:
+            # For cotrain, epoch = LDM training epoch (1-indexed)
+            ldm_epoch = ep + 1
+            
             # Evaluate LSI
             results_lsi = evaluate_current_state(
-                ep + 1,
+                ldm_epoch,
                 "LSI_Diff",
                 vae,
                 unet_lsi_ema,
@@ -2973,16 +3003,14 @@ def train_vae_cotrained_cond(cfg):
                 use_lenet_fid=use_lenet_fid,
             )
             if results_lsi is not None:
-                results_lsi["epoch"] = ep + 1
+                results_lsi["epoch"] = ldm_epoch  # LDM epoch for comparison
                 results_lsi["stage"] = "cotrain"
                 results_lsi["tag"] = "LSI_Diff"
                 eval_records.append(results_lsi)
 
-            # Evaluate Control 
-            results_ctrl = results_lsi
-            '''
+            # Evaluate Control
             results_ctrl = evaluate_current_state(
-                ep + 1,
+                ldm_epoch,
                 "Ctrl_Diff",
                 vae,
                 unet_control_ema,
@@ -2998,9 +3026,8 @@ def train_vae_cotrained_cond(cfg):
                 fid_model=fid_model,
                 use_lenet_fid=use_lenet_fid,
             )
-            '''
             if results_ctrl is not None:
-                results_ctrl["epoch"] = ep + 1
+                results_ctrl["epoch"] = ldm_epoch  # LDM epoch for comparison
                 results_ctrl["stage"] = "cotrain"
                 results_ctrl["tag"] = "Ctrl_Diff"
                 eval_records.append(results_ctrl)
@@ -3117,10 +3144,18 @@ def train_vae_cotrained_cond(cfg):
 
             print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
                   f"Ctrl: {epoch_metrics['score_control']:.4f}")
-
-            if (ep + 1) % eval_freq == 0:
+            
+            if (ep + 1) % eval_freq_refine == 0:
+                # For refine phase:
+                # - Cotrain mode: LDM epoch = epochs_vae + refine_epoch
+                # - Indep mode: LDM epoch = refine_epoch (VAE phase had no LDM training)
+                if freeze_score_in_cotrain:
+                    ldm_epoch = ep + 1  # Indep: refine is the only LDM training
+                else:
+                    ldm_epoch = cfg["epochs_vae"] + ep + 1  # Cotrain: add cotrain epochs
+                
                 results_lsi = evaluate_current_state(
-                        global_epoch,
+                        ldm_epoch,
                         "LSI_Diff_Refine",
                         vae,
                         unet_lsi_ema,
@@ -3137,13 +3172,13 @@ def train_vae_cotrained_cond(cfg):
                         use_lenet_fid=use_lenet_fid,
                 )
                 if results_lsi is not None:
-                    results_lsi["epoch"] = global_epoch
+                    results_lsi["epoch"] = ldm_epoch
                     results_lsi["stage"] = "refine"
                     results_lsi["tag"] = "LSI_Diff_Refine"
                     eval_records.append(results_lsi)
 
                 results_ctrl = evaluate_current_state(
-                        global_epoch,
+                        ldm_epoch,
                         "Ctrl_Diff_Refine",
                         vae,
                         unet_control_ema,
@@ -3160,11 +3195,11 @@ def train_vae_cotrained_cond(cfg):
                         use_lenet_fid=use_lenet_fid,
                 )
                 if results_ctrl is not None:
-                    results_ctrl["epoch"] = global_epoch
+                    results_ctrl["epoch"] = ldm_epoch
                     results_ctrl["stage"] = "refine"
                     results_ctrl["tag"] = "Ctrl_Diff_Refine"
                     eval_records.append(results_ctrl)
-
+                    
     # --- Save Checkpoints ---
     save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
     save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
@@ -3205,60 +3240,337 @@ def train_vae_cotrained_cond(cfg):
 # Evaluation
 # ---------------------------------------------------------------------------
 
+
 import matplotlib.pyplot as plt
 import numpy as np
 
+def plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log=False):
+    """
+    Generic 4-way comparison plot for any metric.
+    - Solid blue: Co-trained LSI
+    - Solid red: Co-trained Tweedie  
+    - Dashed blue: Independent LSI
+    - Dashed red: Independent Tweedie
+    """
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    # Co-trained data (combine cotrain + refine stages)
+    lsi_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("LSI", case=False)]
+    ctrl_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("Ctrl", case=False)]
+    
+    # Independent data (refine stage only, since cotrain has no LDM)
+    lsi_indep = eval_df_indep[eval_df_indep["tag"].str.contains("LSI", case=False)]
+    ctrl_indep = eval_df_indep[eval_df_indep["tag"].str.contains("Ctrl", case=False)]
+    
+    # Plot Co-trained (solid lines)
+    if metric_col in lsi_cotrain.columns and not lsi_cotrain[metric_col].isna().all():
+        ax.plot(lsi_cotrain["epoch"], lsi_cotrain[metric_col],
+                color="blue", linewidth=2, marker='o', markersize=4,
+                linestyle="-", label="Co-trained LSI")
+    
+    if metric_col in ctrl_cotrain.columns and not ctrl_cotrain[metric_col].isna().all():
+        ax.plot(ctrl_cotrain["epoch"], ctrl_cotrain[metric_col],
+                color="red", linewidth=2, marker='s', markersize=4,
+                linestyle="-", label="Co-trained Tweedie")
+    
+    # Plot Independent (dashed lines)
+    if metric_col in lsi_indep.columns and not lsi_indep[metric_col].isna().all():
+        ax.plot(lsi_indep["epoch"], lsi_indep[metric_col],
+                color="blue", linewidth=2, marker='o', markersize=4,
+                linestyle="--", label="Independent LSI")
+    
+    if metric_col in ctrl_indep.columns and not ctrl_indep[metric_col].isna().all():
+        ax.plot(ctrl_indep["epoch"], ctrl_indep[metric_col],
+                color="red", linewidth=2, marker='s', markersize=4,
+                linestyle="--", label="Independent Tweedie")
+
+    ax.set_xlabel("LDM Training Epoch", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+    if use_log:
+        ax.set_yscale("log")
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
+    ax.set_xlim(left=0)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
+
+
+def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_dir):
+    """
+    Generate all comparison plots (4-way: cotrain vs indep, LSI vs Tweedie)
+    for all relevant sampling modes.
+    """
+    plots_dir = os.path.join(results_dir, "comparison_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    print("\n--> Generating comparison visualization suite...")
+    
+    # Define all metrics to plot
+    metrics = [
+        # (metric_col, ylabel, title_suffix, use_log)
+        ("fid_rk4_10", "FID", "FID (RK4 10 Steps)", False),
+        ("fid_heun_20", "FID", "FID (Heun 20 Steps)", False),
+        ("kid_rk4_10", "KID", "KID (RK4 10 Steps)", False),
+        ("kid_heun_20", "KID", "KID (Heun 20 Steps)", False),
+        ("sw2_rk4_10", "SW2 (log scale)", "SW2 (RK4 10 Steps)", True),
+        ("sw2_heun_20", "SW2 (log scale)", "SW2 (Heun 20 Steps)", True),
+        ("lsi_gap_rk4_10", "LSI Gap (lower=better)", "LSI Gap Metric (RK4 10 Steps)", False),
+        ("lsi_gap_heun_20", "LSI Gap (lower=better)", "LSI Gap Metric (Heun 20 Steps)", False),
+    ]
+    
+    for i, (metric_col, ylabel, title_suffix, use_log) in enumerate(metrics, 1):
+        save_path = os.path.join(plots_dir, f"{i:02d}_comparison_{metric_col}.png")
+        title = f"Co-trained vs Independent: {title_suffix}"
+        plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log)
+    
+    print(f"--> Comparison visualization suite complete ({len(metrics)} plots generated)!")
+
+
+def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
+    """
+    Run both co-trained and independent training experiments,
+    then generate comparison plots.
+    
+    Args:
+        cfg_cotrain: Config for co-training experiment
+        cfg_indep: Config for independent experiment
+    
+    Returns:
+        dict containing all results and paths
+    """
+    print("=" * 70)
+    print("RUNNING CO-TRAINED vs INDEPENDENT TRAINING COMPARISON")
+    print("=" * 70)
+    
+    # Create master results directory
+    master_results_dir = cfg_cotrain.get("master_results_dir", "run_results_comparison")
+    if os.path.exists(master_results_dir):
+        shutil.rmtree(master_results_dir)
+    os.makedirs(master_results_dir, exist_ok=True)
+    
+    # Calculate total LDM epochs for each
+    cotrain_ldm_epochs = cfg_cotrain["epochs_vae"] + cfg_cotrain["epochs_refine"]
+    indep_ldm_epochs = cfg_indep["epochs_refine"]  # Only refine has LDM training
+    
+    print(f"\nExperiment setup:")
+    print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cotrain_ldm_epochs} LDM epochs")
+    print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {indep_ldm_epochs} LDM epochs")
+    
+    # --- EXPERIMENT 1: CO-TRAINED ---
+    print("\n" + "=" * 70)
+    print("EXPERIMENT 1: CO-TRAINED (CSEM)")
+    print("=" * 70)
+    
+    cfg_cotrain["results_dir"] = os.path.join(master_results_dir, "run_results_cotrain")
+    
+    seed_everything(cfg_cotrain["seed"])
+    loss_df_cotrain, eval_df_cotrain = train_vae_cotrained_cond(cfg_cotrain)
+    
+    # --- EXPERIMENT 2: INDEPENDENT ---
+    print("\n" + "=" * 70)
+    print("EXPERIMENT 2: INDEPENDENT (Two-Stage)")
+    print("=" * 70)
+    
+    cfg_indep["results_dir"] = os.path.join(master_results_dir, "run_results_indep")
+    
+    seed_everything(cfg_indep["seed"])  # Reset seed for fair comparison
+    loss_df_indep, eval_df_indep = train_vae_cotrained_cond(cfg_indep)
+    
+    # --- GENERATE COMPARISON PLOTS ---
+    print("\n" + "=" * 70)
+    print("GENERATING COMPARISON VISUALIZATIONS")
+    print("=" * 70)
+    
+    generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, master_results_dir)
+    
+    # --- Save Combined DataFrames ---
+    combined_dir = os.path.join(master_results_dir, "combined_dataframes")
+    os.makedirs(combined_dir, exist_ok=True)
+    
+    # Add source column to distinguish
+    eval_df_cotrain_save = eval_df_cotrain.copy()
+    eval_df_cotrain_save["experiment"] = "cotrained"
+    eval_df_indep_save = eval_df_indep.copy()
+    eval_df_indep_save["experiment"] = "independent"
+    
+    combined_eval_df = pd.concat([eval_df_cotrain_save, eval_df_indep_save], ignore_index=True)
+    combined_eval_df.to_csv(os.path.join(combined_dir, "combined_eval_metrics.csv"), index=False)
+    
+    loss_df_cotrain_save = loss_df_cotrain.copy()
+    loss_df_cotrain_save["experiment"] = "cotrained"
+    loss_df_indep_save = loss_df_indep.copy()
+    loss_df_indep_save["experiment"] = "independent"
+    
+    combined_loss_df = pd.concat([loss_df_cotrain_save, loss_df_indep_save], ignore_index=True)
+    combined_loss_df.to_csv(os.path.join(combined_dir, "combined_loss_history.csv"), index=False)
+    
+    print(f"--> Saved combined eval metrics to {combined_dir}/combined_eval_metrics.csv")
+    print(f"--> Saved combined loss history to {combined_dir}/combined_loss_history.csv")
+    
+    # --- ZIP the entire comparison results directory ---
+    zip_path = zip_results_dir(master_results_dir)
+    print(f"--> Zipped all comparison results to: {zip_path}")
+    
+    print(f"\n{'='*70}")
+    print(f"COMPARISON COMPLETE!")
+    print(f"All results saved to: {master_results_dir}")
+    print(f"  - Co-trained results: {master_results_dir}/run_results_cotrain/")
+    print(f"  - Independent results: {master_results_dir}/run_results_indep/")
+    print(f"  - Comparison plots: {master_results_dir}/comparison_plots/")
+    print(f"{'='*70}")
+    
+    return {
+        "loss_df_cotrain": loss_df_cotrain,
+        "eval_df_cotrain": eval_df_cotrain,
+        "loss_df_indep": loss_df_indep,
+        "eval_df_indep": eval_df_indep,
+        "combined_eval_df": combined_eval_df,
+        "combined_loss_df": combined_loss_df,
+        "master_results_dir": master_results_dir,
+        "zip_path": zip_path,
+    }
+
+# --- END NEW FUNCTIONS ---
+
+# --- START REPLACEMENT main() ---
 def main():
-    # User Config
-    cfg = {
+    """
+    Main function that runs co-trained vs independent comparison experiment.
+    
+    Comparison setup:
+    - Co-trained: 200 cotrain epochs + 50 refine epochs = 250 LDM training epochs
+    - Independent: 50 VAE-only epochs + 250 refine epochs = 250 LDM training epochs
+    
+    Both experiments have the same total LDM training epochs for fair comparison.
+    X-axis on plots = "LDM Training Epoch" (1-250 for both)
+    """
+    
+    # === SHARED CONFIG (base settings for both experiments) ===
+    cfg_shared = {
+        # --- Dataset ---
         "dataset": "FMNIST",
         "batch_size": 128,
         "num_workers": 2,
-        "cotrain_head": "lsi",
-        "use_latent_norm": True,
-        "use_ddim_times": True,
-        "kl_reg_type": "norm",
-        "score_w": 1.0,
+        
+        # --- Model Architecture ---
+        "latent_channels": 3,
+        "cond_emb_dim": 64,
+        
+        # --- Learning Rates ---
         "lr_vae": 1e-3,
         "lr_ldm": 2e-4,
-        "lr_refine": 7e-5,
-        "epochs_vae": 200,
-        "epochs_refine": 40,
-        "latent_channels": 3,
+        "lr_refine": 2e-4,
+        
+        # --- KL and perceptual weights ---
         "kl_w": 1e-4,
-        "use_cond_encoder": True,  # if False: encoder ignores labels (exact old behavior)
-        "cond_emb_dim": 64,        # optional: label embedding dim for conditional encoder
-        "stiff_w": 1e-4,
-        "score_w_vae": .4,
         "perc_w": 1.0,
+        
+        # --- Diffusion Settings ---
+        "use_ddim_times": True,
         "t_min": 2e-5,
         "t_max": 2.0,
-        "ckpt_dir": "checkpoints_mnist_comp",
-        "seed": 42,
+        "num_train_timesteps": 1000,
+        "noise_schedule": "cosine",
+        "beta_start": 1e-4,
+        "beta_end": 2e-2,
+        "cosine_s": 0.008,
+        "ddim_eta": 0.0,
+        
+        # --- CFG ---
+        "cfg_label_dropout": 0.25,
+        "cfg_eval_scale": 2.0,
+        "eval_class_labels": [],
+        
+        # --- Evaluation & Logging ---
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
-        "load_from_checkpoint": False,
-        "eval_freq": 10,
         "ema_decay": 0.999,
-        # --- Classifier-Free Guidance (CFG) ---
-        "cfg_label_dropout": 0.25,      # Bernoulli drop prob for class-conditioning during training
-        "cfg_eval_scale": 2.0,         # guidance scale for conditional eval
-        "eval_class_labels": [],      # e.g. evaluate conditional generation for class "2" (set [] to disable)
-        # --- Updates for discrete noise schedule ---
-        "num_train_timesteps": 1000,
-        "noise_schedule": "cosine",     # "cosine" (best default for CIFAR-10), or "linear"
-        "beta_start": 1e-4,             # used only if noise_schedule="linear"
-        "beta_end": 2e-2,               # used only if noise_schedule="linear"
-        "cosine_s": 0.008,              # used only if noise_schedule="cosine"
-        "ddim_eta": 0.0,                # 0.0 = deterministic DDIM (usually best for FID)
+        
+        # --- Misc ---
+        "seed": 42,
+        "load_from_checkpoint": False,
+        "ckpt_dir": "checkpoints",
+        
+        # --- Comparison Output ---
+        "master_results_dir": "run_results_comparison",
     }
+    
+    # === CO-TRAINED CONFIG ===
+    # 200 cotrain epochs (VAE + LDM joint) + 50 refine epochs = 250 LDM epochs total
+    cfg_cotrain = cfg_shared.copy()
+    cfg_cotrain.update({
+        # Training schedule
+        "epochs_vae": 200,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 50,        # Refine phase: LDM-only on frozen VAE
+        
+        # Co-training specific settings
+        "freeze_score_in_cotrain": False,  # Normal co-training
+        "cotrain_head": "lsi",
+        "use_latent_norm": True,
+        "use_cond_encoder": True,
+        "kl_reg_type": "norm",
+        "score_w_vae": 0.4,
+        "stiff_w": 1e-4,
+        "score_w": 1.0,
+        
+        # Eval frequency (eval during both phases)
+        "eval_freq_cotrain": 10,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 10,     # Eval every 10 epochs during refine
+    })
+    
+    # === INDEPENDENT CONFIG ===
+    # 50 VAE-only epochs (no eval) + 250 refine epochs = 250 LDM epochs total
+    cfg_indep = cfg_shared.copy()
+    cfg_indep.update({
+        # Training schedule
+        "epochs_vae": 50,           # VAE-only pretraining (no LDM)
+        "epochs_refine": 250,       # LDM training on frozen VAE
+        
+        # Independent mode settings
+        "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
+        "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
+        "stiff_w": 0.0,                    # No stiffness penalty
+        "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
+        "use_cond_encoder": False,         # No conditional encoder
+        "kl_reg_type": "normal",           # Standard KL to N(0,I)
+        "cotrain_head": "lsi",             # Doesn't matter when frozen
+        "score_w": 1.0,
+        
+        # Eval frequency (no eval during VAE phase, eval during refine)
+        "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
+        "eval_freq_refine": 10,       # Eval every 10 epochs during refine
+    })
 
-    seed_everything(cfg["seed"])
-    ensure_dir(cfg["ckpt_dir"])
-    ensure_dir("samples")
-
-    print("=== Dual Co-Training: LSI vs Control (Tweedie) ===")
-    train_vae_cotrained_cond(cfg)
+    print("=" * 70)
+    print("=== CO-TRAINED vs INDEPENDENT TRAINING COMPARISON ===")
+    print("=" * 70)
+    print("\nExperiment design:")
+    print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cfg_cotrain['epochs_vae'] + cfg_cotrain['epochs_refine']} LDM epochs")
+    print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {cfg_indep['epochs_refine']} LDM epochs")
+    print("\nPlot legend:")
+    print("  - Solid blue: Co-trained LSI")
+    print("  - Solid red: Co-trained Tweedie")
+    print("  - Dashed blue: Independent LSI")
+    print("  - Dashed red: Independent Tweedie")
+    print("=" * 70)
+    
+    results = run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep)
+    
+    print("\n" + "=" * 70)
+    print("FINAL SUMMARY")
+    print("=" * 70)
+    print(f"Results directory: {results['master_results_dir']}")
+    print(f"Zipped results: {results['zip_path']}")
+    print("\nOutput structure:")
+    print(f"  {results['master_results_dir']}/")
+    print(f"  ├── run_results_cotrain/   (co-trained experiment)")
+    print(f"  ├── run_results_indep/     (independent experiment)")
+    print(f"  ├── comparison_plots/      (4-way comparison plots)")
+    print(f"  └── combined_dataframes/   (merged CSV files)")
 
 
 if __name__ == "__main__":
