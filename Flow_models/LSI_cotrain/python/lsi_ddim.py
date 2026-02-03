@@ -1778,19 +1778,23 @@ def evaluate_current_state(
             output_dict["sw2_vae_recon"] = r["w2"]
             output_dict["div_vae_recon"] = r["div"]
         elif "rk4" in config.lower():
-            steps_str = config.split("@")[1] if "@" in config else "10"
-            output_dict[f"fid_rk4_{steps_str}"] = r["fid"]
-            output_dict[f"kid_rk4_{steps_str}"] = r["kid"]
-            output_dict[f"sw2_rk4_{steps_str}"] = r["w2"]
-            output_dict[f"div_rk4_{steps_str}"] = r["div"]
-            output_dict[f"lsi_gap_rk4_{steps_str}"] = r["lsi_gap"]
+            # Extract steps and full suffix from config string like "rk4_ode@20_randtok_cfg1.5"
+            after_at = config.split("@")[1] if "@" in config else "10"
+            # Sanitize for column names (replace dots with underscores)
+            col_suffix = after_at.replace(".", "_")
+            output_dict[f"fid_rk4_{col_suffix}"] = r["fid"]
+            output_dict[f"kid_rk4_{col_suffix}"] = r["kid"]
+            output_dict[f"sw2_rk4_{col_suffix}"] = r["w2"]
+            output_dict[f"div_rk4_{col_suffix}"] = r["div"]
+            output_dict[f"lsi_gap_rk4_{col_suffix}"] = r["lsi_gap"]
         elif "heun" in config.lower():
-            steps_str = config.split("@")[1] if "@" in config else "20"
-            output_dict[f"fid_heun_{steps_str}"] = r["fid"]
-            output_dict[f"kid_heun_{steps_str}"] = r["kid"]
-            output_dict[f"sw2_heun_{steps_str}"] = r["w2"]
-            output_dict[f"div_heun_{steps_str}"] = r["div"]
-            output_dict[f"lsi_gap_heun_{steps_str}"] = r["lsi_gap"]
+            after_at = config.split("@")[1] if "@" in config else "20"
+            col_suffix = after_at.replace(".", "_")
+            output_dict[f"fid_heun_{col_suffix}"] = r["fid"]
+            output_dict[f"kid_heun_{col_suffix}"] = r["kid"]
+            output_dict[f"sw2_heun_{col_suffix}"] = r["w2"]
+            output_dict[f"div_heun_{col_suffix}"] = r["div"]
+            output_dict[f"lsi_gap_heun_{col_suffix}"] = r["lsi_gap"]
 
     # -----------------------------------------------------------------------
     # Optional: class-conditional evaluation + CFG
