@@ -3401,7 +3401,7 @@ def main():
         "t_min": 2e-5,
         "t_max": 2.0,
         "num_train_timesteps": 1000,
-        "train_on_mu': True,
+        "train_on_mu": True,
 
         # --- Not use ----
         "noise_schedule": "cosine",
