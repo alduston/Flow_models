@@ -2865,6 +2865,7 @@ def train_vae_cotrained_cond(cfg):
 
             noise = torch.randn_like(z0)
             z_t = alpha * z0 + sigma * noise
+            z_mu_t =  alpha * mu + sigma * noise
             
             var_0 = torch.exp(logvar)
             mu_t = alpha * mu
@@ -2882,7 +2883,11 @@ def train_vae_cotrained_cond(cfg):
                 eps_pred_lsi = unet_lsi(z_t, t, y_in)
                 score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
                 
-                eps_pred_control = unet_control(z_t, t, y_in)
+                if cfg.get("train_on_mu", False):
+                    eps_pred_control = unet_control(z_mu_t, t, y_in)
+                else:
+                    eps_pred_control = unet_control(z_t, t, y_in)
+                    
                 score_loss_control = F.mse_loss(eps_pred_control, noise)
 
             # --- Stiffness penalty ---
@@ -3097,6 +3102,7 @@ def train_vae_cotrained_cond(cfg):
 
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
+                z_mu_t = alpha * mu + sigma * noise
 
                 # --- LSI Score Training ---
                 var_0 = torch.exp(logvar)
@@ -3118,7 +3124,13 @@ def train_vae_cotrained_cond(cfg):
                         p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
                 # --- Control (Tweedie/DSM) Score Training ---
-                eps_pred_control = unet_control(z_t.detach(), t, y_in)
+                #eps_pred_control = unet_control(z_t.detach(), t, y_in)
+                
+                if cfg.get("train_on_mu", False):
+                    eps_pred_control = unet_control(z_mu_t, t, y_in)
+                else:
+                    eps_pred_control = unet_control(z_t, t, y_in)
+                    
                 score_loss_control = F.mse_loss(eps_pred_control, noise)
 
                 opt_control_refine.zero_grad()
@@ -3389,6 +3401,7 @@ def main():
         "t_min": 2e-5,
         "t_max": 2.0,
         "num_train_timesteps": 1000,
+        "train_on_mu': True,
 
         # --- Not use ----
         "noise_schedule": "cosine",
