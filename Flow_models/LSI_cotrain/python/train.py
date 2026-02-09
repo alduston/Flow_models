@@ -3394,7 +3394,7 @@ def main():
     # === SHARED CONFIG (base settings for both experiments) ===
     cfg_shared = {
         # --- Dataset ---
-        "dataset": "GCIFAR",
+        "dataset": "CIFAR",
         "batch_size": 128,
         "num_workers": 2,
         
@@ -3448,8 +3448,8 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 400,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 640,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 160,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 2e-5,
         
         # Co-training specific settings
@@ -3473,8 +3473,8 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 50,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 500,       # LDM training on frozen VAE
-        "lr_refine": 1e-4,
+        "epochs_refine": 800,       # LDM training on frozen VAE
+        "lr_refine": 4e-4,
         
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
@@ -3483,6 +3483,7 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
+        "kl_w": 1e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
         
