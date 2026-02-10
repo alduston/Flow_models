@@ -394,7 +394,7 @@ def get_fid_model(dataset_key, train_loader, num_classes, device, ckpt_dir="chec
     img_channels = DATASET_INFO.get(dataset_key, {}).get("img_channels", 1)
     # For datasets that get padded (28->32), use 32 for the classifier
     effective_img_size = 32 if img_size == 28 else img_size
-    
+
     print(f"--> Training LeNet classifier for FID ({dataset_key})")
     checkpoint_path = os.path.join(ckpt_dir, f"fid_classifier_{dataset_key.lower()}.pt")
     model = train_fid_classifier(train_loader, num_classes, device, epochs=10, checkpoint_path=checkpoint_path, img_size=effective_img_size, img_channels=img_channels)
@@ -1088,151 +1088,256 @@ class ResBlock(nn.Module):
         return h * self.skip_scale
 
 
-class UNetModel(nn.Module):
+# ---------------------------------------------------------------------------
+# DiT (Diffusion Transformer) — drop-in replacement for UNetModel
+# ---------------------------------------------------------------------------
+# Same forward API:  forward(x, t, y) -> eps_pred
+#   x: [B, C, H, W]  latent tensor
+#   t: [B]            continuous time scalars
+#   y: [B] | None     class labels (None → null/unconditional token)
+#
+# Architecture:  patchify → transformer blocks with adaLN-Zero → unpatchify
+# Reference: Peebles & Xie, "Scalable Diffusion Models with Transformers" (2023)
+# ---------------------------------------------------------------------------
+
+
+class DiTBlock(nn.Module):
     """
-    Same external API as your current UNetModel, but slightly stronger blocks.
+    Transformer block with adaptive Layer Norm zero (adaLN-Zero).
+    Conditioning vector c produces (γ1, β1, α1, γ2, β2, α2) that modulate
+    the pre-norm outputs and gate the residual additions.
+    """
+    def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        # --- Self-attention ---
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.attn_qkv = nn.Linear(hidden_dim, 3 * hidden_dim)
+        self.attn_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # --- Feed-forward ---
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        mlp_hidden = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        # --- adaLN-Zero modulation: produces 6 * hidden_dim from conditioning ---
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 6 * hidden_dim),
+        )
+        # Zero-init so block starts as identity
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, N, D]  token sequence
+        c: [B, D]     conditioning vector (time + optional class)
+        """
+        # Compute all 6 modulation parameters at once
+        mod = self.adaLN_modulation(c).unsqueeze(1)  # [B, 1, 6D]
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = mod.chunk(6, dim=-1)
+
+        # --- Attention branch ---
+        h = self.norm1(x)
+        h = h * (1.0 + gamma1) + beta1
+
+        B, N, D = h.shape
+        qkv = self.attn_qkv(h).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, heads, N, head_dim]
+        q, k, v = qkv.unbind(0)
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1)
+        h = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        h = self.attn_proj(h)
+
+        x = x + alpha1 * h
+
+        # --- MLP branch ---
+        h = self.norm2(x)
+        h = h * (1.0 + gamma2) + beta2
+        h = self.mlp(h)
+        x = x + alpha2 * h
+
+        return x
+
+
+class DiTModel(nn.Module):
+    """
+    Diffusion Transformer (DiT) for latent diffusion.
+
+    Drop-in replacement for UNetModel — same forward(x, t, y) signature.
+
+    Args:
+        in_channels:  number of latent channels (e.g. 4 or 5)
+        patch_size:   spatial patch size for patchification (default 2 for 8×8 latents → 16 tokens)
+        hidden_dim:   transformer hidden dimension
+        depth:        number of DiT blocks
+        num_heads:    attention heads
+        mlp_ratio:    MLP expansion ratio
+        num_classes:  if provided, enables classifier-free class conditioning
+        dropout:      dropout rate in MLP
+        latent_size:  spatial size of the latent (H=W); needed to eagerly allocate pos_embed.
+                      Default 8 matches img_size=32 with 2 stride-2 downsamples in the VAE.
     """
     def __init__(
         self,
         in_channels: int = 4,
-        base_channels: int = 32,
-        channel_mults: Tuple[int, ...] = (1, 2, 4),
-        num_res_blocks: int = 2,
+        patch_size: int = 2,
+        hidden_dim: int = 384,
+        depth: int = 8,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
         num_classes: int | None = None,
         *,
         dropout: float = 0.0,
-        # Add attention at exactly one additional level by default (second-to-last resolution).
-        # For (1,2,4): level 1 corresponds to the "middle" spatial resolution.
+        latent_size: int = 8,
+        # These kwargs are accepted (but ignored) for backward compat with UNetModel call sites
+        base_channels: int = 32,
+        channel_mults: Tuple[int, ...] = (1, 2, 4),
+        num_res_blocks: int = 2,
         attn_levels: Optional[Tuple[int, ...]] = None,
         attn_heads: int = 4,
-        # If you stack many blocks, sqrt(0.5) can help; default 1.0 keeps behavior closer to current.
         skip_scale: float = 1.0,
         mid_attn: bool = True,
     ):
         super().__init__()
-        self.time_embed = TimeEmbedding(base_channels)
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
 
-        # Optional classifier-free class conditioning:
+        # --- Classifier-free guidance setup (same convention as UNetModel) ---
         self.num_classes = num_classes
         self.null_label = num_classes if num_classes is not None else None
-        self.label_emb = nn.Embedding(num_classes + 1, base_channels * 4) if num_classes is not None else None
 
-        if attn_levels is None:
-            # One extra attention level besides the mid block:
-            # - if there are >=2 levels, use the second-to-last; else none.
-            attn_levels = (max(len(channel_mults) - 2, 0),) if len(channel_mults) >= 2 else tuple()
-        self.attn_levels = set(int(i) for i in attn_levels)
-
-        self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
-
-        # Down path
-        self.downs = nn.ModuleList()
-        ch = base_channels
-        chs = [ch]
-        for level, mult in enumerate(channel_mults):
-            out_ch = base_channels * mult
-            for r in range(num_res_blocks):
-                # Only add attention once per chosen level (on the last resblock of that level).
-                use_attn = (level in self.attn_levels) and (r == num_res_blocks - 1)
-                self.downs.append(
-                    ResBlock(
-                        ch, out_ch, base_channels * 4,
-                        dropout=dropout, use_attn=use_attn, attn_heads=attn_heads, skip_scale=skip_scale
-                    )
-                )
-                ch = out_ch
-                chs.append(ch)
-            if level != len(channel_mults) - 1:
-                self.downs.append(nn.Conv2d(ch, ch, 3, 2, 1))
-                chs.append(ch)
-
-        # Mid
-        mid_blocks = [
-            ResBlock(ch, ch, base_channels * 4, dropout=dropout, use_attn=False, attn_heads=attn_heads, skip_scale=skip_scale),
-        ]
-        if mid_attn:
-            mid_blocks.append(AttentionBlock(ch, num_heads=attn_heads))
-        mid_blocks.append(
-            ResBlock(ch, ch, base_channels * 4, dropout=dropout, use_attn=False, attn_heads=attn_heads, skip_scale=skip_scale)
+        # --- Patch embedding: Conv2d acts as linear projection of flattened patches ---
+        self.patch_embed = nn.Conv2d(
+            in_channels, hidden_dim,
+            kernel_size=patch_size, stride=patch_size,
         )
-        self.mid = nn.ModuleList(mid_blocks)
 
-        # Up path
-        self.ups = nn.ModuleList()
-        for level, mult in reversed(list(enumerate(channel_mults))):
-            out_ch = base_channels * mult
-            for r in range(num_res_blocks + 1):
-                skip = chs.pop()
-                # Again: only once per chosen level (on the last resblock before upsample).
-                use_attn = (level in self.attn_levels) and (r == num_res_blocks)
-                self.ups.append(
-                    ResBlock(
-                        ch + skip, out_ch, base_channels * 4,
-                        dropout=dropout, use_attn=use_attn, attn_heads=attn_heads, skip_scale=skip_scale
-                    )
-                )
-                ch = out_ch
-            if level != 0:
-                self.ups.append(nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"),
-                                              nn.Conv2d(ch, ch, 3, 1, 1)))
-
-        self.out = nn.Sequential(
-            make_group_norm(ch),
+        # --- Time embedding (reuse existing sinusoidal + MLP) ---
+        # TimeEmbedding outputs dim = base_dim * 4; we project to hidden_dim
+        self.time_embed_dim = hidden_dim
+        self.time_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Conv2d(ch, in_channels, 3, 1, 1),
+            nn.Linear(hidden_dim, hidden_dim),
         )
+
+        # --- Class embedding ---
+        if num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes + 1, hidden_dim)
+        else:
+            self.label_emb = None
+
+        # --- Positional embedding (eagerly allocated, learnable) ---
+        num_tokens = (latent_size // patch_size) ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, hidden_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # --- Transformer blocks ---
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_dim, num_heads, mlp_ratio=mlp_ratio, dropout=dropout)
+            for _ in range(depth)
+        ])
+
+        # --- Final layer: adaLN + linear projection back to patch pixels ---
+        self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+        )
+        nn.init.zeros_(self.final_modulation[1].weight)
+        nn.init.zeros_(self.final_modulation[1].bias)
+
+        patch_out_dim = in_channels * patch_size * patch_size
+        self.final_proj = nn.Linear(hidden_dim, patch_out_dim)
+        nn.init.zeros_(self.final_proj.weight)
+        nn.init.zeros_(self.final_proj.bias)
+
+    def unpatchify(self, x: torch.Tensor, H_tok: int, W_tok: int) -> torch.Tensor:
+        """
+        x: [B, N, patch_size*patch_size*C]
+        returns: [B, C, H, W]
+        """
+        p = self.patch_size
+        C = self.in_channels
+        x = x.reshape(-1, H_tok, W_tok, p, p, C)
+        x = x.permute(0, 5, 1, 3, 2, 4)  # [B, C, H_tok, p, W_tok, p]
+        x = x.reshape(-1, C, H_tok * p, W_tok * p)
+        return x
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
-        # t: [B], y: [B] (class ids), or y=None for unconditional branch
+        """
+        x: [B, C, H, W]   noisy latent
+        t: [B]             continuous diffusion time
+        y: [B] | None      class labels (None → unconditional null token)
+        returns: [B, C, H, W]   predicted noise (eps)
+        """
+        B, C, H, W = x.shape
         t = t.view(-1)
-        emb = self.time_embed(t)
+        p = self.patch_size
+
+        # --- Patchify: [B, C, H, W] → [B, hidden_dim, H/p, W/p] → [B, N, hidden_dim] ---
+        tokens = self.patch_embed(x)  # [B, hidden_dim, H_tok, W_tok]
+        H_tok, W_tok = tokens.shape[2], tokens.shape[3]
+        tokens = tokens.flatten(2).transpose(1, 2)  # [B, N, hidden_dim]
+
+        # --- Positional embedding ---
+        tokens = tokens + self.pos_embed
+
+        # --- Conditioning vector c = time_emb + class_emb ---
+        # Sinusoidal embedding
+        t_emb = timestep_embedding(t, self.hidden_dim)  # [B, hidden_dim]
+        c = self.time_mlp(t_emb)  # [B, hidden_dim]
 
         if self.label_emb is not None:
             if y is None:
-                y = torch.full((t.shape[0],), int(self.null_label), device=t.device, dtype=torch.long)
+                y_ids = torch.full((B,), int(self.null_label), device=x.device, dtype=torch.long)
             else:
                 if not torch.is_tensor(y):
-                    y = torch.tensor(y, device=t.device)
-                y = y.to(device=t.device, dtype=torch.long).view(-1)
-                if y.shape[0] != t.shape[0]:
-                    y = y.expand(t.shape[0])
-            emb = emb + self.label_emb(y)
+                    y_ids = torch.tensor(y, device=x.device)
+                else:
+                    y_ids = y.to(device=x.device, dtype=torch.long).view(-1)
+                if y_ids.shape[0] != B:
+                    y_ids = y_ids.expand(B)
+            c = c + self.label_emb(y_ids)
 
-        h = self.head(x)
-        hs = [h]
+        # --- Transformer blocks ---
+        for block in self.blocks:
+            tokens = block(tokens, c)
 
-        for layer in self.downs:
-            if isinstance(layer, ResBlock):
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-            hs.append(h)
+        # --- Final layer: adaLN modulation + linear projection ---
+        mod = self.final_modulation(c).unsqueeze(1)  # [B, 1, 2*hidden_dim]
+        gamma, beta = mod.chunk(2, dim=-1)
+        tokens = self.final_norm(tokens) * (1.0 + gamma) + beta
+        tokens = self.final_proj(tokens)  # [B, N, patch_size^2 * C]
 
-        for layer in self.mid:
-            if isinstance(layer, ResBlock):
-                h = layer(h, emb)
-            else:
-                h = layer(h)
+        # --- Unpatchify back to image layout ---
+        out = self.unpatchify(tokens, H_tok, W_tok)
+        return out
 
-        for layer in self.ups:
-            if isinstance(layer, ResBlock):
-                h = torch.cat([h, hs.pop()], dim=1)
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-
-        return self.out(h)
+# Alias so that existing code referencing UNetModel still works
+UNetModel = DiTModel
 
 # ----------------------------------------------------------------------
-# Suggested "minimal beef" settings to try first (no code changes needed):
-#
-# 1) Increase width a bit (smallest retune burden):
-#    UNetModel(base_channels=48, channel_mults=(1,2,4), num_res_blocks=2, dropout=0.05, attn_levels=(1,))
-#
-# 2) Or keep width, add one more level (compute bump, still modest):
-#    UNetModel(base_channels=32, channel_mults=(1,2,4,4), num_res_blocks=2, dropout=0.05, attn_levels=(2,))
-#
-# If joint training gets twitchy, set skip_scale=math.sqrt(0.5) and/or dropout=0.0.
+# DiT default config notes:
+#   DiTModel(hidden_dim=384, depth=8, num_heads=6, patch_size=2)
+#   operates on 8×8 latents → 16 tokens; ~4.3M params.
+#   For larger latents or more capacity, increase hidden_dim/depth.
 # ----------------------------------------------------------------------
 
 
@@ -1631,8 +1736,8 @@ def evaluate_current_state(
             {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
             {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
             {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0}, 
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0}, 
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
 
     results = []
@@ -1659,7 +1764,7 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Unconditional evaluation sweep
     # -----------------------------------------------------------------------
-   
+
     cfg_eval_scale = float(cfg.get("cfg_eval_scale", 2.0))
     for scfg in configs:
         method = scfg["method"]
@@ -1667,7 +1772,7 @@ def evaluate_current_state(
         desc = scfg.get("desc", "")
         use_rand_token = bool(scfg.get("use_rand_token", False))
         cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
-        
+
         # Build suffix for naming - include cfg_level if present
         if use_rand_token:
             if cfg_level is not None:
@@ -1677,7 +1782,7 @@ def evaluate_current_state(
         else:
             config_suffix = ""
         config_name = f"{method}@{steps}{config_suffix}"
-        
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -2089,11 +2194,11 @@ import matplotlib.pyplot as plt
 def discover_metric_columns(eval_df, metric_prefix):
     """
     Discover all columns matching a metric prefix pattern.
-    
+
     Args:
         eval_df: DataFrame with evaluation metrics
         metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap'
-    
+
     Returns:
         List of column names matching the pattern, excluding vae_recon variants
     """
@@ -2103,20 +2208,20 @@ def discover_metric_columns(eval_df, metric_prefix):
     else:
         # Other columns look like: fid_rk4_20_randtok (exclude fid_vae_recon)
         pattern = re.compile(rf'^{metric_prefix}_(?!vae_recon)')
-    
+
     return [col for col in eval_df.columns if pattern.match(col)]
 
 def parse_metric_column(col_name):
     """
     Parse a metric column name into its components.
-    
+
     Examples:
         'fid_rk4_10' -> {'metric': 'fid', 'method': 'rk4', 'steps': '10', 'suffix': ''}
         'fid_rk4_20_randtok' -> {'metric': 'fid', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
         'lsi_gap_rk4_20_randtok' -> {'metric': 'lsi_gap', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
     """
     parts = col_name.split('_')
-    
+
     # Handle lsi_gap specially (has underscore in metric name)
     if parts[0] == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
         metric = 'lsi_gap'
@@ -2124,18 +2229,18 @@ def parse_metric_column(col_name):
     else:
         metric = parts[0]
         remaining = parts[1:]
-    
+
     if len(remaining) < 2:
         return None  # Not a valid metric column (e.g., fid_vae_recon)
-    
+
     method = remaining[0]  # rk4, heun, ddim, euler, etc.
     steps = remaining[1]   # 10, 20, 50, etc.
-    
+
     # Everything after method_steps is the suffix
     suffix = '_'.join(remaining[2:]) if len(remaining) > 2 else ''
     if suffix:
         suffix = '_' + suffix
-    
+
     return {
         'metric': metric,
         'method': method,
@@ -2148,58 +2253,58 @@ def parse_metric_column(col_name):
 def get_metric_groups(eval_df):
     """
     Group all metric columns by (method, steps, suffix) for systematic plotting.
-    
+
     Returns:
         Dict mapping (method, steps, suffix) -> dict of metric columns
         e.g., {('rk4', '20', '_randtok'): {'fid': 'fid_rk4_20_randtok', 'kid': 'kid_rk4_20_randtok', ...}}
     """
     groups = {}
-    
+
     for metric_type in ['fid', 'kid', 'sw2', 'div', 'lsi_gap']:
         cols = discover_metric_columns(eval_df, metric_type)
         for col in cols:
             parsed = parse_metric_column(col)
             if parsed is None:
                 continue
-            
+
             key = (parsed['method'], parsed['steps'], parsed['suffix'])
             if key not in groups:
                 groups[key] = {}
             groups[key][metric_type] = col
-    
+
     return groups
 
 
-def plot_generic_metric(eval_df, metric_col, metric_name, ylabel, title, save_path, 
+def plot_generic_metric(eval_df, metric_col, metric_name, ylabel, title, save_path,
                         use_log=False, include_vae_recon=True):
     """
     Generic plotting function for any metric column.
     Plots LSI vs Tweedie (blue vs red) with optional VAE recon baseline.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
-    
+
     lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
     ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
-    
+
     # VAE recon baseline (if available and requested)
     vae_recon_col = f"{metric_name}_vae_recon"
     if include_vae_recon and vae_recon_col in lsi_df.columns and not lsi_df[vae_recon_col].isna().all():
         ax.plot(lsi_df["epoch"], lsi_df[vae_recon_col],
                 color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
                 label=f"VAE Recon {metric_name.upper()}")
-    
+
     # LSI metric
     if metric_col in lsi_df.columns and not lsi_df[metric_col].isna().all():
         ax.plot(lsi_df["epoch"], lsi_df[metric_col],
                 color="blue", linewidth=2, marker='o', markersize=4,
                 label=f"LSI {metric_name.upper()}")
-    
+
     # Tweedie metric
     if metric_col in ctrl_df.columns and not ctrl_df[metric_col].isna().all():
         ax.plot(ctrl_df["epoch"], ctrl_df[metric_col],
                 color="red", linewidth=2, marker='s', markersize=4,
                 label=f"Tweedie {metric_name.upper()}")
-    
+
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=14)
@@ -2208,7 +2313,7 @@ def plot_generic_metric(eval_df, metric_col, metric_name, ylabel, title, save_pa
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
     ax.set_xlim(left=0)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -2221,10 +2326,10 @@ def plot_gap_metric(eval_df, metric_col, metric_name, title, save_path):
     Positive gap = LSI is better.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
-    
+
     lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)].copy()
     ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)].copy()
-    
+
     if len(lsi_df) > 0 and len(ctrl_df) > 0 and metric_col in lsi_df.columns and metric_col in ctrl_df.columns:
         # Merge on epoch
         merged = pd.merge(
@@ -2233,16 +2338,16 @@ def plot_gap_metric(eval_df, metric_col, metric_name, title, save_path):
             on="epoch",
             suffixes=("_lsi", "_ctrl")
         )
-        
+
         lsi_col = f"{metric_col}_lsi"
         ctrl_col = f"{metric_col}_ctrl"
-        
+
         if lsi_col in merged.columns and ctrl_col in merged.columns:
             merged["gap"] = merged[ctrl_col] - merged[lsi_col]
             ax.plot(merged["epoch"], merged["gap"],
                     color="purple", linewidth=2, marker='o', markersize=4,
                     label=f"{metric_name.upper()} Gap (Tweedie - LSI)")
-            
+
             ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.7)
             if len(merged) > 0:
                 ax.fill_between(merged["epoch"], 0, merged["gap"],
@@ -2251,14 +2356,14 @@ def plot_gap_metric(eval_df, metric_col, metric_name, title, save_path):
                 ax.fill_between(merged["epoch"], 0, merged["gap"],
                                 where=merged["gap"] < 0, alpha=0.3, color="red",
                                 label="Tweedie Better")
-    
+
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel(f"{metric_name.upper()} Gap (Tweedie - LSI)", fontsize=12)
     ax.set_title(title, fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -2269,12 +2374,12 @@ def format_config_label(method, steps, suffix):
     """Create a human-readable label for a sampler configuration."""
     method_names = {
         'rk4': 'RK4',
-        'heun': 'Heun', 
+        'heun': 'Heun',
         'euler': 'Euler',
         'ddim': 'DDIM',
     }
     base = f"{method_names.get(method, method.upper())} {steps} Steps"
-    
+
     if suffix:
         # Parse suffix for human readability
         suffix_clean = suffix.lstrip('_')
@@ -2290,7 +2395,7 @@ def format_config_label(method, steps, suffix):
             cfg_match = re.search(r'cfg([\d.]+)', suffix_clean)
             if cfg_match:
                 base += f" (CFG={cfg_match.group(1)})"
-    
+
     return base
 
 
@@ -2300,9 +2405,9 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
     """
     plots_dir = os.path.join(results_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
-    
+
     print("\n--> Generating visualization suite...")
-    
+
     # Discover all available metric columns
     metric_groups = {}
     for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
@@ -2311,38 +2416,38 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
             parsed = parse_metric_column(col)
             if parsed is None:
                 continue
-            
+
             key = (parsed['method'], parsed['steps'], parsed['suffix'])
             if key not in metric_groups:
                 metric_groups[key] = {}
             metric_groups[key][metric_type] = col
-    
+
     if metric_groups:
         print(f"    Found {len(metric_groups)} sampler configuration(s):")
         for (method, steps, suffix) in sorted(metric_groups.keys()):
             label = format_config_label(method, steps, suffix)
             available = list(metric_groups[(method, steps, suffix)].keys())
             print(f"      - {label}: {available}")
-    
+
     plot_idx = 1
-    
+
     # --- Loss plots (always generate these) ---
     plot_vae_recon_loss(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_vae_recon_loss.png"))
     plot_idx += 1
     plot_score_losses(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_score_losses.png"))
     plot_idx += 1
-    
+
     if not metric_groups:
         print("--> Warning: No metric columns found. Skipping eval metric plots.")
         print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
         return
-    
+
     # --- Metric plots for each sampler configuration ---
     for (method, steps, suffix) in sorted(metric_groups.keys()):
         group = metric_groups[(method, steps, suffix)]
         config_label = format_config_label(method, steps, suffix)
         config_tag = f"{method}_{steps}{suffix}".replace('.', '_')
-        
+
         # FID plot
         if 'fid' in group:
             plot_generic_metric(
@@ -2352,7 +2457,7 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
                 use_log=False, include_vae_recon=True
             )
             plot_idx += 1
-        
+
         # KID plot
         if 'kid' in group:
             plot_generic_metric(
@@ -2362,7 +2467,7 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
                 use_log=False, include_vae_recon=True
             )
             plot_idx += 1
-        
+
         # SW2 plot (log scale)
         if 'sw2' in group:
             plot_generic_metric(
@@ -2372,7 +2477,7 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
                 use_log=True, include_vae_recon=True
             )
             plot_idx += 1
-        
+
         # FID Gap plot
         if 'fid' in group:
             plot_gap_metric(
@@ -2381,7 +2486,7 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
                 os.path.join(plots_dir, f"{plot_idx:02d}_fid_gap_{config_tag}.png")
             )
             plot_idx += 1
-        
+
         # LSI Gap Metric plot
         if 'lsi_gap' in group:
             plot_generic_metric(
@@ -2391,26 +2496,26 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
                 use_log=False, include_vae_recon=False
             )
             plot_idx += 1
-    
+
     print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
 
 def plot_vae_recon_loss(loss_df, save_path):
     """Plot VAE reconstruction loss (cotrain epochs only)."""
     fig, ax = plt.subplots(figsize=(10, 6))
-    
+
     cotrain_df = loss_df[loss_df["stage"] == "cotrain"]
-    
+
     if len(cotrain_df) > 0:
         ax.plot(cotrain_df["epoch"], cotrain_df["recon"],
                 color="black", linewidth=2, marker='o', markersize=4)
-    
+
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel("Reconstruction Loss (MSE)", fontsize=12)
     ax.set_title("VAE Reconstruction Loss (Co-training Phase)", fontsize=14)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -2420,12 +2525,12 @@ def plot_vae_recon_loss(loss_df, save_path):
 def plot_score_losses(loss_df, save_path):
     """Plot LSI vs Tweedie score losses (log scale)."""
     fig, ax = plt.subplots(figsize=(10, 6))
-    
+
     ax.plot(loss_df["epoch"], loss_df["score_lsi"],
             color="blue", linewidth=2, marker='o', markersize=4, label="LSI Score Loss")
     ax.plot(loss_df["epoch"], loss_df["score_control"],
             color="red", linewidth=2, marker='s', markersize=4, label="Tweedie Score Loss")
-    
+
     ax.set_xlabel("Epoch", fontsize=12)
     ax.set_ylabel("Score Loss (MSE, log scale)", fontsize=12)
     ax.set_title("Score Network Losses: LSI vs Tweedie", fontsize=14)
@@ -2433,7 +2538,7 @@ def plot_score_losses(loss_df, save_path):
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which='both')
     ax.set_xlim(left=0)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -2447,66 +2552,66 @@ def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_d
     """
     plots_dir = os.path.join(results_dir, "comparison_plots")
     os.makedirs(plots_dir, exist_ok=True)
-    
+
     print("\n--> Generating comparison visualization suite...")
-    
+
     # Discover all available metric columns from both dataframes
     all_columns = set(eval_df_cotrain.columns) | set(eval_df_indep.columns)
-    
+
     # Group columns by (method, steps, suffix)
     metric_groups = {}
     for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
         cols = discover_metric_columns(eval_df_cotrain, metric_type)
         cols.extend(discover_metric_columns(eval_df_indep, metric_type))
         cols = list(set(cols))  # Remove duplicates
-        
+
         for col in cols:
             parsed = parse_metric_column(col)
             if parsed is None:
                 continue
-            
+
             key = (parsed['method'], parsed['steps'], parsed['suffix'])
             if key not in metric_groups:
                 metric_groups[key] = {}
             metric_groups[key][metric_type] = col
-    
+
     if not metric_groups:
         print("--> Warning: No metric columns found. Skipping comparison plots.")
         return
-    
+
     print(f"    Found {len(metric_groups)} sampler configuration(s) to compare:")
     for (method, steps, suffix) in sorted(metric_groups.keys()):
         label = format_config_label(method, steps, suffix)
         available = list(metric_groups[(method, steps, suffix)].keys())
         print(f"      - {label}: {available}")
-    
+
     # Generate plots
     plot_idx = 1
     ylabel_map = {
         'fid': 'FID',
-        'kid': 'KID', 
+        'kid': 'KID',
         'sw2': 'SW2 (log scale)',
         'lsi_gap': 'LSI Gap (lower=better)',
     }
-    
+
     for (method, steps, suffix) in sorted(metric_groups.keys()):
         group = metric_groups[(method, steps, suffix)]
         config_label = format_config_label(method, steps, suffix)
         config_tag = f"{method}_{steps}{suffix}".replace('.', '_')  # Safe filename
-        
+
         for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
             if metric_type not in group:
                 continue
-            
+
             metric_col = group[metric_type]
             use_log = (metric_type == 'sw2')
             ylabel = ylabel_map[metric_type]
             title = f"Co-trained vs Independent: {metric_type.upper()} ({config_label})"
             save_path = os.path.join(plots_dir, f"{plot_idx:02d}_comparison_{metric_type}_{config_tag}.png")
-            
+
             plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log)
             plot_idx += 1
-    
+
     print(f"--> Comparison visualization suite complete ({plot_idx - 1} plots generated)!")
 
 
@@ -2517,42 +2622,42 @@ def plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, t
     """
     4-way comparison plot for any metric.
     - Solid blue: Co-trained LSI
-    - Solid red: Co-trained Tweedie  
+    - Solid red: Co-trained Tweedie
     - Dashed blue: Independent LSI
     - Dashed red: Independent Tweedie
     """
     fig, ax = plt.subplots(figsize=(12, 7))
-    
+
     # Co-trained data
     lsi_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("LSI", case=False)]
     ctrl_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("Ctrl", case=False)]
-    
+
     # Independent data
     lsi_indep = eval_df_indep[eval_df_indep["tag"].str.contains("LSI", case=False)]
     ctrl_indep = eval_df_indep[eval_df_indep["tag"].str.contains("Ctrl", case=False)]
-    
+
     # Plot Co-trained (solid lines)
     if metric_col in lsi_cotrain.columns and not lsi_cotrain[metric_col].isna().all():
         ax.plot(lsi_cotrain["epoch"], lsi_cotrain[metric_col],
                 color="blue", linewidth=2, marker='o', markersize=4,
                 linestyle="-", label="Co-trained LSI")
-    
+
     if metric_col in ctrl_cotrain.columns and not ctrl_cotrain[metric_col].isna().all():
         ax.plot(ctrl_cotrain["epoch"], ctrl_cotrain[metric_col],
                 color="red", linewidth=2, marker='s', markersize=4,
                 linestyle="-", label="Co-trained Tweedie")
-    
+
     # Plot Independent (dashed lines)
     if metric_col in lsi_indep.columns and not lsi_indep[metric_col].isna().all():
         ax.plot(lsi_indep["epoch"], lsi_indep[metric_col],
                 color="blue", linewidth=2, marker='o', markersize=4,
                 linestyle="--", label="Independent LSI")
-    
+
     if metric_col in ctrl_indep.columns and not ctrl_indep[metric_col].isna().all():
         ax.plot(ctrl_indep["epoch"], ctrl_indep[metric_col],
                 color="red", linewidth=2, marker='s', markersize=4,
                 linestyle="--", label="Independent Tweedie")
-    
+
     ax.set_xlabel("LDM Training Epoch", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=14)
@@ -2561,7 +2666,7 @@ def plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, t
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
     ax.set_xlim(left=0)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -2670,7 +2775,7 @@ def train_vae_cotrained_cond(cfg):
     dataset_key = cfg.get("dataset", "FMNIST")
     train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
     cfg["num_classes"] = num_classes  # for CFG label embedding / eval
-    
+
     # Get image size from dataset info (for model initialization)
     img_size = DATASET_INFO.get(dataset_key, {}).get("img_size", 28)
     img_channels = DATASET_INFO.get(dataset_key, {}).get("img_channels", 1)
@@ -2737,7 +2842,7 @@ def train_vae_cotrained_cond(cfg):
     score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
     cotrain_head = cfg.get("cotrain_head", "lsi")
     freeze_score_in_cotrain = cfg.get("freeze_score_in_cotrain", False)
-    
+
     if freeze_score_in_cotrain:
         # Independent mode: VAE-only optimizer during cotrain phase
         # Score networks will only be trained during refine phase
@@ -2843,11 +2948,11 @@ def train_vae_cotrained_cond(cfg):
             if reg_type == "normal":
                 # Standard VAE KL: N(0,1) target
                 kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-                
+
             elif reg_type == "mod":
                 # Modified KL: Energy/Trace control (No per-sample isotropy)
                 kl = -0.5 * torch.mean(1 - mu.pow(2) - logvar.exp())
-                
+
             elif reg_type == "norm":
                 # Variance Anchor: Only penalize logvar deviation (for use with GroupNorm)
                 # Target logvar=0 (std=1). 0.1 is the spring constant.
@@ -2858,7 +2963,7 @@ def train_vae_cotrained_cond(cfg):
                 logvar_clamped = torch.clamp(logvar, min=-10.0)  # σ² ≥ exp(-10) ≈ 4.5e-5
                 log_det = torch.sum(logvar_clamped, dim=[1, 2, 3])  # [B] vector
                 kl = - torch.mean(log_det)
-                
+
             else:
                 raise ValueError(f"Unknown kl_reg_type: {reg_type}")
 
@@ -2880,14 +2985,14 @@ def train_vae_cotrained_cond(cfg):
             noise = torch.randn_like(z0)
             z_t = alpha * z0 + sigma * noise
             z_mu_t =  alpha * mu + sigma * noise
-            
+
             var_0 = torch.exp(logvar)
             mu_t = alpha * mu
             var_t = (alpha**2) * var_0 + (sigma**2)
-            
+
             # --- Compute both score losses (for logging, even if frozen) ---
             eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
-            
+
             if freeze_score_in_cotrain:
                 # In independent mode, don't compute score predictions during cotrain
                 # Just log zeros for score losses
@@ -2896,12 +3001,12 @@ def train_vae_cotrained_cond(cfg):
             else:
                 eps_pred_lsi = unet_lsi(z_t, t, y_in)
                 score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-                
+
                 if cfg.get("train_on_mu", False):
                     eps_pred_control = unet_control(z_mu_t, t, y_in)
                 else:
                     eps_pred_control = unet_control(z_t, t, y_in)
-                    
+
                 score_loss_control = F.mse_loss(eps_pred_control, noise)
 
             # --- Stiffness penalty ---
@@ -3005,11 +3110,11 @@ def train_vae_cotrained_cond(cfg):
 
         # --- Evaluation (skip if score frozen - no LDM to evaluate) ---
         should_eval_cotrain = (not freeze_score_in_cotrain) and ((ep + 1) % eval_freq_cotrain == 0)
-        
+
         if should_eval_cotrain:
             # For cotrain, epoch = LDM training epoch (1-indexed)
             ldm_epoch = ep + 1
-            
+
             # Evaluate LSI
             results_lsi = evaluate_current_state(
                 ldm_epoch,
@@ -3112,7 +3217,7 @@ def train_vae_cotrained_cond(cfg):
                     # alpha/sigma = OU alpha(t), sigma(t) on the same grid
                     alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
                     sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
-                
+
 
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
@@ -3139,12 +3244,12 @@ def train_vae_cotrained_cond(cfg):
 
                 # --- Control (Tweedie/DSM) Score Training ---
                 #eps_pred_control = unet_control(z_t.detach(), t, y_in)
-                
+
                 if cfg.get("train_on_mu", False):
                     eps_pred_control = unet_control(z_mu_t, t, y_in)
                 else:
                     eps_pred_control = unet_control(z_t, t, y_in)
-                    
+
                 score_loss_control = F.mse_loss(eps_pred_control, noise)
 
                 opt_control_refine.zero_grad()
@@ -3177,7 +3282,7 @@ def train_vae_cotrained_cond(cfg):
 
             print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
                   f"Ctrl: {epoch_metrics['score_control']:.4f}")
-            
+
             if (ep + 1) % eval_freq_refine == 0:
                 # For refine phase:
                 # - Cotrain mode: LDM epoch = epochs_vae + refine_epoch
@@ -3186,7 +3291,7 @@ def train_vae_cotrained_cond(cfg):
                     ldm_epoch = ep + 1  # Indep: refine is the only LDM training
                 else:
                     ldm_epoch = cfg["epochs_vae"] + ep + 1  # Cotrain: add cotrain epochs
-                
+
                 results_lsi = evaluate_current_state(
                         ldm_epoch,
                         "LSI_Diff_Refine",
@@ -3232,7 +3337,7 @@ def train_vae_cotrained_cond(cfg):
                     results_ctrl["stage"] = "refine"
                     results_ctrl["tag"] = "Ctrl_Diff_Refine"
                     eval_records.append(results_ctrl)
-                    
+
     # --- Save Checkpoints ---
     save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
     save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
@@ -3268,7 +3373,7 @@ def train_vae_cotrained_cond(cfg):
     print(f"{'='*60}")
 
     return loss_df, eval_df
-    
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -3278,87 +3383,87 @@ def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
     """
     Run both co-trained and independent training experiments,
     then generate comparison plots.
-    
+
     Args:
         cfg_cotrain: Config for co-training experiment
         cfg_indep: Config for independent experiment
-    
+
     Returns:
         dict containing all results and paths
     """
     print("=" * 70)
     print("RUNNING CO-TRAINED vs INDEPENDENT TRAINING COMPARISON")
     print("=" * 70)
-    
+
     # Create master results directory
     master_results_dir = cfg_cotrain.get("master_results_dir", "run_results_comparison")
     if os.path.exists(master_results_dir):
         shutil.rmtree(master_results_dir)
     os.makedirs(master_results_dir, exist_ok=True)
-    
+
     # Calculate total LDM epochs for each
     cotrain_ldm_epochs = cfg_cotrain["epochs_vae"] + cfg_cotrain["epochs_refine"]
     indep_ldm_epochs = cfg_indep["epochs_refine"]  # Only refine has LDM training
-    
+
     print(f"\nExperiment setup:")
     print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cotrain_ldm_epochs} LDM epochs")
     print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {indep_ldm_epochs} LDM epochs")
-    
+
     # --- EXPERIMENT 1: CO-TRAINED ---
     print("\n" + "=" * 70)
     print("EXPERIMENT 1: CO-TRAINED (CSEM)")
     print("=" * 70)
-    
+
     cfg_cotrain["results_dir"] = os.path.join(master_results_dir, "run_results_cotrain")
-    
+
     seed_everything(cfg_cotrain["seed"])
     loss_df_cotrain, eval_df_cotrain = train_vae_cotrained_cond(cfg_cotrain)
-    
+
     # --- EXPERIMENT 2: INDEPENDENT ---
     print("\n" + "=" * 70)
     print("EXPERIMENT 2: INDEPENDENT (Two-Stage)")
     print("=" * 70)
-    
+
     cfg_indep["results_dir"] = os.path.join(master_results_dir, "run_results_indep")
-    
+
     seed_everything(cfg_indep["seed"])  # Reset seed for fair comparison
     loss_df_indep, eval_df_indep = train_vae_cotrained_cond(cfg_indep)
-    
+
     # --- GENERATE COMPARISON PLOTS ---
     print("\n" + "=" * 70)
     print("GENERATING COMPARISON VISUALIZATIONS")
     print("=" * 70)
-    
+
     generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, master_results_dir)
-    
+
     # --- Save Combined DataFrames ---
     combined_dir = os.path.join(master_results_dir, "combined_dataframes")
     os.makedirs(combined_dir, exist_ok=True)
-    
+
     # Add source column to distinguish
     eval_df_cotrain_save = eval_df_cotrain.copy()
     eval_df_cotrain_save["experiment"] = "cotrained"
     eval_df_indep_save = eval_df_indep.copy()
     eval_df_indep_save["experiment"] = "independent"
-    
+
     combined_eval_df = pd.concat([eval_df_cotrain_save, eval_df_indep_save], ignore_index=True)
     combined_eval_df.to_csv(os.path.join(combined_dir, "combined_eval_metrics.csv"), index=False)
-    
+
     loss_df_cotrain_save = loss_df_cotrain.copy()
     loss_df_cotrain_save["experiment"] = "cotrained"
     loss_df_indep_save = loss_df_indep.copy()
     loss_df_indep_save["experiment"] = "independent"
-    
+
     combined_loss_df = pd.concat([loss_df_cotrain_save, loss_df_indep_save], ignore_index=True)
     combined_loss_df.to_csv(os.path.join(combined_dir, "combined_loss_history.csv"), index=False)
-    
+
     print(f"--> Saved combined eval metrics to {combined_dir}/combined_eval_metrics.csv")
     print(f"--> Saved combined loss history to {combined_dir}/combined_loss_history.csv")
-    
+
     # --- ZIP the entire comparison results directory ---
     zip_path = zip_results_dir(master_results_dir)
     print(f"--> Zipped all comparison results to: {zip_path}")
-    
+
     print(f"\n{'='*70}")
     print(f"COMPARISON COMPLETE!")
     print(f"All results saved to: {master_results_dir}")
@@ -3366,7 +3471,7 @@ def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
     print(f"  - Independent results: {master_results_dir}/run_results_indep/")
     print(f"  - Comparison plots: {master_results_dir}/comparison_plots/")
     print(f"{'='*70}")
-    
+
     return {
         "loss_df_cotrain": loss_df_cotrain,
         "eval_df_cotrain": eval_df_cotrain,
@@ -3382,34 +3487,34 @@ def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
 def main():
     """
     Main function that runs co-trained vs independent comparison experiment.
-    
+
     Comparison setup:
     - Co-trained: 200 cotrain epochs + 50 refine epochs = 250 LDM training epochs
     - Independent: 50 VAE-only epochs + 250 refine epochs = 250 LDM training epochs
-    
+
     Both experiments have the same total LDM training epochs for fair comparison.
     X-axis on plots = "LDM Training Epoch" (1-250 for both)
     """
-    
+
     # === SHARED CONFIG (base settings for both experiments) ===
     cfg_shared = {
         # --- Dataset ---
-        "dataset": "CIFAR",
+        "dataset": "FMNIST",
         "batch_size": 128,
         "num_workers": 2,
-        
+
         # --- Model Architecture ---
-        "latent_channels": 5,
+        "latent_channels": 3,
         "cond_emb_dim": 64,
-        
+
         # --- Learning Rates ---
         "lr_vae": 5e-4,
         "lr_ldm": 1e-4,
-        
+
         # --- KL and perceptual weights ---
         "kl_w": 1e-4,
         "perc_w": 1.0,
-        
+
         # --- Diffusion Settings ---
         "use_ddim_times": True,
         "t_min": 2e-5,
@@ -3423,35 +3528,35 @@ def main():
         "beta_end": 2e-2,
         "cosine_s": 0.008,
         "ddim_eta": 0.0,
-        
+
         # --- CFG ---
         "cfg_label_dropout": 0.25,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
-        
+
         # --- Evaluation & Logging ---
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
         "ema_decay": 0.999,
-        
+
         # --- Misc ---
         "seed": 42,
         "load_from_checkpoint": False,
         "ckpt_dir": "checkpoints",
-        
+
         # --- Comparison Output ---
         "master_results_dir": "run_results_comparison",
     }
-    
+
     # === CO-TRAINED CONFIG ===
     # 200 cotrain epochs (VAE + LDM joint) + 50 refine epochs = 250 LDM epochs total
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 640,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 160,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 320,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 80,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 2e-5,
-        
+
         # Co-training specific settings
         "freeze_score_in_cotrain": False,  # Normal co-training
         "cotrain_head": "lsi",
@@ -3461,21 +3566,21 @@ def main():
         "score_w_vae": 0.4,
         "stiff_w": 1e-4,
         "score_w": 1.0,
-        
+
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 10,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 10,     # Eval every 10 epochs during refine
+        "eval_freq_cotrain": 80,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 80,     # Eval every 10 epochs during refine
     })
-    
+
     # === INDEPENDENT CONFIG ===
     # 50 VAE-only epochs (no eval) + 250 refine epochs = 250 LDM epochs total
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 50,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 800,       # LDM training on frozen VAE
+        "epochs_refine": 400,       # LDM training on frozen VAE
         "lr_refine": 4e-4,
-        
+
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
         "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
@@ -3483,13 +3588,13 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 1e-2,
+        "kl_w": 3e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
-        
+
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
-        "eval_freq_refine": 10,       # Eval every 10 epochs during refine
+        "eval_freq_refine": 80,       # Eval every 10 epochs during refine
     })
 
     print("=" * 70)
@@ -3504,9 +3609,9 @@ def main():
     print("  - Dashed blue: Independent LSI")
     print("  - Dashed red: Independent Tweedie")
     print("=" * 70)
-    
+
     results = run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep)
-    
+
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
     print("=" * 70)
