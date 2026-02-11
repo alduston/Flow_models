@@ -791,142 +791,6 @@ class VAEResBlock(nn.Module):
     def forward(self, x): return self.net(x) + self.skip(x)
 
 
-'''
-class AttentionBlock(nn.Module):
-    def __init__(self, ch):
-        super().__init__()
-        self.norm = make_group_norm(ch)
-        self.qkv = nn.Conv2d(ch, ch*3, 1)
-        self.proj = nn.Conv2d(ch, ch, 1)
-    def forward(self, x):
-        B, C, H, W = x.shape
-        q, k, v = self.qkv(self.norm(x)).reshape(B, 3, C, -1).chunk(3, 1)
-        attn = (q.transpose(-2, -1) @ k) * (C ** -0.5)
-        attn = attn.softmax(dim=-1)
-        h = (v @ attn.transpose(-2, -1)).reshape(B, C, H, W)
-        return x + self.proj(h)
-
-class TimeEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(dim, 4*dim), nn.SiLU(), nn.Linear(4*dim, 4*dim))
-    def forward(self, t):
-        half = self.mlp[0].in_features // 2
-        freqs = torch.exp(torch.linspace(0, math.log(10000), half, device=t.device))
-        args = t[:, None] * freqs[None, :]
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return self.mlp(emb)
-
-
-class UNetModel(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 4,
-        base_channels: int = 32,
-        channel_mults: Tuple[int, ...] = (1, 2, 4),
-        num_res_blocks: int = 2,
-        num_classes: int | None = None,
-    ):
-        super().__init__()
-        self.time_embed = TimeEmbedding(base_channels)
-
-        # Optional classifier-free class conditioning:
-        # - if num_classes is provided, we reserve an extra "null" label at index num_classes
-        # - passing y=None uses the null label
-        self.num_classes = num_classes
-        self.null_label = num_classes if num_classes is not None else None
-        self.label_emb = nn.Embedding(num_classes + 1, base_channels * 4) if num_classes is not None else None
-
-        self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
-        self.downs = nn.ModuleList()
-        ch = base_channels
-        chs = [ch]
-        for i, mult in enumerate(channel_mults):
-            out_ch = base_channels * mult
-            for _ in range(num_res_blocks):
-                self.downs.append(ResBlock(ch, out_ch, base_channels * 4))
-                ch = out_ch
-                chs.append(ch)
-            if i != len(channel_mults) - 1:
-                self.downs.append(nn.Conv2d(ch, ch, 3, 2, 1))
-                chs.append(ch)
-
-        self.mid = nn.ModuleList([
-            ResBlock(ch, ch, base_channels * 4),
-            AttentionBlock(ch),
-            ResBlock(ch, ch, base_channels * 4),
-        ])
-
-        self.ups = nn.ModuleList()
-        for i, mult in reversed(list(enumerate(channel_mults))):
-            out_ch = base_channels * mult
-            for _ in range(num_res_blocks + 1):
-                skip = chs.pop()
-                self.ups.append(ResBlock(ch + skip, out_ch, base_channels * 4))
-                ch = out_ch
-            if i != 0:
-                self.ups.append(nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(ch, ch, 3, 1, 1)))
-
-        self.out = nn.Sequential(
-            make_group_norm(ch),
-            nn.SiLU(),
-            nn.Conv2d(ch, in_channels, 3, 1, 1),
-        )
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
-        # t: [B], y: [B] (class ids), or y=None for unconditional branch
-        emb = self.time_embed(t)
-
-        if self.label_emb is not None:
-            if y is None:
-                y = torch.full((t.shape[0],), int(self.null_label), device=t.device, dtype=torch.long)
-            else:
-                if not torch.is_tensor(y):
-                    y = torch.tensor(y, device=t.device)
-                y = y.to(device=t.device, dtype=torch.long).view(-1)
-                if y.shape[0] != t.shape[0]:
-                    y = y.expand(t.shape[0])
-            emb = emb + self.label_emb(y)
-
-        h = self.head(x)
-        hs = [h]
-        for layer in self.downs:
-            if isinstance(layer, ResBlock):
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-            hs.append(h)
-
-        for layer in self.mid:
-            if isinstance(layer, ResBlock):
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-
-        for layer in self.ups:
-            if isinstance(layer, ResBlock):
-                h = torch.cat([h, hs.pop()], dim=1)
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-
-        return self.out(h)
-
-
-
-class ResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, t_dim):
-        super().__init__()
-        self.block1 = nn.Sequential(make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1))
-        self.time_proj = nn.Linear(t_dim, out_ch)
-        self.block2 = nn.Sequential(make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1))
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-    def forward(self, x, t_emb):
-        h = self.block1(x)
-        h = h + self.time_proj(t_emb)[:, :, None, None]
-        return self.block2(h) + self.skip(x)
-'''
-
 
 import math
 from typing import Tuple, Optional
@@ -934,6 +798,13 @@ from typing import Tuple, Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+
+def make_group_norm(ch: int, num_groups: int = 32) -> nn.GroupNorm:
+    """GroupNorm with automatic group-count fallback."""
+    while num_groups > 1 and ch % num_groups != 0:
+        num_groups //= 2
+    return nn.GroupNorm(num_groups, ch)
 
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10_000) -> torch.Tensor:
@@ -1090,22 +961,28 @@ class ResBlock(nn.Module):
 
 class UNetModel(nn.Module):
     """
-    Same external API as your current UNetModel, but slightly stronger blocks.
+    UNet score network for latent diffusion on 8x8 latent maps.
+
+    Default configuration (~20.3M params) sized to match the DiT-S/2 variant
+    used in the same codebase (~22M params), enabling controlled architecture
+    comparisons at matched parameter budget.
+
+    Channels: 64 -> 128 -> 256  (all cleanly divisible by 32 for GroupNorm)
+    Spatial:  8x8 -> 4x4 -> 2x2
+    Depth:    3 ResBlocks per level
+    Attention: at 4x4 and 2x2 resolutions (levels 1 and 2)
     """
     def __init__(
         self,
-        in_channels: int = 4,
-        base_channels: int = 32,
+        in_channels: int = 5,
+        base_channels: int = 64,
         channel_mults: Tuple[int, ...] = (1, 2, 4),
-        num_res_blocks: int = 2,
+        num_res_blocks: int = 3,
         num_classes: int | None = None,
         *,
-        dropout: float = 0.0,
-        # Add attention at exactly one additional level by default (second-to-last resolution).
-        # For (1,2,4): level 1 corresponds to the "middle" spatial resolution.
-        attn_levels: Optional[Tuple[int, ...]] = None,
+        dropout: float = 0.1,
+        attn_levels: Optional[Tuple[int, ...]] = (1, 2),
         attn_heads: int = 4,
-        # If you stack many blocks, sqrt(0.5) can help; default 1.0 keeps behavior closer to current.
         skip_scale: float = 1.0,
         mid_attn: bool = True,
     ):
