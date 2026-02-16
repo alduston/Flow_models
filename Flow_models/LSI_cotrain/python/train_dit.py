@@ -791,143 +791,6 @@ class VAEResBlock(nn.Module):
     def forward(self, x): return self.net(x) + self.skip(x)
 
 
-'''
-class AttentionBlock(nn.Module):
-    def __init__(self, ch):
-        super().__init__()
-        self.norm = make_group_norm(ch)
-        self.qkv = nn.Conv2d(ch, ch*3, 1)
-        self.proj = nn.Conv2d(ch, ch, 1)
-    def forward(self, x):
-        B, C, H, W = x.shape
-        q, k, v = self.qkv(self.norm(x)).reshape(B, 3, C, -1).chunk(3, 1)
-        attn = (q.transpose(-2, -1) @ k) * (C ** -0.5)
-        attn = attn.softmax(dim=-1)
-        h = (v @ attn.transpose(-2, -1)).reshape(B, C, H, W)
-        return x + self.proj(h)
-
-class TimeEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(dim, 4*dim), nn.SiLU(), nn.Linear(4*dim, 4*dim))
-    def forward(self, t):
-        half = self.mlp[0].in_features // 2
-        freqs = torch.exp(torch.linspace(0, math.log(10000), half, device=t.device))
-        args = t[:, None] * freqs[None, :]
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return self.mlp(emb)
-
-
-class UNetModel(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 4,
-        base_channels: int = 32,
-        channel_mults: Tuple[int, ...] = (1, 2, 4),
-        num_res_blocks: int = 2,
-        num_classes: int | None = None,
-    ):
-        super().__init__()
-        self.time_embed = TimeEmbedding(base_channels)
-
-        # Optional classifier-free class conditioning:
-        # - if num_classes is provided, we reserve an extra "null" label at index num_classes
-        # - passing y=None uses the null label
-        self.num_classes = num_classes
-        self.null_label = num_classes if num_classes is not None else None
-        self.label_emb = nn.Embedding(num_classes + 1, base_channels * 4) if num_classes is not None else None
-
-        self.head = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
-        self.downs = nn.ModuleList()
-        ch = base_channels
-        chs = [ch]
-        for i, mult in enumerate(channel_mults):
-            out_ch = base_channels * mult
-            for _ in range(num_res_blocks):
-                self.downs.append(ResBlock(ch, out_ch, base_channels * 4))
-                ch = out_ch
-                chs.append(ch)
-            if i != len(channel_mults) - 1:
-                self.downs.append(nn.Conv2d(ch, ch, 3, 2, 1))
-                chs.append(ch)
-
-        self.mid = nn.ModuleList([
-            ResBlock(ch, ch, base_channels * 4),
-            AttentionBlock(ch),
-            ResBlock(ch, ch, base_channels * 4),
-        ])
-
-        self.ups = nn.ModuleList()
-        for i, mult in reversed(list(enumerate(channel_mults))):
-            out_ch = base_channels * mult
-            for _ in range(num_res_blocks + 1):
-                skip = chs.pop()
-                self.ups.append(ResBlock(ch + skip, out_ch, base_channels * 4))
-                ch = out_ch
-            if i != 0:
-                self.ups.append(nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(ch, ch, 3, 1, 1)))
-
-        self.out = nn.Sequential(
-            make_group_norm(ch),
-            nn.SiLU(),
-            nn.Conv2d(ch, in_channels, 3, 1, 1),
-        )
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
-        # t: [B], y: [B] (class ids), or y=None for unconditional branch
-        emb = self.time_embed(t)
-
-        if self.label_emb is not None:
-            if y is None:
-                y = torch.full((t.shape[0],), int(self.null_label), device=t.device, dtype=torch.long)
-            else:
-                if not torch.is_tensor(y):
-                    y = torch.tensor(y, device=t.device)
-                y = y.to(device=t.device, dtype=torch.long).view(-1)
-                if y.shape[0] != t.shape[0]:
-                    y = y.expand(t.shape[0])
-            emb = emb + self.label_emb(y)
-
-        h = self.head(x)
-        hs = [h]
-        for layer in self.downs:
-            if isinstance(layer, ResBlock):
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-            hs.append(h)
-
-        for layer in self.mid:
-            if isinstance(layer, ResBlock):
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-
-        for layer in self.ups:
-            if isinstance(layer, ResBlock):
-                h = torch.cat([h, hs.pop()], dim=1)
-                h = layer(h, emb)
-            else:
-                h = layer(h)
-
-        return self.out(h)
-
-
-
-class ResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, t_dim):
-        super().__init__()
-        self.block1 = nn.Sequential(make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1))
-        self.time_proj = nn.Linear(t_dim, out_ch)
-        self.block2 = nn.Sequential(make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1))
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-    def forward(self, x, t_emb):
-        h = self.block1(x)
-        h = h + self.time_proj(t_emb)[:, :, None, None]
-        return self.block2(h) + self.skip(x)
-'''
-
-
 import math
 from typing import Tuple, Optional
 
@@ -3499,12 +3362,12 @@ def main():
     # === SHARED CONFIG (base settings for both experiments) ===
     cfg_shared = {
         # --- Dataset ---
-        "dataset": "FMNIST",
+        "dataset": "CIFAR",
         "batch_size": 128,
         "num_workers": 2,
 
         # --- Model Architecture ---
-        "latent_channels": 3,
+        "latent_channels": 8,
         "cond_emb_dim": 64,
 
         # --- Learning Rates ---
@@ -3522,7 +3385,7 @@ def main():
         "num_train_timesteps": 1000,
         "train_on_mu": True,
 
-        # --- Not use ----
+        # --- Not used ----
         "noise_schedule": "cosine",
         "beta_start": 1e-4,
         "beta_end": 2e-2,
@@ -3553,8 +3416,8 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 320,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 80,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 800,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 200,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 2e-5,
 
         # Co-training specific settings
@@ -3563,13 +3426,13 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.4,
+        "score_w_vae": 0.5,
         "stiff_w": 1e-4,
         "score_w": 1.0,
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 80,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 80,     # Eval every 10 epochs during refine
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
     # === INDEPENDENT CONFIG ===
@@ -3578,7 +3441,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 50,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 400,       # LDM training on frozen VAE
+        "epochs_refine": 800,       # LDM training on frozen VAE
         "lr_refine": 4e-4,
 
         # Independent mode settings
@@ -3588,13 +3451,13 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 3e-2,
+        "kl_w": 2e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
 
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
-        "eval_freq_refine": 80,       # Eval every 10 epochs during refine
+        "eval_freq_refine": 100,       # Eval every 10 epochs during refine
     })
 
     print("=" * 70)
