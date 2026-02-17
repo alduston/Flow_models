@@ -3434,7 +3434,7 @@ def main():
         # --- Diffusion Settings ---
         "use_ddim_times": True,
         "t_min": 1e-4,
-        "t_max": 2.5,
+        "t_max": 1.5,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
 
@@ -3479,13 +3479,13 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.15,
+        "score_w_vae": 0.2,
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 20,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 20,     # Eval every 10 epochs during refine
+        "eval_freq_cotrain": 25,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 25,     # Eval every 10 epochs during refine
     })
 
     # === INDEPENDENT CONFIG ===
