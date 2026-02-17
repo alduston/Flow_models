@@ -1596,11 +1596,11 @@ def evaluate_current_state(
     ]
     if unet is not None:
          configs.extend([
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
 
     results = []
@@ -3381,7 +3381,7 @@ def main():
         # --- Diffusion Settings ---
         "use_ddim_times": True,
         "t_min": 2e-5,
-        "t_max": 2.0,
+        "t_max": 1.5,
         "num_train_timesteps": 1000,
         "train_on_mu": True,
 
@@ -3393,7 +3393,7 @@ def main():
         "ddim_eta": 0.0,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.25,
+        "cfg_label_dropout": 0.15,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
 
@@ -3416,9 +3416,9 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 800,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 200,        # Refine phase: LDM-only on frozen VAE
-        "lr_refine": 2e-5,
+        "epochs_vae": 900,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
+        "lr_refine": 1.5e-5,
 
         # Co-training specific settings
         "freeze_score_in_cotrain": False,  # Normal co-training
@@ -3426,7 +3426,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.5,
+        "score_w_vae": 0.666,
         "stiff_w": 1e-4,
         "score_w": 1.0,
 
@@ -3440,8 +3440,8 @@ def main():
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
-        "epochs_vae": 50,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 800,       # LDM training on frozen VAE
+        "epochs_vae": 100,           # VAE-only pretraining (no LDM)
+        "epochs_refine": 1000,       # LDM training on frozen VAE
         "lr_refine": 4e-4,
 
         # Independent mode settings
