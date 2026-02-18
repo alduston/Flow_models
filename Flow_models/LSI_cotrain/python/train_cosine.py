@@ -3393,7 +3393,7 @@ def main():
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-4,
+        "kl_w": 1e-6,
         "perc_w": 1.0,
 
         # --- Diffusion Settings ---
@@ -3411,14 +3411,14 @@ def main():
         "ddim_eta": 0.0,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.15,
+        "cfg_label_dropout": 0.2,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
 
         # --- Evaluation & Logging ---
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
-        "ema_decay": 0.999,
+        "ema_decay": 0.9995,
 
         # --- Misc ---
         "seed": 42,
@@ -3444,7 +3444,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.666,
+        "score_w_vae": 0.6,
         "stiff_w": 1e-4,
         "score_w": 1.0,
 
