@@ -2864,8 +2864,8 @@ def train_vae_cotrained_cond(cfg):
             opt_tracking = optim.AdamW(unet_lsi.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
 
     # --- Cosine LR Schedulers (cotrain phase) ---
-    sched_joint = CosineAnnealingLR(opt_joint, T_max=cfg["epochs_vae"], eta_min=0)
-    sched_tracking = CosineAnnealingLR(opt_tracking, T_max=cfg["epochs_vae"], eta_min=0) if opt_tracking is not None else None
+    sched_joint = CosineAnnealingLR(opt_joint, T_max=cfg["epochs_vae"], eta_min=1e-6)
+    sched_tracking = CosineAnnealingLR(opt_tracking, T_max=cfg["epochs_vae"], eta_min=1e-6) if opt_tracking is not None else None
 
     lpips_fn = lpips.LPIPS(net='vgg').to(device) if LPIPS_AVAILABLE else None
 
@@ -3193,8 +3193,8 @@ def train_vae_cotrained_cond(cfg):
         opt_control_refine = optim.AdamW(unet_control.parameters(), lr=lr_refine, weight_decay=1e-4)
 
         # --- Cosine LR Schedulers (refine phase) ---
-        sched_lsi_refine = CosineAnnealingLR(opt_lsi_refine, T_max=epochs_refine, eta_min=0)
-        sched_control_refine = CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=0)
+        sched_lsi_refine = CosineAnnealingLR(opt_lsi_refine, T_max=epochs_refine, eta_min=1e-7)
+        sched_control_refine = CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=1e-7)
 
         for ep in range(epochs_refine):
             unet_lsi.train(); unet_control.train()
