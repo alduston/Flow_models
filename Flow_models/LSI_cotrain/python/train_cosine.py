@@ -3449,7 +3449,7 @@ def main():
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
         "score_w_vae": 0.5,
-        "stiff_w": 1e-4,
+        "stiff_w": 1e-6,
         "score_w": 1.0,
 
         # Eval frequency (eval during both phases)
@@ -3462,9 +3462,9 @@ def main():
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
-        "epochs_vae": 100,           # VAE-only pretraining (no LDM)
+        "epochs_vae": 300,           # VAE-only pretraining (no LDM)
         "epochs_refine": 1000,       # LDM training on frozen VAE
-        "lr_refine": 4e-4,
+        "lr_refine": 5e-4,
 
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
