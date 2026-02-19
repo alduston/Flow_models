@@ -3584,7 +3584,7 @@ def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep, accelerator):
         print("=" * 70)
 
     # Create master results directory
-    master_results_dir = cfg_cotrain.get("master_results_dir", "run_results_comparison")
+    master_results_dir = cfg_cotrain.get("master_results_dir", "run_results_comparison") 
     if is_main:
         if os.path.exists(master_results_dir):
             shutil.rmtree(master_results_dir)
