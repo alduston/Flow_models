@@ -17,10 +17,10 @@ from torchvision import transforms, utils as tv_utils
 import shutil
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from datetime import datetime
-import pandas as pd
+from datetime import datetime, timedelta
 
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 import torch.distributed as dist
 
 
@@ -3695,7 +3695,10 @@ def main():
     """
 
     # --- Initialize Accelerator for multi-GPU training ---
-    accelerator = Accelerator()
+    # Increase NCCL timeout to handle long FID evaluation on rank 0
+    # while other ranks wait at barriers. Default 600s is too short.
+    process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=10800))  # 3 hours
+    accelerator = Accelerator(kwargs_handlers=[process_group_kwargs])
     is_main = accelerator.is_main_process
 
     # === SHARED CONFIG (base settings for both experiments) ===
