@@ -1597,11 +1597,11 @@ def evaluate_current_state(
     ]
     if unet is not None:
          configs.extend([
-            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
-            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
-            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
-            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
-            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
 
     results = []
@@ -3402,7 +3402,7 @@ def main():
 
         # --- Diffusion Settings ---
         "use_ddim_times": True,
-        "t_min": 2e-5,
+        "t_min": 1.5e-5,
         "t_max": 1.5,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
@@ -3415,7 +3415,7 @@ def main():
         "ddim_eta": 0.0,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.4,
+        "cfg_label_dropout": 0.3,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
 
@@ -3451,7 +3451,7 @@ def main():
         "score_w_vae": 0.5,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-
+        
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
@@ -3465,7 +3465,8 @@ def main():
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
         "epochs_refine": 1000,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
-
+        "cfg_label_dropout": 0.15,
+        
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
         "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
@@ -3476,7 +3477,7 @@ def main():
         "kl_w": 2e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
-
+        
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
         "eval_freq_refine": 100,       # Eval every 10 epochs during refine
