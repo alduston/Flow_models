@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -511,16 +512,20 @@ def extract_inception_features(images, device, batch_size=100, inception_model=N
         inception_model: optional pre-loaded inception model (for reuse)
 
     Returns:
-        features: [N, 2048] tensor of Inception features
+        features: [N, 2048] tensor of Inception features (on CPU)
         inception_model: the loaded model (for reuse)
     """
+    # Clamp batch size to avoid OOM from 299x299 resize
+    batch_size = min(batch_size, 32)
+
     # Lazy load inception model
     if inception_model is None:
         from torchvision.models import inception_v3
         inception_model = inception_v3(pretrained=True, transform_input=False)
         inception_model.fc = torch.nn.Identity()  # Remove final FC layer
-        inception_model = inception_model.to(device)
-        inception_model.eval()
+    # Ensure model is on the correct device (may have been moved to CPU to save memory)
+    inception_model = inception_model.to(device)
+    inception_model.eval()
 
     features_list = []
 
@@ -542,6 +547,9 @@ def extract_inception_features(images, device, batch_size=100, inception_model=N
 
             feat = inception_model(batch)
             features_list.append(feat.cpu())
+            del batch, feat
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     return torch.cat(features_list, 0), inception_model
 
@@ -1643,6 +1651,9 @@ def evaluate_current_state(
     """
 
     print(f"\n--- Evaluation: {prefix} @ Ep {epoch_idx} ---")
+    # Free as much GPU memory as possible before evaluation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     vae.eval()
     if unet is not None:
         unet.eval()
@@ -1712,11 +1723,11 @@ def evaluate_current_state(
     real_labels = torch.cat(real_labels, 0)[:target_count]
     sample_indices = torch.cat(sample_indices, 0)[:target_count]
 
-    real_flat_A = real_latents_A.view(target_count, -1).to(device)
+    real_flat_A = real_latents_A.view(target_count, -1)  # Keep on CPU
 
     if fixed_posterior_eps_bank_B is not None:
         real_latents_B = torch.cat(real_latents_B, 0)[:target_count]
-        real_flat_B = real_latents_B.view(target_count, -1).to(device)
+        real_flat_B = real_latents_B.view(target_count, -1)  # Keep on CPU
     else:
         real_flat_B = None
 
@@ -1732,7 +1743,13 @@ def evaluate_current_state(
         real_features, fid_model = extract_inception_features(
             real_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
         )
-    real_features = real_features.to(device)
+    real_features = real_features.cpu()  # Keep on CPU; FID/KID compute in numpy/CPU
+
+    # Free GPU memory: move inception model to CPU after extracting real features
+    if fid_model is not None and not use_lenet_fid and hasattr(fid_model, 'to'):
+        fid_model = fid_model.cpu()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     lsi_gap_unet = compute_lsi_gap(
         unet,
@@ -1819,7 +1836,7 @@ def evaluate_current_state(
                 if real_flat_B is not None:
                     w2 = compute_sw2(real_flat_A, real_flat_B, n_projections=sw2_nproj, theta=fixed_sw2_theta)
                 else:
-                    perm = torch.randperm(real_flat_A.size(0), device=device)
+                    perm = torch.randperm(real_flat_A.size(0), )
                     half = real_flat_A.size(0) // 2
                     w2 = compute_sw2(real_flat_A[perm[:half]], real_flat_A[perm[half:2*half]],
                                      n_projections=sw2_nproj, theta=fixed_sw2_theta)
@@ -1867,7 +1884,7 @@ def evaluate_current_state(
 
                 fake_latents = torch.cat(fake_latents_list, 0)
                 fake_imgs = torch.cat(fake_imgs_list, 0)
-                fake_flat = fake_latents.view(fake_latents.shape[0], -1).to(device)
+                fake_flat = fake_latents.view(fake_latents.shape[0], -1)
                 w2 = compute_sw2(real_flat_A, fake_flat, n_projections=sw2_nproj, theta=fixed_sw2_theta)
                 lsi_gap = lsi_gap_unet
 
@@ -1880,7 +1897,13 @@ def evaluate_current_state(
             fake_features, fid_model = extract_inception_features(
                 fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
             )
-        fake_features = fake_features.to(device)
+        fake_features = fake_features.cpu()  # Keep on CPU; FID/KID compute in numpy
+
+        # Move inception model off GPU to free VRAM for diversity computation
+        if fid_model is not None and not use_lenet_fid and hasattr(fid_model, 'to'):
+            fid_model = fid_model.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         fid = compute_fid_from_features(real_features, fake_features)
         kid = compute_kid(real_features, fake_features, num_subsets=100, subset_size=1000)
@@ -1973,12 +1996,12 @@ def evaluate_current_state(
             real_features_y = real_features[mask]
             real_imgs_y = real_imgs[mask]  # CPU tensor, [-1,1]
             real_latents_A_y = real_latents_A[mask]
-            real_flat_A_y = real_latents_A_y.view(n_y, -1).to(device)
+            real_flat_A_y = real_latents_A_y.view(n_y, -1)
 
             # For posterior-floor SW2 in class case
             if fixed_posterior_eps_bank_B is not None:
                 real_latents_B_y = real_latents_B[mask]
-                real_flat_B_y = real_latents_B_y.view(n_y, -1).to(device)
+                real_flat_B_y = real_latents_B_y.view(n_y, -1)
             else:
                 real_flat_B_y = None
 
@@ -2008,7 +2031,13 @@ def evaluate_current_state(
                 fake_features_recon_y, fid_model = extract_inception_features(
                     fake_imgs_recon_y, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
                 )
-            fake_features_recon_y = fake_features_recon_y.to(device)
+            fake_features_recon_y = fake_features_recon_y.cpu()
+
+            # Free GPU memory
+            if fid_model is not None and not use_lenet_fid and hasattr(fid_model, 'to'):
+                fid_model = fid_model.cpu()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             fid_recon_y = compute_fid_from_features(real_features_y, fake_features_recon_y)
 
@@ -2022,7 +2051,7 @@ def evaluate_current_state(
             if real_flat_B_y is not None:
                 w2_recon_y = compute_sw2(real_flat_A_y, real_flat_B_y, n_projections=sw2_nproj, theta=fixed_sw2_theta)
             else:
-                perm = torch.randperm(real_flat_A_y.size(0), device=device)
+                perm = torch.randperm(real_flat_A_y.size(0))
                 half = max(1, real_flat_A_y.size(0) // 2)
                 w2_recon_y = compute_sw2(
                     real_flat_A_y[perm[:half]],
@@ -2115,7 +2144,13 @@ def evaluate_current_state(
                         fake_features_y, fid_model = extract_inception_features(
                             fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
                         )
-                    fake_features_y = fake_features_y.to(device)
+                    fake_features_y = fake_features_y.cpu()
+
+                    # Free GPU memory
+                    if fid_model is not None and not use_lenet_fid and hasattr(fid_model, 'to'):
+                        fid_model = fid_model.cpu()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                     fid_y = compute_fid_from_features(real_features_y, fake_features_y)
 
@@ -2125,7 +2160,7 @@ def evaluate_current_state(
                     else:
                         kid_y = compute_kid(real_features_y, fake_features_y, num_subsets=50, subset_size=subset_size)
 
-                    fake_flat_y = fake_latents.view(fake_latents.shape[0], -1).to(device)
+                    fake_flat_y = fake_latents.view(fake_latents.shape[0], -1)
                     w2_y = compute_sw2(real_flat_A_y, fake_flat_y, n_projections=sw2_nproj, theta=fixed_sw2_theta)
                     div_y = compute_diversity(fake_imgs.to(device), lpips_fn) if LPIPS_AVAILABLE else 0.0
 
@@ -2772,7 +2807,8 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
     tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
     vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    print(f"--> Loaded {dataset_key}: {len(train)} train, {len(test)} test, {num_classes} classes, img_size={img_size}, img_channels={img_channels}")
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        print(f"--> Loaded {dataset_key}: {len(train)} train, {len(test)} test, {num_classes} classes, img_size={img_size}, img_channels={img_channels}")
     return tl, vl, num_classes
 
 
@@ -3218,9 +3254,10 @@ def train_vae_cotrained_cond(cfg, accelerator):
         }
         loss_records.append(epoch_metrics)
 
-        print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | "
-              f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
-              f"Stiff: {epoch_metrics['stiff']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f}")
+        if is_main:
+            print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | "
+                  f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
+                  f"Stiff: {epoch_metrics['stiff']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f}")
 
         if is_main and len(mu_stats) > 0:
             log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
