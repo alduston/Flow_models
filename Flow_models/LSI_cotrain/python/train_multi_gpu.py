@@ -21,6 +21,7 @@ from datetime import datetime
 import pandas as pd
 
 from accelerate import Accelerator
+import torch.distributed as dist
 
 
 # ---------------------------------------------------------------------------
@@ -2956,8 +2957,10 @@ def train_vae_cotrained_cond(cfg, accelerator):
         fixed_sw2_theta = None
 
     # --- Prepare with Accelerator (multi-GPU) ---
-    # Wrap models
-    vae, unet_lsi, unet_control = accelerator.prepare(vae, unet_lsi, unet_control)
+    # Wrap score models (their forward() is called directly in training)
+    unet_lsi, unet_control = accelerator.prepare(unet_lsi, unet_control)
+    # VAE is NOT wrapped in DDP because training calls vae.encode/decode/reparameterize
+    # individually rather than vae.forward(). We manually sync VAE gradients after backward.
     # EMA models stay on the accelerator device but are NOT wrapped (no DDP needed, eval only)
     unet_lsi_ema = unet_lsi_ema.to(device)
     unet_control_ema = unet_control_ema.to(device)
@@ -3132,6 +3135,11 @@ def train_vae_cotrained_cond(cfg, accelerator):
 
             opt_joint.zero_grad()
             accelerator.backward(loss_joint)
+            # Manually sync VAE gradients across GPUs (VAE is not DDP-wrapped)
+            if accelerator.num_processes > 1:
+                for p in vae.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
             if freeze_score_in_cotrain:
                 nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
             elif cotrain_head == "lsi":
@@ -3228,13 +3236,13 @@ def train_vae_cotrained_cond(cfg, accelerator):
         if should_eval_cotrain and is_main:
             # For cotrain, epoch = LDM training epoch (1-indexed)
             ldm_epoch = ep + 1
-            vae_unwrapped = accelerator.unwrap_model(vae)
+            # VAE is not DDP-wrapped, use directly
 
             # Evaluate LSI
             results_lsi = evaluate_current_state(
                 ldm_epoch,
                 "LSI_Diff",
-                vae_unwrapped,
+                vae,
                 unet_lsi_ema,
                 test_l,
                 cfg,
@@ -3424,12 +3432,12 @@ def train_vae_cotrained_cond(cfg, accelerator):
                     ldm_epoch = ep + 1  # Indep: refine is the only LDM training
                 else:
                     ldm_epoch = cfg["epochs_vae"] + ep + 1  # Cotrain: add cotrain epochs
-                vae_unwrapped = accelerator.unwrap_model(vae)
+                # VAE is not DDP-wrapped, use directly
 
                 results_lsi = evaluate_current_state(
                         ldm_epoch,
                         "LSI_Diff_Refine",
-                        vae_unwrapped,
+                        vae,
                         unet_lsi_ema,
                         test_l,
                         cfg,
@@ -3452,7 +3460,7 @@ def train_vae_cotrained_cond(cfg, accelerator):
                 results_ctrl = evaluate_current_state(
                         ldm_epoch,
                         "Ctrl_Diff_Refine",
-                        vae_unwrapped,
+                        vae,
                         unet_control_ema,
                         test_l,
                         cfg,
@@ -3475,7 +3483,7 @@ def train_vae_cotrained_cond(cfg, accelerator):
     # --- Save Checkpoints (main process only) ---
     accelerator.wait_for_everyone()
     if is_main:
-        save_checkpoint(accelerator.unwrap_model(vae).state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
+        save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
         save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
         save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
 
