@@ -3466,6 +3466,7 @@ def main():
         "epochs_refine": 1000,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.15,
+        "t_min": 1.5e-4,
         
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
