@@ -2920,9 +2920,13 @@ def train_vae_cotrained_cond(cfg):
 
                 # --- Tracking head (trains on detached latents) ---
                 z_t_detached = z_t.detach()
+                z_mu_t_detached = z_mu_t.detach()
                 if cotrain_head == "lsi":
                     # Control tracks
-                    eps_pred_control_tracking = unet_control(z_t_detached, t, y_in)
+                    if cfg.get("train_on_mu", False):
+                        eps_pred_control_tracking = unet_control(z_t_detached, t, y_in)
+                    else:
+                        eps_pred_control_tracking = unet_control(z_mu_t_detached, t, y_in)
                     tracking_loss = cfg["score_w"] * F.mse_loss(eps_pred_control_tracking, noise)
                 else:
                     # LSI tracks
@@ -3401,7 +3405,7 @@ def main():
         "t_min": 2e-5,
         "t_max": 1.5,
         "num_train_timesteps": 1000,
-        "train_on_mu": True,
+        "train_on_mu": False,
 
         # --- Not used ----
         "noise_schedule": "cosine",
@@ -3411,7 +3415,7 @@ def main():
         "ddim_eta": 0.0,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.2,
+        "cfg_label_dropout": 0.4,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
 
@@ -3444,7 +3448,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.6,
+        "score_w_vae": 0.5,
         "stiff_w": 1e-4,
         "score_w": 1.0,
 
