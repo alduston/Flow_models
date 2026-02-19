@@ -3325,8 +3325,9 @@ def train_vae_cotrained_cond(cfg, accelerator):
                 results_ctrl["tag"] = "Ctrl_Diff"
                 eval_records.append(results_ctrl)
 
-
-    # ===========================================================================
+        # All ranks must wait here while rank 0 finishes evaluation
+        if should_eval_cotrain:
+            accelerator.wait_for_everyone()
     # REFINEMENT STAGE: Freeze VAE, train only score networks
     # ===========================================================================
     epochs_refine = cfg.get("epochs_refine", 20)
@@ -3516,6 +3517,10 @@ def train_vae_cotrained_cond(cfg, accelerator):
                     results_ctrl["tag"] = "Ctrl_Diff_Refine"
                     eval_records.append(results_ctrl)
 
+            # All ranks must wait here while rank 0 finishes evaluation
+            if (ep + 1) % eval_freq_refine == 0:
+                accelerator.wait_for_everyone()
+
     # --- Save Checkpoints (main process only) ---
     accelerator.wait_for_everyone()
     if is_main:
@@ -3698,7 +3703,7 @@ def main():
         # --- Dataset ---
         "dataset": "FMNIST",
         "batch_size": 128,
-        "eval_batch_size": 32,
+        "eval_batch_size": 64,
         "num_workers": 2,
 
         # --- Model Architecture ---
@@ -3706,8 +3711,8 @@ def main():
         "cond_emb_dim": 32,
 
         # --- Learning Rates ---
-        "lr_vae": 5e-4,
-        "lr_ldm": 1e-4,
+        "lr_vae": 1e-3,
+        "lr_ldm": 2e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
@@ -3715,7 +3720,7 @@ def main():
 
         # --- PatchGAN discriminator ---
         "gan_w": 0.005,
-        "disc_start_epoch": 51,
+        "disc_start_epoch": 5001,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 5e-5,
@@ -3757,8 +3762,8 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 900,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 250,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 50,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
         # Co-training specific settings
@@ -3772,8 +3777,8 @@ def main():
         "score_w": 1.0,
         
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 10,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 10,     # Eval every 10 epochs during refine
+        "eval_freq_cotrain": 25,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 25,     # Eval every 10 epochs during refine
     })
 
     # === INDEPENDENT CONFIG ===
@@ -3781,8 +3786,8 @@ def main():
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
-        "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 1000,       # LDM training on frozen VAE
+        "epochs_vae": 150,           # VAE-only pretraining (no LDM)
+        "epochs_refine": 300,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.15,
         "t_min": 1.5e-4,
@@ -3800,7 +3805,7 @@ def main():
         
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
-        "eval_freq_refine": 50,       # Eval every 10 epochs during refine
+        "eval_freq_refine": 25,       # Eval every 10 epochs during refine
     })
 
     if is_main:
