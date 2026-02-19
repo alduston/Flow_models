@@ -3548,12 +3548,6 @@ def main():
         "cosine_t_max": 0.9999,
         "cosine_s": 0.008,
 
-        # --- Legacy (not used with unified schedule) ----
-        "noise_schedule": "cosine",
-        "beta_start": 1e-4,
-        "beta_end": 2e-2,
-        "ddim_eta": 0.0,
-
         # --- CFG ---
         "cfg_label_dropout": 0.3,
         "cfg_eval_scale": 2.0,
