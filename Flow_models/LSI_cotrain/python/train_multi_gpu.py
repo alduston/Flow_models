@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -1659,7 +1658,7 @@ def evaluate_current_state(
         unet.eval()
 
     target_count = len(loader.dataset)
-    bs = cfg["batch_size"]
+    bs = cfg.get("eval_batch_size", cfg["batch_size"])
     # Compute latent spatial size from img_size (default 32 for backward compat)
     img_size = cfg.get("img_size", 32)
     latent_spatial = img_size // 4
@@ -3699,6 +3698,7 @@ def main():
         # --- Dataset ---
         "dataset": "FMNIST",
         "batch_size": 128,
+        "eval_batch_size": 32,
         "num_workers": 2,
 
         # --- Model Architecture ---
@@ -3772,8 +3772,8 @@ def main():
         "score_w": 1.0,
         
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 50,     # Eval every 10 epochs during refine
+        "eval_freq_cotrain": 10,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 10,     # Eval every 10 epochs during refine
     })
 
     # === INDEPENDENT CONFIG ===
