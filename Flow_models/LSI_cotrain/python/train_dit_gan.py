@@ -3601,14 +3601,14 @@ def main():
         "perc_w": 1.0,
 
         # --- PatchGAN discriminator ---
-        "gan_w": 0.05,
+        "gan_w": 0.02,
         "disc_start_epoch": 50,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 5e-5,
 
         # --- Diffusion Settings ---
-        "time_schedule": "log_snr",     # "log_t", "log_snr", or "cosine"
+        "time_schedule": "log_t",     # "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
         "t_min": 1.5e-5,
         "t_max": 1.5,
@@ -3654,7 +3654,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.5,
+        "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
         
