@@ -8,6 +8,7 @@ from typing import Any, Dict, Tuple
 
 import torch
 from torch import nn, optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import torchvision
@@ -69,26 +70,6 @@ def seed_everything(seed: int = 42) -> None:
 def default_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def make_cosine_warmup_scheduler(optimizer, warmup_epochs: int, total_epochs: int, eta_min_factor: float = 0.01):
-    """Create a cosine annealing LR scheduler with linear warmup.
-
-    Args:
-        optimizer: The optimizer to schedule.
-        warmup_epochs: Number of epochs for linear warmup.
-        total_epochs: Total number of training epochs.
-        eta_min_factor: Minimum LR as fraction of initial LR (default 1%).
-    Returns:
-        torch.optim.lr_scheduler.LambdaLR
-    """
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # Linear warmup: 0 -> 1 over warmup_epochs
-            return (epoch + 1) / warmup_epochs
-        # Cosine decay from 1 -> eta_min_factor over remaining epochs
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return eta_min_factor + 0.5 * (1.0 - eta_min_factor) * (1.0 + math.cos(math.pi * progress))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -147,13 +128,56 @@ def sample_log_uniform_times(B: int, t_min: float, t_max: float, device: torch.d
     return torch.exp(log_t_min + u * (log_t_max - log_t_min))
 
 def get_ou_params(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """OU process: alpha(t) = exp(-t), sigma(t) = sqrt(1 - exp(-2t))."""
     alpha = torch.exp(-t)
     sigma = torch.sqrt(1.0 - torch.exp(-2.0 * t) + 1e-8)
     return alpha, sigma
 
+# ---------------------------------------------------------------------------
+# Log-SNR <-> OU time conversion
+# ---------------------------------------------------------------------------
+
+def ou_logsnr(t: torch.Tensor) -> torch.Tensor:
+    """log-SNR for the OU process: log(alpha^2 / sigma^2)."""
+    e2t = torch.exp(-2.0 * t)
+    return torch.log(e2t / (1.0 - e2t + 1e-12) + 1e-12)
+
+def ou_time_from_logsnr(lam: torch.Tensor) -> torch.Tensor:
+    """Invert log-SNR to OU time.
+
+    From lambda = log(e^{-2t} / (1 - e^{-2t})):
+      e^{-2t} = sigmoid(lambda)
+      t = -0.5 * log(sigmoid(lambda))
+    """
+    sig = torch.sigmoid(lam)
+    return -0.5 * torch.log(sig.clamp(1e-12, 1.0 - 1e-7))
 
 # ---------------------------------------------------------------------------
-# Discrete VP / DDPM noise schedule utilities (cosine/linear)
+# VP-Cosine schedule helpers (Nichol & Dhariwal, Improved DDPM)
+# ---------------------------------------------------------------------------
+
+def get_cosine_params(
+    t_frac: torch.Tensor, cosine_s: float = 0.008,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Given t_frac in (0, 1), return (alpha, sigma, beta) for the VP-cosine schedule.
+
+    alpha_bar(t) = cos^2(g(t)) / cos^2(g(0)),  g(t) = (t+s)/(1+s) * pi/2
+    alpha = sqrt(alpha_bar),  sigma = sqrt(1 - alpha_bar)
+    beta(t) = -d/dt log(alpha_bar) = 2 * tan(g(t)) * g'(t)
+    """
+    g = ((t_frac + cosine_s) / (1.0 + cosine_s)) * (math.pi / 2.0)
+    g0 = (cosine_s / (1.0 + cosine_s)) * (math.pi / 2.0)
+    alpha_bar = (torch.cos(g) / math.cos(g0)) ** 2
+    alpha_bar = alpha_bar.clamp(1e-8, 1.0)
+    alpha = torch.sqrt(alpha_bar)
+    sigma = torch.sqrt((1.0 - alpha_bar).clamp_min(1e-8))
+    g_prime = math.pi / (2.0 * (1.0 + cosine_s))
+    beta = (2.0 * torch.tan(g.clamp(max=math.pi / 2.0 - 1e-4)) * g_prime).clamp(max=20.0)
+    return alpha, sigma, beta
+
+
+# ---------------------------------------------------------------------------
+# Discrete schedule utilities (cosine/linear)
 # ---------------------------------------------------------------------------
 
 def extract_schedule(a: torch.Tensor, t_idx: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
@@ -169,62 +193,92 @@ def make_beta_schedule(
     beta_end: float = 2e-2,
     cosine_s: float = 0.008,
 ) -> torch.Tensor:
-    """Return betas[t] for a discrete VP/DDPM schedule.
-
-    - 'cosine' matches the Improved DDPM cosine ᾱ(t) schedule (Nichol & Dhariwal).
-    - 'linear' is a simple linear beta schedule.
-    """
+    """Return betas[t] for a discrete VP/DDPM schedule (legacy helper)."""
     schedule = str(schedule).lower()
     if num_timesteps < 1:
         raise ValueError("num_timesteps must be >= 1")
-
     if schedule == "linear":
         betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
         return betas.clamp(1e-8, 0.999)
-
     if schedule == "cosine":
-        # Build ᾱ for t in {0..T}
         steps = num_timesteps + 1
         t = torch.linspace(0, num_timesteps, steps, dtype=torch.float32) / num_timesteps
         alphas_cumprod = torch.cos(((t + cosine_s) / (1 + cosine_s)) * math.pi / 2) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        # Convert ᾱ to betas
         betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return betas.clamp(1e-8, 0.999)
-
     raise ValueError(f"Unknown noise_schedule: {schedule}")
 
-def make_ou_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+
+def make_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+    """Build a unified discrete schedule of T timesteps.
+
+    Config key ``time_schedule`` selects the grid type:
+      - "log_t"   : OU process, grid log-uniform in OU time  (original behaviour)
+      - "log_snr" : OU process, grid uniform in log-SNR      (default, recommended)
+      - "cosine"  : VP-cosine process (Nichol & Dhariwal), grid uniform in [0,1]
+
+    Returns dict with keys:
+        T, times, alpha, sigma, beta, schedule_type, cosine_s
     """
-    Precompute a discrete OU schedule:
-      - T discrete times spanning [t_min, t_max]
-      - alpha(t), sigma(t) from get_ou_params
-    Choose log-spaced times so uniform index sampling approximates log-uniform t sampling.
-    """
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
     T = int(cfg.get("num_train_timesteps", 1000))
-    t_min = float(cfg.get("t_min", 2e-5))
-    t_max = float(cfg.get("t_max", 2.0))
 
-    # log-spaced grid from t_min -> t_max (monotone increasing)
-    times = torch.logspace(
-        math.log10(t_min),
-        math.log10(t_max),
-        T,
-        device=device,
-        dtype=torch.float32,
-    )
+    if stype in ("log_t", "log_snr"):
+        t_min = float(cfg.get("t_min", 2e-5))
+        t_max = float(cfg.get("t_max", 2.0))
 
-    # get OU params on the grid; squeeze to [T]
-    a, s = get_ou_params(times.view(T, 1, 1, 1))
-    alpha = a.view(T).float()
-    sigma = s.view(T).float()
+        if stype == "log_t":
+            # Log-spaced grid in OU time (original behaviour)
+            times = torch.logspace(
+                math.log10(t_min), math.log10(t_max), T,
+                device=device, dtype=torch.float32,
+            )
+        else:  # log_snr
+            # Uniform grid in log-SNR, inverted to OU time
+            lam_max = ou_logsnr(torch.tensor(t_min, dtype=torch.float64)).item()
+            lam_min = ou_logsnr(torch.tensor(t_max, dtype=torch.float64)).item()
+            lam_grid = torch.linspace(lam_min, lam_max, T, device=device, dtype=torch.float64)
+            times = ou_time_from_logsnr(lam_grid).float()
+            # lam ascending => OU time descending, so flip to get monotone increasing
+            times = times.flip(0).clamp(t_min, t_max)
 
-    return {
-        "T": torch.tensor(T, device=device, dtype=torch.long),
-        "times": times,   # [T]
-        "alpha": alpha,   # [T]
-        "sigma": sigma,   # [T]
-    }
+        a, s = get_ou_params(times.view(T, 1, 1, 1))
+        alpha = a.view(T).float()
+        sigma = s.view(T).float()
+        beta = torch.zeros(T, device=device, dtype=torch.float32)
+
+        return {
+            "T": torch.tensor(T, device=device, dtype=torch.long),
+            "times": times, "alpha": alpha, "sigma": sigma, "beta": beta,
+            "schedule_type": stype, "cosine_s": 0.0,
+        }
+
+    elif stype == "cosine":
+        cosine_s = float(cfg.get("cosine_s", 0.008))
+        t_min_frac = float(cfg.get("cosine_t_min", 2e-4))
+        t_max_frac = float(cfg.get("cosine_t_max", 0.9999))
+
+        times = torch.linspace(t_min_frac, t_max_frac, T, device=device, dtype=torch.float32)
+        a, s, b = get_cosine_params(times.view(T, 1, 1, 1), cosine_s=cosine_s)
+        alpha = a.view(T).float()
+        sigma = s.view(T).float()
+        beta_arr = b.view(T).float()
+
+        return {
+            "T": torch.tensor(T, device=device, dtype=torch.long),
+            "times": times, "alpha": alpha, "sigma": sigma, "beta": beta_arr,
+            "schedule_type": stype, "cosine_s": cosine_s,
+        }
+    else:
+        raise ValueError(f"Unknown time_schedule: {stype!r}. Expected 'log_t', 'log_snr', or 'cosine'.")
+
+
+# Keep legacy alias
+def make_ou_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+    cfg_copy = dict(cfg); cfg_copy["time_schedule"] = "log_t"
+    return make_schedule(cfg_copy, device)
+
 
 def t_idx_to_time(t_idx: torch.Tensor, cfg: Dict[str, Any], T: int) -> torch.Tensor:
     """Map discrete indices t_idx in [0, T-1] to a continuous scalar used ONLY for time embedding."""
@@ -622,8 +676,8 @@ def compute_lsi_gap(
     num_samples = min(int(num_samples), int(n_data))
     sample_indices = torch.randperm(n_data, device="cpu")[:num_samples]
 
-    # --- Discrete OU schedule ---
-    ou_sched = make_ou_schedule(cfg, device)
+    # --- Discrete schedule (OU or cosine, depending on cfg) ---
+    ou_sched = make_schedule(cfg, device)
     T = int(ou_sched["T"].item())
 
     # Choose a fixed grid of discrete indices
@@ -1233,16 +1287,58 @@ class UniversalSampler:
         t_max: float = 2.0,
         schedule_cfg: Dict[str, Any] | None = None,
         ddim_eta: float = 0.0,
+        schedule_type: str = "log_snr",
+        cosine_s: float = 0.008,
     ):
         self.num_steps = int(num_steps)
         self.t_min = float(t_min)
         self.t_max = float(t_max)
         self.method = str(method).lower()
+        self.schedule_type = str(schedule_type).lower()
+        self.cosine_s = float(cosine_s)
 
         # For discrete samplers (DDIM), we need the same schedule used in training.
         self.schedule_cfg = schedule_cfg
         self.ddim_eta = float(ddim_eta)
         self._ddpm_schedule: Dict[str, torch.Tensor] | None = None
+
+    # -------------------- schedule-aware helpers --------------------
+
+    def _get_alpha_sigma(self, t_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (alpha, sigma) at continuous time t_vec, dispatching on schedule type."""
+        if self.schedule_type == "cosine":
+            a, s, _ = get_cosine_params(t_vec, cosine_s=self.cosine_s)
+            return a, s
+        else:  # log_t or log_snr — both use OU params
+            return get_ou_params(t_vec)
+
+    def _get_beta(self, t_vec: torch.Tensor) -> torch.Tensor:
+        """Return instantaneous beta(t) — only meaningful for cosine VP."""
+        if self.schedule_type == "cosine":
+            _, _, b = get_cosine_params(t_vec, cosine_s=self.cosine_s)
+            return b
+        else:
+            # For OU, beta is formally 2 (constant), but the ODE form is different.
+            return torch.full_like(t_vec, 2.0)
+
+    def _make_time_grid(self, device: torch.device) -> torch.Tensor:
+        """Build descending time grid (t_max -> t_min) for sampling, matching training grid type."""
+        N = self.num_steps + 1
+        if self.schedule_type == "cosine":
+            # Uniform in cosine fraction (descending)
+            return torch.linspace(self.t_max, self.t_min, N, device=device)
+        elif self.schedule_type == "log_snr":
+            # Uniform in log-SNR (mapped to OU time, descending)
+            lam_min_val = ou_logsnr(torch.tensor(self.t_max, dtype=torch.float64)).item()
+            lam_max_val = ou_logsnr(torch.tensor(self.t_min, dtype=torch.float64)).item()
+            lam_grid = torch.linspace(lam_min_val, lam_max_val, N, device=device, dtype=torch.float64)
+            times = ou_time_from_logsnr(lam_grid).float()
+            # lam ascending => OU time descending — already correct order for sampling
+            return times.clamp(self.t_min, self.t_max)
+        else:  # log_t
+            return torch.logspace(
+                math.log10(self.t_max), math.log10(self.t_min), N, device=device
+            )
 
     @staticmethod
     def _predict_eps(
@@ -1261,23 +1357,43 @@ class UniversalSampler:
         eps_cond = unet(x, t_vec, y)
         return eps_uncond + float(cfg_scale) * (eps_cond - eps_uncond)
 
-    # ------------------------- Continuous-time OU samplers -------------------------
+    # ------------------------- Continuous-time samplers -------------------------
 
     def get_ode_derivative(self, x, t, unet, y=None, cfg_scale=None):
+        """Probability-flow ODE derivative, dispatching on schedule type.
+
+        OU:     dx/dt = -x + eps_pred / sigma
+        Cosine: dx/dt = -0.5 * beta(t) * (x - eps_pred / sigma)
+        """
         B = x.shape[0]
         t_vec = t.expand(B)
         eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
-        _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
+        alpha, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
         inv_sigma = 1.0 / (sigma + 1e-10)
-        return -x + inv_sigma * eps_pred
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            return -0.5 * beta_t * (x - inv_sigma * eps_pred)
+        else:  # OU (log_t or log_snr)
+            return -x + inv_sigma * eps_pred
 
     def get_rev_sde_drift(self, x, t, unet, y=None, cfg_scale=None):
+        """Reverse-time SDE drift.
+
+        OU:     drift = -x + 2 * eps_pred / sigma
+        Cosine: drift = -0.5 * beta(t) * x + beta(t) * eps_pred / sigma
+        """
         B = x.shape[0]
         t_vec = t.expand(B)
         eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
-        _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
+        alpha, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
         inv_sigma = 1.0 / (sigma + 1e-8)
-        return -x + 2.0 * inv_sigma * eps_pred
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            return -0.5 * beta_t * x + beta_t * inv_sigma * eps_pred
+        else:  # OU
+            return -x + 2.0 * inv_sigma * eps_pred
 
     def step_euler_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
         dt = t_next - t_curr
@@ -1300,17 +1416,11 @@ class UniversalSampler:
         B = x.shape[0]
         dt = t_next - t_curr
 
-        t_vec = t_curr.expand(B)
-        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
-        _, sigma = get_ou_params(t_vec.view(B, 1, 1, 1))
-        d_curr = -x + (1.0 / (sigma + 1e-10)) * eps_pred
+        d_curr = self.get_ode_derivative(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
         x_proposed = x + dt * d_curr
 
         if t_next > self.t_min:
-            t_next_vec = t_next.expand(B)
-            eps_next = self._predict_eps(unet, x_proposed, t_next_vec, y=y, cfg_scale=cfg_scale)
-            _, sigma_next = get_ou_params(t_next_vec.view(B, 1, 1, 1))
-            d_next = -x_proposed + (1.0 / (sigma_next + 1e-10)) * eps_next
+            d_next = self.get_ode_derivative(x_proposed, t_next, unet, y=y, cfg_scale=cfg_scale)
             x = x + 0.5 * dt * (d_curr + d_next)
         else:
             x = x_proposed
@@ -1318,6 +1428,11 @@ class UniversalSampler:
         return x
 
     def step_heun_sde(self, x, t_curr, t_next, unet, y=None, cfg_scale=None, generator=None):
+        """Heun SDE step with schedule-aware diffusion coefficient.
+
+        OU:     diffusion = sqrt(2)
+        Cosine: diffusion = sqrt(beta(t))
+        """
         dt = t_next - t_curr
         dt_abs = torch.abs(dt).clamp_min(1e-12)
 
@@ -1325,7 +1440,15 @@ class UniversalSampler:
             noise = torch.randn_like(x)
         else:
             noise = torch.randn(x.shape, device=x.device, generator=generator)
-        dW = torch.sqrt(2.0 * dt_abs) * noise
+
+        B = x.shape[0]
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_curr.expand(B).view(B, 1, 1, 1))
+            diff_coeff = torch.sqrt(beta_t.clamp_min(1e-8))
+        else:  # OU: constant diffusion sqrt(2)
+            diff_coeff = math.sqrt(2.0)
+
+        dW = diff_coeff * torch.sqrt(dt_abs) * noise
 
         b_curr = self.get_rev_sde_drift(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
         x_hat = x + dt * b_curr + dW
@@ -1354,21 +1477,17 @@ class UniversalSampler:
         cfg_scale: float | None = None,
         generator=None,
     ) -> torch.Tensor:
-        """
-        OU-DDIM step: one UNet call at t_curr, update to t_next using OU (alpha(t), sigma(t)).
-        Deterministic when ddim_eta=0.
-        """
+        """DDIM step using schedule-aware alpha/sigma (works for OU and cosine)."""
         B = x.shape[0]
 
-        # UNet eval time is exactly the OU time (no clamping, no index mapping)
         t_vec = t_curr.expand(B)
         eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
 
-        alpha_t, sigma_t = get_ou_params(t_vec.view(B, 1, 1, 1))
+        alpha_t, sigma_t = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
         alpha_t = alpha_t.to(x.dtype)
         sigma_t = sigma_t.to(x.dtype)
 
-        # x0 prediction under OU parameterization
+        # x0 prediction
         x0_pred = (x - sigma_t * eps_pred) / (alpha_t + 1e-8)
 
         # If we're at (or below) the terminal noise level, return the denoised prediction
@@ -1376,7 +1495,7 @@ class UniversalSampler:
             return x0_pred
 
         t_next_vec = t_next.expand(B)
-        alpha_next, sigma_next = get_ou_params(t_next_vec.view(B, 1, 1, 1))
+        alpha_next, sigma_next = self._get_alpha_sigma(t_next_vec.view(B, 1, 1, 1))
         alpha_next = alpha_next.to(x.dtype)
         sigma_next = sigma_next.to(x.dtype)
 
@@ -1388,7 +1507,6 @@ class UniversalSampler:
         if eta <= 0.0:
             sigma_ddim = torch.zeros_like(sigma_next)
         else:
-            # same algebra as DDIM, but with continuous a(t)
             denom = (1.0 - a_t).clamp_min(1e-12)
             term1 = ((1.0 - a_next) / denom).clamp_min(0.0)
             term2 = (1.0 - (a_t / (a_next + 1e-12))).clamp_min(0.0)
@@ -1427,17 +1545,11 @@ class UniversalSampler:
             x = x_init
         device = x.device
 
+        # Build descending time grid matching the training schedule type
+        ts = self._make_time_grid(device)
 
         # --- Discrete DDIM path ---
         if self.method == "ddim":
-            # Use the same OU log-universe schedule as the ODE/SDE solvers
-            ts = torch.logspace(
-                math.log10(self.t_max),
-                math.log10(self.t_min),
-                self.num_steps + 1,
-                device=device
-            )
-
             for i in range(self.num_steps):
                 t_curr = ts[i]
                 t_next = ts[i + 1]
@@ -1450,17 +1562,9 @@ class UniversalSampler:
                     cfg_scale=cfg_scale,
                     generator=generator,
                 )
-
             return x
 
-        # --- Continuous OU samplers (existing path) ---
-        ts = torch.logspace(
-            math.log10(self.t_max),
-            math.log10(self.t_min),
-            self.num_steps + 1,
-            device=device
-        )
-
+        # --- Continuous ODE/SDE samplers ---
         for i in range(self.num_steps):
             t_curr = ts[i]
             t_next = ts[i + 1]
@@ -1616,11 +1720,11 @@ def evaluate_current_state(
     ]
     if unet is not None:
          configs.extend([
-            {"method": "rk4_ode",  "steps": 50, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
-            #{"method": "rk4_ode",  "steps": 50, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
-            #{"method": "rk4_ode",  "steps": 50, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
-            #{"method": "rk4_ode",  "steps": 50, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
-            {"method": "rk4_ode",  "steps": 50, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
 
     results = []
@@ -1692,7 +1796,13 @@ def evaluate_current_state(
                     num_steps=steps,
                     t_min=cfg["t_min"],
                     t_max=cfg["t_max"],
+                    schedule_type=cfg.get("time_schedule", "log_snr"),
+                    cosine_s=cfg.get("cosine_s", 0.008),
                 )
+                # For cosine schedule, override t_min/t_max with cosine fraction endpoints
+                if cfg.get("time_schedule", "log_snr") == "cosine":
+                    sampler_kwargs["t_min"] = cfg.get("cosine_t_min", 2e-4)
+                    sampler_kwargs["t_max"] = cfg.get("cosine_t_max", 0.9999)
                 if method == "ddim":
                     sampler_kwargs.update(
                         schedule_cfg=cfg,
@@ -1920,12 +2030,18 @@ def evaluate_current_state(
                     tag = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
                     mode = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
 
-                    sampler = UniversalSampler(
+                    sampler_kwargs_cond = dict(
                         method=method,
                         num_steps=steps,
                         t_min=cfg["t_min"],
                         t_max=cfg["t_max"],
+                        schedule_type=cfg.get("time_schedule", "log_snr"),
+                        cosine_s=cfg.get("cosine_s", 0.008),
                     )
+                    if cfg.get("time_schedule", "log_snr") == "cosine":
+                        sampler_kwargs_cond["t_min"] = cfg.get("cosine_t_min", 2e-4)
+                        sampler_kwargs_cond["t_max"] = cfg.get("cosine_t_max", 0.9999)
+                    sampler = UniversalSampler(**sampler_kwargs_cond)
                     fake_latents_list, fake_imgs_list = [], []
 
                     for i in range(0, n_y, bs):
@@ -2587,46 +2703,34 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
     img_channels = info.get("img_channels", 1)
     is_grayscale_cifar = info.get("grayscale", False)
 
-    # Build transforms based on dataset (separate train/test for augmentation)
+    # Build transforms based on dataset
     if dataset_key == "CIFAR":
         # CIFAR-10 RGB: 32x32, 3 channels, no padding needed
-        tf_train = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-        tf_test = transforms.Compose([
+        tf = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
     elif dataset_key == "GCIFAR":
         # CIFAR-10 grayscale: 32x32, no padding needed
-        tf_train = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.Grayscale(num_output_channels=1),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
-        ])
-        tf_test = transforms.Compose([
+        tf = transforms.Compose([
             transforms.Grayscale(num_output_channels=1),
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,))
         ])
     else:
-        # MNIST-family datasets: 28x28, pad to 32x32 (no flip)
-        tf_train = transforms.Compose([
+        # MNIST-family datasets: 28x28, pad to 32x32
+        tf = transforms.Compose([
             transforms.Pad(2),
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,))
         ])
-        tf_test = tf_train
 
     if dataset_key == "EMNIST":
-        train = dataset_cls("./data", split=info["split"], train=True, download=True, transform=tf_train)
-        test = dataset_cls("./data", split=info["split"], train=False, download=True, transform=tf_test)
+        train = dataset_cls("./data", split=info["split"], train=True, download=True, transform=tf)
+        test = dataset_cls("./data", split=info["split"], train=False, download=True, transform=tf)
     else:
-        train = dataset_cls("./data", train=True, download=True, transform=tf_train)
-        test = dataset_cls("./data", train=False, download=True, transform=tf_test)
+        train = dataset_cls("./data", train=True, download=True, transform=tf)
+        test = dataset_cls("./data", train=False, download=True, transform=tf)
 
     tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
     vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
@@ -2661,11 +2765,11 @@ def train_vae_cotrained_cond(cfg):
     # This switches training from continuous log-uniform OU times to discrete VP/DDPM timesteps.
 
 
-    # --- Discrete OU schedule (optional) ---
-    # For use_ddim_times: discretize OU times (log-spaced) and use OU alpha/sigma.
-    ou_sched = make_ou_schedule(cfg, device)
+    # --- Unified discrete schedule (log_t / log_snr / cosine depending on cfg) ---
+    ou_sched = make_schedule(cfg, device)
     T = int(ou_sched["T"].item())
     noise_sched = ou_sched
+    print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
 
     dataset_key = cfg.get("dataset", "FMNIST")
     train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
@@ -2686,7 +2790,6 @@ def train_vae_cotrained_cond(cfg):
 
     vae = VAE(
         latent_channels=cfg["latent_channels"],
-        base_ch=int(cfg.get("vae_base_ch", 32)),
         use_norm=cfg.get("use_latent_norm", False),
         img_size=effective_img_size,
         img_channels=img_channels,
@@ -2760,10 +2863,9 @@ def train_vae_cotrained_cond(cfg):
             ], weight_decay=1e-4)
             opt_tracking = optim.AdamW(unet_lsi.parameters(), lr=cfg["lr_ldm"], weight_decay=1e-4)
 
-    # --- Cosine Warmup LR Schedulers (cotrain phase) ---
-    warmup_epochs_cotrain = int(cfg.get("warmup_epochs_cotrain", 10))
-    sched_joint = make_cosine_warmup_scheduler(opt_joint, warmup_epochs_cotrain, cfg["epochs_vae"])
-    sched_tracking = make_cosine_warmup_scheduler(opt_tracking, warmup_epochs_cotrain, cfg["epochs_vae"]) if opt_tracking is not None else None
+    # --- Cosine LR Schedulers (cotrain phase) ---
+    sched_joint = CosineAnnealingLR(opt_joint, T_max=cfg["epochs_vae"], eta_min=0)
+    sched_tracking = CosineAnnealingLR(opt_tracking, T_max=cfg["epochs_vae"], eta_min=0) if opt_tracking is not None else None
 
     lpips_fn = lpips.LPIPS(net='vgg').to(device) if LPIPS_AVAILABLE else None
 
@@ -2953,9 +3055,13 @@ def train_vae_cotrained_cond(cfg):
 
                 # --- Tracking head (trains on detached latents) ---
                 z_t_detached = z_t.detach()
+                z_mu_t_detached = z_mu_t.detach()
                 if cotrain_head == "lsi":
                     # Control tracks
-                    eps_pred_control_tracking = unet_control(z_t_detached, t, y_in)
+                    if cfg.get("train_on_mu", False):
+                        eps_pred_control_tracking = unet_control(z_t_detached, t, y_in)
+                    else:
+                        eps_pred_control_tracking = unet_control(z_mu_t_detached, t, y_in)
                     tracking_loss = cfg["score_w"] * F.mse_loss(eps_pred_control_tracking, noise)
                 else:
                     # LSI tracks
@@ -3009,7 +3115,7 @@ def train_vae_cotrained_cond(cfg):
         if len(mu_stats) > 0:
             log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
 
-        # --- Step LR schedulers ---
+        # --- Step cosine LR schedulers ---
         sched_joint.step()
         if sched_tracking is not None:
             sched_tracking.step()
@@ -3086,10 +3192,9 @@ def train_vae_cotrained_cond(cfg):
         opt_lsi_refine = optim.AdamW(unet_lsi.parameters(), lr=lr_refine, weight_decay=1e-4)
         opt_control_refine = optim.AdamW(unet_control.parameters(), lr=lr_refine, weight_decay=1e-4)
 
-        # --- Cosine Warmup LR Schedulers (refine phase) ---
-        warmup_epochs_refine = int(cfg.get("warmup_epochs_refine", 5))
-        sched_lsi_refine = make_cosine_warmup_scheduler(opt_lsi_refine, warmup_epochs_refine, epochs_refine)
-        sched_control_refine = make_cosine_warmup_scheduler(opt_control_refine, warmup_epochs_refine, epochs_refine)
+        # --- Cosine LR Schedulers (refine phase) ---
+        sched_lsi_refine = CosineAnnealingLR(opt_lsi_refine, T_max=epochs_refine, eta_min=0)
+        sched_control_refine = CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=0)
 
         for ep in range(epochs_refine):
             unet_lsi.train(); unet_control.train()
@@ -3194,7 +3299,7 @@ def train_vae_cotrained_cond(cfg):
             print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
                   f"Ctrl: {epoch_metrics['score_control']:.4f}")
 
-            # --- Step LR schedulers ---
+            # --- Step cosine LR schedulers ---
             sched_lsi_refine.step()
             sched_control_refine.step()
 
@@ -3419,8 +3524,7 @@ def main():
         "num_workers": 2,
 
         # --- Model Architecture ---
-        "latent_channels": 4,
-        "vae_base_ch": 64,
+        "latent_channels": 8,
         "cond_emb_dim": 64,
 
         # --- Learning Rates ---
@@ -3432,28 +3536,33 @@ def main():
         "perc_w": 1.0,
 
         # --- Diffusion Settings ---
+        "time_schedule": "log_snr",     # "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1e-4,
+        "t_min": 1.5e-5,
         "t_max": 1.5,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
 
-        # --- Not use ----
+        # --- Cosine VP schedule settings (only used when time_schedule="cosine") ---
+        "cosine_t_min": 2e-4,
+        "cosine_t_max": 0.9999,
+        "cosine_s": 0.008,
+
+        # --- Legacy (not used with unified schedule) ----
         "noise_schedule": "cosine",
         "beta_start": 1e-4,
         "beta_end": 2e-2,
-        "cosine_s": 0.008,
         "ddim_eta": 0.0,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.15,
+        "cfg_label_dropout": 0.3,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
 
         # --- Evaluation & Logging ---
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
-        "ema_decay": 0.9999,
+        "ema_decay": 0.9995,
 
         # --- Misc ---
         "seed": 42,
@@ -3471,7 +3580,7 @@ def main():
         # Training schedule
         "epochs_vae": 900,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
-        "lr_refine": 1.4e-5,
+        "lr_refine": 1.5e-5,
 
         # Co-training specific settings
         "freeze_score_in_cotrain": False,  # Normal co-training
@@ -3479,13 +3588,13 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.2,
+        "score_w_vae": 0.5,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-
+        
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 25,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 25,     # Eval every 10 epochs during refine
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
     # === INDEPENDENT CONFIG ===
@@ -3493,10 +3602,12 @@ def main():
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
-        "epochs_vae": 100,           # VAE-only pretraining (no LDM)
+        "epochs_vae": 300,           # VAE-only pretraining (no LDM)
         "epochs_refine": 1000,       # LDM training on frozen VAE
-        "lr_refine": 4e-4,
-
+        "lr_refine": 5e-4,
+        "cfg_label_dropout": 0.15,
+        "t_min": 1.5e-4,
+        
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
         "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
@@ -3504,10 +3615,10 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 5e-2,
+        "kl_w": 2e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
-
+        
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
         "eval_freq_refine": 100,       # Eval every 10 epochs during refine
