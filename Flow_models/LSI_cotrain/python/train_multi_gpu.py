@@ -20,6 +20,8 @@ from tqdm import tqdm
 from datetime import datetime
 import pandas as pd
 
+from accelerate import Accelerator
+
 
 # ---------------------------------------------------------------------------
 # Dataset Configuration
@@ -2764,6 +2766,8 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
         train = dataset_cls("./data", train=True, download=True, transform=tf)
         test = dataset_cls("./data", train=False, download=True, transform=tf)
 
+    # NOTE: shuffle=True and drop_last=True are handled here; Accelerate's prepare()
+    # will replace the sampler with a DistributedSampler that handles shuffling across GPUs.
     tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
     vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
@@ -2771,7 +2775,7 @@ def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
     return tl, vl, num_classes
 
 
-def train_vae_cotrained_cond(cfg):
+def train_vae_cotrained_cond(cfg, accelerator):
     """
     Modified co-training function with DataFrame logging and visualization.
 
@@ -2782,9 +2786,17 @@ def train_vae_cotrained_cond(cfg):
     - Generates visualization suite after training completes
     - Saves all results to run_results directory
     """
-    # --- Setup Results Directory ---
-    results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"),
-                                   wipe=True, preserve_checkpoints=True)
+    # --- Setup Results Directory (main process only, others wait) ---
+    device = accelerator.device
+    is_main = accelerator.is_main_process
+
+    results_dir = cfg.get("results_dir", "run_results")
+    if is_main:
+        results_dir = setup_run_results_dir(results_dir, wipe=True, preserve_checkpoints=True)
+    accelerator.wait_for_everyone()
+    # Ensure all processes use the same path
+    results_dir = cfg.get("results_dir", "run_results")
+    os.makedirs(results_dir, exist_ok=True)
 
     # Update checkpoint directory to be within results
     cfg["ckpt_dir"] = os.path.join(results_dir, "checkpoints")
@@ -2792,16 +2804,15 @@ def train_vae_cotrained_cond(cfg):
     eval_freq_cotrain = cfg.get("eval_freq_cotrain", eval_freq)  # ADD THIS
     eval_freq_refine = cfg.get("eval_freq_refine", eval_freq)    # ADD THIS
 
-    device = default_device()
     # --- Discrete diffusion schedule (train + sampling) ---
-    # This switches training from continuous log-uniform OU times to discrete VP/DDPM timesteps.
 
 
     # --- Unified discrete schedule (log_t / log_snr / cosine depending on cfg) ---
     ou_sched = make_schedule(cfg, device)
     T = int(ou_sched["T"].item())
     noise_sched = ou_sched
-    print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
+    if is_main:
+        print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
 
     dataset_key = cfg.get("dataset", "FMNIST")
     train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
@@ -2815,8 +2826,10 @@ def train_vae_cotrained_cond(cfg):
     cfg["img_size"] = effective_img_size  # store for later use
     cfg["img_channels"] = img_channels    # store for later use
 
-    # Get FID model (Inception for FMNIST/GCIFAR, LeNet for others)
-    fid_model, use_lenet_fid = get_fid_model(dataset_key, train_l, num_classes, device, cfg["ckpt_dir"])
+    # Get FID model (Inception for FMNIST/GCIFAR, LeNet for others) - main process only
+    fid_model, use_lenet_fid = None, False
+    if is_main:
+        fid_model, use_lenet_fid = get_fid_model(dataset_key, train_l, num_classes, device, cfg["ckpt_dir"])
 
     use_ddim_times = cfg.get("use_ddim_times", False)
 
@@ -2942,19 +2955,43 @@ def train_vae_cotrained_cond(cfg):
         fixed_posterior_eps_bank_B = None
         fixed_sw2_theta = None
 
+    # --- Prepare with Accelerator (multi-GPU) ---
+    # Wrap models
+    vae, unet_lsi, unet_control = accelerator.prepare(vae, unet_lsi, unet_control)
+    # EMA models stay on the accelerator device but are NOT wrapped (no DDP needed, eval only)
+    unet_lsi_ema = unet_lsi_ema.to(device)
+    unet_control_ema = unet_control_ema.to(device)
+
+    # Wrap optimizers and schedulers
+    if opt_tracking is not None:
+        opt_joint, opt_tracking, sched_joint, sched_tracking = accelerator.prepare(
+            opt_joint, opt_tracking, sched_joint, sched_tracking
+        )
+    else:
+        opt_joint, sched_joint = accelerator.prepare(opt_joint, sched_joint)
+
+    if disc is not None:
+        disc, opt_disc = accelerator.prepare(disc, opt_disc)
+
+    # Wrap dataloaders
+    # Only prepare train_l (distributes across GPUs).
+    # test_l is NOT prepared — evaluation runs only on main process with full dataset.
+    train_l = accelerator.prepare(train_l)
+
     # --- Initialize Logging DataFrames ---
     loss_records = []
     eval_records = []
 
-    print("--> Starting Dual Co-training...")
+    if is_main:
+        print("--> Starting Dual Co-training...")
     for ep in range(cfg["epochs_vae"]):
         vae.train(); unet_lsi.train(); unet_control.train()
         metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc", "stiff", "gan_d", "gan_g"]}
         mu_stats = []
 
-        for x, y in tqdm(train_l, desc=f"Ep {ep+1}", leave=False):
-            x = x.to(device)
-            y = y.to(device=device, dtype=torch.long)
+        for x, y in tqdm(train_l, desc=f"Ep {ep+1}", leave=False, disable=not is_main):
+            # x and y are already on the correct device via accelerator.prepare(train_l)
+            y = y.long()
             B = x.shape[0]
 
             # --- Classifier-Free Guidance (label dropout) ---
@@ -3073,7 +3110,7 @@ def train_vae_cotrained_cond(cfg):
                 logits_fake = disc(x_rec.detach())
                 d_loss = hinge_d_loss(logits_real, logits_fake)
                 opt_disc.zero_grad()
-                d_loss.backward()
+                accelerator.backward(d_loss)
                 opt_disc.step()
                 # Generator loss (non-detached)
                 g_loss = hinge_g_loss(disc(x_rec))
@@ -3094,7 +3131,7 @@ def train_vae_cotrained_cond(cfg):
                     loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen + gan_w*g_loss
 
             opt_joint.zero_grad()
-            loss_joint.backward()
+            accelerator.backward(loss_joint)
             if freeze_score_in_cotrain:
                 nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
             elif cotrain_head == "lsi":
@@ -3108,10 +3145,10 @@ def train_vae_cotrained_cond(cfg):
                 # --- EMA Update (co-trained head) ---
                 with torch.no_grad():
                     if cotrain_head == "lsi":
-                        for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                        for p_online, p_ema in zip(accelerator.unwrap_model(unet_lsi).parameters(), unet_lsi_ema.parameters()):
                             p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
                     else:
-                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                        for p_online, p_ema in zip(accelerator.unwrap_model(unet_control).parameters(), unet_control_ema.parameters()):
                             p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
                 # --- Tracking head (trains on detached latents) ---
@@ -3130,7 +3167,7 @@ def train_vae_cotrained_cond(cfg):
                     tracking_loss = cfg["score_w"] * F.mse_loss(eps_pred_lsi_tracking, eps_target_lsi.detach())
 
                 opt_tracking.zero_grad()
-                tracking_loss.backward()
+                accelerator.backward(tracking_loss)
                 if cotrain_head == "lsi":
                     nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
                 else:
@@ -3140,10 +3177,10 @@ def train_vae_cotrained_cond(cfg):
                 # --- EMA Update (tracking head) ---
                 with torch.no_grad():
                     if cotrain_head == "lsi":
-                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                        for p_online, p_ema in zip(accelerator.unwrap_model(unet_control).parameters(), unet_control_ema.parameters()):
                             p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
                     else:
-                        for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                        for p_online, p_ema in zip(accelerator.unwrap_model(unet_lsi).parameters(), unet_lsi_ema.parameters()):
                             p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
             metrics["loss"] += loss_joint.item()
@@ -3177,7 +3214,7 @@ def train_vae_cotrained_cond(cfg):
               f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
               f"Stiff: {epoch_metrics['stiff']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f}")
 
-        if len(mu_stats) > 0:
+        if is_main and len(mu_stats) > 0:
             log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
 
         # --- Step cosine LR schedulers ---
@@ -3188,15 +3225,16 @@ def train_vae_cotrained_cond(cfg):
         # --- Evaluation (skip if score frozen - no LDM to evaluate) ---
         should_eval_cotrain = (not freeze_score_in_cotrain) and ((ep + 1) % eval_freq_cotrain == 0)
 
-        if should_eval_cotrain:
+        if should_eval_cotrain and is_main:
             # For cotrain, epoch = LDM training epoch (1-indexed)
             ldm_epoch = ep + 1
+            vae_unwrapped = accelerator.unwrap_model(vae)
 
             # Evaluate LSI
             results_lsi = evaluate_current_state(
                 ldm_epoch,
                 "LSI_Diff",
-                vae,
+                vae_unwrapped,
                 unet_lsi_ema,
                 test_l,
                 cfg,
@@ -3251,7 +3289,8 @@ def train_vae_cotrained_cond(cfg):
     lr_refine = cfg.get("lr_refine", 1e-4)
 
     if epochs_refine > 0:
-        print(f"\n--> Starting Refinement Stage ({epochs_refine} epochs, lr={lr_refine})...")
+        if is_main:
+            print(f"\n--> Starting Refinement Stage ({epochs_refine} epochs, lr={lr_refine})...")
 
         vae.eval()
         for p in vae.parameters():
@@ -3264,13 +3303,18 @@ def train_vae_cotrained_cond(cfg):
         sched_lsi_refine = CosineAnnealingLR(opt_lsi_refine, T_max=epochs_refine, eta_min=1e-7)
         sched_control_refine = CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=1e-7)
 
+        # Prepare refine optimizers/schedulers with accelerator
+        opt_lsi_refine, opt_control_refine, sched_lsi_refine, sched_control_refine = accelerator.prepare(
+            opt_lsi_refine, opt_control_refine, sched_lsi_refine, sched_control_refine
+        )
+
         for ep in range(epochs_refine):
             unet_lsi.train(); unet_control.train()
             metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control"]}
 
-            for x, y in tqdm(train_l, desc=f"Refine Ep {ep+1}", leave=False):
-                x = x.to(device)
-                y = y.to(device=device, dtype=torch.long)
+            for x, y in tqdm(train_l, desc=f"Refine Ep {ep+1}", leave=False, disable=not is_main):
+                # x and y are already on the correct device via accelerator.prepare(train_l)
+                y = y.long()
                 B = x.shape[0]
 
                 # --- Classifier-Free Guidance (label dropout) ---
@@ -3317,13 +3361,13 @@ def train_vae_cotrained_cond(cfg):
                 score_loss_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
 
                 opt_lsi_refine.zero_grad()
-                score_loss_lsi.backward()
+                accelerator.backward(score_loss_lsi)
                 nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
                 opt_lsi_refine.step()
 
                 # --- EMA Update (LSI) ---
                 with torch.no_grad():
-                    for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                    for p_online, p_ema in zip(accelerator.unwrap_model(unet_lsi).parameters(), unet_lsi_ema.parameters()):
                         p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
                 # --- Control (Tweedie/DSM) Score Training ---
@@ -3337,13 +3381,13 @@ def train_vae_cotrained_cond(cfg):
                 score_loss_control = F.mse_loss(eps_pred_control, noise)
 
                 opt_control_refine.zero_grad()
-                score_loss_control.backward()
+                accelerator.backward(score_loss_control)
                 nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
                 opt_control_refine.step()
 
                 # --- EMA Update (Control) ---
                 with torch.no_grad():
-                    for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                    for p_online, p_ema in zip(accelerator.unwrap_model(unet_control).parameters(), unet_control_ema.parameters()):
                         p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
                 metrics_refine["score_lsi"] += score_loss_lsi.item()
@@ -3364,14 +3408,15 @@ def train_vae_cotrained_cond(cfg):
             }
             loss_records.append(epoch_metrics)
 
-            print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
-                  f"Ctrl: {epoch_metrics['score_control']:.4f}")
+            if is_main:
+                print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+                      f"Ctrl: {epoch_metrics['score_control']:.4f}")
 
             # --- Step cosine LR schedulers ---
             sched_lsi_refine.step()
             sched_control_refine.step()
 
-            if (ep + 1) % eval_freq_refine == 0:
+            if (ep + 1) % eval_freq_refine == 0 and is_main:
                 # For refine phase:
                 # - Cotrain mode: LDM epoch = epochs_vae + refine_epoch
                 # - Indep mode: LDM epoch = refine_epoch (VAE phase had no LDM training)
@@ -3379,11 +3424,12 @@ def train_vae_cotrained_cond(cfg):
                     ldm_epoch = ep + 1  # Indep: refine is the only LDM training
                 else:
                     ldm_epoch = cfg["epochs_vae"] + ep + 1  # Cotrain: add cotrain epochs
+                vae_unwrapped = accelerator.unwrap_model(vae)
 
                 results_lsi = evaluate_current_state(
                         ldm_epoch,
                         "LSI_Diff_Refine",
-                        vae,
+                        vae_unwrapped,
                         unet_lsi_ema,
                         test_l,
                         cfg,
@@ -3406,7 +3452,7 @@ def train_vae_cotrained_cond(cfg):
                 results_ctrl = evaluate_current_state(
                         ldm_epoch,
                         "Ctrl_Diff_Refine",
-                        vae,
+                        vae_unwrapped,
                         unet_control_ema,
                         test_l,
                         cfg,
@@ -3426,39 +3472,42 @@ def train_vae_cotrained_cond(cfg):
                     results_ctrl["tag"] = "Ctrl_Diff_Refine"
                     eval_records.append(results_ctrl)
 
-    # --- Save Checkpoints ---
-    save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
-    save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
-    save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
+    # --- Save Checkpoints (main process only) ---
+    accelerator.wait_for_everyone()
+    if is_main:
+        save_checkpoint(accelerator.unwrap_model(vae).state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
+        save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
+        save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
 
     # --- Create DataFrames ---
     loss_df = pd.DataFrame(loss_records)
     eval_df = pd.DataFrame(eval_records) if eval_records else pd.DataFrame()
 
-    # --- Save DataFrames ---
-    save_dataframes(loss_df, eval_df, results_dir)
+    if is_main:
+        # --- Save DataFrames ---
+        save_dataframes(loss_df, eval_df, results_dir)
 
-    # --- Generate Visualizations ---
-    if len(loss_df) > 0 and len(eval_df) > 0:
-        generate_all_visualizations(loss_df, eval_df, results_dir)
-    else:
-        print("--> Warning: Insufficient data for visualization generation")
+        # --- Generate Visualizations ---
+        if len(loss_df) > 0 and len(eval_df) > 0:
+            generate_all_visualizations(loss_df, eval_df, results_dir)
+        else:
+            print("--> Warning: Insufficient data for visualization generation")
 
-    # --- Save run configuration ---
-    cfg_path = os.path.join(results_dir, "config.txt")
-    with open(cfg_path, "w") as f:
-        for k, v in cfg.items():
-            f.write(f"{k}: {v}\n")
-    print(f"--> Saved configuration to {cfg_path}")
+        # --- Save run configuration ---
+        cfg_path = os.path.join(results_dir, "config.txt")
+        with open(cfg_path, "w") as f:
+            for k, v in cfg.items():
+                f.write(f"{k}: {v}\n")
+        print(f"--> Saved configuration to {cfg_path}")
 
 
-    # --- ZIP the entire results directory (DEFAULT) ---
-    zip_path = zip_results_dir(results_dir)
-    print(f"--> Zipped results to: {zip_path}")
+        # --- ZIP the entire results directory (DEFAULT) ---
+        zip_path = zip_results_dir(results_dir)
+        print(f"--> Zipped results to: {zip_path}")
 
-    print(f"\n{'='*60}")
-    print(f"Training complete! All results saved to: {results_dir}")
-    print(f"{'='*60}")
+        print(f"\n{'='*60}")
+        print(f"Training complete! All results saved to: {results_dir}")
+        print(f"{'='*60}")
 
     return loss_df, eval_df
 
@@ -3467,7 +3516,7 @@ def train_vae_cotrained_cond(cfg):
 # ---------------------------------------------------------------------------
 
 
-def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
+def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep, accelerator):
     """
     Run both co-trained and independent training experiments,
     then generate comparison plots.
@@ -3479,86 +3528,98 @@ def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
     Returns:
         dict containing all results and paths
     """
-    print("=" * 70)
-    print("RUNNING CO-TRAINED vs INDEPENDENT TRAINING COMPARISON")
-    print("=" * 70)
+    is_main = accelerator.is_main_process
+    if is_main:
+        print("=" * 70)
+        print("RUNNING CO-TRAINED vs INDEPENDENT TRAINING COMPARISON")
+        print("=" * 70)
 
     # Create master results directory
     master_results_dir = cfg_cotrain.get("master_results_dir", "run_results_comparison")
-    if os.path.exists(master_results_dir):
-        shutil.rmtree(master_results_dir)
-    os.makedirs(master_results_dir, exist_ok=True)
+    if is_main:
+        if os.path.exists(master_results_dir):
+            shutil.rmtree(master_results_dir)
+        os.makedirs(master_results_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     # Calculate total LDM epochs for each
     cotrain_ldm_epochs = cfg_cotrain["epochs_vae"] + cfg_cotrain["epochs_refine"]
     indep_ldm_epochs = cfg_indep["epochs_refine"]  # Only refine has LDM training
 
-    print(f"\nExperiment setup:")
-    print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cotrain_ldm_epochs} LDM epochs")
-    print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {indep_ldm_epochs} LDM epochs")
+    if is_main:
+        print(f"\nExperiment setup:")
+        print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cotrain_ldm_epochs} LDM epochs")
+        print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {indep_ldm_epochs} LDM epochs")
 
     # --- EXPERIMENT 1: CO-TRAINED ---
-    print("\n" + "=" * 70)
-    print("EXPERIMENT 1: CO-TRAINED (CSEM)")
-    print("=" * 70)
+    if is_main:
+        print("\n" + "=" * 70)
+        print("EXPERIMENT 1: CO-TRAINED (CSEM)")
+        print("=" * 70)
 
     cfg_cotrain["results_dir"] = os.path.join(master_results_dir, "run_results_cotrain")
 
     seed_everything(cfg_cotrain["seed"])
-    loss_df_cotrain, eval_df_cotrain = train_vae_cotrained_cond(cfg_cotrain)
+    loss_df_cotrain, eval_df_cotrain = train_vae_cotrained_cond(cfg_cotrain, accelerator)
 
     # --- EXPERIMENT 2: INDEPENDENT ---
-    print("\n" + "=" * 70)
-    print("EXPERIMENT 2: INDEPENDENT (Two-Stage)")
-    print("=" * 70)
+    if is_main:
+        print("\n" + "=" * 70)
+        print("EXPERIMENT 2: INDEPENDENT (Two-Stage)")
+        print("=" * 70)
 
     cfg_indep["results_dir"] = os.path.join(master_results_dir, "run_results_indep")
 
     seed_everything(cfg_indep["seed"])  # Reset seed for fair comparison
-    loss_df_indep, eval_df_indep = train_vae_cotrained_cond(cfg_indep)
+    loss_df_indep, eval_df_indep = train_vae_cotrained_cond(cfg_indep, accelerator)
 
     # --- GENERATE COMPARISON PLOTS ---
-    print("\n" + "=" * 70)
-    print("GENERATING COMPARISON VISUALIZATIONS")
-    print("=" * 70)
+    if is_main:
+        print("\n" + "=" * 70)
+        print("GENERATING COMPARISON VISUALIZATIONS")
+        print("=" * 70)
 
-    generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, master_results_dir)
+        generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, master_results_dir)
 
-    # --- Save Combined DataFrames ---
-    combined_dir = os.path.join(master_results_dir, "combined_dataframes")
-    os.makedirs(combined_dir, exist_ok=True)
+        # --- Save Combined DataFrames ---
+        combined_dir = os.path.join(master_results_dir, "combined_dataframes")
+        os.makedirs(combined_dir, exist_ok=True)
 
-    # Add source column to distinguish
-    eval_df_cotrain_save = eval_df_cotrain.copy()
-    eval_df_cotrain_save["experiment"] = "cotrained"
-    eval_df_indep_save = eval_df_indep.copy()
-    eval_df_indep_save["experiment"] = "independent"
+        # Add source column to distinguish
+        eval_df_cotrain_save = eval_df_cotrain.copy()
+        eval_df_cotrain_save["experiment"] = "cotrained"
+        eval_df_indep_save = eval_df_indep.copy()
+        eval_df_indep_save["experiment"] = "independent"
 
-    combined_eval_df = pd.concat([eval_df_cotrain_save, eval_df_indep_save], ignore_index=True)
-    combined_eval_df.to_csv(os.path.join(combined_dir, "combined_eval_metrics.csv"), index=False)
+        combined_eval_df = pd.concat([eval_df_cotrain_save, eval_df_indep_save], ignore_index=True)
+        combined_eval_df.to_csv(os.path.join(combined_dir, "combined_eval_metrics.csv"), index=False)
 
-    loss_df_cotrain_save = loss_df_cotrain.copy()
-    loss_df_cotrain_save["experiment"] = "cotrained"
-    loss_df_indep_save = loss_df_indep.copy()
-    loss_df_indep_save["experiment"] = "independent"
+        loss_df_cotrain_save = loss_df_cotrain.copy()
+        loss_df_cotrain_save["experiment"] = "cotrained"
+        loss_df_indep_save = loss_df_indep.copy()
+        loss_df_indep_save["experiment"] = "independent"
 
-    combined_loss_df = pd.concat([loss_df_cotrain_save, loss_df_indep_save], ignore_index=True)
-    combined_loss_df.to_csv(os.path.join(combined_dir, "combined_loss_history.csv"), index=False)
+        combined_loss_df = pd.concat([loss_df_cotrain_save, loss_df_indep_save], ignore_index=True)
+        combined_loss_df.to_csv(os.path.join(combined_dir, "combined_loss_history.csv"), index=False)
 
-    print(f"--> Saved combined eval metrics to {combined_dir}/combined_eval_metrics.csv")
-    print(f"--> Saved combined loss history to {combined_dir}/combined_loss_history.csv")
+        print(f"--> Saved combined eval metrics to {combined_dir}/combined_eval_metrics.csv")
+        print(f"--> Saved combined loss history to {combined_dir}/combined_loss_history.csv")
 
-    # --- ZIP the entire comparison results directory ---
-    zip_path = zip_results_dir(master_results_dir)
-    print(f"--> Zipped all comparison results to: {zip_path}")
+        # --- ZIP the entire comparison results directory ---
+        zip_path = zip_results_dir(master_results_dir)
+        print(f"--> Zipped all comparison results to: {zip_path}")
 
-    print(f"\n{'='*70}")
-    print(f"COMPARISON COMPLETE!")
-    print(f"All results saved to: {master_results_dir}")
-    print(f"  - Co-trained results: {master_results_dir}/run_results_cotrain/")
-    print(f"  - Independent results: {master_results_dir}/run_results_indep/")
-    print(f"  - Comparison plots: {master_results_dir}/comparison_plots/")
-    print(f"{'='*70}")
+        print(f"\n{'='*70}")
+        print(f"COMPARISON COMPLETE!")
+        print(f"All results saved to: {master_results_dir}")
+        print(f"  - Co-trained results: {master_results_dir}/run_results_cotrain/")
+        print(f"  - Independent results: {master_results_dir}/run_results_indep/")
+        print(f"  - Comparison plots: {master_results_dir}/comparison_plots/")
+        print(f"{'='*70}")
+    else:
+        combined_eval_df = pd.DataFrame()
+        combined_loss_df = pd.DataFrame()
+        zip_path = ""
 
     return {
         "loss_df_cotrain": loss_df_cotrain,
@@ -3583,6 +3644,10 @@ def main():
     Both experiments have the same total LDM training epochs for fair comparison.
     X-axis on plots = "LDM Training Epoch" (1-250 for both)
     """
+
+    # --- Initialize Accelerator for multi-GPU training ---
+    accelerator = Accelerator()
+    is_main = accelerator.is_main_process
 
     # === SHARED CONFIG (base settings for both experiments) ===
     cfg_shared = {
@@ -3693,32 +3758,34 @@ def main():
         "eval_freq_refine": 50,       # Eval every 10 epochs during refine
     })
 
-    print("=" * 70)
-    print("=== CO-TRAINED vs INDEPENDENT TRAINING COMPARISON ===")
-    print("=" * 70)
-    print("\nExperiment design:")
-    print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cfg_cotrain['epochs_vae'] + cfg_cotrain['epochs_refine']} LDM epochs")
-    print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {cfg_indep['epochs_refine']} LDM epochs")
-    print("\nPlot legend:")
-    print("  - Solid blue: Co-trained LSI")
-    print("  - Solid red: Co-trained Tweedie")
-    print("  - Dashed blue: Independent LSI")
-    print("  - Dashed red: Independent Tweedie")
-    print("=" * 70)
+    if is_main:
+        print("=" * 70)
+        print("=== CO-TRAINED vs INDEPENDENT TRAINING COMPARISON ===")
+        print("=" * 70)
+        print("\nExperiment design:")
+        print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cfg_cotrain['epochs_vae'] + cfg_cotrain['epochs_refine']} LDM epochs")
+        print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {cfg_indep['epochs_refine']} LDM epochs")
+        print("\nPlot legend:")
+        print("  - Solid blue: Co-trained LSI")
+        print("  - Solid red: Co-trained Tweedie")
+        print("  - Dashed blue: Independent LSI")
+        print("  - Dashed red: Independent Tweedie")
+        print("=" * 70)
 
-    results = run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep)
+    results = run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep, accelerator)
 
-    print("\n" + "=" * 70)
-    print("FINAL SUMMARY")
-    print("=" * 70)
-    print(f"Results directory: {results['master_results_dir']}")
-    print(f"Zipped results: {results['zip_path']}")
-    print("\nOutput structure:")
-    print(f"  {results['master_results_dir']}/")
-    print(f"  ├── run_results_cotrain/   (co-trained experiment)")
-    print(f"  ├── run_results_indep/     (independent experiment)")
-    print(f"  ├── comparison_plots/      (4-way comparison plots)")
-    print(f"  └── combined_dataframes/   (merged CSV files)")
+    if is_main:
+        print("\n" + "=" * 70)
+        print("FINAL SUMMARY")
+        print("=" * 70)
+        print(f"Results directory: {results['master_results_dir']}")
+        print(f"Zipped results: {results['zip_path']}")
+        print("\nOutput structure:")
+        print(f"  {results['master_results_dir']}/")
+        print(f"  ├── run_results_cotrain/   (co-trained experiment)")
+        print(f"  ├── run_results_indep/     (independent experiment)")
+        print(f"  ├── comparison_plots/      (4-way comparison plots)")
+        print(f"  └── combined_dataframes/   (merged CSV files)")
 
 
 if __name__ == "__main__":
