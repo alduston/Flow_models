@@ -747,7 +747,7 @@ def compute_lsi_gap(
 
     return total_lsi_gap / total_count if total_count > 0 else 0.0
 
-
+'''
 class VAE(nn.Module):
     def __init__(
         self,
@@ -863,7 +863,207 @@ class VAEResBlock(nn.Module):
         )
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
     def forward(self, x): return self.net(x) + self.skip(x)
+'''
 
+class VAE(nn.Module):
+    """
+    Convolutional VAE with two stride-2 downsamples (img_size → img_size/4 latent).
+
+    Backward-compatible: the default values for every NEW parameter reproduce the
+    original 1.7 M-param architecture exactly.  To unlock the bigger decoder,
+    pass the new knobs when you construct the model (see "NEW" comments below).
+
+    Recommended call for CIFAR with 8 latent channels:
+        VAE(latent_channels=8, base_ch=64, img_size=32, img_channels=3,
+            num_res_blocks=2, decoder_attn_half=True, latent_proj_depth=2,
+            num_classes=10, cond_emb_dim=64, use_norm=True)
+    """
+
+    def __init__(
+        self,
+        latent_channels: int = 4,
+        base_ch: int = 32,
+        use_norm: bool = False,
+        img_size: int = 28,
+        img_channels: int = 1,
+        # --- Optional conditional encoder (unchanged) ---
+        num_classes: int | None = None,
+        null_label: int | None = None,
+        cond_emb_dim: int = 64,
+        # --- NEW capacity knobs (defaults = old behaviour) ---
+        num_res_blocks: int = 1,           # ResBlocks per stage  (old=1, try 2)
+        decoder_attn_half: bool = False,    # add Attention at half-res (16×16) in decoder
+        latent_proj_depth: int = 1,         # 1 = single 1×1 conv (old), 2 = ResBlock → 1×1
+    ):
+        super().__init__()
+
+        # ---- bookkeeping (unchanged) ------------------------------------
+        self.use_norm = use_norm
+        self.img_size = img_size
+        self.img_channels = int(img_channels)
+        self.latent_channels = int(latent_channels)
+        self.base_ch = int(base_ch)
+        self.num_res_blocks = int(num_res_blocks)
+        self.decoder_attn_half = decoder_attn_half
+        self.latent_proj_depth = int(latent_proj_depth)
+
+        self.num_classes = None if num_classes is None else int(num_classes)
+        self.null_label = (
+            None if self.num_classes is None
+            else int(self.num_classes if null_label is None else null_label)
+        )
+
+        ch1 = base_ch          # after enc_conv_in  (full res)
+        ch2 = base_ch * 2      # after first downsample (half res)
+        ch4 = base_ch * 4      # after second downsample / bottleneck (quarter res)
+
+        # ================================================================
+        #  ENCODER
+        # ================================================================
+        self.enc_conv_in = nn.Conv2d(img_channels, ch1, 3, 1, 1)
+
+        # Stage 0 — full-res → half-res
+        enc_stage0 = [VAEResBlock(ch1, ch1) for _ in range(num_res_blocks)]
+        enc_stage0.append(nn.Conv2d(ch1, ch2, 3, 2, 1))           # stride-2 downsample
+
+        # Stage 1 — half-res → quarter-res
+        enc_stage1 = [VAEResBlock(ch2, ch2) for _ in range(num_res_blocks)]
+        enc_stage1.append(nn.Conv2d(ch2, ch4, 3, 2, 1))           # stride-2 downsample
+
+        # Stage 2 — bottleneck (quarter-res, with attention)
+        enc_stage2: list[nn.Module] = [VAEResBlock(ch4, ch4)]
+        enc_stage2.append(AttentionBlock(ch4))
+        for _ in range(num_res_blocks):                            # extra ResBlocks
+            enc_stage2.append(VAEResBlock(ch4, ch4))
+
+        self.enc_blocks = nn.ModuleList([
+            nn.Sequential(*enc_stage0),
+            nn.Sequential(*enc_stage1),
+            nn.Sequential(*enc_stage2),
+        ])
+
+        enc_out_ch = ch4
+
+        # ---- conditional bottleneck bias (unchanged) --------------------
+        if self.num_classes is not None:
+            self.y_emb = nn.Embedding(self.num_classes + 1, cond_emb_dim)
+            self.cond_proj = nn.Linear(cond_emb_dim, enc_out_ch)
+            nn.init.zeros_(self.cond_proj.weight)
+            nn.init.zeros_(self.cond_proj.bias)
+        else:
+            self.y_emb = None
+            self.cond_proj = None
+
+        # ---- latent projection (enc_out_ch → latent_channels) -----------
+        if latent_proj_depth >= 2:
+            # NEW: intermediate ResBlock before the 1×1 projection softens
+            #      the channel bottleneck (e.g. 256 → 256 → 8 instead of 256 → 8)
+            self.enc_pre_proj = VAEResBlock(enc_out_ch, enc_out_ch)
+        else:
+            self.enc_pre_proj = None
+
+        self.mu = nn.Conv2d(enc_out_ch, latent_channels, 1)
+        self.logvar = nn.Conv2d(enc_out_ch, latent_channels, 1)
+
+        # GroupNorm on mu (unchanged)
+        if self.use_norm:
+            self.gn_mu = nn.GroupNorm(num_groups=1, num_channels=latent_channels, affine=False)
+
+        # ================================================================
+        #  DECODER
+        # ================================================================
+
+        # ---- latent back-projection (latent_channels → ch4) -------------
+        if latent_proj_depth >= 2:
+            # NEW: 1×1 expand → ResBlock gives the decoder a richer input
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, 1)
+            self.dec_post_proj = VAEResBlock(ch4, ch4)
+        else:
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, 1)
+            self.dec_post_proj = None
+
+        # Stage 0 — bottleneck (quarter-res, with attention)
+        dec_stage0: list[nn.Module] = [VAEResBlock(ch4, ch4)]
+        dec_stage0.append(AttentionBlock(ch4))
+        for _ in range(num_res_blocks):
+            dec_stage0.append(VAEResBlock(ch4, ch4))
+
+        # Stage 1 — quarter-res → half-res
+        dec_stage1: list[nn.Module] = [
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(ch4, ch2, 3, 1, 1),
+        ]
+        for _ in range(num_res_blocks):
+            dec_stage1.append(VAEResBlock(ch2, ch2))
+        if decoder_attn_half:                                       # NEW
+            dec_stage1.append(AttentionBlock(ch2))
+
+        # Stage 2 — half-res → full-res
+        dec_stage2: list[nn.Module] = [
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(ch2, ch1, 3, 1, 1),
+        ]
+        for _ in range(num_res_blocks):
+            dec_stage2.append(VAEResBlock(ch1, ch1))
+
+        self.dec_blocks = nn.ModuleList([
+            nn.Sequential(*dec_stage0),
+            nn.Sequential(*dec_stage1),
+            nn.Sequential(*dec_stage2),
+        ])
+
+        self.dec_out = nn.Sequential(
+            nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
+        )
+
+    # -----------------------------------------------------------------
+    #  encode / decode / forward  — signatures are IDENTICAL to before
+    # -----------------------------------------------------------------
+
+    def encode(self, x: torch.Tensor, y: torch.Tensor | None = None):
+        h = self.enc_conv_in(x)
+        for block in self.enc_blocks:
+            h = block(h)
+
+        # class-conditioning at bottleneck (unchanged)
+        if self.num_classes is not None:
+            B, C, H, W = h.shape
+            if y is None:
+                y = torch.full((B,), self.null_label, device=h.device, dtype=torch.long)
+            else:
+                y = y.to(device=h.device, dtype=torch.long).view(B)
+            emb = self.y_emb(y)
+            bias = self.cond_proj(emb).view(B, C, 1, 1)
+            h = h + bias
+
+        if self.enc_pre_proj is not None:
+            h = self.enc_pre_proj(h)
+
+        mu = self.mu(h)
+        logvar = self.logvar(h)
+
+        if self.use_norm:
+            mu = self.gn_mu(mu)
+
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        h = self.dec_conv_in(z)
+        if self.dec_post_proj is not None:
+            h = self.dec_post_proj(h)
+        for block in self.dec_blocks:
+            h = block(h)
+        return torch.tanh(self.dec_out(h))
+
+    def forward(self, x, y: torch.Tensor | None = None):
+        mu, logvar = self.encode(x, y=y)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
 
 # ---------------------------------------------------------------------------
 # PatchGAN Discriminator (Stable Diffusion / pix2pix style)
@@ -3032,7 +3232,10 @@ def train_vae_cotrained_cond(cfg):
 
             noise = torch.randn_like(z0)
             z_t = alpha * z0 + sigma * noise
-            z_mu_t =  alpha * mu + sigma * noise
+            if cfg.get("train_on_mu", False):
+                z_mu_t =  alpha * mu + sigma * noise
+            else:
+                z_mu_t = z_t
 
             var_0 = torch.exp(logvar)
             mu_t = alpha * mu
@@ -3302,7 +3505,10 @@ def train_vae_cotrained_cond(cfg):
 
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
-                z_mu_t = alpha * mu + sigma * noise
+                if cfg.get("train_on_mu", False):
+                    z_mu_t = alpha * mu + sigma * noise
+                else:
+                    z_mu_t = z_t
 
                 # --- LSI Score Training ---
                 var_0 = torch.exp(logvar)
@@ -3585,24 +3791,30 @@ def main():
     cfg_shared = {
         # --- Dataset ---
         "dataset": "CIFAR",
-        "batch_size": 128,
+        "batch_size": 256,
         "num_workers": 2,
 
         # --- Model Architecture ---
         "latent_channels": 8,
         "cond_emb_dim": 64,
 
+        # --- New encoder architecture ---
+        "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
+        "num_res_blocks": 2,        # NEW — second ResBlock per stage
+        "decoder_attn_half": True,  # NEW — attention at 16×16 in decoder
+        "latent_proj_depth": 2,     # NEW — ResBlock buffer around the channel bottleneck
+        
         # --- Learning Rates ---
-        "lr_vae": 9e-4,
-        "lr_ldm": 3e-4,
+        "lr_vae": 7.5e-4,
+        "lr_ldm": 1.5e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
         "perc_w": 1.0,
 
         # --- PatchGAN discriminator ---
-        "gan_w": 0.02,
-        "disc_start_epoch": 50,
+        "gan_w": 0.005,
+        "disc_start_epoch": 250,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 5e-5,
@@ -3621,14 +3833,14 @@ def main():
         "cosine_s": 0.008,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.3,
+        "cfg_label_dropout": 0.25,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
 
         # --- Evaluation & Logging ---
         "use_fixed_eval_banks": True,
         "sw2_n_projections": 1000,
-        "ema_decay": 0.9995,
+        "ema_decay": 0.9997,
 
         # --- Misc ---
         "seed": 42,
@@ -3644,7 +3856,7 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 900,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 1100,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
@@ -3669,10 +3881,10 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 1000,       # LDM training on frozen VAE
+        "epochs_refine": 1200,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.15,
-        "t_min": 1.5e-4,
+        "t_min": 3e-4,
         
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
@@ -3681,7 +3893,7 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 2e-2,
+        "kl_w": 1e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
         
