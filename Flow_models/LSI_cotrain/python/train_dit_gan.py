@@ -747,8 +747,9 @@ def compute_lsi_gap(
 
     return total_lsi_gap / total_count if total_count > 0 else 0.0
 
-'''
-class VAE(nn.Module):
+###################################  OLD VAE CLASS #####################################
+
+class VAE_old(nn.Module):
     def __init__(
         self,
         latent_channels: int = 4,
@@ -852,18 +853,6 @@ class VAE(nn.Module):
         mu, logvar = self.encode(x, y=y)
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
-
-
-class VAEResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1),
-            make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1)
-        )
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-    def forward(self, x): return self.net(x) + self.skip(x)
-'''
 
 class VAE(nn.Module):
     """
@@ -1015,7 +1004,7 @@ class VAE(nn.Module):
         self.dec_out = nn.Sequential(
             nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
         )
-
+    
     # -----------------------------------------------------------------
     #  encode / decode / forward  — signatures are IDENTICAL to before
     # -----------------------------------------------------------------
@@ -1064,6 +1053,18 @@ class VAE(nn.Module):
         mu, logvar = self.encode(x, y=y)
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
+
+
+class VAEResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1),
+            make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        )
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    def forward(self, x): return self.net(x) + self.skip(x)
+
 
 # ---------------------------------------------------------------------------
 # PatchGAN Discriminator (Stable Diffusion / pix2pix style)
@@ -1952,7 +1953,7 @@ def evaluate_current_state(
     ]
     if unet is not None:
          configs.extend([
-            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
@@ -3856,8 +3857,8 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 1100,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 1300,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 200,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
         # Co-training specific settings
@@ -3866,7 +3867,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.6,
+        "score_w_vae": 0.666,
         "stiff_w": 1e-6,
         "score_w": 1.0,
         
@@ -3881,7 +3882,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 1200,       # LDM training on frozen VAE
+        "epochs_refine": 1500,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.15,
         "t_min": 3e-4,
