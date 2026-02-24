@@ -3824,6 +3824,7 @@ def main():
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
         "aux_d": 8,
+        
         # --- New encoder architecture ---
         "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
