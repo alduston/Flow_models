@@ -3823,7 +3823,7 @@ def main():
 
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
-        "aux_d": 0,
+        "aux_d": 8,
         # --- New encoder architecture ---
         "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
@@ -3840,7 +3840,7 @@ def main():
 
         # --- PatchGAN discriminator ---
         "gan_w": 0.005,
-        "disc_start_epoch": 250,
+        "disc_start_epoch": 5,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 5e-5,
@@ -3882,8 +3882,8 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 1300,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 200,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 1400,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
         # Co-training specific settings
@@ -3899,6 +3899,7 @@ def main():
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
+
     })
 
     # === INDEPENDENT CONFIG ===
@@ -3926,6 +3927,14 @@ def main():
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
         "eval_freq_refine": 100,       # Eval every 10 epochs during refine
+
+        
+        # --- PatchGAN discriminator ---
+        "gan_w": 0.01,
+        "disc_start_epoch": 5,
+        "disc_ndf": 64,
+        "disc_n_layers": 2,
+        "lr_disc": 1e-4,
     })
 
     print("=" * 70)
