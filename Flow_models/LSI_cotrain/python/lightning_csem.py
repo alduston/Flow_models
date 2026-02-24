@@ -4000,19 +4000,19 @@ def main():
         "latent_channels": 8,
         "cond_emb_dim": 64,
 
-# --- DiT / Transformer settings (LightningDiT-style) ---
-"dit_patch_size": 1,        # patch_size=1 => 8x8 latents -> 64 tokens
-"dit_hidden_dim": 384,
-"dit_depth": 12,
-"dit_num_heads": 6,
-"dit_mlp_ratio": 4.0,
-"dit_dropout": 0.0,
-
-# --- Optimizer ---
-"adam_beta2": 0.95,
-
-# --- Flow-matching loss ---
-"cosine_w": 1.0,
+        # --- DiT / Transformer settings (LightningDiT-style) ---
+        "dit_patch_size": 1,        # patch_size=1 => 8x8 latents -> 64 tokens
+        "dit_hidden_dim": 384,
+        "dit_depth": 12,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        
+        # --- Optimizer ---
+        "adam_beta2": 0.95,
+        
+        # --- Flow-matching loss ---
+        "cosine_w": 1.0,
 
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
