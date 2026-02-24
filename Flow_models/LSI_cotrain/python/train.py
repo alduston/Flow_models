@@ -865,6 +865,38 @@ class VAEResBlock(nn.Module):
     def forward(self, x): return self.net(x) + self.skip(x)
 
 
+# ---------------------------------------------------------------------------
+# PatchGAN Discriminator (Stable Diffusion / pix2pix style)
+# ---------------------------------------------------------------------------
+
+class PatchDiscriminator(nn.Module):
+    """Lightweight NLayerDiscriminator (PatchGAN) as used in SD / taming-transformers."""
+    def __init__(self, in_channels: int = 3, ndf: int = 64, n_layers: int = 2):
+        super().__init__()
+        layers = [nn.Conv2d(in_channels, ndf, 4, 2, 1), nn.LeakyReLU(0.2, True)]
+        ch = ndf
+        for i in range(1, n_layers):
+            ch_next = min(ch * 2, ndf * 8)
+            layers += [nn.Conv2d(ch, ch_next, 4, 2, 1), nn.LeakyReLU(0.2, True)]
+            ch = ch_next
+        ch_next = min(ch * 2, ndf * 8)
+        layers += [nn.Conv2d(ch, ch_next, 4, 1, 1), nn.LeakyReLU(0.2, True)]
+        ch = ch_next
+        layers += [nn.Conv2d(ch, 1, 4, 1, 1)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def hinge_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (F.relu(1.0 - logits_real).mean() + F.relu(1.0 + logits_fake).mean())
+
+
+def hinge_g_loss(logits_fake: torch.Tensor) -> torch.Tensor:
+    return -logits_fake.mean()
+
+
 import math
 from typing import Tuple, Optional
 
@@ -2869,6 +2901,19 @@ def train_vae_cotrained_cond(cfg):
 
     lpips_fn = lpips.LPIPS(net='vgg').to(device) if LPIPS_AVAILABLE else None
 
+    # --- PatchGAN Discriminator ---
+    gan_w = float(cfg.get("gan_w", 0.0))
+    disc_start_epoch = int(cfg.get("disc_start_epoch", 0))
+    if gan_w > 0.0:
+        disc = PatchDiscriminator(
+            in_channels=img_channels, ndf=int(cfg.get("disc_ndf", 64)),
+            n_layers=int(cfg.get("disc_n_layers", 2)),
+        ).to(device)
+        opt_disc = optim.Adam(disc.parameters(), lr=float(cfg.get("lr_disc", 5e-5)), betas=(0.5, 0.9))
+    else:
+        disc = None
+        opt_disc = None
+
     # --- Fixed Evaluation Banks ---
     # Latent spatial size: img_size // 4 (two 2x downsampling in encoder)
     latent_spatial = effective_img_size // 4
@@ -2904,7 +2949,7 @@ def train_vae_cotrained_cond(cfg):
     print("--> Starting Dual Co-training...")
     for ep in range(cfg["epochs_vae"]):
         vae.train(); unet_lsi.train(); unet_control.train()
-        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc", "stiff"]}
+        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "perc", "stiff", "gan_d", "gan_g"]}
         mu_stats = []
 
         for x, y in tqdm(train_l, desc=f"Ep {ep+1}", leave=False):
@@ -3020,17 +3065,33 @@ def train_vae_cotrained_cond(cfg):
             else:
                 stiff_pen = torch.tensor(0.0, device=device)
 
+            # --- PatchGAN adversarial loss ---
+            use_gan = gan_w > 0.0 and disc is not None and (ep + 1) >= disc_start_epoch
+            if use_gan:
+                # Discriminator step (detached reconstructions)
+                logits_real = disc(x)
+                logits_fake = disc(x_rec.detach())
+                d_loss = hinge_d_loss(logits_real, logits_fake)
+                opt_disc.zero_grad()
+                d_loss.backward()
+                opt_disc.step()
+                # Generator loss (non-detached)
+                g_loss = hinge_g_loss(disc(x_rec))
+            else:
+                d_loss = torch.tensor(0.0, device=device)
+                g_loss = torch.tensor(0.0, device=device)
+
             # --- Joint loss ---
             if freeze_score_in_cotrain:
                 # Independent mode: VAE-only loss (no score, no stiffness)
-                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl
+                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + gan_w*g_loss
             else:
                 # Co-training mode: include score loss
                 score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
                 if cotrain_head == "lsi":
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen + gan_w*g_loss
                 else:  # cotrain_head == "control"
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen + gan_w*g_loss
 
             opt_joint.zero_grad()
             loss_joint.backward()
@@ -3092,6 +3153,8 @@ def train_vae_cotrained_cond(cfg):
             metrics["score_control"] += score_loss_control.item()
             metrics["perc"] += perc.item()
             metrics["stiff"] += stiff_pen.item()
+            metrics["gan_d"] += d_loss.item()
+            metrics["gan_g"] += g_loss.item()
 
         # --- Compute epoch averages and log ---
         n_batches = len(train_l)
@@ -3105,12 +3168,14 @@ def train_vae_cotrained_cond(cfg):
             "score_control": metrics["score_control"] / n_batches,
             "perc": metrics["perc"] / n_batches,
             "stiff": metrics["stiff"] / n_batches,
+            "gan_d": metrics["gan_d"] / n_batches,
+            "gan_g": metrics["gan_g"] / n_batches,
         }
         loss_records.append(epoch_metrics)
 
         print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | "
               f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
-              f"Stiff: {epoch_metrics['stiff']:.4f}")
+              f"Stiff: {epoch_metrics['stiff']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f}")
 
         if len(mu_stats) > 0:
             log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
@@ -3535,8 +3600,15 @@ def main():
         "kl_w": 1e-6,
         "perc_w": 1.0,
 
+        # --- PatchGAN discriminator ---
+        "gan_w": 0.005,
+        "disc_start_epoch": 50,
+        "disc_ndf": 64,
+        "disc_n_layers": 2,
+        "lr_disc": 5e-5,
+
         # --- Diffusion Settings ---
-        "time_schedule": "log_snr",     # "log_t", "log_snr", or "cosine"
+        "time_schedule": "log_t",     # "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
         "t_min": 1.5e-5,
         "t_max": 1.5,
@@ -3572,7 +3644,7 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 900,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 1400,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
@@ -3582,7 +3654,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.5,
+        "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
         
@@ -3597,7 +3669,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 1000,       # LDM training on frozen VAE
+        "epochs_refine": 1500,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.15,
         "t_min": 1.5e-4,
