@@ -4226,7 +4226,7 @@ def main():
         "disc_start_epoch": 25,
         "disc_ndf": 64,
         "disc_n_layers": 2,
-        "lr_disc": 5e-5,
+        "lr_disc": 1e-4,
 
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
