@@ -4265,7 +4265,7 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 900,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 700,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
@@ -4275,7 +4275,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.5,
+        "score_w_vae": 0.666,
         "stiff_w": 1e-6,
         "score_w": 1.0,
         
@@ -4290,7 +4290,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 1000,       # LDM training on frozen VAE
+        "epochs_refine": 800,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 1e-5,
