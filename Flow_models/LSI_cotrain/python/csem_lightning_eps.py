@@ -3990,7 +3990,7 @@ def main():
         "num_workers": 2,
 
         # --- Model Architecture ---
-        "latent_channels": 0,
+        "latent_channels": 8,
         "cond_emb_dim": 64,
 
         # --- DiT / Transformer settings (LightningDiT-style) ---
@@ -4008,7 +4008,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
-        "aux_d": 8,
+        "aux_d": 0,
         # --- New encoder architecture ---
         "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
@@ -4016,8 +4016,8 @@ def main():
         "latent_proj_depth": 2,     # NEW — ResBlock buffer around the channel bottleneck
         
         # --- Learning Rates ---
-        "lr_vae": 5e-4,
-        "lr_ldm": 2e-4,
+        "lr_vae": 3e-4,
+        "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
@@ -4025,10 +4025,10 @@ def main():
 
         # --- PatchGAN discriminator ---
         "gan_w": 0.005,
-        "disc_start_epoch": 250,
+        "disc_start_epoch": 25,
         "disc_ndf": 64,
         "disc_n_layers": 2,
-        "lr_disc": 5e-5,
+        "lr_disc": 1e-4,
 
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
@@ -4067,7 +4067,7 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 1400,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 800,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
@@ -4092,7 +4092,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 1500,       # LDM training on frozen VAE
+        "epochs_refine": 900,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 1e-5,
