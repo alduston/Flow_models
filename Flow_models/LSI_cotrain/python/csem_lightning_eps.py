@@ -3990,7 +3990,7 @@ def main():
         "num_workers": 2,
 
         # --- Model Architecture ---
-        "latent_channels": 8,
+        "latent_channels": 0,
         "cond_emb_dim": 64,
 
         # --- DiT / Transformer settings (LightningDiT-style) ---
@@ -4034,7 +4034,7 @@ def main():
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
         "t_min": 1.5e-5,
-        "t_max": 1.5
+        "t_max": 1.5,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
 
