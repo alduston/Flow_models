@@ -774,7 +774,11 @@ def compute_lsi_gap(
 
                     sigma_sq = sigma ** 2 + 1e-8
                     eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                    score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
+
+                    #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
+                    score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
+
+
 
                     total_lsi_gap += score_gap_per_sample.sum().item()
                     total_count += bsz
@@ -1103,7 +1107,7 @@ class VAE(nn.Module):
         self.dec_out = nn.Sequential(
             nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
         )
-    
+
     # -----------------------------------------------------------------
     #  encode / decode / forward  — signatures are IDENTICAL to before
     # -----------------------------------------------------------------
@@ -1639,8 +1643,6 @@ class DiTModel(nn.Module):
 
         out = self.unpatchify(tokens, H_tok, W_tok)
         return out
-
-
 # Alias so that existing code referencing UNetModel still works
 UNetModel = DiTModel
 
@@ -1967,6 +1969,162 @@ class UniversalSampler:
         return x
 
 
+# ---------------------------------------------------------------------------
+# Oracle Score Model (exact CSEM identity over full training set)
+# ---------------------------------------------------------------------------
+
+class OracleScoreModel:
+    """Exact CSEM oracle score computed by importance-weighted sum over all
+    training-set Gaussian components.
+
+    Interface matches ``DiTModel.__call__(z_t, t, y) -> eps_pred`` so it can
+    be used as a drop-in replacement inside ``UniversalSampler``.
+
+    Parameters
+    ----------
+    all_mu : Tensor [N, C, H, W]   – encoder means (CPU)
+    all_logvar : Tensor [N, C, H, W] – encoder log-variances (CPU)
+    all_labels : Tensor [N]         – integer class labels (CPU)
+    cfg : dict                      – experiment config (needs time_schedule, t_min, t_max, …)
+    device : torch.device
+    ref_chunk_size : int            – how many Gaussian components to load on GPU at once
+    """
+
+    def __init__(
+        self,
+        all_mu: torch.Tensor,
+        all_logvar: torch.Tensor,
+        all_labels: torch.Tensor,
+        cfg: Dict[str, Any],
+        device: torch.device,
+        ref_chunk_size: int = 4096,
+    ):
+        self.spatial_shape = tuple(all_mu.shape[1:])                              # (C, H, W)
+        self.N = all_mu.shape[0]
+        self.D = int(np.prod(self.spatial_shape))
+        self.cfg = cfg
+        self.device = device
+        self.num_classes = cfg.get("num_classes", None)
+        self.null_label = self.num_classes if self.num_classes is not None else None
+
+        # Pre-load ALL reference data on GPU (≈ 2 × N × D × 4 bytes).
+        # For N=60k, D=512 this is ~240 MB — comfortably fits on any modern GPU.
+        self.all_mu_flat = all_mu.reshape(self.N, -1).float().to(device)          # [N, D]
+        self.all_var_flat = torch.exp(
+            all_logvar.reshape(self.N, -1).float()
+        ).to(device)                                                               # [N, D]
+        self.all_labels = all_labels.long().to(device)                             # [N]
+
+    # ------------------------------------------------------------------
+
+    def eval(self):
+        """No-op (compatibility with model.eval())."""
+        return self
+
+    def train(self, mode=True):
+        """No-op (compatibility)."""
+        return self
+
+    def parameters(self):
+        """No parameters (compatibility)."""
+        return iter([])
+
+    # ------------------------------------------------------------------
+
+    def _get_alpha_sigma(self, t_scalar: torch.Tensor):
+        """Return (alpha, sigma) scalars for a single time value."""
+        stype = str(self.cfg.get("time_schedule", "log_snr")).lower()
+        t = t_scalar.view(1, 1)
+        if stype in ("flow", "flow_matching"):
+            a, s = get_flow_params(t)
+        elif stype == "cosine":
+            a, s, _ = get_cosine_params(t, cosine_s=float(self.cfg.get("cosine_s", 0.008)))
+        else:
+            a, s = get_ou_params(t)
+        return a.squeeze(), s.squeeze()
+
+    # ------------------------------------------------------------------
+
+    def _compute_eps(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        label_filter: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Core oracle computation (all reference data GPU-resident, no chunking).
+
+        Parameters
+        ----------
+        z_t : [B, C, H, W]
+        t   : [B]  (assumed constant across batch)
+        label_filter : [B] int labels – if given, restrict the sum per query to
+                       reference points whose label matches.  ``None`` → unconditional.
+
+        Returns
+        -------
+        eps_oracle : [B, C, H, W]
+        """
+        B = z_t.shape[0]
+        device = z_t.device
+
+        t_scalar = t[0]
+        alpha, sigma = self._get_alpha_sigma(t_scalar)
+        alpha = alpha.to(device)
+        sigma = sigma.to(device)
+        alpha_sq = alpha * alpha
+        sigma_sq = sigma * sigma
+
+        z_flat = z_t.reshape(B, self.D)                          # [B, D]
+
+        # Diffuse reference components to time t
+        mu_t = alpha * self.all_mu_flat                           # [N, D]
+        var_t = alpha_sq * self.all_var_flat + sigma_sq           # [N, D]
+        one_over_var = 1.0 / var_t                                # [N, D]
+        mu_over_var = mu_t * one_over_var                         # [N, D]
+
+        # --- log-weights [B, N] ---
+        log_var_sum = torch.log(var_t).sum(dim=1)                 # [N]
+        mu_sq_over_var_sum = (mu_t * mu_over_var).sum(dim=1)      # [N]
+
+        # log p(z_t | x_i) ∝ -0.5 [log|Σ_t| + z^2·(1/v) - 2 z·(μ/v) + μ^2/v]
+        all_log_w = -0.5 * (
+            log_var_sum.unsqueeze(0)                              # [1, N]
+            + (z_flat * z_flat) @ one_over_var.T                  # [B, N]
+            - 2.0 * z_flat @ mu_over_var.T                        # [B, N]
+            + mu_sq_over_var_sum.unsqueeze(0)                     # [1, N]
+        )
+
+        # Conditional masking
+        if label_filter is not None:
+            mask = (self.all_labels.unsqueeze(0) == label_filter.unsqueeze(1))  # [B, N]
+            all_log_w[~mask] = float('-inf')
+
+        # Softmax weights
+        w = torch.softmax(all_log_w, dim=1)                      # [B, N]
+
+        # Weighted score: eps = sigma * (z * (w @ 1/var) - (w @ mu/var))
+        A = w @ one_over_var                                      # [B, D]
+        Bv = w @ mu_over_var                                      # [B, D]
+        eps_flat = sigma * (z_flat * A - Bv)
+
+        return eps_flat.reshape(B, *self.spatial_shape)
+
+    # ------------------------------------------------------------------
+
+    def __call__(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward call matching DiTModel interface.
+
+        * ``y is None``  → unconditional oracle score (sum over all components).
+        * ``y`` given     → class-conditional oracle score (sum over matching labels).
+        """
+        return self._compute_eps(z_t, t, label_filter=y)
+
+
 def evaluate_current_state(
     epoch_idx,
     prefix,
@@ -2097,6 +2255,33 @@ def evaluate_current_state(
     )
 
     # -----------------------------------------------------------------------
+    # Oracle score model (exact CSEM over full training set)
+    # -----------------------------------------------------------------------
+    print("  Building OracleScoreModel from precomputed Gaussian components...")
+    oracle_model = OracleScoreModel(
+        all_mu=encoder_mus,
+        all_logvar=encoder_logvars,
+        all_labels=real_labels,
+        cfg=cfg,
+        device=device,
+        ref_chunk_size=4096,
+    )
+
+    lsi_gap_oracle = compute_lsi_gap(
+        oracle_model,
+        encoder_mus,
+        encoder_logvars,
+        cfg,
+        device,
+        labels=None,  # unconditional branch
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(5000, target_count),
+        num_time_points=50,
+        batch_size=bs,
+    )
+    print(f"  Oracle (unconditional) LSI gap = {lsi_gap_oracle:.6f}")
+
+    # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
     # -----------------------------------------------------------------------
     configs = [
@@ -2105,11 +2290,18 @@ def evaluate_current_state(
     if unet is not None:
          configs.extend([
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
-            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
-            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
-            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
+    # Oracle sampler configs (same steps / CFG levels as the NN)
+    configs.extend([
+        #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1,   "use_oracle": True},
+        #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1.5, "use_oracle": True},
+        #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 2.0, "use_oracle": True},
+        {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
+    ])
 
     results = []
 
@@ -2121,7 +2313,7 @@ def evaluate_current_state(
 
     # Fixed random token bank: used when sampler config has use_rand_token=True
     rand_token_bank_all = None
-    if unet is not None and cfg.get("num_classes", None) is not None:
+    if cfg.get("num_classes", None) is not None:
         num_classes = int(cfg["num_classes"])
         # Use an independent CPU RNG so this bank is stable and does not depend on global seeding state.
         g_tok = torch.Generator(device="cpu")
@@ -2143,15 +2335,20 @@ def evaluate_current_state(
         desc = scfg.get("desc", "")
         use_rand_token = bool(scfg.get("use_rand_token", False))
         cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
+        use_oracle = bool(scfg.get("use_oracle", False))
+
+        # Choose which score model to sample with
+        score_model = oracle_model if use_oracle else unet
 
         # Build suffix for naming - include cfg_level if present
+        oracle_tag = "_oracle" if use_oracle else ""
         if use_rand_token:
             if cfg_level is not None:
-                config_suffix = f"_randtok_cfg{cfg_level}"
+                config_suffix = f"_randtok_cfg{cfg_level}{oracle_tag}"
             else:
-                config_suffix = "_randtok"
+                config_suffix = f"_randtok{oracle_tag}"
         else:
-            config_suffix = ""
+            config_suffix = oracle_tag
         config_name = f"{method}@{steps}{config_suffix}"
 
         if torch.cuda.is_available():
@@ -2205,11 +2402,9 @@ def evaluate_current_state(
                     g_scale = cfg_level if use_rand_token and cfg_level is not None else None
                     if noise_bank_all is not None:
                         xT = noise_bank_all[i:i + batch_sz].to(device)
-                        #z_gen = sampler.sample(unet, x_init=xT, y=y_batch, cfg_scale=None)
-                        z_gen = sampler.sample(unet, x_init=xT, y=y_batch, cfg_scale=g_scale)
+                        z_gen = sampler.sample(score_model, x_init=xT, y=y_batch, cfg_scale=g_scale)
                     else:
-                        #z_gen = sampler.sample(unet, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=None)
-                        z_gen = sampler.sample(unet, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
+                        z_gen = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
 
                     fake_latents_list.append(z_gen.cpu())
                     fake_imgs_list.append(vae.decode(z_gen).cpu())
@@ -2218,7 +2413,7 @@ def evaluate_current_state(
                 fake_imgs = torch.cat(fake_imgs_list, 0)
                 fake_flat = fake_latents.view(fake_latents.shape[0], -1).to(device)
                 w2 = compute_sw2(real_flat_A, fake_flat, n_projections=sw2_nproj, theta=fixed_sw2_theta)
-                lsi_gap = lsi_gap_unet
+                lsi_gap = lsi_gap_oracle if use_oracle else lsi_gap_unet
 
         # Compute image metrics (unconditional)
         if use_lenet_fid:
@@ -2258,15 +2453,17 @@ def evaluate_current_state(
 
     # Print main results
     print(f"\n  >>> Sweep Results [{prefix}] <<<")
-    print(f"  {'Config':<15} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10}")
-    print("  " + "-" * 100)
+    print(f"  {'Config':<40} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10}")
+    print("  " + "-" * 120)
     for r in results:
-        print(f"  {r['config']:<15} | {r['desc']:<20} | {r['fid']:<8.2f} | {r['kid']:<10.4f} | "
+        print(f"  {r['config']:<40} | {r['desc']:<20} | {r['fid']:<8.2f} | {r['kid']:<10.4f} | "
               f"{r['w2']:<10.6f} | {r['div']:<8.4f} | {r['lsi_gap']:<10.4f}")
-    print("  " + "-" * 100 + "\n")
+    print("  " + "-" * 120 + "\n")
 
     # Flatten for DataFrame logging
     output_dict: Dict[str, Any] = {}
+    output_dict["lsi_gap_oracle_uncond"] = lsi_gap_oracle
+    output_dict["lsi_gap_unet_uncond"] = lsi_gap_unet
     for r in results:
         config = r["config"]
         if "VAE_Rec_eps" in config:
@@ -3187,7 +3384,7 @@ def train_vae_cotrained_cond(cfg):
         aux_d=int(cfg.get("aux_d", 0)),
     ).to(device)
 
-    # --- Online Models ---
+   # --- Online Models ---
     dit_kwargs = dict(
         in_channels=int(cfg["latent_channels"]),
         patch_size=int(cfg.get("dit_patch_size", 1)),
@@ -3198,8 +3395,8 @@ def train_vae_cotrained_cond(cfg):
         dropout=float(cfg.get("dit_dropout", 0.0)),
         num_classes=num_classes,
         latent_size=int(latent_spatial),
+        #factored_head=bool(cfg.get("factored_head", False)),
     )
-
     unet_lsi = UNetModel(**dit_kwargs).to(device)
     unet_control = UNetModel(**dit_kwargs).to(device)
 
@@ -3603,6 +3800,8 @@ def train_vae_cotrained_cond(cfg):
                 results_lsi["tag"] = "LSI_Diff"
                 eval_records.append(results_lsi)
 
+            results_ctrl = results_lsi
+            '''
             # Evaluate Control
             results_ctrl = evaluate_current_state(
                 ldm_epoch,
@@ -3621,6 +3820,7 @@ def train_vae_cotrained_cond(cfg):
                 fid_model=fid_model,
                 use_lenet_fid=use_lenet_fid,
             )
+            '''
             if results_ctrl is not None:
                 results_ctrl["epoch"] = ldm_epoch  # LDM epoch for comparison
                 results_ctrl["stage"] = "cotrain"
@@ -4000,10 +4200,10 @@ def main():
         "dit_num_heads": 6,
         "dit_mlp_ratio": 4.0,
         "dit_dropout": 0.0,
-        
+
         # --- Optimizer ---
         "adam_beta2": 0.95,
-        
+
         # --- Flow-matching loss ---
         "cosine_w": 0.0,
 
@@ -4014,17 +4214,17 @@ def main():
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
         "decoder_attn_half": True,  # NEW — attention at 16×16 in decoder
         "latent_proj_depth": 2,     # NEW — ResBlock buffer around the channel bottleneck
-        
+
         # --- Learning Rates ---
-        "lr_vae": 3e-4,
-        "lr_ldm": 1e-4,
+        "lr_vae": 5e-4,
+        "lr_ldm": 2e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
         "perc_w": 1.0,
 
         # --- PatchGAN discriminator ---
-        "gan_w": 0.005,
+        "gan_w": 0.002,
         "disc_start_epoch": 25,
         "disc_ndf": 64,
         "disc_n_layers": 2,
@@ -4045,7 +4245,7 @@ def main():
 
         # --- CFG ---
         "cfg_label_dropout": 0.2,
-        "cfg_eval_scale": 2.0,
+        "cfg_eval_scale": 3.0,
         "eval_class_labels": [],
 
         # --- Evaluation & Logging ---
@@ -4071,16 +4271,20 @@ def main():
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
+
+        # Score head gaussian factored param 
+        #"factored_head": True,
+
         # Co-training specific settings
         "freeze_score_in_cotrain": False,  # Normal co-training
         "cotrain_head": "lsi",
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.6,
+        "score_w_vae": 0.666,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-        
+
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
@@ -4095,8 +4299,11 @@ def main():
         "epochs_refine": 900,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
-        "t_min": 1e-5,
-        
+        "t_min": 3e-4,
+
+        # Score head gaussian factored param 
+        #"factored_head": False,
+
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
         "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
@@ -4107,7 +4314,7 @@ def main():
         "kl_w": 1e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
-        
+
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
         "eval_freq_refine": 100,       # Eval every 10 epochs during refine
