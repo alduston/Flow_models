@@ -4005,7 +4005,7 @@ def main():
         "adam_beta2": 0.95,
         
         # --- Flow-matching loss ---
-        "cosine_w": 0.1,
+        "cosine_w": 0.0,
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
         "aux_d": 8,
