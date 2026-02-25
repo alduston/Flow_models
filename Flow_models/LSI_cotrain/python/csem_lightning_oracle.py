@@ -774,8 +774,11 @@ def compute_lsi_gap(
 
                     sigma_sq = sigma ** 2 + 1e-8
                     eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
+
                     #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
                     score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
+
+
 
                     total_lsi_gap += score_gap_per_sample.sum().item()
                     total_count += bsz
@@ -827,8 +830,7 @@ def compute_lsi_gap(
 
                 sigma_sq = sigma ** 2 + 1e-8
                 eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))
-                score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
+                score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))
 
                 total_lsi_gap += score_gap_per_sample.sum().item()
                 total_count += bsz
@@ -1105,7 +1107,7 @@ class VAE(nn.Module):
         self.dec_out = nn.Sequential(
             nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
         )
-    
+
     # -----------------------------------------------------------------
     #  encode / decode / forward  — signatures are IDENTICAL to before
     # -----------------------------------------------------------------
@@ -1641,8 +1643,7 @@ class DiTModel(nn.Module):
 
         out = self.unpatchify(tokens, H_tok, W_tok)
         return out
-
-
+        
 # Alias so that existing code referencing UNetModel still works
 UNetModel = DiTModel
 
@@ -3384,7 +3385,7 @@ def train_vae_cotrained_cond(cfg):
         aux_d=int(cfg.get("aux_d", 0)),
     ).to(device)
 
-    # --- Online Models ---
+   # --- Online Models ---
     dit_kwargs = dict(
         in_channels=int(cfg["latent_channels"]),
         patch_size=int(cfg.get("dit_patch_size", 1)),
@@ -3395,8 +3396,8 @@ def train_vae_cotrained_cond(cfg):
         dropout=float(cfg.get("dit_dropout", 0.0)),
         num_classes=num_classes,
         latent_size=int(latent_spatial),
+        #factored_head=bool(cfg.get("factored_head", False)),
     )
-
     unet_lsi = UNetModel(**dit_kwargs).to(device)
     unet_control = UNetModel(**dit_kwargs).to(device)
 
@@ -4200,10 +4201,10 @@ def main():
         "dit_num_heads": 6,
         "dit_mlp_ratio": 4.0,
         "dit_dropout": 0.0,
-        
+
         # --- Optimizer ---
         "adam_beta2": 0.95,
-        
+
         # --- Flow-matching loss ---
         "cosine_w": 0.0,
 
@@ -4214,10 +4215,10 @@ def main():
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
         "decoder_attn_half": True,  # NEW — attention at 16×16 in decoder
         "latent_proj_depth": 2,     # NEW — ResBlock buffer around the channel bottleneck
-        
+
         # --- Learning Rates ---
-        "lr_vae": 5e-4,
-        "lr_ldm": 2e-4,
+        "lr_vae": 3e-4,
+        "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
@@ -4267,9 +4268,13 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 700,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 800,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
+
+
+        # Score head gaussian factored param 
+        #"factored_head": True,
 
         # Co-training specific settings
         "freeze_score_in_cotrain": False,  # Normal co-training
@@ -4280,7 +4285,7 @@ def main():
         "score_w_vae": 0.666,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-        
+
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
@@ -4292,11 +4297,14 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 800,       # LDM training on frozen VAE
+        "epochs_refine": 900,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
-        "t_min": 1e-5,
-        
+        "t_min": 3e-4,
+
+        # Score head gaussian factored param 
+        #"factored_head": False,
+
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
         "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
@@ -4304,10 +4312,10 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 1e-2,
+        "kl_w": 1e-3,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
-        
+
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
         "eval_freq_refine": 100,       # Eval every 10 epochs during refine
