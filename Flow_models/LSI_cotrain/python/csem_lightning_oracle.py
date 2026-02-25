@@ -1103,7 +1103,7 @@ class VAE(nn.Module):
         self.dec_out = nn.Sequential(
             nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
         )
-
+    
     # -----------------------------------------------------------------
     #  encode / decode / forward  — signatures are IDENTICAL to before
     # -----------------------------------------------------------------
@@ -1997,18 +1997,21 @@ class OracleScoreModel:
         device: torch.device,
         ref_chunk_size: int = 4096,
     ):
-        # Store reference data on CPU – moved to GPU in chunks during scoring
-        self.all_mu_flat = all_mu.reshape(all_mu.shape[0], -1).float()          # [N, D]
-        self.all_logvar_flat = all_logvar.reshape(all_logvar.shape[0], -1).float()  # [N, D]
-        self.all_labels = all_labels.long()                                      # [N]
         self.spatial_shape = tuple(all_mu.shape[1:])                              # (C, H, W)
         self.N = all_mu.shape[0]
-        self.D = self.all_mu_flat.shape[1]
+        self.D = int(np.prod(self.spatial_shape))
         self.cfg = cfg
         self.device = device
-        self.ref_chunk_size = ref_chunk_size
         self.num_classes = cfg.get("num_classes", None)
         self.null_label = self.num_classes if self.num_classes is not None else None
+
+        # Pre-load ALL reference data on GPU (≈ 2 × N × D × 4 bytes).
+        # For N=60k, D=512 this is ~240 MB — comfortably fits on any modern GPU.
+        self.all_mu_flat = all_mu.reshape(self.N, -1).float().to(device)          # [N, D]
+        self.all_var_flat = torch.exp(
+            all_logvar.reshape(self.N, -1).float()
+        ).to(device)                                                               # [N, D]
+        self.all_labels = all_labels.long().to(device)                             # [N]
 
     # ------------------------------------------------------------------
 
@@ -2046,7 +2049,7 @@ class OracleScoreModel:
         t: torch.Tensor,
         label_filter: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Core oracle computation.
+        """Core oracle computation (all reference data GPU-resident, no chunking).
 
         Parameters
         ----------
@@ -2069,78 +2072,39 @@ class OracleScoreModel:
         alpha_sq = alpha * alpha
         sigma_sq = sigma * sigma
 
-        z_flat = z_t.reshape(B, self.D).to(device)          # [B, D]
-        z_sq = z_flat * z_flat                                # [B, D]
+        z_flat = z_t.reshape(B, self.D)                          # [B, D]
 
-        N = self.N
-        M_chunk = self.ref_chunk_size
+        # Diffuse reference components to time t
+        mu_t = alpha * self.all_mu_flat                           # [N, D]
+        var_t = alpha_sq * self.all_var_flat + sigma_sq           # [N, D]
+        one_over_var = 1.0 / var_t                                # [N, D]
+        mu_over_var = mu_t * one_over_var                         # [N, D]
 
-        # --- Pass 1: compute all log-weights [B, N] -----------------------
-        all_log_w = torch.empty(B, N, device=device, dtype=torch.float32)
+        # --- log-weights [B, N] ---
+        log_var_sum = torch.log(var_t).sum(dim=1)                 # [N]
+        mu_sq_over_var_sum = (mu_t * mu_over_var).sum(dim=1)      # [N]
 
-        for start in range(0, N, M_chunk):
-            end = min(start + M_chunk, N)
-            M = end - start
+        # log p(z_t | x_i) ∝ -0.5 [log|Σ_t| + z^2·(1/v) - 2 z·(μ/v) + μ^2/v]
+        all_log_w = -0.5 * (
+            log_var_sum.unsqueeze(0)                              # [1, N]
+            + (z_flat * z_flat) @ one_over_var.T                  # [B, N]
+            - 2.0 * z_flat @ mu_over_var.T                        # [B, N]
+            + mu_sq_over_var_sum.unsqueeze(0)                     # [1, N]
+        )
 
-            mu_c = self.all_mu_flat[start:end].to(device)          # [M, D]
-            lv_c = self.all_logvar_flat[start:end].to(device)      # [M, D]
-            var_c = torch.exp(lv_c)                                 # [M, D]
-
-            mu_t = alpha * mu_c                                     # [M, D]
-            var_t = alpha_sq * var_c + sigma_sq                     # [M, D]
-
-            one_over_var = 1.0 / var_t                              # [M, D]
-            mu_over_var = mu_t * one_over_var                       # [M, D]
-
-            log_var_sum = torch.log(var_t).sum(dim=1)               # [M]
-            mu_sq_over_var_sum = (mu_t * mu_over_var).sum(dim=1)    # [M]
-
-            # log p(z_t | x_i) ∝ -0.5 [log|Σ_t| + (z-μ_t)^T Σ_t^{-1} (z-μ_t)]
-            # = -0.5 [log_var_sum + z^2 @ (1/v) - 2 z @ (μ/v) + μ^2/v_sum]
-            term_zz = z_sq @ one_over_var.T                         # [B, M]
-            term_zm = z_flat @ mu_over_var.T                        # [B, M]
-
-            all_log_w[:, start:end] = -0.5 * (
-                log_var_sum.unsqueeze(0)
-                + term_zz
-                - 2.0 * term_zm
-                + mu_sq_over_var_sum.unsqueeze(0)
-            )
-
-        # --- Mask for conditional score ------------------------------------
+        # Conditional masking
         if label_filter is not None:
-            ref_labels = self.all_labels.to(device)              # [N]
-            # label_filter: [B] → match matrix [B, N]
-            mask = (ref_labels.unsqueeze(0) == label_filter.unsqueeze(1))
+            mask = (self.all_labels.unsqueeze(0) == label_filter.unsqueeze(1))  # [B, N]
             all_log_w[~mask] = float('-inf')
 
-        # --- Softmax weights -----------------------------------------------
-        w = torch.softmax(all_log_w, dim=1)                     # [B, N]
+        # Softmax weights
+        w = torch.softmax(all_log_w, dim=1)                      # [B, N]
 
-        # --- Pass 2: weighted score via A, B_term --------------------------
-        A_acc = torch.zeros(B, self.D, device=device)
-        B_acc = torch.zeros(B, self.D, device=device)
+        # Weighted score: eps = sigma * (z * (w @ 1/var) - (w @ mu/var))
+        A = w @ one_over_var                                      # [B, D]
+        Bv = w @ mu_over_var                                      # [B, D]
+        eps_flat = sigma * (z_flat * A - Bv)
 
-        for start in range(0, N, M_chunk):
-            end = min(start + M_chunk, N)
-            M = end - start
-
-            mu_c = self.all_mu_flat[start:end].to(device)
-            lv_c = self.all_logvar_flat[start:end].to(device)
-            var_c = torch.exp(lv_c)
-
-            mu_t = alpha * mu_c
-            var_t = alpha_sq * var_c + sigma_sq
-            one_over_var = 1.0 / var_t
-            mu_over_var = mu_t * one_over_var
-
-            w_c = w[:, start:end]                               # [B, M]
-
-            A_acc += w_c @ one_over_var                          # [B, D]
-            B_acc += w_c @ mu_over_var                           # [B, D]
-
-        # eps_oracle = sigma * (z * A - B_term)
-        eps_flat = sigma * (z_flat * A_acc - B_acc)
         return eps_flat.reshape(B, *self.spatial_shape)
 
     # ------------------------------------------------------------------
@@ -4221,7 +4185,7 @@ def main():
         "num_workers": 2,
 
         # --- Model Architecture ---
-        "latent_channels": 8,
+        "latent_channels": 0,
         "cond_emb_dim": 64,
 
         # --- DiT / Transformer settings (LightningDiT-style) ---
@@ -4231,21 +4195,21 @@ def main():
         "dit_num_heads": 6,
         "dit_mlp_ratio": 4.0,
         "dit_dropout": 0.0,
-
+        
         # --- Optimizer ---
         "adam_beta2": 0.95,
-
+        
         # --- Flow-matching loss ---
         "cosine_w": 0.0,
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
-        "aux_d": 0,
+        "aux_d": 8,
         # --- New encoder architecture ---
         "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
         "decoder_attn_half": True,  # NEW — attention at 16×16 in decoder
         "latent_proj_depth": 2,     # NEW — ResBlock buffer around the channel bottleneck
-
+        
         # --- Learning Rates ---
         "lr_vae": 5e-4,
         "lr_ldm": 2e-4,
@@ -4256,10 +4220,10 @@ def main():
 
         # --- PatchGAN discriminator ---
         "gan_w": 0.002,
-        "disc_start_epoch": 50,
+        "disc_start_epoch": 25,
         "disc_ndf": 64,
         "disc_n_layers": 2,
-        "lr_disc": 1e-4,
+        "lr_disc": 5e-5,
 
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
@@ -4276,7 +4240,7 @@ def main():
 
         # --- CFG ---
         "cfg_label_dropout": 0.2,
-        "cfg_eval_scale": 2.0,
+        "cfg_eval_scale": 3.0,
         "eval_class_labels": [],
 
         # --- Evaluation & Logging ---
@@ -4308,12 +4272,12 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.6,
+        "score_w_vae": 0.5,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-
+        
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 5,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
@@ -4323,11 +4287,11 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 1500,       # LDM training on frozen VAE
+        "epochs_refine": 1000,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 1e-5,
-
+        
         # Independent mode settings
         "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
         "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
@@ -4338,7 +4302,7 @@ def main():
         "kl_w": 1e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
-
+        
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
         "eval_freq_refine": 100,       # Eval every 10 epochs during refine
