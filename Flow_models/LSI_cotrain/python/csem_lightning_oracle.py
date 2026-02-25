@@ -3798,6 +3798,8 @@ def train_vae_cotrained_cond(cfg):
                 results_lsi["tag"] = "LSI_Diff"
                 eval_records.append(results_lsi)
 
+            results_ctrl = results_lsi
+            '''
             # Evaluate Control
             results_ctrl = evaluate_current_state(
                 ldm_epoch,
@@ -3816,6 +3818,7 @@ def train_vae_cotrained_cond(cfg):
                 fid_model=fid_model,
                 use_lenet_fid=use_lenet_fid,
             )
+            '''
             if results_ctrl is not None:
                 results_ctrl["epoch"] = ldm_epoch  # LDM epoch for comparison
                 results_ctrl["stage"] = "cotrain"
@@ -4185,7 +4188,7 @@ def main():
         "num_workers": 2,
 
         # --- Model Architecture ---
-        "latent_channels": 0,
+        "latent_channels": 8,
         "cond_emb_dim": 64,
 
         # --- DiT / Transformer settings (LightningDiT-style) ---
@@ -4203,7 +4206,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
-        "aux_d": 8,
+        "aux_d": 0,
         # --- New encoder architecture ---
         "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
