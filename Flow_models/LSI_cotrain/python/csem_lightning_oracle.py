@@ -774,7 +774,8 @@ def compute_lsi_gap(
 
                     sigma_sq = sigma ** 2 + 1e-8
                     eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                    score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
+                    #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
+                    score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
 
                     total_lsi_gap += score_gap_per_sample.sum().item()
                     total_count += bsz
@@ -826,7 +827,8 @@ def compute_lsi_gap(
 
                 sigma_sq = sigma ** 2 + 1e-8
                 eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))
+                #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))
+                score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
 
                 total_lsi_gap += score_gap_per_sample.sum().item()
                 total_count += bsz
