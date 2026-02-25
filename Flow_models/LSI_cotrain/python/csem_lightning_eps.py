@@ -3993,23 +3993,22 @@ def main():
         "latent_channels": 8,
         "cond_emb_dim": 64,
 
-# --- DiT / Transformer settings (LightningDiT-style) ---
-"dit_patch_size": 1,        # patch_size=1 => 8x8 latents -> 64 tokens
-"dit_hidden_dim": 384,
-"dit_depth": 12,
-"dit_num_heads": 6,
-"dit_mlp_ratio": 4.0,
-"dit_dropout": 0.0,
-
-# --- Optimizer ---
-"adam_beta2": 0.95,
-
-# --- Flow-matching loss ---
-"cosine_w": 1.0,
-
+        # --- DiT / Transformer settings (LightningDiT-style) ---
+        "dit_patch_size": 1,        # patch_size=1 => 8x8 latents -> 64 tokens
+        "dit_hidden_dim": 384,
+        "dit_depth": 12,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        
+        # --- Optimizer ---
+        "adam_beta2": 0.95,
+        
+        # --- Flow-matching loss ---
+        "cosine_w": 0.1,
 
         # --- NEW: auxiliary encoder noise channels (0 disables) ---
-        "aux_d": 0,
+        "aux_d": 8,
         # --- New encoder architecture ---
         "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
         "num_res_blocks": 2,        # NEW — second ResBlock per stage
@@ -4017,7 +4016,7 @@ def main():
         "latent_proj_depth": 2,     # NEW — ResBlock buffer around the channel bottleneck
         
         # --- Learning Rates ---
-        "lr_vae": 7.5e-4,
+        "lr_vae": 5e-4,
         "lr_ldm": 2e-4,
 
         # --- KL and perceptual weights ---
@@ -4032,10 +4031,10 @@ def main():
         "lr_disc": 5e-5,
 
         # --- Diffusion Settings ---
-        "time_schedule": "flow",     # "flow", "log_t", "log_snr", or "cosine"
-        "use_ddim_times": False,
-        "t_min": 1e-5,
-        "t_max": 0.99999,
+        "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
+        "use_ddim_times": True,
+        "t_min": 1.5e-5,
+        "t_max": 1.5
         "num_train_timesteps": 1000,
         "train_on_mu": False,
 
@@ -4045,7 +4044,7 @@ def main():
         "cosine_s": 0.008,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.1,
+        "cfg_label_dropout": 0.2,
         "cfg_eval_scale": 2.0,
         "eval_class_labels": [],
 
@@ -4068,8 +4067,8 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 1300,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 200,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 1400,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
         # Co-training specific settings
@@ -4078,7 +4077,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.666,
+        "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
         
