@@ -829,7 +829,7 @@ def compute_lsi_gap(
 
                 sigma_sq = sigma ** 2 + 1e-8
                 eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                
+
                 #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
                 score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
 
@@ -1813,6 +1813,477 @@ class UniversalSampler:
         eps_cond = unet(x, t_vec, y)
         return eps_uncond + float(cfg_scale) * (eps_cond - eps_uncond)
 
+    # ---------- factored-head helpers (exponential integrator) ----------
+
+    @staticmethod
+    def _predict_components(
+        unet,
+        x: torch.Tensor,
+        t_vec: torch.Tensor,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict (eps, lam, nu) from a factored-head model, with optional CFG.
+
+        Requires unet.factored_head == True.  The CFG combination is exact
+        because eps = lam * z - nu is bilinear in (lam, nu) for fixed z.
+        """
+        if not getattr(unet, "factored_head", False):
+            raise ValueError(
+                "Exponential integrator samplers (exp_euler_ode / exp_heun_ode) "
+                "require a model with factored_head=True so that the precision "
+                "and natural-mean heads are exposed."
+            )
+
+        if cfg_scale is None or cfg_scale <= 0.0 or y is None:
+            return unet(x, t_vec, y, return_components=True)
+
+        eps_u, lam_u, nu_u = unet(x, t_vec, None, return_components=True)
+        eps_c, lam_c, nu_c = unet(x, t_vec, y, return_components=True)
+        w = float(cfg_scale)
+        eps = eps_u + w * (eps_c - eps_u)
+        lam = lam_u + w * (lam_c - lam_u)
+        nu = nu_u + w * (nu_c - nu_u)
+        return eps, lam, nu
+
+    @staticmethod
+    def _phi1(x: torch.Tensor) -> torch.Tensor:
+        r"""Compute the entire function \varphi_1(x) = (e^x - 1) / x.
+
+        Uses a 4th-order Taylor expansion for |x| < 1e-4 to avoid 0/0.
+        """
+        small = x.abs() < 1e-4
+        # Taylor: 1 + x/2 + x^2/6 + x^3/24
+        taylor = 1.0 + x * (0.5 + x * (1.0 / 6.0 + x / 24.0))
+        # For |x| >= 1e-4 the direct formula is fine
+        x_safe = torch.where(small, torch.ones_like(x), x)
+        exact = torch.expm1(x_safe) / x_safe
+        return torch.where(small, taylor, exact)
+
+    def _exp_integrate(
+        self,
+        z: torch.Tensor,
+        lam: torch.Tensor,
+        nu: torch.Tensor,
+        t_curr: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Exact diagonal exponential integration over one frozen-coefficient step.
+
+        The probability-flow ODE with factored score takes the form (per channel)
+
+            dz_i / dt  =  A_i \cdot z_i  +  C_i
+
+        where A (diagonal) and C depend on the schedule type:
+
+        * OU:     A_i = lam_i / sigma - 1,      C_i = -nu_i / sigma
+        * Cosine: A_i = 0.5 beta (lam_i/sigma - 1),  C_i = -0.5 beta nu_i / sigma
+
+        With A and C frozen, the exact solution is
+
+            z_i(t + dt) = exp(A_i dt) z_i(t)  +  phi_1(A_i dt) dt C_i
+        """
+        B = z.shape[0]
+        t_vec = t_curr.expand(B)
+
+        _, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-10)
+
+        if self.schedule_type in ("flow", "flow_matching"):
+            raise ValueError(
+                "Exponential integrator is not supported for flow matching schedules."
+            )
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            half_beta = 0.5 * beta_t
+            A = half_beta * (lam * inv_sigma - 1.0)
+            C = -half_beta * nu * inv_sigma
+        else:
+            # OU (log_t or log_snr): dz/dt = -z + eps/sigma
+            # with eps = lam*z - nu  =>  dz/dt = (lam/sigma - 1)*z - nu/sigma
+            A = lam * inv_sigma - 1.0
+            C = -nu * inv_sigma
+
+        Ah = A * dt
+        return torch.exp(Ah) * z + self._phi1(Ah) * dt * C
+
+    # ------------------------- Continuous-time samplers -------------------------
+
+    def get_ode_derivative(self, x, t, unet, y=None, cfg_scale=None):
+        """ODE derivative.
+
+        - Flow matching: dz/dt = v(z,t)
+        - OU/cosine: probability-flow ODE (eps parameterization)
+        """
+        B = x.shape[0]
+        t_vec = t.expand(B)
+
+        if self.schedule_type in ("flow", "flow_matching"):
+            # Model predicts eps; convert to velocity via z_t = eps + t * v.
+            eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+            t_b = t_vec.view(B, 1, 1, 1).clamp_min(1e-5)
+            v_pred = (x - eps_pred) / t_b
+            return v_pred
+
+        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+        alpha, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-10)
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            return -0.5 * beta_t * (x - inv_sigma * eps_pred)
+        # OU (log_t or log_snr)
+        return -x + inv_sigma * eps_pred
+
+    def get_rev_sde_drift(self, x, t, unet, y=None, cfg_scale=None):
+        """Reverse-time SDE drift (OU/cosine only)."""
+        if self.schedule_type in ("flow", "flow_matching"):
+            raise ValueError("Reverse-time SDE drift is not defined for flow matching. Use an ODE sampler (rk4_ode/heun_ode/euler_ode).")
+
+        B = x.shape[0]
+        t_vec = t.expand(B)
+        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+        alpha, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-8)
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            return -0.5 * beta_t * x + beta_t * inv_sigma * eps_pred
+        return -x + 2.0 * inv_sigma * eps_pred
+
+    def step_euler_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        dt = t_next - t_curr
+        d_curr = self.get_ode_derivative(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        return x + dt * d_curr
+
+    def step_rk4_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        dt = t_next - t_curr
+        half_dt = dt * 0.5
+        t_half = t_curr + half_dt
+
+        k1 = self.get_ode_derivative(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        k2 = self.get_ode_derivative(x + half_dt * k1, t_half, unet, y=y, cfg_scale=cfg_scale)
+        k3 = self.get_ode_derivative(x + half_dt * k2, t_half, unet, y=y, cfg_scale=cfg_scale)
+        k4 = self.get_ode_derivative(x + dt * k3, t_next, unet, y=y, cfg_scale=cfg_scale)
+
+        return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+    def step_heun_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        B = x.shape[0]
+        dt = t_next - t_curr
+
+        d_curr = self.get_ode_derivative(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        x_proposed = x + dt * d_curr
+
+        if t_next > self.t_min:
+            d_next = self.get_ode_derivative(x_proposed, t_next, unet, y=y, cfg_scale=cfg_scale)
+            x = x + 0.5 * dt * (d_curr + d_next)
+        else:
+            x = x_proposed
+
+        return x
+
+    def step_heun_sde(self, x, t_curr, t_next, unet, y=None, cfg_scale=None, generator=None):
+        """Heun SDE step with schedule-aware diffusion coefficient.
+
+        OU:     diffusion = sqrt(2)
+        Cosine: diffusion = sqrt(beta(t))
+        """
+        dt = t_next - t_curr
+        dt_abs = torch.abs(dt).clamp_min(1e-12)
+
+        if generator is None:
+            noise = torch.randn_like(x)
+        else:
+            noise = torch.randn(x.shape, device=x.device, generator=generator)
+
+        B = x.shape[0]
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_curr.expand(B).view(B, 1, 1, 1))
+            diff_coeff = torch.sqrt(beta_t.clamp_min(1e-8))
+        else:  # OU: constant diffusion sqrt(2)
+            diff_coeff = math.sqrt(2.0)
+
+        dW = diff_coeff * torch.sqrt(dt_abs) * noise
+
+        b_curr = self.get_rev_sde_drift(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        x_hat = x + dt * b_curr + dW
+
+        b_next = self.get_rev_sde_drift(x_hat, t_next, unet, y=y, cfg_scale=cfg_scale)
+        x_new = x + 0.5 * dt * (b_curr + b_next) + dW
+        return x_new
+
+    # --------------- Diagonal exponential integrators ---------------
+
+    def step_exp_euler_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        """First-order diagonal exponential integrator (1 NFE per step).
+
+        Freezes the learned (lam, nu) at (x, t_curr) and exactly integrates
+        the resulting constant-coefficient diagonal-linear ODE over [t_curr, t_next].
+
+        Requires a model with ``factored_head=True``.
+        """
+        B = x.shape[0]
+        t_vec = t_curr.expand(B)
+        _eps, lam, nu = self._predict_components(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+        dt = t_next - t_curr
+        return self._exp_integrate(x, lam, nu, t_curr, dt)
+
+    def step_exp_heun_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        """Second-order exponential Heun integrator (2 NFE per step).
+
+        1. Evaluate (lam, nu) at (x, t_curr); exp-Euler predict x_hat at t_next.
+        2. Evaluate (lam, nu) at (x_hat, t_next).
+        3. Average the two sets of natural parameters.
+        4. Re-integrate from x using the averaged coefficients.
+
+        This exactly treats per-channel stiffness at the cost of two forward
+        passes (same as standard Heun) and matches the second-order exponential
+        Heun variant described in Section 5.1 of the precision-head note.
+
+        Requires a model with ``factored_head=True``.
+        """
+        B = x.shape[0]
+        dt = t_next - t_curr
+
+        # --- predictor: exp-Euler from t_curr ---
+        t_vec_curr = t_curr.expand(B)
+        _eps_curr, lam_curr, nu_curr = self._predict_components(
+            unet, x, t_vec_curr, y=y, cfg_scale=cfg_scale,
+        )
+        x_hat = self._exp_integrate(x, lam_curr, nu_curr, t_curr, dt)
+
+        # At the terminal step just return the Euler prediction
+        if (t_next <= self.t_min).item():
+            return x_hat
+
+        # --- corrector: evaluate at predicted point ---
+        t_vec_next = t_next.expand(B)
+        _eps_next, lam_next, nu_next = self._predict_components(
+            unet, x_hat, t_vec_next, y=y, cfg_scale=cfg_scale,
+        )
+
+        # Average natural parameters and re-integrate from x
+        lam_avg = 0.5 * (lam_curr + lam_next)
+        nu_avg = 0.5 * (nu_curr + nu_next)
+        return self._exp_integrate(x, lam_avg, nu_avg, t_curr, dt)
+
+    # ------------------------- Discrete DDIM sampler -------------------------
+
+    def _get_ddpm_schedule(self, device: torch.device) -> Dict[str, torch.Tensor]:
+        if self._ddpm_schedule is None or self._ddpm_schedule["betas"].device != device:
+            if self.schedule_cfg is None:
+                raise ValueError("DDIM sampling requires schedule_cfg (pass the same cfg used for training).")
+            self._ddpm_schedule = make_ddpm_schedule(self.schedule_cfg, device)
+        return self._ddpm_schedule
+
+
+    def step_ddim(
+        self,
+        x: torch.Tensor,
+        t_curr: torch.Tensor,          # scalar tensor on device
+        t_next: torch.Tensor,          # scalar tensor on device (smaller than t_curr)
+        unet,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+        generator=None,
+    ) -> torch.Tensor:
+        """DDIM step using schedule-aware alpha/sigma (works for OU and cosine)."""
+        B = x.shape[0]
+
+        t_vec = t_curr.expand(B)
+        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+
+        alpha_t, sigma_t = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        alpha_t = alpha_t.to(x.dtype)
+        sigma_t = sigma_t.to(x.dtype)
+
+        # x0 prediction
+        x0_pred = (x - sigma_t * eps_pred) / (alpha_t + 1e-8)
+
+        # If we're at (or below) the terminal noise level, return the denoised prediction
+        if (t_next <= self.t_min).item():
+            return x0_pred
+
+        t_next_vec = t_next.expand(B)
+        alpha_next, sigma_next = self._get_alpha_sigma(t_next_vec.view(B, 1, 1, 1))
+        alpha_next = alpha_next.to(x.dtype)
+        sigma_next = sigma_next.to(x.dtype)
+
+        # DDIM-style stochasticity using a(t) = alpha(t)^2
+        a_t = alpha_t ** 2
+        a_next = alpha_next ** 2
+
+        eta = float(self.ddim_eta)
+        if eta <= 0.0:
+            sigma_ddim = torch.zeros_like(sigma_next)
+        else:
+            denom = (1.0 - a_t).clamp_min(1e-12)
+            term1 = ((1.0 - a_next) / denom).clamp_min(0.0)
+            term2 = (1.0 - (a_t / (a_next + 1e-12))).clamp_min(0.0)
+            sigma_ddim = eta * torch.sqrt(term1 * term2)
+
+        # direction coefficient
+        dir_coeff = torch.sqrt((1.0 - a_next - sigma_ddim ** 2).clamp_min(0.0))
+
+        if eta > 0.0:
+            if generator is None:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.randn(x.shape, device=x.device, generator=generator)
+            x_next = alpha_next * x0_pred + dir_coeff * eps_pred + sigma_ddim * noise
+        else:
+            x_next = alpha_next * x0_pred + dir_coeff * eps_pred
+
+        return x_next
+
+    def sample(
+        self,
+        unet,
+        shape=None,
+        device=None,
+        x_init=None,
+        generator=None,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ):
+        unet.eval()
+
+        if x_init is None:
+            assert shape is not None and device is not None
+            x = torch.randn(shape, device=device, generator=generator)
+        else:
+            x = x_init
+        device = x.device
+
+        # Build descending time grid matching the training schedule type
+        ts = self._make_time_grid(device)
+
+        # --- Discrete DDIM path ---
+        if self.method == "ddim":
+            for i in range(self.num_steps):
+                t_curr = ts[i]
+                t_next = ts[i + 1]
+                x = self.step_ddim(
+                    x,
+                    t_curr=t_curr,
+                    t_next=t_next,
+                    unet=unet,
+                    y=y,
+                    cfg_scale=cfg_scale,
+                    generator=generator,
+                )
+            return x
+
+        # --- Continuous ODE/SDE samplers ---
+        for i in range(self.num_steps):
+            t_curr = ts[i]
+            t_next = ts[i + 1]
+
+            if self.method == "rk4_ode":
+                x = self.step_rk4_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "euler_ode":
+                x = self.step_euler_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "heun_ode":
+                x = self.step_heun_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "heun_sde":
+                x = self.step_heun_sde(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale, generator=generator)
+            elif self.method == "exp_euler_ode":
+                x = self.step_exp_euler_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "exp_heun_ode":
+                x = self.step_exp_heun_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            else:
+                raise ValueError(f"Unknown sampling method: {self.method}")
+
+        return x
+
+
+'''
+class UniversalSampler:
+    def __init__(
+
+        self,
+        method: str = "heun_sde",
+        num_steps: int = 20,
+        t_min: float = 2e-5,
+        t_max: float = 2.0,
+        schedule_cfg: Dict[str, Any] | None = None,
+        ddim_eta: float = 0.0,
+        schedule_type: str = "log_snr",
+        cosine_s: float = 0.008,
+    ):
+        self.num_steps = int(num_steps)
+        self.t_min = float(t_min)
+        self.t_max = float(t_max)
+        self.method = str(method).lower()
+        self.schedule_type = str(schedule_type).lower()
+        self.cosine_s = float(cosine_s)
+
+        # For discrete samplers (DDIM), we need the same schedule used in training.
+        self.schedule_cfg = schedule_cfg
+        self.ddim_eta = float(ddim_eta)
+        self._ddpm_schedule: Dict[str, torch.Tensor] | None = None
+
+    # -------------------- schedule-aware helpers --------------------
+
+    def _get_alpha_sigma(self, t_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (alpha, sigma) at continuous time t_vec, dispatching on schedule type."""
+        if self.schedule_type in ("flow", "flow_matching"):
+            # linear interpolant
+            return get_flow_params(t_vec)
+        if self.schedule_type == "cosine":
+            a, s, _ = get_cosine_params(t_vec, cosine_s=self.cosine_s)
+            return a, s
+        # log_t or log_snr — both use OU params
+        return get_ou_params(t_vec)
+
+    def _get_beta(self, t_vec: torch.Tensor) -> torch.Tensor:
+        """Return instantaneous beta(t) — only meaningful for cosine VP."""
+        if self.schedule_type == "cosine":
+            _, _, b = get_cosine_params(t_vec, cosine_s=self.cosine_s)
+            return b
+        else:
+            # For OU, beta is formally 2 (constant), but the ODE form is different.
+            return torch.full_like(t_vec, 2.0)
+
+    def _make_time_grid(self, device: torch.device) -> torch.Tensor:
+        """Build a time grid for sampling.
+
+        - OU / cosine samplers run **reverse-time**: t_max -> t_min (descending grid).
+        - Flow matching runs **forward-time**: t_min -> t_max (ascending grid).
+        """
+        N = self.num_steps + 1
+        if self.schedule_type in ("flow", "flow_matching"):
+            return torch.linspace(self.t_min, self.t_max, N, device=device)
+        if self.schedule_type == "cosine":
+            return torch.linspace(self.t_max, self.t_min, N, device=device)
+        if self.schedule_type == "log_snr":
+            lam_min_val = ou_logsnr(torch.tensor(self.t_max, dtype=torch.float64)).item()
+            lam_max_val = ou_logsnr(torch.tensor(self.t_min, dtype=torch.float64)).item()
+            lam_grid = torch.linspace(lam_min_val, lam_max_val, N, device=device, dtype=torch.float64)
+            times = ou_time_from_logsnr(lam_grid).float()
+            return times.clamp(self.t_min, self.t_max)
+        # log_t
+        return torch.logspace(math.log10(self.t_max), math.log10(self.t_min), N, device=device)
+
+    @staticmethod
+    def _predict_eps(
+        unet,
+        x: torch.Tensor,
+        t_vec: torch.Tensor,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Classifier-Free Guidance in eps-parameterization."""
+        if cfg_scale is None or cfg_scale <= 0.0 or y is None:
+            return unet(x, t_vec, y)
+
+        # unconditional branch uses y=None (UNetModel maps to null label internally)
+        eps_uncond = unet(x, t_vec, None)
+        eps_cond = unet(x, t_vec, y)
+        return eps_uncond + float(cfg_scale) * (eps_cond - eps_uncond)
+
     # ------------------------- Continuous-time samplers -------------------------
 
     def get_ode_derivative(self, x, t, unet, y=None, cfg_scale=None):
@@ -2043,6 +2514,8 @@ class UniversalSampler:
                 raise ValueError(f"Unknown sampling method: {self.method}")
 
         return x
+
+'''
 
 
 # ---------------------------------------------------------------------------
@@ -2369,6 +2842,7 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            {"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
@@ -2487,7 +2961,10 @@ def evaluate_current_state(
 
                 fake_latents = torch.cat(fake_latents_list, 0)
                 fake_imgs = torch.cat(fake_imgs_list, 0)
-                fake_flat = fake_latents.view(fake_latents.shape[0], -1).to(device)
+                # Line 2977: change .view to .reshape
+
+                fake_flat = fake_latents.reshape(fake_latents.shape[0], -1).to(device)
+                #fake_flat = fake_latents.view(fake_latents.shape[0], -1).to(device)
                 w2 = compute_sw2(real_flat_A, fake_flat, n_projections=sw2_nproj, theta=fixed_sw2_theta)
                 lsi_gap = lsi_gap_oracle if use_oracle else lsi_gap_unet
 
@@ -3733,7 +4210,8 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
-                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
 
                 if cfg.get("train_on_mu", False):
                     eps_pred_control = unet_control(z_mu_t, t, y_in)
@@ -3835,7 +4313,9 @@ def train_vae_cotrained_cond(cfg):
                     loss_cos = (1.0 - F.cosine_similarity(eps_pred_lsi_tracking.flatten(1), eps_target_lsi_det.flatten(1), dim=1)).mean()
                     tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
                     if use_factored:
-                        tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
+                        #tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
+                        tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr)
+
 
                 opt_tracking.zero_grad()
                 tracking_loss.backward()
@@ -4056,7 +4536,8 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
-                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
 
                 opt_lsi_refine.zero_grad()
                 score_loss_lsi.backward()
@@ -4330,7 +4811,7 @@ def main():
     Both experiments have the same total LDM training epochs for fair comparison.
     X-axis on plots = "LDM Training Epoch" (1-250 for both)
     """
-  
+
     # === SHARED CONFIG (base settings for both experiments) ===
     cfg_shared = {
         # --- Dataset ---
@@ -4357,7 +4838,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.001,
+        "aux_head_w": 0.004,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
