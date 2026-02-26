@@ -839,6 +839,171 @@ def compute_lsi_gap(
     return total_lsi_gap / total_count if total_count > 0 else 0.0
 
 
+def compute_mse_gap(
+    score_net,
+    oracle_model,
+    encoder_mus: torch.Tensor,
+    encoder_logvars: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    labels: torch.Tensor | None = None,
+    num_classes: int | None = None,
+    num_samples: int = 5000,
+    batch_size: int = 128,
+    space: str = "eps",
+) -> float:
+    """Integrated MSE between the learned score network and the oracle score.
+
+    MSE_gap = E_{t, x}[ || eps_theta(z_t, t) - eps*(z_t, t) ||_2^2 ]
+
+    where t is drawn *uniformly* over the full discrete training time grid
+    (``num_train_timesteps`` points produced by ``make_schedule``), and
+    z_t is obtained by
+
+        x  -->  (mu_0, Sigma_0) = Enc(x)
+        z_0  ~  N(mu_0, Sigma_0)
+        z_t  =  alpha(t) z_0  +  sigma(t) eps,   eps ~ N(0,I)
+
+    Parameters
+    ----------
+    score_net : nn.Module | OracleScoreModel
+        Learned eps-prediction network (same call signature as DiTModel).
+    oracle_model : OracleScoreModel
+        Oracle (exact CSEM) eps-prediction model.
+    encoder_mus, encoder_logvars : Tensor [N, C, H, W]
+        Precomputed encoder outputs over the evaluation dataset (CPU).
+    cfg : dict
+        Experiment configuration (needs time_schedule, t_min, t_max, num_train_timesteps, …).
+    device : torch.device
+    labels : Tensor [N] or None
+        Class labels; passed to both score_net and oracle_model.
+    num_classes : int or None
+    num_samples : int
+        How many data points to average over.
+    batch_size : int
+    space : ``"eps"`` | ``"score"``
+        ``"eps"``   – plain MSE in eps-prediction space (default).
+        ``"score"`` – divides each term by sigma(t)^2 so that the comparison
+                      is in score space  (score = -eps / sigma).
+
+    Returns
+    -------
+    float  – the averaged MSE gap.
+    """
+    if score_net is None or oracle_model is None:
+        return 0.0
+
+    score_net.eval()
+    oracle_model.eval()
+
+    n_data = encoder_mus.shape[0]
+    num_samples = min(int(num_samples), int(n_data))
+    sample_indices = torch.randperm(n_data, device="cpu")[:num_samples]
+
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+
+    # ------------------------------------------------------------------
+    # Build the full discrete training time grid
+    # ------------------------------------------------------------------
+    if stype in ("flow", "flow_matching"):
+        T = int(cfg.get("num_train_timesteps", 1000))
+        t_min = float(cfg.get("t_min", 1e-5))
+        t_max = float(cfg.get("t_max", 0.99999))
+        t_grid = torch.linspace(t_min, t_max, T, device=device, dtype=torch.float32)
+
+        total_mse = 0.0
+        total_count = 0
+
+        with torch.no_grad():
+            for i in range(0, num_samples, batch_size):
+                batch_indices = sample_indices[i:i + batch_size]
+                batch_mu = encoder_mus[batch_indices].to(device)
+                batch_logvar = encoder_logvars[batch_indices].to(device)
+                batch_std = torch.exp(0.5 * batch_logvar)
+                bsz = batch_mu.shape[0]
+
+                y_batch = None
+                if labels is not None:
+                    y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+                # Sample z0 ~ q(z0 | x)
+                eps_0 = torch.randn_like(batch_mu)
+                z0 = batch_mu + batch_std * eps_0
+
+                for t_val in t_grid:
+                    t = t_val.expand(bsz)
+                    alpha = t_val.view(1, 1, 1, 1)
+                    sigma = (1.0 - t_val).view(1, 1, 1, 1).clamp_min(1e-8)
+
+                    noise = torch.randn_like(z0)
+                    z_t = alpha * z0 + sigma * noise
+
+                    eps_pred = score_net(z_t, t, y_batch)
+                    eps_oracle = oracle_model(z_t, t, y_batch)
+
+                    diff_sq = (eps_pred - eps_oracle) ** 2
+                    if space == "score":
+                        sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                        diff_sq = diff_sq / sigma_sq
+
+                    mse_per_sample = diff_sq.sum(dim=(1, 2, 3))  # [bsz]
+                    total_mse += mse_per_sample.sum().item()
+                    total_count += bsz
+
+        return total_mse / total_count if total_count > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    # OU / cosine (discrete schedule)
+    # ------------------------------------------------------------------
+    ou_sched = make_schedule(cfg, device)
+    T = int(ou_sched["T"].item())
+    # Use all T discrete timesteps
+    t_idx_grid = torch.arange(T, device=device, dtype=torch.long)
+
+    total_mse = 0.0
+    total_count = 0
+
+    with torch.no_grad():
+        for i in range(0, num_samples, batch_size):
+            batch_indices = sample_indices[i:i + batch_size]
+            batch_mu = encoder_mus[batch_indices].to(device)
+            batch_logvar = encoder_logvars[batch_indices].to(device)
+            batch_std = torch.exp(0.5 * batch_logvar)
+            bsz = batch_mu.shape[0]
+
+            y_batch = None
+            if labels is not None:
+                y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+            eps_0 = torch.randn_like(batch_mu)
+            z0 = batch_mu + batch_std * eps_0
+
+            for t_idx_scalar in t_idx_grid:
+                t_idx = t_idx_scalar.expand(bsz)
+
+                t_val = ou_sched["times"].gather(0, t_idx_scalar.view(1)).view(1)
+                t = t_val.expand(bsz).float()
+
+                alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+
+                noise = torch.randn_like(z0)
+                z_t = alpha * z0 + sigma * noise
+
+                eps_pred = score_net(z_t, t, y_batch)
+                eps_oracle = oracle_model(z_t, t, y_batch)
+
+                diff_sq = (eps_pred - eps_oracle) ** 2
+                if space == "score":
+                    sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                    diff_sq = diff_sq / sigma_sq
+
+                mse_per_sample = diff_sq.sum(dim=(1, 2, 3))  # [bsz]
+                total_mse += mse_per_sample.sum().item()
+                total_count += bsz
+
+    return total_mse / total_count if total_count > 0 else 0.0
+
 
 # ── VAE ───────────────────────────────────────────────────────────────
 
@@ -2511,6 +2676,35 @@ def evaluate_current_state(
     print(f"  Oracle (unconditional) LSI gap = {lsi_gap_oracle:.6f}")
 
     # -----------------------------------------------------------------------
+    # MSE gap: learned score net vs oracle (eps-space and score-space)
+    # -----------------------------------------------------------------------
+    print("  Computing MSE gap (eps-space) vs oracle...")
+    mse_gap_eps = compute_mse_gap(
+        unet, oracle_model,
+        encoder_mus, encoder_logvars,
+        cfg, device,
+        labels=None,
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(5000, target_count),
+        batch_size=bs,
+        space="eps",
+    )
+    print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
+
+    print("  Computing MSE gap (score-space) vs oracle...")
+    mse_gap_score = compute_mse_gap(
+        unet, oracle_model,
+        encoder_mus, encoder_logvars,
+        cfg, device,
+        labels=None,
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(5000, target_count),
+        batch_size=bs,
+        space="score",
+    )
+    print(f"  MSE gap (score-space, uncond) = {mse_gap_score:.6f}")
+
+    # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
     # -----------------------------------------------------------------------
     configs = [
@@ -2674,6 +2868,8 @@ def evaluate_current_state(
             "w2": w2,
             "div": div,
             "lsi_gap": lsi_gap,
+            "mse_gap_eps": mse_gap_eps if not use_oracle else 0.0,
+            "mse_gap_score": mse_gap_score if not use_oracle else 0.0,
         })
 
         # Save sample panels for the main sweep
@@ -2689,17 +2885,20 @@ def evaluate_current_state(
 
     # Print main results
     print(f"\n  >>> Sweep Results [{prefix}] <<<")
-    print(f"  {'Config':<40} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10}")
-    print("  " + "-" * 120)
+    print(f"  {'Config':<40} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10} | {'MSE(eps)':<10} | {'MSE(score)':<10}")
+    print("  " + "-" * 150)
     for r in results:
         print(f"  {r['config']:<40} | {r['desc']:<20} | {r['fid']:<8.2f} | {r['kid']:<10.4f} | "
-              f"{r['w2']:<10.6f} | {r['div']:<8.4f} | {r['lsi_gap']:<10.4f}")
-    print("  " + "-" * 120 + "\n")
+              f"{r['w2']:<10.6f} | {r['div']:<8.4f} | {r['lsi_gap']:<10.4f} | "
+              f"{r['mse_gap_eps']:<10.4f} | {r['mse_gap_score']:<10.4f}")
+    print("  " + "-" * 150 + "\n")
 
     # Flatten for DataFrame logging
     output_dict: Dict[str, Any] = {}
     output_dict["lsi_gap_oracle_uncond"] = lsi_gap_oracle
     output_dict["lsi_gap_unet_uncond"] = lsi_gap_unet
+    output_dict["mse_gap_eps_uncond"] = mse_gap_eps
+    output_dict["mse_gap_score_uncond"] = mse_gap_score
     for r in results:
         config = r["config"]
         if "VAE_Rec_eps" in config:
@@ -2716,6 +2915,8 @@ def evaluate_current_state(
             output_dict[f"sw2_rk4_{col_suffix}"] = r["w2"]
             output_dict[f"div_rk4_{col_suffix}"] = r["div"]
             output_dict[f"lsi_gap_rk4_{col_suffix}"] = r["lsi_gap"]
+            output_dict[f"mse_gap_eps_rk4_{col_suffix}"] = r["mse_gap_eps"]
+            output_dict[f"mse_gap_score_rk4_{col_suffix}"] = r["mse_gap_score"]
         elif "heun" in config.lower():
             after_at = config.split("@")[1] if "@" in config else "20"
             col_suffix = after_at.replace(".", "_")
@@ -2724,6 +2925,8 @@ def evaluate_current_state(
             output_dict[f"sw2_heun_{col_suffix}"] = r["w2"]
             output_dict[f"div_heun_{col_suffix}"] = r["div"]
             output_dict[f"lsi_gap_heun_{col_suffix}"] = r["lsi_gap"]
+            output_dict[f"mse_gap_eps_heun_{col_suffix}"] = r["mse_gap_eps"]
+            output_dict[f"mse_gap_score_heun_{col_suffix}"] = r["mse_gap_score"]
 
     # -----------------------------------------------------------------------
     # Optional: class-conditional evaluation + CFG
@@ -3013,7 +3216,7 @@ def discover_metric_columns(eval_df, metric_prefix):
 
     Args:
         eval_df: DataFrame with evaluation metrics
-        metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap'
+        metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score'
 
     Returns:
         List of column names matching the pattern, excluding vae_recon variants
@@ -3021,6 +3224,12 @@ def discover_metric_columns(eval_df, metric_prefix):
     if metric_prefix == 'lsi_gap':
         # lsi_gap columns look like: lsi_gap_rk4_20_randtok
         pattern = re.compile(r'^lsi_gap_')
+    elif metric_prefix == 'mse_gap_eps':
+        # mse_gap_eps columns look like: mse_gap_eps_rk4_20_randtok
+        pattern = re.compile(r'^mse_gap_eps_')
+    elif metric_prefix == 'mse_gap_score':
+        # mse_gap_score columns look like: mse_gap_score_rk4_20_randtok
+        pattern = re.compile(r'^mse_gap_score_')
     else:
         # Other columns look like: fid_rk4_20_randtok (exclude fid_vae_recon)
         pattern = re.compile(rf'^{metric_prefix}_(?!vae_recon)')
@@ -3035,11 +3244,17 @@ def parse_metric_column(col_name):
         'fid_rk4_10' -> {'metric': 'fid', 'method': 'rk4', 'steps': '10', 'suffix': ''}
         'fid_rk4_20_randtok' -> {'metric': 'fid', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
         'lsi_gap_rk4_20_randtok' -> {'metric': 'lsi_gap', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
+        'mse_gap_eps_rk4_25_randtok' -> {'metric': 'mse_gap_eps', 'method': 'rk4', 'steps': '25', 'suffix': '_randtok'}
+        'mse_gap_score_rk4_25_randtok' -> {'metric': 'mse_gap_score', 'method': 'rk4', 'steps': '25', 'suffix': '_randtok'}
     """
     parts = col_name.split('_')
 
+    # Handle mse_gap_eps / mse_gap_score specially (3-token metric name)
+    if parts[0] == 'mse' and len(parts) > 2 and parts[1] == 'gap' and parts[2] in ('eps', 'score'):
+        metric = f'mse_gap_{parts[2]}'
+        remaining = parts[3:]  # Skip 'mse', 'gap', 'eps'/'score'
     # Handle lsi_gap specially (has underscore in metric name)
-    if parts[0] == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
+    elif parts[0] == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
         metric = 'lsi_gap'
         remaining = parts[2:]  # Skip 'lsi' and 'gap'
     else:
@@ -3076,7 +3291,7 @@ def get_metric_groups(eval_df):
     """
     groups = {}
 
-    for metric_type in ['fid', 'kid', 'sw2', 'div', 'lsi_gap']:
+    for metric_type in ['fid', 'kid', 'sw2', 'div', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
         cols = discover_metric_columns(eval_df, metric_type)
         for col in cols:
             parsed = parse_metric_column(col)
@@ -3226,7 +3441,7 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
 
     # Discover all available metric columns
     metric_groups = {}
-    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
         cols = discover_metric_columns(eval_df, metric_type)
         for col in cols:
             parsed = parse_metric_column(col)
@@ -3313,6 +3528,26 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
             )
             plot_idx += 1
 
+        # MSE Gap (eps-space) plot
+        if 'mse_gap_eps' in group:
+            plot_generic_metric(
+                eval_df, group['mse_gap_eps'], 'mse_gap_eps', 'MSE Gap eps (lower = better)',
+                f"MSE Gap vs Oracle, eps-space ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_mse_gap_eps_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+
+        # MSE Gap (score-space) plot
+        if 'mse_gap_score' in group:
+            plot_generic_metric(
+                eval_df, group['mse_gap_score'], 'mse_gap_score', 'MSE Gap score (lower = better)',
+                f"MSE Gap vs Oracle, score-space ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_mse_gap_score_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+
     print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
 
 def plot_vae_recon_loss(loss_df, save_path):
@@ -3376,7 +3611,7 @@ def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_d
 
     # Group columns by (method, steps, suffix)
     metric_groups = {}
-    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
         cols = discover_metric_columns(eval_df_cotrain, metric_type)
         cols.extend(discover_metric_columns(eval_df_indep, metric_type))
         cols = list(set(cols))  # Remove duplicates
@@ -3408,6 +3643,8 @@ def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_d
         'kid': 'KID',
         'sw2': 'SW2 (log scale)',
         'lsi_gap': 'LSI Gap (lower=better)',
+        'mse_gap_eps': 'MSE Gap eps (lower=better)',
+        'mse_gap_score': 'MSE Gap score (lower=better)',
     }
 
     for (method, steps, suffix) in sorted(metric_groups.keys()):
@@ -3415,7 +3652,7 @@ def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_d
         config_label = format_config_label(method, steps, suffix)
         config_tag = f"{method}_{steps}{suffix}".replace('.', '_')  # Safe filename
 
-        for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+        for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
             if metric_type not in group:
                 continue
 
