@@ -2685,12 +2685,12 @@ def evaluate_current_state(
         cfg, device,
         labels=None,
         num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
+        num_samples=min(2500, target_count),
         batch_size=bs,
         space="eps",
     )
     print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
-
+    '''
     print("  Computing MSE gap (score-space) vs oracle...")
     mse_gap_score = compute_mse_gap(
         unet, oracle_model,
@@ -2703,7 +2703,9 @@ def evaluate_current_state(
         space="score",
     )
     print(f"  MSE gap (score-space, uncond) = {mse_gap_score:.6f}")
-
+    '''
+    mse_gap_score = mse_gap_eps
+    
     # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
     # -----------------------------------------------------------------------
@@ -2716,9 +2718,8 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
-            #{"method": "exp_heun_ode_exp",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
-             
-            {"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+            #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+            #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
@@ -4828,7 +4829,7 @@ def main():
     cfg_cotrain.update({
         # Training schedule
         "epochs_vae": 600,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 25,        # Refine phase: LDM-only on frozen VAE
+        "epochs_refine": 150,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
         # Score head gaussian factored param
@@ -4846,7 +4847,7 @@ def main():
 
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 150,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 25,     # Eval every 10 epochs during refine
+        "eval_freq_refine": 50,     # Eval every 10 epochs during refine
     })
 
     # === INDEPENDENT CONFIG ===
@@ -4855,7 +4856,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 625,       # LDM training on frozen VAE
+        "epochs_refine": 750,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 3e-4,
@@ -4876,7 +4877,7 @@ def main():
 
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
-        "eval_freq_refine": 100,       # Eval every 10 epochs during refine
+        "eval_freq_refine": 150,       # Eval every 10 epochs during refine
     })
 
     print("=" * 70)
