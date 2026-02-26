@@ -702,7 +702,7 @@ def compute_lsi_gap(
     device,
     labels: torch.Tensor | None = None,
     num_classes: int | None = None,
-    num_samples: int = 5000,
+    num_samples: int = 2500,
     num_time_points: int = 50,
     batch_size: int = 128,
 ):
@@ -848,7 +848,7 @@ def compute_mse_gap(
     device: torch.device,
     labels: torch.Tensor | None = None,
     num_classes: int | None = None,
-    num_samples: int = 5000,
+    num_samples: int = 2500,
     batch_size: int = 128,
     space: str = "eps",
 ) -> float:
@@ -2643,7 +2643,7 @@ def evaluate_current_state(
         device,
         labels=None,  # unconditional branch
         num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
+        num_samples=min(2500, target_count),
         num_time_points=50,
         batch_size=bs,
     )
@@ -2669,7 +2669,7 @@ def evaluate_current_state(
         device,
         labels=None,  # unconditional branch
         num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
+        num_samples=min(2500, target_count),
         num_time_points=50,
         batch_size=bs,
     )
@@ -2698,7 +2698,7 @@ def evaluate_current_state(
         cfg, device,
         labels=None,
         num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
+        num_samples=min(2500, target_count),
         batch_size=bs,
         space="score",
     )
