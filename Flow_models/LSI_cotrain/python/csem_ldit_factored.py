@@ -4838,7 +4838,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.004,
+        "aux_head_w": 0.005,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
@@ -4922,7 +4922,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.666,
+        "score_w_vae": 0.5,
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
