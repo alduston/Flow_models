@@ -829,7 +829,7 @@ def compute_lsi_gap(
 
                 sigma_sq = sigma ** 2 + 1e-8
                 eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                
+
                 #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
                 score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
 
@@ -838,127 +838,259 @@ def compute_lsi_gap(
 
     return total_lsi_gap / total_count if total_count > 0 else 0.0
 
-###################################  OLD VAE CLASS #####################################
 
-class VAE_old(nn.Module):
-    def __init__(
-        self,
-        latent_channels: int = 4,
-        base_ch: int = 32,
-        use_norm: bool = False,
-        img_size: int = 28,
-        img_channels: int = 1,
-        # --- NEW: optional conditional encoder ---
-        num_classes: int | None = None,
-        null_label: int | None = None,
-        cond_emb_dim: int = 64,
-        # --- NEW: auxiliary encoder noise (mixture-of-Gaussians per x) ---
-        aux_d: int = 0,
-    ):
+def compute_mse_gap(
+    score_net,
+    oracle_model,
+    encoder_mus: torch.Tensor,
+    encoder_logvars: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    labels: torch.Tensor | None = None,
+    num_classes: int | None = None,
+    num_samples: int = 5000,
+    batch_size: int = 128,
+    space: str = "eps",
+) -> float:
+    """Integrated MSE between the learned score network and the oracle score.
+
+    MSE_gap = E_{t, x}[ || eps_theta(z_t, t) - eps*(z_t, t) ||_2^2 ]
+
+    where t is drawn *uniformly* over the full discrete training time grid
+    (``num_train_timesteps`` points produced by ``make_schedule``), and
+    z_t is obtained by
+
+        x  -->  (mu_0, Sigma_0) = Enc(x)
+        z_0  ~  N(mu_0, Sigma_0)
+        z_t  =  alpha(t) z_0  +  sigma(t) eps,   eps ~ N(0,I)
+
+    Parameters
+    ----------
+    score_net : nn.Module | OracleScoreModel
+        Learned eps-prediction network (same call signature as DiTModel).
+    oracle_model : OracleScoreModel
+        Oracle (exact CSEM) eps-prediction model.
+    encoder_mus, encoder_logvars : Tensor [N, C, H, W]
+        Precomputed encoder outputs over the evaluation dataset (CPU).
+    cfg : dict
+        Experiment configuration (needs time_schedule, t_min, t_max, num_train_timesteps, …).
+    device : torch.device
+    labels : Tensor [N] or None
+        Class labels; passed to both score_net and oracle_model.
+    num_classes : int or None
+    num_samples : int
+        How many data points to average over.
+    batch_size : int
+    space : ``"eps"`` | ``"score"``
+        ``"eps"``   – plain MSE in eps-prediction space (default).
+        ``"score"`` – divides each term by sigma(t)^2 so that the comparison
+                      is in score space  (score = -eps / sigma).
+
+    Returns
+    -------
+    float  – the averaged MSE gap.
+    """
+    if score_net is None or oracle_model is None:
+        return 0.0
+
+    score_net.eval()
+    oracle_model.eval()
+
+    n_data = encoder_mus.shape[0]
+    num_samples = min(int(num_samples), int(n_data))
+    sample_indices = torch.randperm(n_data, device="cpu")[:num_samples]
+
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+
+    # ------------------------------------------------------------------
+    # Build the full discrete training time grid
+    # ------------------------------------------------------------------
+    if stype in ("flow", "flow_matching"):
+        T = int(cfg.get("num_train_timesteps", 1000))
+        t_min = float(cfg.get("t_min", 1e-5))
+        t_max = float(cfg.get("t_max", 0.99999))
+        t_grid = torch.linspace(t_min, t_max, T, device=device, dtype=torch.float32)
+
+        total_mse = 0.0
+        total_count = 0
+
+        with torch.no_grad():
+            for i in range(0, num_samples, batch_size):
+                batch_indices = sample_indices[i:i + batch_size]
+                batch_mu = encoder_mus[batch_indices].to(device)
+                batch_logvar = encoder_logvars[batch_indices].to(device)
+                batch_std = torch.exp(0.5 * batch_logvar)
+                bsz = batch_mu.shape[0]
+
+                y_batch = None
+                if labels is not None:
+                    y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+                # Sample z0 ~ q(z0 | x)
+                eps_0 = torch.randn_like(batch_mu)
+                z0 = batch_mu + batch_std * eps_0
+
+                for t_val in t_grid:
+                    t = t_val.expand(bsz)
+                    alpha = t_val.view(1, 1, 1, 1)
+                    sigma = (1.0 - t_val).view(1, 1, 1, 1).clamp_min(1e-8)
+
+                    noise = torch.randn_like(z0)
+                    z_t = alpha * z0 + sigma * noise
+
+                    eps_pred = score_net(z_t, t, y_batch)
+                    eps_oracle = oracle_model(z_t, t, y_batch)
+
+                    diff_sq = (eps_pred - eps_oracle) ** 2
+                    if space == "score":
+                        sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                        diff_sq = diff_sq / sigma_sq
+
+                    mse_per_sample = diff_sq.sum(dim=(1, 2, 3))  # [bsz]
+                    total_mse += mse_per_sample.sum().item()
+                    total_count += bsz
+
+        return total_mse / total_count if total_count > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    # OU / cosine (discrete schedule)
+    # ------------------------------------------------------------------
+    ou_sched = make_schedule(cfg, device)
+    T = int(ou_sched["T"].item())
+    # Use all T discrete timesteps
+    t_idx_grid = torch.arange(T, device=device, dtype=torch.long)
+
+    total_mse = 0.0
+    total_count = 0
+
+    with torch.no_grad():
+        for i in range(0, num_samples, batch_size):
+            batch_indices = sample_indices[i:i + batch_size]
+            batch_mu = encoder_mus[batch_indices].to(device)
+            batch_logvar = encoder_logvars[batch_indices].to(device)
+            batch_std = torch.exp(0.5 * batch_logvar)
+            bsz = batch_mu.shape[0]
+
+            y_batch = None
+            if labels is not None:
+                y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+            eps_0 = torch.randn_like(batch_mu)
+            z0 = batch_mu + batch_std * eps_0
+
+            for t_idx_scalar in t_idx_grid:
+                t_idx = t_idx_scalar.expand(bsz)
+
+                t_val = ou_sched["times"].gather(0, t_idx_scalar.view(1)).view(1)
+                t = t_val.expand(bsz).float()
+
+                alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+
+                noise = torch.randn_like(z0)
+                z_t = alpha * z0 + sigma * noise
+
+                eps_pred = score_net(z_t, t, y_batch)
+                eps_oracle = oracle_model(z_t, t, y_batch)
+
+                diff_sq = (eps_pred - eps_oracle) ** 2
+                if space == "score":
+                    sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                    diff_sq = diff_sq / sigma_sq
+
+                mse_per_sample = diff_sq.sum(dim=(1, 2, 3))  # [bsz]
+                total_mse += mse_per_sample.sum().item()
+                total_count += bsz
+
+    return total_mse / total_count if total_count > 0 else 0.0
+
+
+# ── VAE ───────────────────────────────────────────────────────────────
+
+"""
+Refactored VAE with LDM-aligned architectural improvements.
+
+Changes vs previous version (all gated by flags, defaults reproduce old behaviour):
+  1. conv3x3_proj=True  : GN→SiLU→3×3 combined mu+logvar projection (encoder)
+                          + 3×3 decoder input conv (replaces 1×1)
+  2. decoder_extra_block : +1 VAEResBlock per decoder stage (LDM asymmetry)
+  3. encoder_attn_half   : attention at half-res (16×16) in encoder
+  4. use_tanh_out=False  : raw decoder output (no tanh saturation)
+  5. clamp_logvar=True   : clamp logvar to [-30, 20]
+  6. attn_zero_init=False: standard init on VAE attention proj (faster learning)
+"""
+
+# ── VAEAttentionBlock (updated: optional zero-init) ──────────────────────
+
+class VAEAttentionBlock(nn.Module):
+    """
+    Multi-head self-attention with optional zero-init on output projection.
+
+    zero_init=True  (default): proj starts as no-op — good for score nets.
+    zero_init=False           : standard init — faster attention learning in VAEs.
+    """
+    def __init__(self, ch: int, num_heads: int = 4, zero_init: bool = True):
         super().__init__()
-        # Encoder
-        self.use_norm = use_norm
-        self.img_size = img_size
-        self.img_channels = int(img_channels)
-        self.latent_channels = int(latent_channels)
-        self.base_ch = int(base_ch)
+        ch = int(ch)
+        num_heads = int(num_heads)
 
-        # If num_classes is provided, encoder becomes class-conditional.
-        self.num_classes = None if num_classes is None else int(num_classes)
-        self.null_label = None if self.num_classes is None else int(self.num_classes if null_label is None else null_label)
+        num_heads = min(num_heads, ch)
+        while num_heads > 1 and (ch % num_heads) != 0:
+            num_heads -= 1
 
-        self.enc_conv_in = nn.Conv2d(img_channels, base_ch, 3, 1, 1)
+        self.ch = ch
+        self.num_heads = num_heads
+        self.head_dim = ch // num_heads
 
-        self.enc_blocks = nn.ModuleList([
-            nn.Sequential(VAEResBlock(base_ch, base_ch), nn.Conv2d(base_ch, base_ch * 2, 3, 2, 1)),
-            nn.Sequential(VAEResBlock(base_ch * 2, base_ch * 2), nn.Conv2d(base_ch * 2, base_ch * 4, 3, 2, 1)),
-            nn.Sequential(VAEResBlock(base_ch * 4, base_ch * 4), AttentionBlock(base_ch * 4), VAEResBlock(base_ch * 4, base_ch * 4)),
-        ])
+        self.norm = make_group_norm(ch)
+        self.qkv = nn.Conv2d(ch, 3 * ch, kernel_size=1)
+        self.proj = nn.Conv2d(ch, ch, kernel_size=1)
 
-        enc_out_ch = base_ch * 4
+        if zero_init:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
 
-        # --- NEW: conditional bottleneck bias (zero-init) ---
-        if self.num_classes is not None:
-            # reserve num_classes as unconditional/null label (consistent with CFG dropout)
-            self.y_emb = nn.Embedding(self.num_classes + 1, cond_emb_dim)
-            self.cond_proj = nn.Linear(cond_emb_dim, enc_out_ch)
-            nn.init.zeros_(self.cond_proj.weight)
-            nn.init.zeros_(self.cond_proj.bias)
-        else:
-            self.y_emb = None
-            self.cond_proj = None
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        qkv = qkv.view(B, 3, self.num_heads, self.head_dim, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
-        self.mu = nn.Conv2d(enc_out_ch, latent_channels, 1)
-        self.logvar = nn.Conv2d(enc_out_ch, latent_channels, 1)
+        attn = torch.matmul(q.transpose(-2, -1).float(), k.float())
+        attn = attn * (self.head_dim ** -0.5)
+        attn = attn.softmax(dim=-1).to(q.dtype)
 
-        # GroupNorm on eta (mu)
-        if self.use_norm:
-            self.gn_mu = nn.GroupNorm(num_groups=1, num_channels=latent_channels, affine=False)
+        out = torch.matmul(v, attn.transpose(-2, -1))
+        out = out.reshape(B, C, H, W)
+        return x + self.proj(out)
 
-        # Decoder (unchanged)
-        self.dec_conv_in = nn.Conv2d(latent_channels, base_ch * 4, 1)
-        self.dec_blocks = nn.ModuleList([
-            nn.Sequential(VAEResBlock(base_ch * 4, base_ch * 4), AttentionBlock(base_ch * 4), VAEResBlock(base_ch * 4, base_ch * 4)),
-            nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(base_ch * 4, base_ch * 2, 3, 1, 1), VAEResBlock(base_ch * 2, base_ch * 2)),
-            nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(base_ch * 2, base_ch, 3, 1, 1), VAEResBlock(base_ch, base_ch)),
-        ])
-        self.dec_out = nn.Sequential(
-            nn.GroupNorm(16, base_ch), nn.SiLU(), nn.Conv2d(base_ch, img_channels, 3, 1, 1)
+
+# ── VAEResBlock (unchanged) ───────────────────────────────────────────
+
+class VAEResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1),
+            make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1)
         )
-
-    def encode(self, x: torch.Tensor, y: torch.Tensor | None = None):
-        h = self.enc_conv_in(x)
-        for block in self.enc_blocks:
-            h = block(h)
-
-        # --- NEW: inject class-conditioning at bottleneck if enabled ---
-        if self.num_classes is not None:
-            B, C, H, W = h.shape
-            if y is None:
-                y = torch.full((B,), self.null_label, device=h.device, dtype=torch.long)
-            else:
-                y = y.to(device=h.device, dtype=torch.long).view(B)
-
-            emb = self.y_emb(y)                         # [B, cond_emb_dim]
-            bias = self.cond_proj(emb).view(B, C, 1, 1)  # [B, C, 1, 1]
-            h = h + bias                                 # broadcast to [B, C, H, W]
-
-        mu = self.mu(h)
-        logvar = self.logvar(h)
-
-        if self.use_norm:
-            mu = self.gn_mu(mu)
-
-        return mu, logvar
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def decode(self, z):
-        h = self.dec_conv_in(z)
-        for block in self.dec_blocks:
-            h = block(h)
-        return torch.tanh(self.dec_out(h))
-
-    def forward(self, x, y: torch.Tensor | None = None):
-        mu, logvar = self.encode(x, y=y)
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
-
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    def forward(self, x): return self.net(x) + self.skip(x)
 
 class VAE(nn.Module):
     """
     Convolutional VAE with two stride-2 downsamples (img_size → img_size/4 latent).
 
-    Backward-compatible: the default values for every NEW parameter reproduce the
-    original 1.7 M-param architecture exactly.  To unlock the bigger decoder,
-    pass the new knobs when you construct the model (see "NEW" comments below).
+    Backward-compatible: every NEW parameter's default reproduces the prior
+    architecture exactly.
 
-    Recommended call for CIFAR with 8 latent channels:
+    Recommended CIFAR call (with all improvements):
         VAE(latent_channels=8, base_ch=64, img_size=32, img_channels=3,
             num_res_blocks=2, decoder_attn_half=True, latent_proj_depth=2,
+            encoder_attn_half=True, decoder_extra_block=True,
+            conv3x3_proj=True, use_tanh_out=False,
+            clamp_logvar=True, attn_zero_init=False,
             num_classes=10, cond_emb_dim=64, use_norm=True)
     """
 
@@ -969,20 +1101,27 @@ class VAE(nn.Module):
         use_norm: bool = False,
         img_size: int = 28,
         img_channels: int = 1,
-        # --- Optional conditional encoder (unchanged) ---
+        # --- Optional conditional encoder ---
         num_classes: int | None = None,
         null_label: int | None = None,
         cond_emb_dim: int = 64,
-        # --- NEW: auxiliary encoder noise (mixture-of-Gaussians per x) ---
+        # --- Auxiliary encoder noise (mixture-of-Gaussians per x) ---
         aux_d: int = 0,
-        # --- NEW capacity knobs (defaults = old behaviour) ---
-        num_res_blocks: int = 1,           # ResBlocks per stage  (old=1, try 2)
-        decoder_attn_half: bool = False,    # add Attention at half-res (16×16) in decoder
-        latent_proj_depth: int = 1,         # 1 = single 1×1 conv (old), 2 = ResBlock → 1×1
+        # --- Capacity knobs (v1, defaults = original behaviour) ---
+        num_res_blocks: int = 1,
+        decoder_attn_half: bool = False,
+        latent_proj_depth: int = 1,
+        # --- v2 architectural knobs (defaults = v1 behaviour) ---
+        encoder_attn_half: bool = False,     # [4] attention at half-res in encoder
+        decoder_extra_block: bool = False,   # [3] +1 ResBlock per decoder stage
+        conv3x3_proj: bool = False,          # [1,2] 3×3 latent projection + decoder input
+        use_tanh_out: bool = True,           # [5] False = raw output, no tanh
+        clamp_logvar: bool = False,          # [6] clamp logvar to [-30, 20]
+        attn_zero_init: bool = True,         # [7] False = standard init on VAE attn
     ):
         super().__init__()
 
-        # ---- bookkeeping (unchanged) ------------------------------------
+        # ---- bookkeeping ------------------------------------------------
         self.use_norm = use_norm
         self.img_size = img_size
         self.img_channels = int(img_channels)
@@ -991,9 +1130,13 @@ class VAE(nn.Module):
         self.num_res_blocks = int(num_res_blocks)
         self.decoder_attn_half = decoder_attn_half
         self.latent_proj_depth = int(latent_proj_depth)
-
-        # Auxiliary noise dimensionality (0 => disabled / backward-compatible)
         self.aux_d = int(aux_d)
+        self.encoder_attn_half = encoder_attn_half
+        self.decoder_extra_block = decoder_extra_block
+        self.conv3x3_proj = conv3x3_proj
+        self.use_tanh_out = use_tanh_out
+        self.clamp_logvar = clamp_logvar
+        self.attn_zero_init = attn_zero_init
 
         self.num_classes = None if num_classes is None else int(num_classes)
         self.null_label = (
@@ -1001,9 +1144,11 @@ class VAE(nn.Module):
             else int(self.num_classes if null_label is None else null_label)
         )
 
-        ch1 = base_ch          # after enc_conv_in  (full res)
-        ch2 = base_ch * 2      # after first downsample (half res)
-        ch4 = base_ch * 4      # after second downsample / bottleneck (quarter res)
+        ch1 = base_ch          # full res
+        ch2 = base_ch * 2      # half res
+        ch4 = base_ch * 4      # quarter res / bottleneck
+
+        azero = self.attn_zero_init  # shorthand for attention blocks
 
         # ================================================================
         #  ENCODER
@@ -1012,16 +1157,18 @@ class VAE(nn.Module):
 
         # Stage 0 — full-res → half-res
         enc_stage0 = [VAEResBlock(ch1, ch1) for _ in range(num_res_blocks)]
-        enc_stage0.append(nn.Conv2d(ch1, ch2, 3, 2, 1))           # stride-2 downsample
+        enc_stage0.append(nn.Conv2d(ch1, ch2, 3, 2, 1))           # stride-2 down
 
         # Stage 1 — half-res → quarter-res
-        enc_stage1 = [VAEResBlock(ch2, ch2) for _ in range(num_res_blocks)]
-        enc_stage1.append(nn.Conv2d(ch2, ch4, 3, 2, 1))           # stride-2 downsample
+        enc_stage1: list[nn.Module] = [VAEResBlock(ch2, ch2) for _ in range(num_res_blocks)]
+        if encoder_attn_half:                                       # [4] NEW
+            enc_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
+        enc_stage1.append(nn.Conv2d(ch2, ch4, 3, 2, 1))           # stride-2 down
 
         # Stage 2 — bottleneck (quarter-res, with attention)
         enc_stage2: list[nn.Module] = [VAEResBlock(ch4, ch4)]
-        enc_stage2.append(AttentionBlock(ch4))
-        for _ in range(num_res_blocks):                            # extra ResBlocks
+        enc_stage2.append(VAEAttentionBlock(ch4, zero_init=azero))
+        for _ in range(num_res_blocks):
             enc_stage2.append(VAEResBlock(ch4, ch4))
 
         self.enc_blocks = nn.ModuleList([
@@ -1032,7 +1179,7 @@ class VAE(nn.Module):
 
         enc_out_ch = ch4
 
-        # ---- conditional bottleneck bias (unchanged) --------------------
+        # ---- conditional bottleneck bias --------------------------------
         if self.num_classes is not None:
             self.y_emb = nn.Embedding(self.num_classes + 1, cond_emb_dim)
             self.cond_proj = nn.Linear(cond_emb_dim, enc_out_ch)
@@ -1044,22 +1191,36 @@ class VAE(nn.Module):
 
         # ---- latent projection (enc_out_ch → latent_channels) -----------
         if latent_proj_depth >= 2:
-            # NEW: intermediate ResBlock before the 1×1 projection softens
-            #      the channel bottleneck (e.g. 256 → 256 → 8 instead of 256 → 8)
             self.enc_pre_proj = VAEResBlock(enc_out_ch, enc_out_ch)
         else:
             self.enc_pre_proj = None
 
-        self.mu = nn.Conv2d(enc_out_ch + self.aux_d, latent_channels, 1)
-        self.logvar = nn.Conv2d(enc_out_ch + self.aux_d, latent_channels, 1)
+        proj_in_ch = enc_out_ch + self.aux_d
 
-        # If aux is enabled, start by *ignoring* it (so behavior matches old model at init).
+        if self.conv3x3_proj:
+            # [1] NEW: terminal norm → activation → 3×3 combined mu+logvar
+            self.enc_norm_out = make_group_norm(proj_in_ch)
+            self.enc_conv_out = nn.Conv2d(proj_in_ch, 2 * latent_channels, 3, 1, 1)
+            # no separate mu / logvar convs
+            self.mu = None
+            self.logvar = None
+        else:
+            # legacy: separate 1×1 convs
+            self.enc_norm_out = None
+            self.enc_conv_out = None
+            self.mu = nn.Conv2d(proj_in_ch, latent_channels, 1)
+            self.logvar = nn.Conv2d(proj_in_ch, latent_channels, 1)
+
+        # aux zero-init (so aux channels are ignored at init)
         if self.aux_d > 0:
             with torch.no_grad():
-                self.mu.weight[:, enc_out_ch:, :, :].zero_()
-                self.logvar.weight[:, enc_out_ch:, :, :].zero_()
+                if self.conv3x3_proj:
+                    self.enc_conv_out.weight[:, enc_out_ch:, :, :].zero_()
+                else:
+                    self.mu.weight[:, enc_out_ch:, :, :].zero_()
+                    self.logvar.weight[:, enc_out_ch:, :, :].zero_()
 
-        # GroupNorm on mu (unchanged)
+        # GroupNorm on mu
         if self.use_norm:
             self.gn_mu = nn.GroupNorm(num_groups=1, num_channels=latent_channels, affine=False)
 
@@ -1068,18 +1229,21 @@ class VAE(nn.Module):
         # ================================================================
 
         # ---- latent back-projection (latent_channels → ch4) -------------
+        dec_in_ks = 3 if self.conv3x3_proj else 1                  # [2] NEW
         if latent_proj_depth >= 2:
-            # NEW: 1×1 expand → ResBlock gives the decoder a richer input
-            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, 1)
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
             self.dec_post_proj = VAEResBlock(ch4, ch4)
         else:
-            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, 1)
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
             self.dec_post_proj = None
+
+        # number of ResBlocks per decoder stage
+        dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
 
         # Stage 0 — bottleneck (quarter-res, with attention)
         dec_stage0: list[nn.Module] = [VAEResBlock(ch4, ch4)]
-        dec_stage0.append(AttentionBlock(ch4))
-        for _ in range(num_res_blocks):
+        dec_stage0.append(VAEAttentionBlock(ch4, zero_init=azero))
+        for _ in range(dec_nrb):
             dec_stage0.append(VAEResBlock(ch4, ch4))
 
         # Stage 1 — quarter-res → half-res
@@ -1087,17 +1251,17 @@ class VAE(nn.Module):
             nn.Upsample(scale_factor=2),
             nn.Conv2d(ch4, ch2, 3, 1, 1),
         ]
-        for _ in range(num_res_blocks):
+        for _ in range(dec_nrb):
             dec_stage1.append(VAEResBlock(ch2, ch2))
-        if decoder_attn_half:                                       # NEW
-            dec_stage1.append(AttentionBlock(ch2))
+        if decoder_attn_half:
+            dec_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
 
         # Stage 2 — half-res → full-res
         dec_stage2: list[nn.Module] = [
             nn.Upsample(scale_factor=2),
             nn.Conv2d(ch2, ch1, 3, 1, 1),
         ]
-        for _ in range(num_res_blocks):
+        for _ in range(dec_nrb):
             dec_stage2.append(VAEResBlock(ch1, ch1))
 
         self.dec_blocks = nn.ModuleList([
@@ -1111,7 +1275,7 @@ class VAE(nn.Module):
         )
 
     # -----------------------------------------------------------------
-    #  encode / decode / forward  — signatures are IDENTICAL to before
+    #  encode / decode / forward  — signatures IDENTICAL to before
     # -----------------------------------------------------------------
 
     def encode(self, x: torch.Tensor, y: torch.Tensor | None = None):
@@ -1119,7 +1283,7 @@ class VAE(nn.Module):
         for block in self.enc_blocks:
             h = block(h)
 
-        # class-conditioning at bottleneck (unchanged)
+        # class-conditioning at bottleneck
         if self.num_classes is not None:
             B, C, H, W = h.shape
             if y is None:
@@ -1133,15 +1297,26 @@ class VAE(nn.Module):
         if self.enc_pre_proj is not None:
             h = self.enc_pre_proj(h)
 
-        # Auxiliary stochastic conditioning: concatenate iid N(0,1) noise channels.
-        # This turns q(z|x) into a (continuous) mixture over w, while preserving Gaussian components.
+        # Auxiliary stochastic conditioning
         if self.aux_d > 0:
             B, _, H, W = h.shape
             w = torch.randn(B, self.aux_d, H, W, device=h.device, dtype=h.dtype)
             h = torch.cat([h, w], dim=1)
 
-        mu = self.mu(h)
-        logvar = self.logvar(h)
+        # ── latent projection ──
+        if self.conv3x3_proj:
+            # [1] combined: GN → SiLU → 3×3 → split
+            h = F.silu(self.enc_norm_out(h))
+            moments = self.enc_conv_out(h)
+            mu, logvar = moments.chunk(2, dim=1)
+        else:
+            # legacy: separate 1×1 convs
+            mu = self.mu(h)
+            logvar = self.logvar(h)
+
+        # [6] logvar clamping
+        if self.clamp_logvar:
+            logvar = logvar.clamp(-30.0, 20.0)
 
         if self.use_norm:
             mu = self.gn_mu(mu)
@@ -1159,23 +1334,14 @@ class VAE(nn.Module):
             h = self.dec_post_proj(h)
         for block in self.dec_blocks:
             h = block(h)
-        return torch.tanh(self.dec_out(h))
+        out = self.dec_out(h)
+        return torch.tanh(out) if self.use_tanh_out else out        # [5]
 
     def forward(self, x, y: torch.Tensor | None = None):
         mu, logvar = self.encode(x, y=y)
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
 
-
-class VAEResBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.net = nn.Sequential(
-            make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1),
-            make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1)
-        )
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-    def forward(self, x): return self.net(x) + self.skip(x)
 
 
 # ---------------------------------------------------------------------------
@@ -1812,6 +1978,101 @@ class UniversalSampler:
         eps_cond = unet(x, t_vec, y)
         return eps_uncond + float(cfg_scale) * (eps_cond - eps_uncond)
 
+    # ---------- factored-head helpers (exponential integrator) ----------
+
+    @staticmethod
+    def _predict_components(
+        unet,
+        x: torch.Tensor,
+        t_vec: torch.Tensor,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict (eps, lam, nu) from a factored-head model, with optional CFG.
+
+        Requires unet.factored_head == True.  The CFG combination is exact
+        because eps = lam * z - nu is bilinear in (lam, nu) for fixed z.
+        """
+        if not getattr(unet, "factored_head", False):
+            raise ValueError(
+                "Exponential integrator samplers (exp_euler_ode / exp_heun_ode) "
+                "require a model with factored_head=True so that the precision "
+                "and natural-mean heads are exposed."
+            )
+
+        if cfg_scale is None or cfg_scale <= 0.0 or y is None:
+            return unet(x, t_vec, y, return_components=True)
+
+        eps_u, lam_u, nu_u = unet(x, t_vec, None, return_components=True)
+        eps_c, lam_c, nu_c = unet(x, t_vec, y, return_components=True)
+        w = float(cfg_scale)
+        eps = eps_u + w * (eps_c - eps_u)
+        lam = lam_u + w * (lam_c - lam_u)
+        nu = nu_u + w * (nu_c - nu_u)
+        return eps, lam, nu
+
+    @staticmethod
+    def _phi1(x: torch.Tensor) -> torch.Tensor:
+        r"""Compute the entire function \varphi_1(x) = (e^x - 1) / x.
+
+        Uses a 4th-order Taylor expansion for |x| < 1e-4 to avoid 0/0.
+        """
+        small = x.abs() < 1e-4
+        # Taylor: 1 + x/2 + x^2/6 + x^3/24
+        taylor = 1.0 + x * (0.5 + x * (1.0 / 6.0 + x / 24.0))
+        # For |x| >= 1e-4 the direct formula is fine
+        x_safe = torch.where(small, torch.ones_like(x), x)
+        exact = torch.expm1(x_safe) / x_safe
+        return torch.where(small, taylor, exact)
+
+    def _exp_integrate(
+        self,
+        z: torch.Tensor,
+        lam: torch.Tensor,
+        nu: torch.Tensor,
+        t_curr: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Exact diagonal exponential integration over one frozen-coefficient step.
+
+        The probability-flow ODE with factored score takes the form (per channel)
+
+            dz_i / dt  =  A_i \cdot z_i  +  C_i
+
+        where A (diagonal) and C depend on the schedule type:
+
+        * OU:     A_i = lam_i / sigma - 1,      C_i = -nu_i / sigma
+        * Cosine: A_i = 0.5 beta (lam_i/sigma - 1),  C_i = -0.5 beta nu_i / sigma
+
+        With A and C frozen, the exact solution is
+
+            z_i(t + dt) = exp(A_i dt) z_i(t)  +  phi_1(A_i dt) dt C_i
+        """
+        B = z.shape[0]
+        t_vec = t_curr.expand(B)
+
+        _, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-10)
+
+        if self.schedule_type in ("flow", "flow_matching"):
+            raise ValueError(
+                "Exponential integrator is not supported for flow matching schedules."
+            )
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            half_beta = 0.5 * beta_t
+            A = half_beta * (lam * inv_sigma - 1.0)
+            C = -half_beta * nu * inv_sigma
+        else:
+            # OU (log_t or log_snr): dz/dt = -z + eps/sigma
+            # with eps = lam*z - nu  =>  dz/dt = (lam/sigma - 1)*z - nu/sigma
+            A = lam * inv_sigma - 1.0
+            C = -nu * inv_sigma
+
+        Ah = A * dt
+        return torch.exp(Ah) * z + self._phi1(Ah) * dt * C
+
     # ------------------------- Continuous-time samplers -------------------------
 
     def get_ode_derivative(self, x, t, unet, y=None, cfg_scale=None):
@@ -1917,6 +2178,61 @@ class UniversalSampler:
         b_next = self.get_rev_sde_drift(x_hat, t_next, unet, y=y, cfg_scale=cfg_scale)
         x_new = x + 0.5 * dt * (b_curr + b_next) + dW
         return x_new
+
+    # --------------- Diagonal exponential integrators ---------------
+
+    def step_exp_euler_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        """First-order diagonal exponential integrator (1 NFE per step).
+
+        Freezes the learned (lam, nu) at (x, t_curr) and exactly integrates
+        the resulting constant-coefficient diagonal-linear ODE over [t_curr, t_next].
+
+        Requires a model with ``factored_head=True``.
+        """
+        B = x.shape[0]
+        t_vec = t_curr.expand(B)
+        _eps, lam, nu = self._predict_components(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+        dt = t_next - t_curr
+        return self._exp_integrate(x, lam, nu, t_curr, dt)
+
+    def step_exp_heun_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        """Second-order exponential Heun integrator (2 NFE per step).
+
+        1. Evaluate (lam, nu) at (x, t_curr); exp-Euler predict x_hat at t_next.
+        2. Evaluate (lam, nu) at (x_hat, t_next).
+        3. Average the two sets of natural parameters.
+        4. Re-integrate from x using the averaged coefficients.
+
+        This exactly treats per-channel stiffness at the cost of two forward
+        passes (same as standard Heun) and matches the second-order exponential
+        Heun variant described in Section 5.1 of the precision-head note.
+
+        Requires a model with ``factored_head=True``.
+        """
+        B = x.shape[0]
+        dt = t_next - t_curr
+
+        # --- predictor: exp-Euler from t_curr ---
+        t_vec_curr = t_curr.expand(B)
+        _eps_curr, lam_curr, nu_curr = self._predict_components(
+            unet, x, t_vec_curr, y=y, cfg_scale=cfg_scale,
+        )
+        x_hat = self._exp_integrate(x, lam_curr, nu_curr, t_curr, dt)
+
+        # At the terminal step just return the Euler prediction
+        if (t_next <= self.t_min).item():
+            return x_hat
+
+        # --- corrector: evaluate at predicted point ---
+        t_vec_next = t_next.expand(B)
+        _eps_next, lam_next, nu_next = self._predict_components(
+            unet, x_hat, t_vec_next, y=y, cfg_scale=cfg_scale,
+        )
+
+        # Average natural parameters and re-integrate from x
+        lam_avg = 0.5 * (lam_curr + lam_next)
+        nu_avg = 0.5 * (nu_curr + nu_next)
+        return self._exp_integrate(x, lam_avg, nu_avg, t_curr, dt)
 
     # ------------------------- Discrete DDIM sampler -------------------------
 
@@ -2038,11 +2354,14 @@ class UniversalSampler:
                 x = self.step_heun_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
             elif self.method == "heun_sde":
                 x = self.step_heun_sde(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale, generator=generator)
+            elif self.method == "exp_euler_ode":
+                x = self.step_exp_euler_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "exp_heun_ode":
+                x = self.step_exp_heun_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
             else:
                 raise ValueError(f"Unknown sampling method: {self.method}")
 
         return x
-
 
 # ---------------------------------------------------------------------------
 # Oracle Score Model (exact CSEM identity over full training set)
@@ -2357,6 +2676,35 @@ def evaluate_current_state(
     print(f"  Oracle (unconditional) LSI gap = {lsi_gap_oracle:.6f}")
 
     # -----------------------------------------------------------------------
+    # MSE gap: learned score net vs oracle (eps-space and score-space)
+    # -----------------------------------------------------------------------
+    print("  Computing MSE gap (eps-space) vs oracle...")
+    mse_gap_eps = compute_mse_gap(
+        unet, oracle_model,
+        encoder_mus, encoder_logvars,
+        cfg, device,
+        labels=None,
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(5000, target_count),
+        batch_size=bs,
+        space="eps",
+    )
+    print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
+
+    print("  Computing MSE gap (score-space) vs oracle...")
+    mse_gap_score = compute_mse_gap(
+        unet, oracle_model,
+        encoder_mus, encoder_logvars,
+        cfg, device,
+        labels=None,
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(5000, target_count),
+        batch_size=bs,
+        space="score",
+    )
+    print(f"  MSE gap (score-space, uncond) = {mse_gap_score:.6f}")
+
+    # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
     # -----------------------------------------------------------------------
     configs = [
@@ -2368,6 +2716,10 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+
+            {"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+            {"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
@@ -2486,7 +2838,10 @@ def evaluate_current_state(
 
                 fake_latents = torch.cat(fake_latents_list, 0)
                 fake_imgs = torch.cat(fake_imgs_list, 0)
-                fake_flat = fake_latents.view(fake_latents.shape[0], -1).to(device)
+                # Line 2977: change .view to .reshape
+
+                fake_flat = fake_latents.reshape(fake_latents.shape[0], -1).to(device)
+                #fake_flat = fake_latents.view(fake_latents.shape[0], -1).to(device)
                 w2 = compute_sw2(real_flat_A, fake_flat, n_projections=sw2_nproj, theta=fixed_sw2_theta)
                 lsi_gap = lsi_gap_oracle if use_oracle else lsi_gap_unet
 
@@ -2513,6 +2868,8 @@ def evaluate_current_state(
             "w2": w2,
             "div": div,
             "lsi_gap": lsi_gap,
+            "mse_gap_eps": mse_gap_eps if not use_oracle else 0.0,
+            "mse_gap_score": mse_gap_score if not use_oracle else 0.0,
         })
 
         # Save sample panels for the main sweep
@@ -2528,17 +2885,20 @@ def evaluate_current_state(
 
     # Print main results
     print(f"\n  >>> Sweep Results [{prefix}] <<<")
-    print(f"  {'Config':<40} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10}")
-    print("  " + "-" * 120)
+    print(f"  {'Config':<40} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10} | {'MSE(eps)':<10} | {'MSE(score)':<10}")
+    print("  " + "-" * 150)
     for r in results:
         print(f"  {r['config']:<40} | {r['desc']:<20} | {r['fid']:<8.2f} | {r['kid']:<10.4f} | "
-              f"{r['w2']:<10.6f} | {r['div']:<8.4f} | {r['lsi_gap']:<10.4f}")
-    print("  " + "-" * 120 + "\n")
+              f"{r['w2']:<10.6f} | {r['div']:<8.4f} | {r['lsi_gap']:<10.4f} | "
+              f"{r['mse_gap_eps']:<10.4f} | {r['mse_gap_score']:<10.4f}")
+    print("  " + "-" * 150 + "\n")
 
     # Flatten for DataFrame logging
     output_dict: Dict[str, Any] = {}
     output_dict["lsi_gap_oracle_uncond"] = lsi_gap_oracle
     output_dict["lsi_gap_unet_uncond"] = lsi_gap_unet
+    output_dict["mse_gap_eps_uncond"] = mse_gap_eps
+    output_dict["mse_gap_score_uncond"] = mse_gap_score
     for r in results:
         config = r["config"]
         if "VAE_Rec_eps" in config:
@@ -2555,6 +2915,8 @@ def evaluate_current_state(
             output_dict[f"sw2_rk4_{col_suffix}"] = r["w2"]
             output_dict[f"div_rk4_{col_suffix}"] = r["div"]
             output_dict[f"lsi_gap_rk4_{col_suffix}"] = r["lsi_gap"]
+            output_dict[f"mse_gap_eps_rk4_{col_suffix}"] = r["mse_gap_eps"]
+            output_dict[f"mse_gap_score_rk4_{col_suffix}"] = r["mse_gap_score"]
         elif "heun" in config.lower():
             after_at = config.split("@")[1] if "@" in config else "20"
             col_suffix = after_at.replace(".", "_")
@@ -2563,6 +2925,8 @@ def evaluate_current_state(
             output_dict[f"sw2_heun_{col_suffix}"] = r["w2"]
             output_dict[f"div_heun_{col_suffix}"] = r["div"]
             output_dict[f"lsi_gap_heun_{col_suffix}"] = r["lsi_gap"]
+            output_dict[f"mse_gap_eps_heun_{col_suffix}"] = r["mse_gap_eps"]
+            output_dict[f"mse_gap_score_heun_{col_suffix}"] = r["mse_gap_score"]
 
     # -----------------------------------------------------------------------
     # Optional: class-conditional evaluation + CFG
@@ -2852,7 +3216,7 @@ def discover_metric_columns(eval_df, metric_prefix):
 
     Args:
         eval_df: DataFrame with evaluation metrics
-        metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap'
+        metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score'
 
     Returns:
         List of column names matching the pattern, excluding vae_recon variants
@@ -2860,6 +3224,12 @@ def discover_metric_columns(eval_df, metric_prefix):
     if metric_prefix == 'lsi_gap':
         # lsi_gap columns look like: lsi_gap_rk4_20_randtok
         pattern = re.compile(r'^lsi_gap_')
+    elif metric_prefix == 'mse_gap_eps':
+        # mse_gap_eps columns look like: mse_gap_eps_rk4_20_randtok
+        pattern = re.compile(r'^mse_gap_eps_')
+    elif metric_prefix == 'mse_gap_score':
+        # mse_gap_score columns look like: mse_gap_score_rk4_20_randtok
+        pattern = re.compile(r'^mse_gap_score_')
     else:
         # Other columns look like: fid_rk4_20_randtok (exclude fid_vae_recon)
         pattern = re.compile(rf'^{metric_prefix}_(?!vae_recon)')
@@ -2874,11 +3244,17 @@ def parse_metric_column(col_name):
         'fid_rk4_10' -> {'metric': 'fid', 'method': 'rk4', 'steps': '10', 'suffix': ''}
         'fid_rk4_20_randtok' -> {'metric': 'fid', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
         'lsi_gap_rk4_20_randtok' -> {'metric': 'lsi_gap', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
+        'mse_gap_eps_rk4_25_randtok' -> {'metric': 'mse_gap_eps', 'method': 'rk4', 'steps': '25', 'suffix': '_randtok'}
+        'mse_gap_score_rk4_25_randtok' -> {'metric': 'mse_gap_score', 'method': 'rk4', 'steps': '25', 'suffix': '_randtok'}
     """
     parts = col_name.split('_')
 
+    # Handle mse_gap_eps / mse_gap_score specially (3-token metric name)
+    if parts[0] == 'mse' and len(parts) > 2 and parts[1] == 'gap' and parts[2] in ('eps', 'score'):
+        metric = f'mse_gap_{parts[2]}'
+        remaining = parts[3:]  # Skip 'mse', 'gap', 'eps'/'score'
     # Handle lsi_gap specially (has underscore in metric name)
-    if parts[0] == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
+    elif parts[0] == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
         metric = 'lsi_gap'
         remaining = parts[2:]  # Skip 'lsi' and 'gap'
     else:
@@ -2915,7 +3291,7 @@ def get_metric_groups(eval_df):
     """
     groups = {}
 
-    for metric_type in ['fid', 'kid', 'sw2', 'div', 'lsi_gap']:
+    for metric_type in ['fid', 'kid', 'sw2', 'div', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
         cols = discover_metric_columns(eval_df, metric_type)
         for col in cols:
             parsed = parse_metric_column(col)
@@ -3065,7 +3441,7 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
 
     # Discover all available metric columns
     metric_groups = {}
-    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
         cols = discover_metric_columns(eval_df, metric_type)
         for col in cols:
             parsed = parse_metric_column(col)
@@ -3152,6 +3528,26 @@ def generate_all_visualizations(loss_df, eval_df, results_dir):
             )
             plot_idx += 1
 
+        # MSE Gap (eps-space) plot
+        if 'mse_gap_eps' in group:
+            plot_generic_metric(
+                eval_df, group['mse_gap_eps'], 'mse_gap_eps', 'MSE Gap eps (lower = better)',
+                f"MSE Gap vs Oracle, eps-space ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_mse_gap_eps_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+
+        # MSE Gap (score-space) plot
+        if 'mse_gap_score' in group:
+            plot_generic_metric(
+                eval_df, group['mse_gap_score'], 'mse_gap_score', 'MSE Gap score (lower = better)',
+                f"MSE Gap vs Oracle, score-space ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_mse_gap_score_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+
     print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
 
 def plot_vae_recon_loss(loss_df, save_path):
@@ -3215,7 +3611,7 @@ def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_d
 
     # Group columns by (method, steps, suffix)
     metric_groups = {}
-    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
         cols = discover_metric_columns(eval_df_cotrain, metric_type)
         cols.extend(discover_metric_columns(eval_df_indep, metric_type))
         cols = list(set(cols))  # Remove duplicates
@@ -3247,6 +3643,8 @@ def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_d
         'kid': 'KID',
         'sw2': 'SW2 (log scale)',
         'lsi_gap': 'LSI Gap (lower=better)',
+        'mse_gap_eps': 'MSE Gap eps (lower=better)',
+        'mse_gap_score': 'MSE Gap score (lower=better)',
     }
 
     for (method, steps, suffix) in sorted(metric_groups.keys()):
@@ -3254,7 +3652,7 @@ def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_d
         config_label = format_config_label(method, steps, suffix)
         config_tag = f"{method}_{steps}{suffix}".replace('.', '_')  # Safe filename
 
-        for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap']:
+        for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
             if metric_type not in group:
                 continue
 
@@ -3448,18 +3846,29 @@ def train_vae_cotrained_cond(cfg):
         use_ddim_times = False
 
     vae = VAE(
-        latent_channels=cfg["latent_channels"],
-        use_norm=cfg.get("use_latent_norm", False),
-        img_size=effective_img_size,
-        img_channels=img_channels,
-        # NEW: condition only if enabled
-        num_classes=(num_classes if cfg.get("use_cond_encoder", False) else None),
-        null_label=int(num_classes),  # reserve num_classes as unconditional token
-        cond_emb_dim=int(cfg.get("cond_emb_dim", 64)),
-        aux_d=int(cfg.get("aux_d", 0)),
-    ).to(device)
+                  latent_channels=cfg["latent_channels"],
+                  base_ch=int(cfg.get("base_ch", 64)),
+                  use_norm=cfg.get("use_latent_norm", False),
+                  img_size=effective_img_size,
+                  img_channels=img_channels,
+                  num_classes=(num_classes if cfg.get("use_cond_encoder", False) else None),
+                  null_label=int(num_classes),
+                  cond_emb_dim=int(cfg.get("cond_emb_dim", 64)),
+                  aux_d=int(cfg.get("aux_d", 0)),
+                  # v1 knobs
+                  num_res_blocks=int(cfg.get("num_res_blocks", 2)),
+                  decoder_attn_half=cfg.get("decoder_attn_half", True),
+                  latent_proj_depth=int(cfg.get("latent_proj_depth", 2)),
+                  # v2 knobs
+                  encoder_attn_half=cfg.get("encoder_attn_half", False),
+                  decoder_extra_block=cfg.get("decoder_extra_block", False),
+                  conv3x3_proj=cfg.get("conv3x3_proj", False),
+                  use_tanh_out=cfg.get("use_tanh_out", True),
+                  clamp_logvar=cfg.get("clamp_logvar", False),
+                  attn_zero_init=cfg.get("attn_zero_init", True),
+              ).to(device)
 
-   # --- Online Models ---
+    # --- Online Models ---
     dit_kwargs = dict(
         in_channels=int(cfg["latent_channels"]),
         patch_size=int(cfg.get("dit_patch_size", 1)),
@@ -3721,7 +4130,8 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
-                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
 
                 if cfg.get("train_on_mu", False):
                     eps_pred_control = unet_control(z_mu_t, t, y_in)
@@ -3823,7 +4233,9 @@ def train_vae_cotrained_cond(cfg):
                     loss_cos = (1.0 - F.cosine_similarity(eps_pred_lsi_tracking.flatten(1), eps_target_lsi_det.flatten(1), dim=1)).mean()
                     tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
                     if use_factored:
-                        tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
+                        #tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
+                        tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr)
+
 
                 opt_tracking.zero_grad()
                 tracking_loss.backward()
@@ -4044,7 +4456,8 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
-                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
 
                 opt_lsi_refine.zero_grad()
                 score_loss_lsi.backward()
@@ -4328,7 +4741,7 @@ def main():
 
         # --- Model Architecture ---
         "latent_channels": 8,
-        "cond_emb_dim": 64,
+        "cond_emb_dim": 32,
 
         # --- DiT / Transformer settings (LightningDiT-style) ---
         "dit_patch_size": 1,        # patch_size=1 => 8x8 latents -> 64 tokens
@@ -4345,15 +4758,22 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.001,
+        "aux_head_w": 0.005,
 
-        # --- NEW: auxiliary encoder noise channels (0 disables) ---
+        # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
-        # --- New encoder architecture ---
-        "base_ch": 64,              # was 32 — doubles channel widths to 64→128→256
-        "num_res_blocks": 2,        # NEW — second ResBlock per stage
-        "decoder_attn_half": True,  # NEW — attention at 16×16 in decoder
-        "latent_proj_depth": 2,     # NEW — ResBlock buffer around the channel bottleneck
+        # --- Encoder architecture (v1 knobs, unchanged) ---
+        "base_ch": 64,
+        "num_res_blocks": 2,
+        "decoder_attn_half": True,
+        "latent_proj_depth": 2,
+        # --- v2 architectural improvements ---
+        "encoder_attn_half": True,       # [4] attention at 16×16 in encoder
+        "decoder_extra_block": True,     # [3] +1 ResBlock per decoder stage
+        "conv3x3_proj": True,            # [1,2] 3×3 latent proj + decoder input
+        "use_tanh_out": False,           # [5] raw output, no tanh saturation
+        "clamp_logvar": True,            # [6] clamp logvar to [-30, 20]
+        "attn_zero_init": False,         # [7] standard init on VAE attention
 
         # --- Learning Rates ---
         "lr_vae": 3e-4,
@@ -4373,9 +4793,9 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1.5e-5,
+        "t_min": 1.0e-5,
         "t_max": 1.5,
-        "num_train_timesteps": 1000,
+        "num_train_timesteps": 1250,
         "train_on_mu": False,
 
         # --- Cosine VP schedule settings (only used when time_schedule="cosine") ---
@@ -4407,10 +4827,9 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 500,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 600,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 150,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
-
 
         # Score head gaussian factored param
         "factored_head": True,
@@ -4421,12 +4840,12 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.666,
+        "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 150,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 50,     # Eval every 10 epochs during refine
     })
 
@@ -4435,8 +4854,8 @@ def main():
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
-        "epochs_vae": 200,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 600,       # LDM training on frozen VAE
+        "epochs_vae": 300,           # VAE-only pretraining (no LDM)
+        "epochs_refine": 750,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 3e-4,
