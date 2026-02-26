@@ -830,7 +830,10 @@ def compute_lsi_gap(
 
                 sigma_sq = sigma ** 2 + 1e-8
                 eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
-                score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))
+                
+                #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
+                score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
+
 
                 total_lsi_gap += score_gap_per_sample.sum().item()
                 total_count += bsz
@@ -4231,10 +4234,10 @@ def main():
         "clamp_logvar": True,            # [6] clamp logvar to [-30, 20]
         "attn_zero_init": False,         # [7] standard init on VAE attention
 
-      
+
         # --- Learning Rates ---
-        "lr_vae": 5e-4,
-        "lr_ldm": 2e-4,
+        "lr_vae": 3e-4,
+        "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
@@ -4294,7 +4297,7 @@ def main():
         "use_latent_norm": True,
         "use_cond_encoder": True,
         "kl_reg_type": "norm",
-        "score_w_vae": 0.666,
+        "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
