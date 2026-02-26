@@ -2643,7 +2643,7 @@ def evaluate_current_state(
         device,
         labels=None,  # unconditional branch
         num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
+        num_samples=min(2500, target_count),
         num_time_points=50,
         batch_size=bs,
     )
@@ -2669,7 +2669,7 @@ def evaluate_current_state(
         device,
         labels=None,  # unconditional branch
         num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
+        num_samples=min(2500, target_count),
         num_time_points=50,
         batch_size=bs,
     )
@@ -2685,12 +2685,14 @@ def evaluate_current_state(
         cfg, device,
         labels=None,
         num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
+        num_samples=min(2500, target_count),
         batch_size=bs,
         space="eps",
     )
     print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
-
+    mse_gap_score = mse_gap_eps
+    
+    '''
     print("  Computing MSE gap (score-space) vs oracle...")
     mse_gap_score = compute_mse_gap(
         unet, oracle_model,
@@ -2703,7 +2705,8 @@ def evaluate_current_state(
         space="score",
     )
     print(f"  MSE gap (score-space, uncond) = {mse_gap_score:.6f}")
-
+    '''
+    
     # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
     # -----------------------------------------------------------------------
@@ -2718,7 +2721,7 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
             #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
 
-            {"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+            #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
