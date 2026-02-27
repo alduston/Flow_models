@@ -2535,6 +2535,7 @@ def evaluate_current_state(
     results_dir=None,
     fid_model=None,
     use_lenet_fid=False,
+    train_loader=None,
 ):
     """Evaluate unconditional generation and (optionally) class-conditional generation with CFG.
 
@@ -2651,11 +2652,29 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Oracle score model (exact CSEM over full training set)
     # -----------------------------------------------------------------------
-    print("  Building OracleScoreModel from precomputed Gaussian components...")
+    print("  Building OracleScoreModel from training-set Gaussian components...")
+    if train_loader is not None:
+        train_mus, train_logvars, train_labels_list = [], [], []
+        with torch.no_grad():
+            for x, y in train_loader:
+                x = x.to(device)
+                use_cond_enc = bool(cfg.get("use_cond_encoder", False))
+                mu_tr, logvar_tr = vae.encode(x, y=y.to(device=device, dtype=torch.long) if use_cond_enc else None)
+                train_mus.append(mu_tr.cpu())
+                train_logvars.append(logvar_tr.cpu())
+                train_labels_list.append(y.view(-1).cpu())
+        oracle_mus = torch.cat(train_mus, 0)
+        oracle_logvars = torch.cat(train_logvars, 0)
+        oracle_labels = torch.cat(train_labels_list, 0)
+    else:
+        # Fallback: use the (test) encodings already computed above
+        oracle_mus = encoder_mus
+        oracle_logvars = encoder_logvars
+        oracle_labels = real_labels
     oracle_model = OracleScoreModel(
-        all_mu=encoder_mus,
-        all_logvar=encoder_logvars,
-        all_labels=real_labels,
+        all_mu=oracle_mus,
+        all_logvar=oracle_logvars,
+        all_labels=oracle_labels,
         cfg=cfg,
         device=device,
         ref_chunk_size=4096,
@@ -4322,6 +4341,7 @@ def train_vae_cotrained_cond(cfg):
                 results_dir=results_dir,
                 fid_model=fid_model,
                 use_lenet_fid=use_lenet_fid,
+                train_loader=train_l,
             )
             if results_lsi is not None:
                 results_lsi["epoch"] = ldm_epoch  # LDM epoch for comparison
@@ -4348,6 +4368,7 @@ def train_vae_cotrained_cond(cfg):
                 results_dir=results_dir,
                 fid_model=fid_model,
                 use_lenet_fid=use_lenet_fid,
+                train_loader=train_l,
             )
             '''
             if results_ctrl is not None:
@@ -4545,6 +4566,7 @@ def train_vae_cotrained_cond(cfg):
                         results_dir=results_dir,
                         fid_model=fid_model,
                         use_lenet_fid=use_lenet_fid,
+                        train_loader=train_l,
                 )
                 if results_lsi is not None:
                     results_lsi["epoch"] = ldm_epoch
@@ -4568,6 +4590,7 @@ def train_vae_cotrained_cond(cfg):
                         results_dir=results_dir,
                         fid_model=fid_model,
                         use_lenet_fid=use_lenet_fid,
+                        train_loader=train_l,
                 )
                 if results_ctrl is not None:
                     results_ctrl["epoch"] = ldm_epoch
@@ -4777,7 +4800,7 @@ def main():
         "attn_zero_init": False,         # [7] standard init on VAE attention
 
         # --- Learning Rates ---
-        "lr_vae": 3e-4,
+        "lr_vae": 2e-4,
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
@@ -4794,7 +4817,7 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1.0e-5,
+        "t_min": 1e-5,
         "t_max": 1.5,
         "num_train_timesteps": 1250,
         "train_on_mu": False,
