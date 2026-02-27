@@ -4794,9 +4794,9 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1.5e-5,
+        "t_min": 1.0e-5,
         "t_max": 1.5,
-        "num_train_timesteps": 1000,
+        "num_train_timesteps": 1250,
         "train_on_mu": False,
 
         # --- Cosine VP schedule settings (only used when time_schedule="cosine") ---
