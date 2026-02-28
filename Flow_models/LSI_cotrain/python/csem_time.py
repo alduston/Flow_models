@@ -4829,7 +4829,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.005,
+        "aux_head_w": 0.003,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
@@ -4847,12 +4847,12 @@ def main():
         "attn_zero_init": False,         # [7] standard init on VAE attention
 
         # --- Learning Rates ---
-        "lr_vae": 3e-4,
+        "lr_vae": 2.5e-4,
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
-        "perc_w": 1.0,
+        "perc_w": 0.65,
 
         # --- PatchGAN discriminator ---
         "gan_w": 0.002,
@@ -4864,9 +4864,9 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1.0e-5,
+        "t_min": 5e-5,
         "t_max": 1.5,
-        "num_train_timesteps": 1250,
+        "num_train_timesteps": 1000,
         "train_on_mu": False,
 
         # --- Cosine VP schedule settings (only used when time_schedule="cosine") ---
@@ -4875,7 +4875,7 @@ def main():
         "cosine_s": 0.008,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.2,
+        "cfg_label_dropout": 0.15,
         "cfg_eval_scale": 3.0,
         "eval_class_labels": [],
 
@@ -4898,7 +4898,7 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 600,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 750,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
@@ -4910,18 +4910,18 @@ def main():
         "cotrain_head": "lsi",
         "use_latent_norm": True,
         "use_cond_encoder": True,
-        "kl_reg_type": "norm",
-        "score_w_vae": 0.6,
+        "kl_reg_type": "normal",
+        "score_w_vae": 0.75,
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
-        "w_decode_time": 0.1,
+        "w_decode_time": 0.2,
         "dec_time_emb_dim": 128,
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 150,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 50,     # Eval every 10 epochs during refine
     })
 
@@ -4931,7 +4931,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 700,       # LDM training on frozen VAE
+        "epochs_refine": 850,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 3e-4,
