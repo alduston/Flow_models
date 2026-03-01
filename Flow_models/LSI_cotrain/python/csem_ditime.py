@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -2822,6 +2820,16 @@ def evaluate_current_state(
     latent_shape = (cfg["latent_channels"], latent_spatial, latent_spatial)
     sw2_nproj = int(cfg.get("sw2_n_projections", 1000))
 
+    # Decode time for time-dependent decoder: default to t_min (in-distribution)
+    # rather than t=0 (out-of-distribution). Configurable via cfg["decode_time"].
+    _decode_t_val = float(cfg.get("decode_time", None) or cfg["t_min"])
+
+    def _decode_t(n: int) -> torch.Tensor | None:
+        """Return a [n]-shaped decode-time tensor if VAE has a time-conditioned decoder, else None."""
+        if getattr(vae, 'time_cond_decoder', False):
+            return torch.full((n,), _decode_t_val, device=device)
+        return None
+
     # Validate banks
     if fixed_noise_bank is not None:
         assert fixed_noise_bank.shape[0] >= target_count
@@ -3057,7 +3065,7 @@ def evaluate_current_state(
             if method == "VAE_Rec_eps":
                 fake_imgs = torch.cat([
                     vae.decode(real_latents_A[i:i + bs].to(device),
-                               t=torch.zeros(min(bs, len(real_latents_A)-i), device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
+                               t=_decode_t(min(bs, len(real_latents_A)-i))).cpu()
                     for i in range(0, len(real_latents_A), bs)
                 ], 0)
 
@@ -3107,8 +3115,7 @@ def evaluate_current_state(
                         z_gen = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
 
                     fake_latents_list.append(z_gen.cpu())
-                    t_zero = torch.zeros(z_gen.shape[0], device=device) if getattr(vae, 'time_cond_decoder', False) else None
-                    fake_imgs_list.append(vae.decode(z_gen, t=t_zero).cpu())
+                    fake_imgs_list.append(vae.decode(z_gen, t=_decode_t(z_gen.shape[0])).cpu())
 
                 fake_latents = torch.cat(fake_latents_list, 0)
                 fake_imgs = torch.cat(fake_imgs_list, 0)
@@ -3255,7 +3262,7 @@ def evaluate_current_state(
             with torch.no_grad():
                 fake_imgs_recon_y = torch.cat([
                     vae.decode(real_latents_A_y[i:i + bs].to(device),
-                               t=torch.zeros(min(bs, n_y-i), device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
+                               t=_decode_t(min(bs, n_y-i))).cpu()
                     for i in range(0, n_y, bs)
                 ], 0)
 
@@ -3361,8 +3368,7 @@ def evaluate_current_state(
                             )
 
                         fake_latents_list.append(z_gen.cpu())
-                        t_zero = torch.zeros(z_gen.shape[0], device=device) if getattr(vae, 'time_cond_decoder', False) else None
-                        fake_imgs_list.append(vae.decode(z_gen, t=t_zero).cpu())
+                        fake_imgs_list.append(vae.decode(z_gen, t=_decode_t(z_gen.shape[0])).cpu())
 
                     fake_latents = torch.cat(fake_latents_list, 0)
                     fake_imgs = torch.cat(fake_imgs_list, 0)
@@ -5140,7 +5146,8 @@ def main():
 
         # Time-dependent decoder (TDD) — DiT-based
         "time_cond_decoder": True,
-        "w_decode_time": 0.1,
+        "decode_time": None,            # Decode time for eval; None → t_min (in-distribution default)
+        #"w_decode_time": 0.1,
         "dec_dit_hidden_dim": 256,
         "dec_dit_depth": 6,
         "dec_dit_num_heads": 4,
