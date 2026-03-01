@@ -2842,7 +2842,8 @@ def evaluate_current_state(
         with torch.no_grad():
             if method == "VAE_Rec_eps":
                 fake_imgs = torch.cat([
-                    vae.decode(real_latents_A[i:i + bs].to(device)).cpu()
+                    vae.decode(real_latents_A[i:i + bs].to(device),
+                               t=torch.zeros(min(bs, len(real_latents_A)-i), device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
                     for i in range(0, len(real_latents_A), bs)
                 ], 0)
 
@@ -2892,7 +2893,8 @@ def evaluate_current_state(
                         z_gen = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
 
                     fake_latents_list.append(z_gen.cpu())
-                    fake_imgs_list.append(vae.decode(z_gen).cpu())
+                    t_zero = torch.zeros(z_gen.shape[0], device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                    fake_imgs_list.append(vae.decode(z_gen, t=t_zero).cpu())
 
                 fake_latents = torch.cat(fake_latents_list, 0)
                 fake_imgs = torch.cat(fake_imgs_list, 0)
@@ -3038,7 +3040,8 @@ def evaluate_current_state(
             # ---------------------------------------------------------------
             with torch.no_grad():
                 fake_imgs_recon_y = torch.cat([
-                    vae.decode(real_latents_A_y[i:i + bs].to(device)).cpu()
+                    vae.decode(real_latents_A_y[i:i + bs].to(device),
+                               t=torch.zeros(min(bs, n_y-i), device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
                     for i in range(0, n_y, bs)
                 ], 0)
 
@@ -3144,7 +3147,8 @@ def evaluate_current_state(
                             )
 
                         fake_latents_list.append(z_gen.cpu())
-                        fake_imgs_list.append(vae.decode(z_gen).cpu())
+                        t_zero = torch.zeros(z_gen.shape[0], device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                        fake_imgs_list.append(vae.decode(z_gen, t=t_zero).cpu())
 
                     fake_latents = torch.cat(fake_latents_list, 0)
                     fake_imgs = torch.cat(fake_imgs_list, 0)
@@ -4087,47 +4091,12 @@ def train_vae_cotrained_cond(cfg):
             mu, logvar = vae.encode(x, y=y_in if use_cond_enc else None)
             logvar = torch.clamp(logvar, min=-30.0, max=20.0)
 
-            # Decode from corrected geometry so all base losses see (mu+mu_r, Sigma+Sigma_r)
+            # Reparameterize z0 from encoder
             z0 = vae.reparameterize(mu, logvar)
-            x_rec = vae.decode(z0)
 
             if len(mu_stats) < 5: mu_stats.append(mu.detach())
 
-            recon = F.mse_loss(x_rec, x)
-
-            if LPIPS_AVAILABLE:
-                x_3c = x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
-                x_rec_3c = x_rec.repeat(1, 3, 1, 1) if x_rec.shape[1] == 1 else x_rec
-                perc = lpips_fn(x_rec_3c, x_3c).mean()
-            else:
-                perc = torch.tensor(0.0, device=device)
-
-            # [NEW] Flexible KL Regularization Selector
-            reg_type = cfg.get("kl_reg_type", "mod") # 'normal', 'mod', or 'norm'
-
-            if reg_type == "normal":
-                # Standard VAE KL: N(0,1) target
-                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-            elif reg_type == "mod":
-                # Modified KL: Energy/Trace control (No per-sample isotropy)
-                kl = -0.5 * torch.mean(1 - mu.pow(2) - logvar.exp())
-
-            elif reg_type == "norm":
-                # Variance Anchor: Only penalize logvar deviation (for use with GroupNorm)
-                # Target logvar=0 (std=1). 0.1 is the spring constant.
-                kl = torch.mean(logvar.pow(2))
-
-            elif reg_type == "vol":
-                # Volume-preserving regularization: -λ·𝔼[log det Σ]
-                logvar_clamped = torch.clamp(logvar, min=-10.0)  # σ² ≥ exp(-10) ≈ 4.5e-5
-                log_det = torch.sum(logvar_clamped, dim=[1, 2, 3])  # [B] vector
-                kl = - torch.mean(log_det)
-
-            else:
-                raise ValueError(f"Unknown kl_reg_type: {reg_type}")
-
-            # --- Time / forward process ---
+            # --- Time / forward process (BEFORE decode) ---
             if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
                 t = sample_logit_normal_times(B, cfg["t_min"], cfg["t_max"], device)
                 alpha, sigma = get_flow_params(t.view(B, 1, 1, 1))
@@ -4157,6 +4126,44 @@ def train_vae_cotrained_cond(cfg):
             var_0 = torch.exp(logvar)
             mu_t = alpha * mu
             var_t = (alpha**2) * var_0 + (sigma**2)
+
+            # --- Decode from z_t with time-dependent decoder ---
+            # All reconstruction losses (recon, lpips, gan) are applied to D(z_t, t)
+            x_rec = vae.decode(z_t, t)
+
+            recon = F.mse_loss(x_rec, x)
+
+            if LPIPS_AVAILABLE:
+                x_3c = x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
+                x_rec_3c = x_rec.repeat(1, 3, 1, 1) if x_rec.shape[1] == 1 else x_rec
+                perc = lpips_fn(x_rec_3c, x_3c).mean()
+            else:
+                perc = torch.tensor(0.0, device=device)
+
+            # [NEW] Flexible KL Regularization on mu_t, var_t (time-dependent moments)
+            reg_type = cfg.get("kl_reg_type", "mod") # 'normal', 'mod', or 'norm'
+            logvar_t = torch.log(var_t + 1e-8)
+
+            if reg_type == "normal":
+                # Standard VAE KL applied to q(z_t|x): N(mu_t, var_t) vs N(0,1)
+                kl = -0.5 * torch.mean(1 + logvar_t - mu_t.pow(2) - var_t)
+
+            elif reg_type == "mod":
+                # Modified KL: Energy/Trace control on z_t moments
+                kl = -0.5 * torch.mean(1 - mu_t.pow(2) - var_t)
+
+            elif reg_type == "norm":
+                # Variance Anchor on z_t: penalize logvar_t deviation from 0
+                kl = torch.mean(logvar_t.pow(2))
+
+            elif reg_type == "vol":
+                # Volume-preserving regularization on z_t
+                logvar_t_clamped = torch.clamp(logvar_t, min=-10.0)
+                log_det = torch.sum(logvar_t_clamped, dim=[1, 2, 3])  # [B]
+                kl = - torch.mean(log_det)
+
+            else:
+                raise ValueError(f"Unknown kl_reg_type: {reg_type}")
 
             # --- Compute both score losses (for logging, even if frozen) ---
             cos_w = float(cfg.get("cosine_w", 1.0))
@@ -4210,16 +4217,8 @@ def train_vae_cotrained_cond(cfg):
             else:
                 stiff_pen = torch.tensor(0.0, device=device)
 
-            # --- Time-Dependent Decoder (TDD) loss ---
-            w_decode_time = float(cfg.get("w_decode_time", 0.0))
-            use_tdd = cfg.get("time_cond_decoder", False) and w_decode_time > 0.0
-            if use_tdd:
-                # D(z_t, t): decode noised latents with time conditioning
-                x_rec_t = vae.decode(z_t, t)
-                # ||D(z_t, t) - D(z_0, 0)||^2  — gradients flow through both terms
-                tdd_loss = F.mse_loss(x_rec_t, x_rec)
-            else:
-                tdd_loss = torch.tensor(0.0, device=device)
+            # --- TDD loss removed: all reconstruction losses now applied directly to D(z_t, t) ---
+            tdd_loss = torch.tensor(0.0, device=device)
 
             # --- PatchGAN adversarial loss ---
             use_gan = gan_w > 0.0 and disc is not None and (ep + 1) >= disc_start_epoch
@@ -4240,14 +4239,14 @@ def train_vae_cotrained_cond(cfg):
             # --- Joint loss ---
             if freeze_score_in_cotrain:
                 # Independent mode: VAE-only loss (no score, no stiffness)
-                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + gan_w*g_loss + w_decode_time*tdd_loss
+                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + gan_w*g_loss
             else:
                 # Co-training mode: include score loss
                 score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
                 if cotrain_head == "lsi":
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen + gan_w*g_loss + w_decode_time*tdd_loss
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen + gan_w*g_loss
                 else:  # cotrain_head == "control"
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen + gan_w*g_loss + w_decode_time*tdd_loss
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen + gan_w*g_loss
 
             opt_joint.zero_grad()
             loss_joint.backward()
