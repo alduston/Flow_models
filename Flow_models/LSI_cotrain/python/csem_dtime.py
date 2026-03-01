@@ -2729,6 +2729,10 @@ def evaluate_current_state(
     )
     print(f"  Oracle (unconditional) LSI gap = {lsi_gap_oracle:.6f}")
 
+    mse_gap_eps =  lsi_gap_oracle
+    mse_gap_score =  lsi_gap_oracle
+
+    '''
     # -----------------------------------------------------------------------
     # MSE gap: learned score net vs oracle (eps-space and score-space)
     # -----------------------------------------------------------------------
@@ -2745,7 +2749,6 @@ def evaluate_current_state(
     )
     print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
     mse_gap_score = mse_gap_eps
-    '''
     print("  Computing MSE gap (score-space) vs oracle...")
     mse_gap_score = compute_mse_gap(
         unet, oracle_model,
@@ -2773,8 +2776,8 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
             #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
-            {"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
-            {"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
+            #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+            #{"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
@@ -4829,7 +4832,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.005,
+        "aux_head_w": 0.0025,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
@@ -4847,15 +4850,15 @@ def main():
         "attn_zero_init": False,         # [7] standard init on VAE attention
 
         # --- Learning Rates ---
-        "lr_vae": 2e-4,
+        "lr_vae": 2.5e-4,
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
-        "perc_w": 1.0,
+        "perc_w": .85,
 
         # --- PatchGAN discriminator ---
-        "gan_w": 0.002,
+        "gan_w": 0.0025,
         "disc_start_epoch": 25,
         "disc_ndf": 64,
         "disc_n_layers": 2,
@@ -4864,9 +4867,9 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1.0e-5,
+        "t_min": 3e-5,
         "t_max": 1.5,
-        "num_train_timesteps": 1250,
+        "num_train_timesteps": 1000,
         "train_on_mu": False,
 
         # --- Cosine VP schedule settings (only used when time_schedule="cosine") ---
@@ -4875,7 +4878,7 @@ def main():
         "cosine_s": 0.008,
 
         # --- CFG ---
-        "cfg_label_dropout": 0.2,
+        "cfg_label_dropout": 0.1,
         "cfg_eval_scale": 3.0,
         "eval_class_labels": [],
 
@@ -4898,7 +4901,7 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 600,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 750,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
@@ -4909,19 +4912,19 @@ def main():
         "freeze_score_in_cotrain": False,  # Normal co-training
         "cotrain_head": "lsi",
         "use_latent_norm": True,
-        "use_cond_encoder": True,
-        "kl_reg_type": "norm",
-        "score_w_vae": 0.75,
+        "use_cond_encoder": False,
+        "kl_reg_type": "normal",
+        "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
-        "w_decode_time": 0.25,
+        "w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 150,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 50,     # Eval every 10 epochs during refine
     })
 
@@ -4931,7 +4934,7 @@ def main():
     cfg_indep.update({
         # Training schedule
         "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 700,       # LDM training on frozen VAE
+        "epochs_refine": 850,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 3e-4,
@@ -4946,7 +4949,7 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 1e-3,
+        "kl_w": 1e-2,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
 
