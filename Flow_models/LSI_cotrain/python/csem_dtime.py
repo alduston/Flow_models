@@ -4935,8 +4935,8 @@ def main():
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
-        "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 850,       # LDM training on frozen VAE
+        "epochs_vae": 500,           # VAE-only pretraining (no LDM)
+        "epochs_refine": 900,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 3e-4,
@@ -4951,7 +4951,7 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 1e-2,
+        "kl_w": 1e-3,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
 
