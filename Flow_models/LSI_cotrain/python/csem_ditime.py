@@ -2989,7 +2989,7 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
             #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
             #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
-            #{"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
+            {"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
             {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
@@ -2998,6 +2998,8 @@ def evaluate_current_state(
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1.5, "use_oracle": True},
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 2.0, "use_oracle": True},
         {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
+        {"method": "rk4_ode", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
+        
     ])
 
     results = []
