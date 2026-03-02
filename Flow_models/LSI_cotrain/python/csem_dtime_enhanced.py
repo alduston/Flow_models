@@ -8,6 +8,11 @@ Original file is located at
 """
 
 
+! pip install lpips
+! pip install torchmetrics
+! pip install torch-fidelity
+
+
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -1326,7 +1331,7 @@ class VAE(nn.Module):
         # number of ResBlocks per decoder stage
         dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
 
-        
+
         # helper to build time-conditioned ResBlocks in decoder (if enabled)
         def _dec_res(in_ch: int, out_ch: int) -> nn.Module:
             if time_cond_decoder:
