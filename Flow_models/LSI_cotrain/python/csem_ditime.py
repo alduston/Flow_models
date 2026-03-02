@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -1068,6 +1070,7 @@ class VAEAttentionBlock(nn.Module):
 
 # ── VAEResBlock (unchanged) ───────────────────────────────────────────
 
+
 class VAEResBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -1077,6 +1080,132 @@ class VAEResBlock(nn.Module):
         )
         self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
     def forward(self, x): return self.net(x) + self.skip(x)
+
+
+# ── Decoder-specific time-conditioned modules ───────────────────────────
+
+def decoder_time_embedding(t: torch.Tensor, dim: int, schedule_type: str = "log_t") -> torch.Tensor:
+    """Compute a time embedding for the decoder using log-SNR as the base quantity.
+
+    Log-SNR is approximately linear in "perceptual difficulty" of reconstruction,
+    giving the sinusoidal embedding more uniform coverage of the regime the decoder
+    needs to distinguish.
+
+    For flow-matching schedules (alpha=t, sigma=1-t), we compute
+        lambda = log(t^2 / (1-t)^2)
+    which is the analogous SNR quantity.
+    """
+    if schedule_type in ("flow", "flow_matching"):
+        # flow: alpha=t, sigma=1-t  =>  logSNR = log(t^2/(1-t)^2)
+        t_clamp = t.clamp(1e-6, 1.0 - 1e-6)
+        logsnr = torch.log(t_clamp ** 2 / ((1.0 - t_clamp) ** 2 + 1e-12) + 1e-12)
+    elif schedule_type == "cosine":
+        # For cosine VP, compute logSNR from alpha_bar
+        # alpha_bar ≈ cos^2(...), sigma^2 = 1 - alpha_bar
+        # We approximate via the OU logsnr of an equivalent OU time
+        # For simplicity, map t_frac through cosine params
+        from functools import lru_cache
+        t_clamp = t.clamp(1e-6, 1.0 - 1e-6)
+        g = ((t_clamp + 0.008) / 1.008) * (math.pi / 2.0)
+        g0 = (0.008 / 1.008) * (math.pi / 2.0)
+        alpha_bar = (torch.cos(g) / math.cos(g0)) ** 2
+        alpha_bar = alpha_bar.clamp(1e-8, 1.0 - 1e-8)
+        logsnr = torch.log(alpha_bar / (1.0 - alpha_bar))
+    else:
+        # OU process (log_t, log_snr): use ou_logsnr directly
+        logsnr = ou_logsnr(t)
+    return timestep_embedding(logsnr, dim)
+
+
+class TimeCondVAEResBlock(nn.Module):
+    """Decoder ResBlock with per-block AdaGN time conditioning (FiLM on second norm).
+
+    Mirrors the score network's ResBlock pattern: the time embedding produces
+    (scale, shift) that modulate the second GroupNorm, giving every block
+    its own time-dependent behavior.
+
+    Zero-init on conv2 so the block starts as identity.
+    """
+    def __init__(self, in_ch: int, out_ch: int, t_dim: int):
+        super().__init__()
+        self.norm1 = make_group_norm(in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
+        self.time_proj = nn.Linear(t_dim, 2 * out_ch)  # scale, shift
+        self.norm2 = make_group_norm(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        # Zero-init conv2 so block starts as identity
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        scale, shift = self.time_proj(t_emb).chunk(2, dim=1)
+        h = self.norm2(h) * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
+        h = self.conv2(F.silu(h))
+        return h + self.skip(x)
+
+
+class TimeCondAttentionBlock(nn.Module):
+    """Multi-head self-attention with time-dependent temperature modulation.
+
+    At small t (high SNR), attention should focus on local sharpening.
+    At large t (low SNR), attention needs long-range coherence.
+    The time embedding modulates the attention temperature (scale) and adds
+    a global bias, similar to adaLN-Zero in DiT blocks.
+    """
+    def __init__(self, ch: int, t_dim: int, num_heads: int = 4, zero_init: bool = True):
+        super().__init__()
+        ch = int(ch)
+        num_heads = int(num_heads)
+        num_heads = min(num_heads, ch)
+        while num_heads > 1 and (ch % num_heads) != 0:
+            num_heads -= 1
+
+        self.ch = ch
+        self.num_heads = num_heads
+        self.head_dim = ch // num_heads
+
+        self.norm = make_group_norm(ch)
+        self.qkv = nn.Conv2d(ch, 3 * ch, kernel_size=1)
+        self.proj = nn.Conv2d(ch, ch, kernel_size=1)
+
+        # Time-dependent modulation: (scale_factor, gate) for attention
+        # scale_factor modulates attention temperature
+        # gate controls residual contribution (adaLN-Zero style)
+        self.time_attn_mod = nn.Linear(t_dim, 2)
+        # Init: temperature scale=0 (so effective scale = 1.0), gate=0 (zero residual at init)
+        nn.init.zeros_(self.time_attn_mod.weight)
+        nn.init.zeros_(self.time_attn_mod.bias)
+
+        if zero_init:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        qkv = qkv.view(B, 3, self.num_heads, self.head_dim, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+        # Time-dependent attention temperature and gate
+        mod = self.time_attn_mod(t_emb)  # [B, 2]
+        temp_scale = mod[:, 0].view(B, 1, 1, 1)  # modulates 1/sqrt(d)
+        attn_gate = torch.sigmoid(mod[:, 1]).view(B, 1, 1, 1)  # residual gate
+
+        # Effective scale: base scale * (1 + learned offset)
+        effective_scale = (self.head_dim ** -0.5) * (1.0 + temp_scale)
+
+        attn = torch.matmul(q.transpose(-2, -1).float(), k.float())
+        attn = attn * effective_scale.unsqueeze(-1).float()
+        attn = attn.softmax(dim=-1).to(q.dtype)
+
+        out = torch.matmul(v, attn.transpose(-2, -1))
+        out = out.reshape(B, C, H, W)
+        return x + attn_gate * self.proj(out)
+
+
 
 class VAE(nn.Module):
     """
@@ -1119,15 +1248,8 @@ class VAE(nn.Module):
         clamp_logvar: bool = False,          # [6] clamp logvar to [-30, 20]
         attn_zero_init: bool = True,         # [7] False = standard init on VAE attn
         # --- Time-dependent decoder (TDD) ---
-        time_cond_decoder: bool = False,     # Enable DiT-based time-conditioned decoder
-        dec_time_emb_dim: int = 128,         # (legacy, ignored when time_cond_decoder=True)
-        # --- DiT decoder architecture (used when time_cond_decoder=True) ---
-        dec_dit_hidden_dim: int = 256,
-        dec_dit_depth: int = 6,
-        dec_dit_num_heads: int = 4,
-        dec_dit_mlp_ratio: float = 4.0,
-        dec_dit_patch_size: int = 1,
-        dec_num_classes: int | None = None,  # class conditioning for DiT decoder (independent of encoder)
+        time_cond_decoder: bool = False,     # Enable FiLM time conditioning in decoder
+        dec_time_emb_dim: int = 128,         # Dimension of decoder time embedding
     ):
         super().__init__()
 
@@ -1237,46 +1359,80 @@ class VAE(nn.Module):
         # ================================================================
         #  DECODER
         # ================================================================
+
+        # ---- latent back-projection (latent_channels → ch4) -------------
+        dec_in_ks = 3 if self.conv3x3_proj else 1                  # [2] NEW
+        if latent_proj_depth >= 2:
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
+            self.dec_post_proj = VAEResBlock(ch4, ch4)
+        else:
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
+            self.dec_post_proj = None
+
+        # number of ResBlocks per decoder stage
+        dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
+
+        # ================================================================
+        #  TIME-DEPENDENT DECODER (TDD) v2 — per-block AdaGN + scale gating
+        # ================================================================
         self.time_cond_decoder = time_cond_decoder
 
         if time_cond_decoder:
-            # ── DiT-based decoder (mirrors the score network architecture) ──
-            latent_size = img_size // 4  # two stride-2 downsamples
-            self.dit_decoder = DiTVAEDecoder(
-                latent_channels=latent_channels,
-                latent_size=latent_size,
-                img_channels=img_channels,
-                img_size=img_size,
-                hidden_dim=dec_dit_hidden_dim,
-                depth=dec_dit_depth,
-                num_heads=dec_dit_num_heads,
-                mlp_ratio=dec_dit_mlp_ratio,
-                patch_size=dec_dit_patch_size,
-                base_ch=base_ch,
-                num_classes=dec_num_classes,
-                use_tanh_out=use_tanh_out,
+            self.dec_time_emb_dim = dec_time_emb_dim
+            self.dec_schedule_type = None  # set at first decode() call from cfg
+
+            # [Rec 5] Deeper time MLP (3-layer) for richer time representations
+            self.dec_time_mlp = nn.Sequential(
+                nn.Linear(dec_time_emb_dim, 4 * dec_time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(4 * dec_time_emb_dim, 4 * dec_time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(4 * dec_time_emb_dim, dec_time_emb_dim),
             )
-            # Placeholders so decode() can be uniform
-            self.dec_conv_in = None
-            self.dec_post_proj = None
+
+            # [Rec 1] Per-ResBlock AdaGN: TimeCondVAEResBlock replaces VAEResBlock
+            # [Rec 4] TimeCondAttentionBlock replaces VAEAttentionBlock
+
+            # Stage 0 — bottleneck (quarter-res, with time-conditioned attention)
+            self.dec_stage0_res = nn.ModuleList()
+            self.dec_stage0_attn = nn.ModuleList()
+            self.dec_stage0_res.append(TimeCondVAEResBlock(ch4, ch4, dec_time_emb_dim))
+            self.dec_stage0_attn.append(TimeCondAttentionBlock(ch4, dec_time_emb_dim, zero_init=azero))
+            for _ in range(dec_nrb):
+                self.dec_stage0_res.append(TimeCondVAEResBlock(ch4, ch4, dec_time_emb_dim))
+
+            # Stage 1 — quarter-res → half-res
+            self.dec_stage1_up = nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(ch4, ch2, 3, 1, 1))
+            self.dec_stage1_res = nn.ModuleList()
+            for _ in range(dec_nrb):
+                self.dec_stage1_res.append(TimeCondVAEResBlock(ch2, ch2, dec_time_emb_dim))
+            self.dec_stage1_attn = nn.ModuleList()
+            if decoder_attn_half:
+                self.dec_stage1_attn.append(TimeCondAttentionBlock(ch2, dec_time_emb_dim, zero_init=azero))
+
+            # Stage 2 — half-res → full-res
+            self.dec_stage2_up = nn.Sequential(nn.Upsample(scale_factor=2), nn.Conv2d(ch2, ch1, 3, 1, 1))
+            self.dec_stage2_res = nn.ModuleList()
+            for _ in range(dec_nrb):
+                self.dec_stage2_res.append(TimeCondVAEResBlock(ch1, ch1, dec_time_emb_dim))
+
+            # [Rec 3] Scale-dependent time gating
+            # Stage 0 (quarter-res): always active (no gate)
+            # Stage 1 (half-res): gated — biased toward on
+            # Stage 2 (full-res): gated — biased toward on
+            # At large t (low SNR), fine-res stages soft-bypass; at t≈0 all fully active
+            self.dec_stage_gate1 = nn.Linear(dec_time_emb_dim, 1)
+            nn.init.zeros_(self.dec_stage_gate1.weight)
+            nn.init.constant_(self.dec_stage_gate1.bias, 4.0)  # sigmoid(4) ≈ 0.98
+            self.dec_stage_gate2 = nn.Linear(dec_time_emb_dim, 1)
+            nn.init.zeros_(self.dec_stage_gate2.weight)
+            nn.init.constant_(self.dec_stage_gate2.bias, 4.0)
+
+            # Fallback: keep dec_blocks as None sentinel so old code paths don't crash
             self.dec_blocks = None
-            self.dec_out = None
+            self.dec_film_layers = None
         else:
-            # ── Standard conv decoder (no time conditioning) ────────────────
-            self.dit_decoder = None
-
-            # ---- latent back-projection (latent_channels → ch4) -------------
-            dec_in_ks = 3 if self.conv3x3_proj else 1                  # [2] NEW
-            if latent_proj_depth >= 2:
-                self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
-                self.dec_post_proj = VAEResBlock(ch4, ch4)
-            else:
-                self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
-                self.dec_post_proj = None
-
-            # number of ResBlocks per decoder stage
-            dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
-
+            # --- Legacy non-time-conditioned decoder (unchanged) ---
             # Stage 0 — bottleneck (quarter-res, with attention)
             dec_stage0: list[nn.Module] = [VAEResBlock(ch4, ch4)]
             dec_stage0.append(VAEAttentionBlock(ch4, zero_init=azero))
@@ -1306,10 +1462,11 @@ class VAE(nn.Module):
                 nn.Sequential(*dec_stage1),
                 nn.Sequential(*dec_stage2),
             ])
+            self.dec_film_layers = None
 
-            self.dec_out = nn.Sequential(
-                nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
-            )
+        self.dec_out = nn.Sequential(
+            nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
+        )
 
     # -----------------------------------------------------------------
     #  encode / decode / forward  — signatures IDENTICAL to before
@@ -1364,27 +1521,63 @@ class VAE(nn.Module):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-
-    def decode(self, z, t=None, y=None):
-        if self.dit_decoder is not None:
-            # ── DiT-based decoder ──
-            return self.dit_decoder(z, t=t, y=y)
-
-        # ── Standard conv decoder (no time conditioning) ──
+    
+    def decode(self, z, t=None, schedule_type=None):
         h = self.dec_conv_in(z)
         if self.dec_post_proj is not None:
             h = self.dec_post_proj(h)
 
-        for i, block in enumerate(self.dec_blocks):
-            h = block(h)
+        if self.time_cond_decoder and t is not None:
+            # [Rec 2] Log-SNR time embedding instead of raw sinusoidal
+            stype = schedule_type or getattr(self, 'dec_schedule_type', None) or "log_t"
+            raw_emb = decoder_time_embedding(t, self.dec_time_emb_dim, schedule_type=stype)
+            t_emb = self.dec_time_mlp(raw_emb)
+
+            # ── Stage 0: bottleneck (quarter-res) — always active ──
+            for j, res_block in enumerate(self.dec_stage0_res):
+                h = res_block(h, t_emb)
+                # Insert attention after the first ResBlock (mirrors encoder)
+                if j == 0 and len(self.dec_stage0_attn) > 0:
+                    h = self.dec_stage0_attn[0](h, t_emb)
+
+            # ── Stage 1: quarter-res → half-res — scale-gated ──
+            # [Rec 3] Scale gating: at large t, skip fine-res refinement
+            gate1 = torch.sigmoid(self.dec_stage_gate1(t_emb))  # [B, 1]
+            h_pre_up1 = h  # save for residual if gate ≈ 0
+            h = self.dec_stage1_up(h)
+            h_up1 = h  # upsampled but un-refined (the "skip" path)
+            for res_block in self.dec_stage1_res:
+                h = res_block(h, t_emb)
+            for attn_block in self.dec_stage1_attn:
+                h = attn_block(h, t_emb)
+            # Gated combination: gate≈1 → use refined, gate≈0 → use raw upsample
+            h = gate1[:, :, None, None] * h + (1.0 - gate1[:, :, None, None]) * h_up1
+
+            # ── Stage 2: half-res → full-res — scale-gated ──
+            gate2 = torch.sigmoid(self.dec_stage_gate2(t_emb))  # [B, 1]
+            h = self.dec_stage2_up(h)
+            h_up2 = h  # upsampled but un-refined
+            for res_block in self.dec_stage2_res:
+                h = res_block(h, t_emb)
+            h = gate2[:, :, None, None] * h + (1.0 - gate2[:, :, None, None]) * h_up2
+
+        elif self.dec_blocks is not None:
+            # --- Legacy non-time-conditioned path (unchanged) ---
+            for block in self.dec_blocks:
+                h = block(h)
+        else:
+            raise RuntimeError(
+                "time_cond_decoder=True but t=None was passed to decode(). "
+                "Provide a time tensor or disable time_cond_decoder."
+            )
 
         out = self.dec_out(h)
         return torch.tanh(out) if self.use_tanh_out else out        # [5]
-
+        
     def forward(self, x, y: torch.Tensor | None = None):
         mu, logvar = self.encode(x, y=y)
         z = self.reparameterize(mu, logvar)
-        return self.decode(z, y=y), mu, logvar
+        return self.decode(z), mu, logvar
 
 
 
@@ -1937,226 +2130,6 @@ UNetModel = DiTModel
 #   operates on 8×8 latents → 16 tokens; ~4.3M params.
 #   For larger latents or more capacity, increase hidden_dim/depth.
 # ----------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# DiTVAEDecoder — Transformer-based VAE decoder mirroring the DiT score net
-# ---------------------------------------------------------------------------
-# Replaces FiLM-based time conditioning with full adaLN-Zero transformer blocks.
-# Reuses DiTBlock, RMSNorm, SwiGLU, timestep_embedding from the score network
-# so the decoder "sees" time through the same mechanism as the score model.
-#
-# Architecture:
-#   1. patch_embed: Conv2d projection at latent spatial resolution
-#   2. + 2D sin-cos positional embeddings (same construction as DiTModel)
-#   3. N × DiTBlock with adaLN-Zero time+class conditioning
-#   4. final adaLN modulation + linear projection
-#   5. unpatchify → lightweight conv upsampler to image resolution
-# ---------------------------------------------------------------------------
-
-class DiTVAEDecoder(nn.Module):
-    """
-    VAE Decoder that mirrors the LightningDiT score architecture.
-
-    The transformer backbone operates at latent spatial resolution with the
-    same adaLN-Zero conditioning used by the score network.  A lightweight
-    conv tail handles the spatial upsampling to image resolution.
-
-    Reuses: DiTBlock, RMSNorm, SwiGLU, timestep_embedding (all defined above
-    for the score model).
-    """
-
-    def __init__(
-        self,
-        latent_channels: int,
-        latent_size: int,
-        img_channels: int,
-        img_size: int,
-        *,
-        hidden_dim: int = 256,
-        depth: int = 6,
-        num_heads: int = 4,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        patch_size: int = 1,
-        base_ch: int = 64,
-        num_classes: int | None = None,
-        use_tanh_out: bool = False,
-    ):
-        super().__init__()
-        self.latent_channels = int(latent_channels)
-        self.latent_size = int(latent_size)
-        self.img_channels = int(img_channels)
-        self.img_size = int(img_size)
-        self.hidden_dim = int(hidden_dim)
-        self.patch_size = int(patch_size)
-        self.use_tanh_out = bool(use_tanh_out)
-
-        self.num_classes = None if num_classes is None else int(num_classes)
-        self.null_label = self.num_classes  # unconditional token index
-
-        ch1 = int(base_ch)
-        ch2 = ch1 * 2
-        ch4 = ch1 * 4
-
-        # ── Patch embedding (latent → token space) ────────────────────────
-        self.patch_embed = nn.Conv2d(
-            self.latent_channels, self.hidden_dim,
-            kernel_size=self.patch_size, stride=self.patch_size,
-        )
-
-        # ── Time embedding (sinusoidal → MLP, same arch as DiTModel) ─────
-        self.time_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-
-        # ── Class embedding (optional, mirrors DiTModel) ─────────────────
-        if self.num_classes is not None:
-            self.label_emb = nn.Embedding(self.num_classes + 1, self.hidden_dim)
-        else:
-            self.label_emb = None
-
-        # ── Fixed 2D sin-cos positional embedding ────────────────────────
-        grid = self.latent_size // self.patch_size
-        pos = DiTModel._build_2d_sincos_pos_embed(self.hidden_dim, grid)
-        self.register_buffer("pos_embed", pos, persistent=False)
-
-        # ── DiT transformer blocks ───────────────────────────────────────
-        self.blocks = nn.ModuleList([
-            DiTBlock(self.hidden_dim, int(num_heads),
-                     mlp_ratio=float(mlp_ratio), dropout=float(dropout))
-            for _ in range(int(depth))
-        ])
-
-        # ── Final adaLN modulation (same as DiTModel) ────────────────────
-        self.final_norm = RMSNorm(self.hidden_dim, eps=1e-6)
-        self.final_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, 2 * self.hidden_dim),
-        )
-
-        # ── Project tokens → spatial feature map ─────────────────────────
-        patch_out_dim = ch4 * self.patch_size * self.patch_size
-        self.final_proj = nn.Linear(self.hidden_dim, patch_out_dim)
-
-        # ── Lightweight conv upsampler: latent_size → img_size ───────────
-        num_upsamples = int(round(math.log2(self.img_size / self.latent_size)))
-        assert self.latent_size * (2 ** num_upsamples) == self.img_size, \
-            f"img_size ({self.img_size}) must be latent_size ({self.latent_size}) × power of 2"
-
-        up_layers: list[nn.Module] = []
-        ch_in = ch4
-        for i in range(num_upsamples):
-            ch_out = ch2 if i == 0 else ch1
-            up_layers.extend([
-                nn.Upsample(scale_factor=2, mode="nearest"),
-                nn.Conv2d(ch_in, ch_out, 3, 1, 1),
-                make_group_norm(ch_out),
-                nn.SiLU(),
-                nn.Conv2d(ch_out, ch_out, 3, 1, 1),
-            ])
-            ch_in = ch_out
-        self.upsample = nn.Sequential(*up_layers)
-
-        # ── Output projection ────────────────────────────────────────────
-        self.out_conv = nn.Sequential(
-            make_group_norm(ch_in),
-            nn.SiLU(),
-            nn.Conv2d(ch_in, self.img_channels, 3, 1, 1),
-        )
-
-        self._initialize_weights()
-
-    # ── Weight init (LightningDiT-style) ─────────────────────────────────
-
-    def _initialize_weights(self) -> None:
-        def _init(m: nn.Module) -> None:
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
-                if m.weight is not None and m.weight.dim() > 1:
-                    nn.init.xavier_uniform_(m.weight)
-                if getattr(m, "bias", None) is not None:
-                    nn.init.zeros_(m.bias)
-        self.apply(_init)
-
-        # Zero-init all adaLN modulations + final projection → identity at init
-        for blk in self.blocks:
-            nn.init.zeros_(blk.adaLN_modulation[1].weight)
-            nn.init.zeros_(blk.adaLN_modulation[1].bias)
-        nn.init.zeros_(self.final_modulation[1].weight)
-        nn.init.zeros_(self.final_modulation[1].bias)
-        nn.init.zeros_(self.final_proj.weight)
-        nn.init.zeros_(self.final_proj.bias)
-
-    # ── Unpatchify (same logic as DiTModel) ──────────────────────────────
-
-    def unpatchify(self, x: torch.Tensor, H_tok: int, W_tok: int) -> torch.Tensor:
-        p = self.patch_size
-        out_ch = x.shape[-1] // (p * p)
-        x = x.reshape(-1, H_tok, W_tok, p, p, out_ch)
-        x = x.permute(0, 5, 1, 3, 2, 4)
-        x = x.reshape(-1, out_ch, H_tok * p, W_tok * p)
-        return x
-
-    # ── Forward ──────────────────────────────────────────────────────────
-
-    def forward(
-        self,
-        z: torch.Tensor,
-        t: torch.Tensor | None = None,
-        y: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            z: [B, latent_channels, H_lat, W_lat] — noisy latent z_t
-            t: [B] continuous time scalars (if None → t=0, i.e. clean decode)
-            y: [B] class labels (optional)
-
-        Returns:
-            x̂_0: [B, img_channels, img_size, img_size]
-        """
-        B = z.shape[0]
-
-        # 1. Patchify
-        tokens = self.patch_embed(z)                      # [B, D, H_tok, W_tok]
-        H_tok, W_tok = tokens.shape[2], tokens.shape[3]
-        tokens = tokens.flatten(2).transpose(1, 2)        # [B, N, D]
-        tokens = tokens + self.pos_embed
-
-        # 2. Build conditioning vector c = time_emb (+ class_emb)
-        if t is None:
-            t = torch.zeros(B, device=z.device)
-        t_emb = timestep_embedding(t.view(-1), self.hidden_dim)
-        c = self.time_mlp(t_emb)                          # [B, D]
-
-        if self.label_emb is not None:
-            if y is None:
-                y_ids = torch.full((B,), int(self.null_label),
-                                   device=z.device, dtype=torch.long)
-            else:
-                y_ids = y.to(device=z.device, dtype=torch.long).view(-1)
-                if y_ids.shape[0] != B:
-                    y_ids = y_ids.expand(B)
-            c = c + self.label_emb(y_ids)
-
-        # 3. DiT transformer blocks
-        for blk in self.blocks:
-            tokens = blk(tokens, c)
-
-        # 4. Final adaLN modulation
-        gamma, beta = self.final_modulation(c).unsqueeze(1).chunk(2, dim=-1)
-        tokens = self.final_norm(tokens) * (1.0 + gamma) + beta
-
-        # 5. Project + unpatchify → spatial feature map at latent resolution
-        tokens = self.final_proj(tokens)
-        h = self.unpatchify(tokens, H_tok, W_tok)         # [B, ch4, H_lat, W_lat]
-
-        # 6. Conv upsample to image resolution
-        h = self.upsample(h)
-        out = self.out_conv(h)
-
-        return torch.tanh(out) if self.use_tanh_out else out
 
 
 class UniversalSampler:
@@ -2819,16 +2792,8 @@ def evaluate_current_state(
     latent_spatial = img_size // 4
     latent_shape = (cfg["latent_channels"], latent_spatial, latent_spatial)
     sw2_nproj = int(cfg.get("sw2_n_projections", 1000))
-
-    # Decode time for time-dependent decoder: default to t_min (in-distribution)
-    # rather than t=0 (out-of-distribution). Configurable via cfg["decode_time"].
-    _decode_t_val = float(cfg.get("decode_time", None) or cfg["t_min"])
-
-    def _decode_t(n: int) -> torch.Tensor | None:
-        """Return a [n]-shaped decode-time tensor if VAE has a time-conditioned decoder, else None."""
-        if getattr(vae, 'time_cond_decoder', False):
-            return torch.full((n,), _decode_t_val, device=device)
-        return None
+    _dt = cfg.get("decode_time", None)
+    decode_time = float(_dt) if _dt is not None else float(cfg["t_min"])
 
     # Validate banks
     if fixed_noise_bank is not None:
@@ -3004,10 +2969,8 @@ def evaluate_current_state(
     configs.extend([
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1,   "use_oracle": True},
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1.5, "use_oracle": True},
-        #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 2.0, "use_oracle": True},
-        {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
         {"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
-        
+        {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
     ])
 
     results = []
@@ -3065,7 +3028,7 @@ def evaluate_current_state(
             if method == "VAE_Rec_eps":
                 fake_imgs = torch.cat([
                     vae.decode(real_latents_A[i:i + bs].to(device),
-                               t=_decode_t(min(bs, len(real_latents_A)-i))).cpu()
+                               t=torch.full((min(bs, len(real_latents_A)-i),), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
                     for i in range(0, len(real_latents_A), bs)
                 ], 0)
 
@@ -3115,7 +3078,8 @@ def evaluate_current_state(
                         z_gen = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
 
                     fake_latents_list.append(z_gen.cpu())
-                    fake_imgs_list.append(vae.decode(z_gen, t=_decode_t(z_gen.shape[0])).cpu())
+                    t_dec = torch.full((z_gen.shape[0],), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                    fake_imgs_list.append(vae.decode(z_gen, t=t_dec).cpu())
 
                 fake_latents = torch.cat(fake_latents_list, 0)
                 fake_imgs = torch.cat(fake_imgs_list, 0)
@@ -3262,7 +3226,7 @@ def evaluate_current_state(
             with torch.no_grad():
                 fake_imgs_recon_y = torch.cat([
                     vae.decode(real_latents_A_y[i:i + bs].to(device),
-                               t=_decode_t(min(bs, n_y-i))).cpu()
+                               t=torch.full((min(bs, n_y-i),), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
                     for i in range(0, n_y, bs)
                 ], 0)
 
@@ -3368,7 +3332,8 @@ def evaluate_current_state(
                             )
 
                         fake_latents_list.append(z_gen.cpu())
-                        fake_imgs_list.append(vae.decode(z_gen, t=_decode_t(z_gen.shape[0])).cpu())
+                        t_dec = torch.full((z_gen.shape[0],), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                        fake_imgs_list.append(vae.decode(z_gen, t=t_dec).cpu())
 
                     fake_latents = torch.cat(fake_latents_list, 0)
                     fake_imgs = torch.cat(fake_imgs_list, 0)
@@ -4151,13 +4116,6 @@ def train_vae_cotrained_cond(cfg):
                   # TDD knobs
                   time_cond_decoder=cfg.get("time_cond_decoder", False),
                   dec_time_emb_dim=int(cfg.get("dec_time_emb_dim", 128)),
-                  # DiT decoder knobs
-                  dec_dit_hidden_dim=int(cfg.get("dec_dit_hidden_dim", 256)),
-                  dec_dit_depth=int(cfg.get("dec_dit_depth", 6)),
-                  dec_dit_num_heads=int(cfg.get("dec_dit_num_heads", 4)),
-                  dec_dit_mlp_ratio=float(cfg.get("dec_dit_mlp_ratio", 4.0)),
-                  dec_dit_patch_size=int(cfg.get("dec_dit_patch_size", 1)),
-                  dec_num_classes=(num_classes if cfg.get("time_cond_decoder", False) else None),
               ).to(device)
 
     # --- Online Models ---
@@ -4356,7 +4314,7 @@ def train_vae_cotrained_cond(cfg):
 
             # --- Decode from z_t with time-dependent decoder ---
             # All reconstruction losses (recon, lpips, gan) are applied to D(z_t, t)
-            x_rec = vae.decode(z_t, t, y=y_in)
+            x_rec = vae.decode(z_t, t)
 
             recon = F.mse_loss(x_rec, x)
 
@@ -5127,7 +5085,7 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 750,          # Cotrain phase: VAE + LDM joint training
+        "epochs_vae": 800,          # Cotrain phase: VAE + LDM joint training
         "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1.5e-5,
 
@@ -5144,19 +5102,14 @@ def main():
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
-        # Time-dependent decoder (TDD) — DiT-based
+        # Time-dependent decoder (TDD) v2 — per-block AdaGN + log-SNR + scale gating
         "time_cond_decoder": True,
-        "decode_time": None,            # Decode time for eval; None → t_min (in-distribution default)
-        #"w_decode_time": 0.1,
-        "dec_dit_hidden_dim": 256,
-        "dec_dit_depth": 6,
-        "dec_dit_num_heads": 4,
-        "dec_dit_mlp_ratio": 4.0,
-        "dec_dit_patch_size": 1,
+        "dec_time_emb_dim": 128,
+        "decode_time": None,             # Decode at this t; defaults to t_min if None
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
-        "eval_freq_refine": 50,     # Eval every 10 epochs during refine
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
+        "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
     # === INDEPENDENT CONFIG ===
@@ -5164,8 +5117,8 @@ def main():
     cfg_indep = cfg_shared.copy()
     cfg_indep.update({
         # Training schedule
-        "epochs_vae": 300,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 850,       # LDM training on frozen VAE
+        "epochs_vae": 500,           # VAE-only pretraining (no LDM)
+        "epochs_refine": 900,       # LDM training on frozen VAE
         "lr_refine": 5e-4,
         "cfg_label_dropout": 0.1,
         "t_min": 3e-4,
@@ -5180,7 +5133,7 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 1e-2,
+        "kl_w": 1e-3,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
 
