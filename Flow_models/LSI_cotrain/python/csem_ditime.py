@@ -4276,6 +4276,8 @@ def train_vae_cotrained_cond(cfg):
 
             # --- Conditional geometry correction (ResidualGaussianAdapter) ---
             use_cond_enc = bool(cfg.get("use_cond_encoder", False))
+            use_tdd =  bool(cfg.get("time_cond_decoder"False))
+            
             mu, logvar = vae.encode(x, y=y_in if use_cond_enc else None)
             logvar = torch.clamp(logvar, min=-30.0, max=20.0)
 
@@ -4318,9 +4320,15 @@ def train_vae_cotrained_cond(cfg):
             # --- Decode from z_t with time-dependent decoder ---
             # All reconstruction losses (recon, lpips, gan) are applied to D(z_t, t)
             x_rec = vae.decode(z_t, t)
-
+            
             recon = F.mse_loss(x_rec, x)
 
+            snr_downweight = bool(cfg.get("snr_downeight", False))
+            if snr_downweight and use_tdd:
+                snr_weight = (alpha.view(B, 1, 1, 1) ** 2).mean()  # scalar in [0,1]
+            else:
+                snr_weight = (alpha.view(B, 1, 1, 1) ** 2).mean()**0  # scalar in [0,1]
+            
             if LPIPS_AVAILABLE:
                 x_3c = x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
                 x_rec_3c = x_rec.repeat(1, 3, 1, 1) if x_rec.shape[1] == 1 else x_rec
@@ -4427,14 +4435,14 @@ def train_vae_cotrained_cond(cfg):
             # --- Joint loss ---
             if freeze_score_in_cotrain:
                 # Independent mode: VAE-only loss (no score, no stiffness)
-                loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + gan_w*g_loss
+                loss_joint = recon + cfg["perc_w"]*snr_weight*perc + cfg["kl_w"]*kl + gan_w*snr_weight**2*g_loss
             else:
                 # Co-training mode: include score loss
                 score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
                 if cotrain_head == "lsi":
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen + gan_w*g_loss
+                    loss_joint = recon + cfg["perc_w"]*snr_weight*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + stiff_w*stiff_pen + gan_w*snr_weight**2*g_loss
                 else:  # cotrain_head == "control"
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen + gan_w*g_loss
+                    loss_joint = recon + cfg["perc_w"]*snr_weight*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + stiff_w*stiff_pen + gan_w*snr_weight**2*g_loss
 
             opt_joint.zero_grad()
             loss_joint.backward()
@@ -5045,6 +5053,7 @@ def main():
         "kl_w": 1e-6,
         "perc_w": .85,
 
+
         # --- PatchGAN discriminator ---
         "gan_w": 0.0025,
         "disc_start_epoch": 25,
@@ -5111,6 +5120,7 @@ def main():
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
         "decode_time": None,             # Decode at this t; defaults to t_min if None
+        "snr_downweight": True,
 
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
