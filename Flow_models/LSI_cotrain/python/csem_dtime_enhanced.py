@@ -7,12 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/1buAe2yN_dW5eZP6J6Ssa5nQlBls-vDqO
 """
 
-
-! pip install lpips
-! pip install torchmetrics
-! pip install torch-fidelity
-
-
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
