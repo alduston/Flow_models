@@ -1,4 +1,5 @@
-
+# -*- coding: utf-8 -*-
+# csem_fldit.ipynb — CSEM co-training for latent diffusion models
 
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
@@ -1070,7 +1071,6 @@ class VAEAttentionBlock(nn.Module):
 
 # ── VAEResBlock (unchanged) ───────────────────────────────────────────
 
-
 class VAEResBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -1101,10 +1101,6 @@ def decoder_time_embedding(t: torch.Tensor, dim: int, schedule_type: str = "log_
         logsnr = torch.log(t_clamp ** 2 / ((1.0 - t_clamp) ** 2 + 1e-12) + 1e-12)
     elif schedule_type == "cosine":
         # For cosine VP, compute logSNR from alpha_bar
-        # alpha_bar ≈ cos^2(...), sigma^2 = 1 - alpha_bar
-        # We approximate via the OU logsnr of an equivalent OU time
-        # For simplicity, map t_frac through cosine params
-        from functools import lru_cache
         t_clamp = t.clamp(1e-6, 1.0 - 1e-6)
         g = ((t_clamp + 0.008) / 1.008) * (math.pi / 2.0)
         g0 = (0.008 / 1.008) * (math.pi / 2.0)
@@ -1152,7 +1148,7 @@ class TimeCondAttentionBlock(nn.Module):
     At small t (high SNR), attention should focus on local sharpening.
     At large t (low SNR), attention needs long-range coherence.
     The time embedding modulates the attention temperature (scale) and adds
-    a global bias, similar to adaLN-Zero in DiT blocks.
+    a residual gate, similar to adaLN-Zero in DiT blocks.
     """
     def __init__(self, ch: int, t_dim: int, num_heads: int = 4, zero_init: bool = True):
         super().__init__()
@@ -1198,13 +1194,12 @@ class TimeCondAttentionBlock(nn.Module):
         effective_scale = (self.head_dim ** -0.5) * (1.0 + temp_scale)
 
         attn = torch.matmul(q.transpose(-2, -1).float(), k.float())
-        attn = attn * effective_scale.unsqueeze(-1).float()
+        attn = attn * effective_scale.float()
         attn = attn.softmax(dim=-1).to(q.dtype)
 
         out = torch.matmul(v, attn.transpose(-2, -1))
         out = out.reshape(B, C, H, W)
         return x + attn_gate * self.proj(out)
-
 
 
 class VAE(nn.Module):
@@ -1373,13 +1368,18 @@ class VAE(nn.Module):
         dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
 
         # ================================================================
-        #  TIME-DEPENDENT DECODER (TDD) v2 — per-block AdaGN + scale gating
+        #  TIME-DEPENDENT DECODER (TDD) v2
+        #  - Per-ResBlock AdaGN (rec 1)
+        #  - Log-SNR time embedding (rec 2, applied in decode())
+        #  - Scale-dependent time gating (rec 3)
+        #  - Time-conditioned attention (rec 4)
+        #  - Deeper 3-layer time MLP (rec 5)
         # ================================================================
         self.time_cond_decoder = time_cond_decoder
+        self.dec_schedule_type = None  # set externally after construction
 
         if time_cond_decoder:
             self.dec_time_emb_dim = dec_time_emb_dim
-            self.dec_schedule_type = None  # set at first decode() call from cfg
 
             # [Rec 5] Deeper time MLP (3-layer) for richer time representations
             self.dec_time_mlp = nn.Sequential(
@@ -1428,7 +1428,7 @@ class VAE(nn.Module):
             nn.init.zeros_(self.dec_stage_gate2.weight)
             nn.init.constant_(self.dec_stage_gate2.bias, 4.0)
 
-            # Fallback: keep dec_blocks as None sentinel so old code paths don't crash
+            # Sentinel so legacy code paths don't crash
             self.dec_blocks = None
             self.dec_film_layers = None
         else:
@@ -1521,15 +1521,15 @@ class VAE(nn.Module):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-    
-    def decode(self, z, t=None, schedule_type=None):
+
+    def decode(self, z, t=None):
         h = self.dec_conv_in(z)
         if self.dec_post_proj is not None:
             h = self.dec_post_proj(h)
 
         if self.time_cond_decoder and t is not None:
             # [Rec 2] Log-SNR time embedding instead of raw sinusoidal
-            stype = schedule_type or getattr(self, 'dec_schedule_type', None) or "log_t"
+            stype = getattr(self, 'dec_schedule_type', None) or "log_t"
             raw_emb = decoder_time_embedding(t, self.dec_time_emb_dim, schedule_type=stype)
             t_emb = self.dec_time_mlp(raw_emb)
 
@@ -1543,7 +1543,6 @@ class VAE(nn.Module):
             # ── Stage 1: quarter-res → half-res — scale-gated ──
             # [Rec 3] Scale gating: at large t, skip fine-res refinement
             gate1 = torch.sigmoid(self.dec_stage_gate1(t_emb))  # [B, 1]
-            h_pre_up1 = h  # save for residual if gate ≈ 0
             h = self.dec_stage1_up(h)
             h_up1 = h  # upsampled but un-refined (the "skip" path)
             for res_block in self.dec_stage1_res:
@@ -1573,7 +1572,7 @@ class VAE(nn.Module):
 
         out = self.dec_out(h)
         return torch.tanh(out) if self.use_tanh_out else out        # [5]
-        
+
     def forward(self, x, y: torch.Tensor | None = None):
         mu, logvar = self.encode(x, y=y)
         z = self.reparameterize(mu, logvar)
@@ -4118,6 +4117,10 @@ def train_vae_cotrained_cond(cfg):
                   dec_time_emb_dim=int(cfg.get("dec_time_emb_dim", 128)),
               ).to(device)
 
+    # Tell the TDD decoder which schedule type to use for log-SNR embedding
+    if cfg.get("time_cond_decoder", False):
+        vae.dec_schedule_type = str(cfg.get("time_schedule", "log_t")).lower()
+
     # --- Online Models ---
     dit_kwargs = dict(
         in_channels=int(cfg["latent_channels"]),
@@ -4978,6 +4981,7 @@ def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
     }
 
 # --- END NEW FUNCTIONS ---
+
 def main():
     """
     Main function that runs co-trained vs independent comparison experiment.
@@ -5102,8 +5106,9 @@ def main():
         "stiff_w": 1e-6,
         "score_w": 1.0,
 
-        # Time-dependent decoder (TDD) v2 — per-block AdaGN + log-SNR + scale gating
+        # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
+        #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
         "decode_time": None,             # Decode at this t; defaults to t_min if None
 
