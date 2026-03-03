@@ -4465,6 +4465,7 @@ def train_vae_cotrained_cond(cfg):
             # Computed later to optionally use precision-masked weighting.
             perc = torch.tensor(0.0, device=device)
             # [NEW] Flexible KL Regularization on mu_t, var_t (time-dependent moments)
+             # [NEW] Flexible KL Regularization on mu_t, var_t (time-dependent moments)
             reg_type = cfg.get("kl_reg_type", "mod") # 'normal', 'mod', or 'norm'
             logvar_t = torch.log(var_t + 1e-8)
 
@@ -4485,6 +4486,10 @@ def train_vae_cotrained_cond(cfg):
                 logvar_t_clamped = torch.clamp(logvar_t, min=-10.0)
                 log_det = torch.sum(logvar_t_clamped, dim=[1, 2, 3])  # [B]
                 kl = - torch.mean(log_det)
+
+            elif reg_type == "temporal":
+                beta = float(cfg.get("temporal_beta", 2.0))
+                kl = torch.mean(F.softplus(logvar * beta) / beta)
 
             else:
                 raise ValueError(f"Unknown kl_reg_type: {reg_type}")
@@ -4583,6 +4588,7 @@ def train_vae_cotrained_cond(cfg):
 
             # --- PatchGAN adversarial loss ---
             use_gan = gan_w_eff > 0.0 and disc is not None and (ep + 1) >= disc_start_epoch
+
             if use_gan:
                 if use_tdd:
                     # Real target: pixel-space "best possible" denoising at the same time level (Wiener approximation)
@@ -4810,6 +4816,12 @@ def train_vae_cotrained_cond(cfg):
                 results_ctrl["tag"] = "Ctrl_Diff"
                 eval_records.append(results_ctrl)
 
+            # --- Save Checkpoints at Evaluation ---
+            print(f"  Saving checkpoints at cotrain eval (LDM epoch {ldm_epoch})...")
+            save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
+            save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
+            save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
+
 
     # ===========================================================================
     # REFINEMENT STAGE: Freeze VAE, train only score networks
@@ -5029,6 +5041,12 @@ def train_vae_cotrained_cond(cfg):
                     results_ctrl["tag"] = "Ctrl_Diff_Refine"
                     eval_records.append(results_ctrl)
 
+                # --- Save Checkpoints at Evaluation ---
+                print(f"  Saving checkpoints at refine eval (LDM epoch {ldm_epoch})...")
+                save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
+                save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
+                save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
+
     # --- Save Checkpoints ---
     save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
     save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
@@ -5236,18 +5254,18 @@ def main():
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-6,
+        "kl_w": 1e-2,
         "perc_w": .85,
-        "lpips_mode": "prec_mask",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
+        "lpips_mode": "gamma",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
 
 
         # --- PatchGAN discriminator ---
-        "gan_w": 0.0025,
+        "gan_w": 0.002,
         "gan_w_tdd_mult": 4.0,
         "disc_time_emb_dim": 128,
         "wiener_alpha_min": 1e-4,
         "wiener_max_var": 1e3,
-        "disc_start_epoch": 25,
+        "disc_start_epoch": 5,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 1e-4,
@@ -5301,7 +5319,7 @@ def main():
         "cotrain_head": "lsi",
         "use_latent_norm": True,
         "use_cond_encoder": False,
-        "kl_reg_type": "normal",
+        "kl_reg_type": "temporal",
         "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
@@ -5314,7 +5332,7 @@ def main():
         "snr_downweight": True,
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
@@ -5338,7 +5356,7 @@ def main():
         "stiff_w": 0.0,                    # No stiffness penalty
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
-        "kl_reg_type": "normal",           # Standard KL to N(0,I)
+        "kl_reg_type": "temporal",           # Standard KL to N(0,I)
         "kl_w": 1e-3,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
