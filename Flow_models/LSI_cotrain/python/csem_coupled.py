@@ -4349,6 +4349,7 @@ def train_vae_cotrained_cond(cfg):
     gan_w = float(cfg.get("gan_w", 0.0))
     gan_w_tdd_mult = float(cfg.get("gan_w_tdd_mult", 1.0))
     disc_start_epoch = int(cfg.get("disc_start_epoch", 0))
+    gan_logit_clamp = float(cfg.get("gan_logit_clamp", 10.0))
     use_tdd_global = bool(cfg.get("time_cond_decoder", False))
     use_tdd_gan_global = use_tdd_global and bool(cfg.get("time_dependent_gan", True))
     gan_w_eff = gan_w * (gan_w_tdd_mult if use_tdd_gan_global else 1.0)
@@ -4679,8 +4680,9 @@ def train_vae_cotrained_cond(cfg):
                     d_loss.backward()
                     opt_disc.step()
 
-                    # Generator loss (non-detached)
-                    g_loss = hinge_g_loss(disc(x_rec, t))
+                    # Generator loss (non-detached, logits clamped to bound grad magnitude)
+                    g_logits = disc(x_rec, t).clamp(-gan_logit_clamp, gan_logit_clamp)
+                    g_loss = hinge_g_loss(g_logits)
                 else:
                     # Legacy non-time-conditioned discriminator against true x0
                     logits_real = disc(x)
@@ -4689,7 +4691,8 @@ def train_vae_cotrained_cond(cfg):
                     opt_disc.zero_grad()
                     d_loss.backward()
                     opt_disc.step()
-                    g_loss = hinge_g_loss(disc(x_rec))
+                    g_logits = disc(x_rec).clamp(-gan_logit_clamp, gan_logit_clamp)
+                    g_loss = hinge_g_loss(g_logits)
                 # --- GAN generator time weighting ---
                 gan_time_mode = str(cfg.get("gan_time_weight", "uniform")).lower()
                 if gan_time_mode != "uniform" and use_tdd:
@@ -5348,10 +5351,11 @@ def main():
         "disc_time_emb_dim": 128,
         "wiener_alpha_min": 1e-4,
         "wiener_max_var": 1e3,
-        "disc_start_epoch": 51,
+        "disc_start_epoch": 501,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 1e-4,
+        "gan_logit_clamp": 10.0,            # Clamp D logits in G loss to prevent divergence
         "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
 
         # --- Diffusion Settings ---
@@ -5413,7 +5417,7 @@ def main():
 
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
-        "time_dependent_gan": True,
+        "time_dependent_gan": False,
         "gan_time_weight": "snr",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
