@@ -4295,6 +4295,10 @@ def train_vae_cotrained_cond(cfg):
     aux_head_w = float(cfg.get("aux_head_w", 0.05))
     freeze_score_in_cotrain = cfg.get("freeze_score_in_cotrain", False)
 
+    # --- Asymmetric decode MSE weights ---
+    score_w_decode = float(cfg.get("score_w_decode", 0.5))
+    decode_w = float(cfg.get("decode_w", 1.0))
+
     # --- MSE mode: 'raw', 'score', or 'score_detached' ---
     mse_mode = str(cfg.get("mse_mode", "raw")).lower()
     assert mse_mode in ("raw", "score", "score_detached"), \
@@ -4311,6 +4315,8 @@ def train_vae_cotrained_cond(cfg):
                 f"(freeze_score_in_cotrain must be False)."
             )
     print(f"--> MSE mode: {mse_mode}")
+    if mse_mode == "score":
+        print(f"    score_w_decode={score_w_decode}, decode_w={decode_w}")
 
     if freeze_score_in_cotrain:
         # Independent mode: VAE-only optimizer during cotrain phase
@@ -4584,7 +4590,24 @@ def train_vae_cotrained_cond(cfg):
                 x_rec = vae.decode(z_t, t)
                 x_rec_mse = x_rec
 
-            recon = F.mse_loss(x_rec_mse, x)
+            # --- Asymmetric MSE weighting ---
+            # In 'score' mode, the MSE couples both the score head (via z_hat_0_att)
+            # and the decoder.  We want different gradient scales for each:
+            #   score head  ←  score_w_decode * ∂MSE/∂score
+            #   decoder     ←  decode_w       * ∂MSE/∂decoder
+            #
+            # Trick: recon_full (from x_rec_mse) sends grad to both score + decoder.
+            #        recon_det  (from x_rec)     sends grad to decoder only.
+            # Since the forward *values* are identical (detach doesn't change values),
+            # the linear combination below yields the desired per-component scaling:
+            #   score sees:   score_w_decode * grad
+            #   decoder sees: score_w_decode * grad + (decode_w - score_w_decode) * grad = decode_w * grad
+            if mse_mode == "score" and not freeze_score_in_cotrain:
+                recon_full = F.mse_loss(x_rec_mse, x)
+                recon_det  = F.mse_loss(x_rec, x)
+                recon = score_w_decode * recon_full + (decode_w - score_w_decode) * recon_det
+            else:
+                recon = decode_w * F.mse_loss(x_rec_mse, x)
 
             # --- Stiffness penalty ---
             stiff_w = cfg.get("stiff_w", 0.0)
@@ -5325,7 +5348,7 @@ def main():
         "disc_time_emb_dim": 128,
         "wiener_alpha_min": 1e-4,
         "wiener_max_var": 1e3,
-        "disc_start_epoch": 501,
+        "disc_start_epoch": 51,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 1e-4,
@@ -5385,10 +5408,12 @@ def main():
         "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
+        "score_w_decode": 0.5,             # Gradient scale: score head ← MSE recon loss
+        "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
-        "time_dependent_gan": False,
+        "time_dependent_gan": True,
         "gan_time_weight": "snr",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
