@@ -4327,10 +4327,11 @@ def train_vae_cotrained_cond(cfg):
     gan_w_tdd_mult = float(cfg.get("gan_w_tdd_mult", 1.0))
     disc_start_epoch = int(cfg.get("disc_start_epoch", 0))
     use_tdd_global = bool(cfg.get("time_cond_decoder", False))
-    gan_w_eff = gan_w * (gan_w_tdd_mult if use_tdd_global else 1.0)
+    use_tdd_gan_global = use_tdd_global and bool(cfg.get("time_dependent_gan", True))
+    gan_w_eff = gan_w * (gan_w_tdd_mult if use_tdd_gan_global else 1.0)
 
     if gan_w_eff > 0.0:
-        if use_tdd_global:
+        if use_tdd_gan_global:
             disc = TimeCondPatchDiscriminator(
                 in_channels=img_channels,
                 ndf=int(cfg.get("disc_ndf", 64)),
@@ -4409,6 +4410,7 @@ def train_vae_cotrained_cond(cfg):
             # --- Conditional geometry correction (ResidualGaussianAdapter) ---
             use_cond_enc = bool(cfg.get("use_cond_encoder", False))
             use_tdd =  bool(cfg.get("time_cond_decoder", False))
+            use_tdd_gan = use_tdd and bool(cfg.get("time_dependent_gan", True))
             
             mu, logvar = vae.encode(x, y=y_in if use_cond_enc else None)
             logvar = torch.clamp(logvar, min=-30.0, max=20.0)
@@ -4590,7 +4592,7 @@ def train_vae_cotrained_cond(cfg):
             use_gan = gan_w_eff > 0.0 and disc is not None and (ep + 1) >= disc_start_epoch
 
             if use_gan:
-                if use_tdd:
+                if use_tdd_gan:
                     # Real target: pixel-space "best possible" denoising at the same time level (Wiener approximation)
                     with torch.no_grad():
                         x_real = wiener_reference_x0(
@@ -4620,6 +4622,19 @@ def train_vae_cotrained_cond(cfg):
                     d_loss.backward()
                     opt_disc.step()
                     g_loss = hinge_g_loss(disc(x_rec))
+                # --- GAN generator time weighting ---
+                gan_time_mode = str(cfg.get("gan_time_weight", "uniform")).lower()
+                if gan_time_mode != "uniform" and use_tdd:
+                    snr = (alpha ** 2) / (sigma ** 2 + 1e-12)
+                    if gan_time_mode == "gamma":
+                        gan_tw = snr / (snr + 1.0)            # sigmoid(logSNR), in [0,1]
+                    elif gan_time_mode == "snr":
+                        gan_tw = snr
+                    elif gan_time_mode == "snr2":
+                        gan_tw = snr ** 2
+                    else:
+                        raise ValueError(f"Unknown gan_time_weight: {gan_time_mode!r}. Expected 'uniform', 'gamma', 'snr', or 'snr2'.")
+                    g_loss = g_loss * gan_tw.view(B, -1).mean().detach()
             else:
                 d_loss = torch.tensor(0.0, device=device)
                 g_loss = torch.tensor(0.0, device=device)
@@ -5269,6 +5284,7 @@ def main():
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 1e-4,
+        "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
 
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
@@ -5326,10 +5342,12 @@ def main():
 
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
+        "time_dependent_gan": False,
+        "gan_time_weight": "snr",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
-        "decode_time": None,             # Decode at this t; defaults to t_min if None
-        "snr_downweight": True,
+        "decode_time": 1e-6,             # Decode at this t; defaults to t_min if None
+        #"snr_downweight": True,
 
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
@@ -5363,6 +5381,8 @@ def main():
 
         # Time-dependent decoder (TDD) — disabled for independent baseline
         "time_cond_decoder": False,
+        "time_dependent_gan": False,
+        "gan_time_weight": "uniform",
         "w_decode_time": 0.0,
 
         # Eval frequency (no eval during VAE phase, eval during refine)
