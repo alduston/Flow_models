@@ -5238,7 +5238,7 @@ def main():
         # --- KL and perceptual weights ---
         "kl_w": 1e-6,
         "perc_w": .85,
-        "lpips_mode": "snr",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
+        "lpips_mode": "prec_mask",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
 
 
         # --- PatchGAN discriminator ---
