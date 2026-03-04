@@ -2240,14 +2240,6 @@ class DiTModel(nn.Module):
 # Alias so that existing code referencing UNetModel still works
 UNetModel = DiTModel
 
-# ----------------------------------------------------------------------
-# DiT default config notes:
-#   DiTModel(hidden_dim=384, depth=8, num_heads=6, patch_size=2)
-#   operates on 8×8 latents → 16 tokens; ~4.3M params.
-#   For larger latents or more capacity, increase hidden_dim/depth.
-# ----------------------------------------------------------------------
-
-
 class UniversalSampler:
     def __init__(
         self,
@@ -2259,6 +2251,7 @@ class UniversalSampler:
         ddim_eta: float = 0.0,
         schedule_type: str = "log_snr",
         cosine_s: float = 0.008,
+        readout_mode: str = "direct",
     ):
         self.num_steps = int(num_steps)
         self.t_min = float(t_min)
@@ -2266,6 +2259,24 @@ class UniversalSampler:
         self.method = str(method).lower()
         self.schedule_type = str(schedule_type).lower()
         self.cosine_s = float(cosine_s)
+
+        # --- Composed-decoder readout mode ---
+        # Controls how z_t at the final integration step is converted to the
+        # latent fed into the decoder:
+        #   "direct"       : return z_{t_min} as-is (current default behaviour).
+        #                    Caller decodes at decode_time (≈ t_min).
+        #   "conditional"  : apply single-model conditional Tweedie readout at
+        #                    t_final using y (no CFG).  Returns (z_hat_0, t_final).
+        #                    Recommended when transport uses CFG but decoder was
+        #                    trained on single-model score predictions.
+        #   "cfg"          : apply CFG Tweedie readout (same cfg_scale as transport).
+        #                    Out-of-distribution for the decoder at high guidance
+        #                    scales — use for ablation only.
+        #   "unconditional": apply unconditional (y=None) Tweedie readout.
+        #                    Useful as a baseline / for unconditional generation.
+        assert readout_mode in ("direct", "conditional", "cfg", "unconditional"), \
+            f"Unknown readout_mode={readout_mode!r}. Expected 'direct', 'conditional', 'cfg', or 'unconditional'."
+        self.readout_mode = str(readout_mode)
 
         # For discrete samplers (DDIM), we need the same schedule used in training.
         self.schedule_cfg = schedule_cfg
@@ -2656,6 +2667,58 @@ class UniversalSampler:
 
         return x_next
 
+    # --------------- Composed-decoder readout ---------------
+
+    def _apply_readout(
+        self,
+        z_t: torch.Tensor,
+        t_final: torch.Tensor,
+        unet,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply the composed-decoder Tweedie readout at the final integration step.
+
+        The composed decoder D_t(z_t) = D( (z_t - sigma*eps) / alpha, t ) was
+        the *actual* training-time decoder objective.  This method computes the
+        Tweedie z_hat_0 = (z_t - sigma*eps) / alpha using the score head with
+        the mode specified by self.readout_mode.
+
+        Transport (ODE/SDE integration) always uses cfg_scale for the velocity
+        field.  The readout_mode controls ONLY the final projection:
+
+          "direct"       → no Tweedie, return (z_t, None)
+          "conditional"  → eps = unet(z_t, t, y)           [single-model, in-distribution]
+          "cfg"          → eps via CFG at cfg_scale         [OOD at high w, ablation only]
+          "unconditional"→ eps = unet(z_t, t, None)         [unconditional baseline]
+
+        Returns (z_out, readout_t):
+          - z_out:     the latent to pass to vae.decode
+          - readout_t: the time to pass to the TDD decoder (t_final for composed,
+                       None for direct → caller uses its default decode_time)
+        """
+        if self.readout_mode == "direct":
+            return z_t, None
+
+        B = z_t.shape[0]
+        t_vec = t_final.expand(B)
+        alpha, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+
+        if self.readout_mode == "conditional":
+            # Single-model conditional prediction — in-distribution for the decoder
+            eps_readout = unet(z_t, t_vec, y)
+        elif self.readout_mode == "cfg":
+            # CFG prediction — same as transport; potentially OOD for decoder at high w
+            eps_readout = self._predict_eps(unet, z_t, t_vec, y=y, cfg_scale=cfg_scale)
+        elif self.readout_mode == "unconditional":
+            # Unconditional prediction — y=None
+            eps_readout = unet(z_t, t_vec, None)
+        else:
+            raise ValueError(f"Unknown readout_mode: {self.readout_mode!r}")
+
+        z_hat_0 = (z_t - sigma * eps_readout) / (alpha + 1e-8)
+        return z_hat_0, t_final
+
     def sample(
         self,
         unet,
@@ -2665,7 +2728,19 @@ class UniversalSampler:
         generator=None,
         y: torch.Tensor | None = None,
         cfg_scale: float | None = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the full sampling loop and apply the composed-decoder readout.
+
+        Returns
+        -------
+        (z, readout_t) : Tuple[Tensor, Tensor | None]
+            z         – latent to feed to vae.decode.
+                        For readout_mode='direct', this is z_{t_min} (raw ODE/SDE output).
+                        For composed modes, this is z_hat_0 from Tweedie at t_final.
+            readout_t – scalar tensor: the time at which the readout was applied.
+                        None when readout_mode='direct' (caller should use its own decode_time).
+                        For composed modes, this is the final time in the integration grid.
+        """
         unet.eval()
 
         if x_init is None:
@@ -2692,7 +2767,7 @@ class UniversalSampler:
                     cfg_scale=cfg_scale,
                     generator=generator,
                 )
-            return x
+            return self._apply_readout(x, ts[-1], unet, y=y, cfg_scale=cfg_scale)
 
         # --- Continuous ODE/SDE samplers ---
         for i in range(self.num_steps):
@@ -2714,7 +2789,8 @@ class UniversalSampler:
             else:
                 raise ValueError(f"Unknown sampling method: {self.method}")
 
-        return x
+        # Apply composed-decoder readout (Tweedie projection at t_final)
+        return self._apply_readout(x, ts[-1], unet, y=y, cfg_scale=cfg_scale)
 
 # ---------------------------------------------------------------------------
 # Oracle Score Model (exact CSEM identity over full training set)
@@ -3078,15 +3154,19 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
             #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
             #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
-            {"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
-            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0},
+            #{"method": "heun_sde",  "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0},
+             
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 3.0, "readout_mode": "direct"},
+            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4 cond-readout)", "use_rand_token": True, "cfg_level": 3.0, "readout_mode": "conditional"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
     configs.extend([
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1,   "use_oracle": True},
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1.5, "use_oracle": True},
-        {"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
-        {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
+        #{"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
+        
+        {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True, "readout_mode": "direct"},
+        {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4 cond-readout)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True, "readout_mode": "conditional"},
     ])
 
     results = []
@@ -3122,19 +3202,21 @@ def evaluate_current_state(
         use_rand_token = bool(scfg.get("use_rand_token", False))
         cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
         use_oracle = bool(scfg.get("use_oracle", False))
+        readout_mode = str(scfg.get("readout_mode", "direct"))
 
         # Choose which score model to sample with
         score_model = oracle_model if use_oracle else unet
 
-        # Build suffix for naming - include cfg_level if present
+        # Build suffix for naming - include cfg_level and readout_mode if present
         oracle_tag = "_oracle" if use_oracle else ""
+        readout_tag = f"_{readout_mode}" if readout_mode != "direct" else ""
         if use_rand_token:
             if cfg_level is not None:
-                config_suffix = f"_randtok_cfg{cfg_level}{oracle_tag}"
+                config_suffix = f"_randtok_cfg{cfg_level}{readout_tag}{oracle_tag}"
             else:
-                config_suffix = f"_randtok{oracle_tag}"
+                config_suffix = f"_randtok{readout_tag}{oracle_tag}"
         else:
-            config_suffix = oracle_tag
+            config_suffix = f"{readout_tag}{oracle_tag}"
         config_name = f"{method}@{steps}{config_suffix}"
 
         if torch.cuda.is_available():
@@ -3166,6 +3248,7 @@ def evaluate_current_state(
                     t_max=cfg["t_max"],
                     schedule_type=cfg.get("time_schedule", "log_snr"),
                     cosine_s=cfg.get("cosine_s", 0.008),
+                    readout_mode=readout_mode,
                 )
                 # For cosine schedule, override t_min/t_max with cosine fraction endpoints
                 if cfg.get("time_schedule", "log_snr") == "cosine":
@@ -3189,12 +3272,19 @@ def evaluate_current_state(
                     g_scale = cfg_level if use_rand_token and cfg_level is not None else None
                     if noise_bank_all is not None:
                         xT = noise_bank_all[i:i + batch_sz].to(device)
-                        z_gen = sampler.sample(score_model, x_init=xT, y=y_batch, cfg_scale=g_scale)
+                        z_gen, readout_t = sampler.sample(score_model, x_init=xT, y=y_batch, cfg_scale=g_scale)
                     else:
-                        z_gen = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
+                        z_gen, readout_t = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
 
                     fake_latents_list.append(z_gen.cpu())
-                    t_dec = torch.full((z_gen.shape[0],), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                    # Decode time: use readout_t from composed decoder if available,
+                    # otherwise fall back to the configured decode_time (≈ t_min).
+                    if readout_t is not None and getattr(vae, 'time_cond_decoder', False):
+                        t_dec = torch.full((z_gen.shape[0],), readout_t.item(), device=device)
+                    elif getattr(vae, 'time_cond_decoder', False):
+                        t_dec = torch.full((z_gen.shape[0],), decode_time, device=device)
+                    else:
+                        t_dec = None
                     fake_imgs_list.append(vae.decode(z_gen, t=t_dec).cpu())
 
                 fake_latents = torch.cat(fake_latents_list, 0)
@@ -3419,6 +3509,7 @@ def evaluate_current_state(
                         t_max=cfg["t_max"],
                         schedule_type=cfg.get("time_schedule", "log_snr"),
                         cosine_s=cfg.get("cosine_s", 0.008),
+                        readout_mode="direct",  # Conditional eval uses direct readout by default
                     )
                     if cfg.get("time_schedule", "log_snr") == "cosine":
                         sampler_kwargs_cond["t_min"] = cfg.get("cosine_t_min", 2e-4)
@@ -3432,14 +3523,14 @@ def evaluate_current_state(
 
                         if noise_bank_y is not None:
                             xT = noise_bank_y[i:i + batch_sz].to(device)
-                            z_gen = sampler.sample(
+                            z_gen, readout_t = sampler.sample(
                                 unet,
                                 x_init=xT,
                                 y=y_batch,
                                 cfg_scale=(None if g_scale <= 0.0 else float(g_scale)),
                             )
                         else:
-                            z_gen = sampler.sample(
+                            z_gen, readout_t = sampler.sample(
                                 unet,
                                 shape=(batch_sz, *latent_shape),
                                 device=device,
@@ -3448,7 +3539,12 @@ def evaluate_current_state(
                             )
 
                         fake_latents_list.append(z_gen.cpu())
-                        t_dec = torch.full((z_gen.shape[0],), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                        if readout_t is not None and getattr(vae, 'time_cond_decoder', False):
+                            t_dec = torch.full((z_gen.shape[0],), readout_t.item(), device=device)
+                        elif getattr(vae, 'time_cond_decoder', False):
+                            t_dec = torch.full((z_gen.shape[0],), decode_time, device=device)
+                        else:
+                            t_dec = None
                         fake_imgs_list.append(vae.decode(z_gen, t=t_dec).cpu())
 
                     fake_latents = torch.cat(fake_latents_list, 0)
@@ -5342,7 +5438,7 @@ def main():
         # --- KL and perceptual weights ---
         "kl_w": 1e-2,
         "perc_w": .85,
-        "lpips_mode": "prec_mask",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
+        "lpips_mode": "gamma",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
 
 
         # --- PatchGAN discriminator ---
@@ -5412,7 +5508,7 @@ def main():
         "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-        "score_w_decode": 0.5,             # Gradient scale: score head ← MSE recon loss
+        "score_w_decode": 0.3333,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
         # Time-dependent decoder (TDD)
