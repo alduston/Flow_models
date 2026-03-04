@@ -1008,6 +1008,381 @@ def compute_mse_gap(
     return total_mse / total_count if total_count > 0 else 0.0
 
 
+# ── Per-t MSE gap + new evaluation visualizations ────────────────────
+
+# Module-level cache: stores y-limits from the first eval so subsequent
+# evals use identical axes for comparability.
+_mse_gap_ylim_cache: Dict[str, Tuple[float, float]] = {}
+
+
+def compute_mse_gap_by_t(
+    score_net,
+    oracle_model,
+    encoder_mus: torch.Tensor,
+    encoder_logvars: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    labels: torch.Tensor | None = None,
+    num_classes: int | None = None,
+    num_samples: int = 5000,
+    batch_size: int = 128,
+    space: str = "eps",
+    num_t_bins: int = 30,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Like compute_mse_gap but also returns a per-t-bin breakdown.
+
+    Returns
+    -------
+    scalar_mse : float – overall mean MSE (same as compute_mse_gap).
+    t_bin_centres : np.ndarray [num_t_bins] – bin centre t values.
+    mse_by_bin : np.ndarray [num_t_bins] – mean MSE in each bin.
+    """
+    if score_net is None or oracle_model is None:
+        return 0.0, np.zeros(num_t_bins), np.zeros(num_t_bins)
+
+    score_net.eval()
+    oracle_model.eval()
+
+    n_data = encoder_mus.shape[0]
+    num_samples = min(int(num_samples), int(n_data))
+    sample_indices = torch.randperm(n_data, device="cpu")[:num_samples]
+
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+
+    # ------------------------------------------------------------------
+    # Build the full discrete training time grid
+    # ------------------------------------------------------------------
+    if stype in ("flow", "flow_matching"):
+        T = int(cfg.get("num_train_timesteps", 1000))
+        t_min = float(cfg.get("t_min", 1e-5))
+        t_max = float(cfg.get("t_max", 0.99999))
+        t_grid = torch.linspace(t_min, t_max, T, device=device, dtype=torch.float32)
+    else:
+        ou_sched = make_schedule(cfg, device)
+        T_int = int(ou_sched["T"].item())
+        t_grid = ou_sched["times"].to(device)  # [T_int]
+
+    t_grid_np = t_grid.cpu().numpy()
+    # Create log-spaced bin edges for a smooth curve
+    t_lo, t_hi = float(t_grid_np.min()), float(t_grid_np.max())
+    bin_edges = np.logspace(np.log10(max(t_lo, 1e-8)), np.log10(t_hi), num_t_bins + 1)
+    bin_sums = np.zeros(num_t_bins, dtype=np.float64)
+    bin_counts = np.zeros(num_t_bins, dtype=np.float64)
+    t_bin_centres = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    total_mse = 0.0
+    total_count = 0
+
+    with torch.no_grad():
+        for i in range(0, num_samples, batch_size):
+            batch_indices = sample_indices[i:i + batch_size]
+            batch_mu = encoder_mus[batch_indices].to(device)
+            batch_logvar = encoder_logvars[batch_indices].to(device)
+            batch_std = torch.exp(0.5 * batch_logvar)
+            bsz = batch_mu.shape[0]
+
+            y_batch = None
+            if labels is not None:
+                y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+            eps_0 = torch.randn_like(batch_mu)
+            z0 = batch_mu + batch_std * eps_0
+
+            if stype in ("flow", "flow_matching"):
+                for t_val in t_grid:
+                    t = t_val.expand(bsz)
+                    alpha = t_val.view(1, 1, 1, 1)
+                    sigma = (1.0 - t_val).view(1, 1, 1, 1).clamp_min(1e-8)
+
+                    noise = torch.randn_like(z0)
+                    z_t = alpha * z0 + sigma * noise
+
+                    eps_pred = score_net(z_t, t, y_batch)
+                    eps_oracle = oracle_model(z_t, t, y_batch)
+
+                    diff_sq = (eps_pred - eps_oracle) ** 2
+                    if space == "score":
+                        sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                        diff_sq = diff_sq / sigma_sq
+
+                    mse_per_sample = diff_sq.sum(dim=(1, 2, 3))
+                    batch_mse_mean = mse_per_sample.mean().item()
+                    total_mse += mse_per_sample.sum().item()
+                    total_count += bsz
+
+                    # Bin assignment
+                    tv = float(t_val.item())
+                    bidx = int(np.searchsorted(bin_edges, tv, side="right")) - 1
+                    bidx = max(0, min(bidx, num_t_bins - 1))
+                    bin_sums[bidx] += batch_mse_mean * bsz
+                    bin_counts[bidx] += bsz
+            else:
+                ou_sched_local = make_schedule(cfg, device)
+                t_idx_grid = torch.arange(int(ou_sched_local["T"].item()), device=device, dtype=torch.long)
+                for t_idx_scalar in t_idx_grid:
+                    t_idx = t_idx_scalar.expand(bsz)
+                    t_val = ou_sched_local["times"].gather(0, t_idx_scalar.view(1)).view(1)
+                    t = t_val.expand(bsz).float()
+
+                    alpha = extract_schedule(ou_sched_local["alpha"], t_idx, z0.shape)
+                    sigma = extract_schedule(ou_sched_local["sigma"], t_idx, z0.shape)
+
+                    noise = torch.randn_like(z0)
+                    z_t = alpha * z0 + sigma * noise
+
+                    eps_pred = score_net(z_t, t, y_batch)
+                    eps_oracle = oracle_model(z_t, t, y_batch)
+
+                    diff_sq = (eps_pred - eps_oracle) ** 2
+                    if space == "score":
+                        sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                        diff_sq = diff_sq / sigma_sq
+
+                    mse_per_sample = diff_sq.sum(dim=(1, 2, 3))
+                    batch_mse_mean = mse_per_sample.mean().item()
+                    total_mse += mse_per_sample.sum().item()
+                    total_count += bsz
+
+                    tv = float(t_val.item())
+                    bidx = int(np.searchsorted(bin_edges, tv, side="right")) - 1
+                    bidx = max(0, min(bidx, num_t_bins - 1))
+                    bin_sums[bidx] += batch_mse_mean * bsz
+                    bin_counts[bidx] += bsz
+
+    scalar_mse = total_mse / total_count if total_count > 0 else 0.0
+
+    # Per-bin means (leave zero where no data fell)
+    valid = bin_counts > 0
+    mse_by_bin = np.zeros(num_t_bins, dtype=np.float64)
+    mse_by_bin[valid] = bin_sums[valid] / bin_counts[valid]
+
+    return scalar_mse, t_bin_centres, mse_by_bin
+
+
+def plot_recon_error_vs_t(
+    vae,
+    encoder_mus: torch.Tensor,
+    encoder_logvars: torch.Tensor,
+    real_imgs: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    save_path: str,
+    num_t_points: int = 10,
+    num_samples: int = 256,
+    batch_size: int = 64,
+):
+    """Viz I: Reconstruction error (log) vs t (log).
+
+    For each of ``num_t_points`` log-spaced t values in [t_min, t_max],
+    encode x → z_0, form z_t = alpha(t)*z_0 + sigma(t)*eps, decode
+    D(z_t, t), and record MSE vs x.
+    """
+    vae.eval()
+    t_min = float(cfg["t_min"])
+    t_max = float(cfg["t_max"])
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+
+    t_values = np.logspace(np.log10(t_min), np.log10(t_max), num_t_points)
+
+    n_data = encoder_mus.shape[0]
+    num_samples = min(num_samples, n_data)
+    idx = torch.randperm(n_data)[:num_samples]
+
+    mu_sub = encoder_mus[idx].to(device)
+    logvar_sub = encoder_logvars[idx].to(device)
+    std_sub = torch.exp(0.5 * logvar_sub)
+    imgs_sub = real_imgs[idx].to(device)
+
+    eps_0 = torch.randn_like(mu_sub)
+    z0 = mu_sub + std_sub * eps_0
+
+    mse_values = []
+
+    with torch.no_grad():
+        for tv in t_values:
+            t_tensor = torch.tensor(tv, device=device, dtype=torch.float32)
+            if stype in ("flow", "flow_matching"):
+                alpha = t_tensor
+                sigma = (1.0 - t_tensor).clamp_min(1e-8)
+            elif stype == "cosine":
+                a, s, _ = get_cosine_params(
+                    t_tensor.view(1, 1), cosine_s=float(cfg.get("cosine_s", 0.008))
+                )
+                alpha, sigma = a.squeeze(), s.squeeze()
+            else:
+                a, s = get_ou_params(t_tensor.view(1, 1))
+                alpha, sigma = a.squeeze(), s.squeeze()
+
+            noise = torch.randn_like(z0)
+            z_t = alpha * z0 + sigma * noise
+
+            # Decode in mini-batches
+            recon_list = []
+            for j in range(0, num_samples, batch_size):
+                z_batch = z_t[j:j + batch_size]
+                bsz_j = z_batch.shape[0]
+                if getattr(vae, 'time_cond_decoder', False):
+                    t_dec = torch.full((bsz_j,), tv, device=device)
+                else:
+                    t_dec = None
+                recon_list.append(vae.decode(z_batch, t=t_dec))
+            recon = torch.cat(recon_list, 0)
+
+            mse_val = ((recon - imgs_sub) ** 2).mean().item()
+            mse_values.append(mse_val)
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    ax.loglog(t_values, mse_values, "o-", linewidth=2, markersize=5)
+    ax.set_xlabel("t")
+    ax.set_ylabel("Reconstruction MSE")
+    ax.set_title("Reconstruction Error vs t")
+    ax.set_ylim(1e-3, 1.0)
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"    Saved recon-error-vs-t plot → {save_path}")
+
+
+def plot_mse_gap_by_t(
+    t_bin_centres: np.ndarray,
+    mse_by_bin: np.ndarray,
+    save_path: str,
+    cache_key: str = "default",
+):
+    """Viz II: MSE gap (eps-space) vs t (log-log), with consistent y-limits.
+
+    On the first call for a given ``cache_key``, the y-limits are recorded
+    from the data.  Subsequent calls reuse those limits for comparability.
+    """
+    global _mse_gap_ylim_cache
+
+    valid = mse_by_bin > 0
+    if not np.any(valid):
+        print(f"    [plot_mse_gap_by_t] No valid bins — skipping plot.")
+        return
+
+    t_plot = t_bin_centres[valid]
+    mse_plot = mse_by_bin[valid]
+
+    if cache_key not in _mse_gap_ylim_cache:
+        y_lo = float(mse_plot.min()) * 0.5
+        y_hi = float(mse_plot.max()) * 2.0
+        _mse_gap_ylim_cache[cache_key] = (y_lo, y_hi)
+
+    y_lo, y_hi = _mse_gap_ylim_cache[cache_key]
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    ax.loglog(t_plot, mse_plot, "o-", linewidth=2, markersize=4, color="tab:red")
+    ax.set_xlabel("t")
+    ax.set_ylabel("MSE gap (eps-space)")
+    ax.set_title("Score MSE Gap vs t (eps parameterization)")
+    ax.set_ylim(y_lo, y_hi)
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"    Saved mse-gap-by-t plot → {save_path}")
+
+
+def plot_decoder_output_grid(
+    vae,
+    encoder_mus: torch.Tensor,
+    encoder_logvars: torch.Tensor,
+    real_imgs: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    save_path: str,
+    num_rows: int = 5,
+    num_cols: int = 5,
+    t_upper: float = 0.5,
+):
+    """Viz III: D(z_t, t) grid — rows = different x_0, columns = different t.
+
+    ``num_cols`` t values are log-spaced from t_min to ``t_upper``.
+    ``num_rows`` different x_0's are encoded and noised.
+    """
+    vae.eval()
+    t_min = float(cfg["t_min"])
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+
+    t_values = np.logspace(np.log10(t_min), np.log10(t_upper), num_cols)
+
+    n_data = encoder_mus.shape[0]
+    idx = torch.randperm(n_data)[:num_rows]
+
+    mu_sub = encoder_mus[idx].to(device)
+    logvar_sub = encoder_logvars[idx].to(device)
+    std_sub = torch.exp(0.5 * logvar_sub)
+    imgs_sub = real_imgs[idx]  # keep on CPU for display
+
+    eps_0 = torch.randn_like(mu_sub)
+    z0 = mu_sub + std_sub * eps_0
+
+    # Collect decoded images: list of [num_rows, C, H, W]
+    all_panels = []
+
+    with torch.no_grad():
+        for tv in t_values:
+            t_tensor = torch.tensor(tv, device=device, dtype=torch.float32)
+            if stype in ("flow", "flow_matching"):
+                alpha = t_tensor
+                sigma = (1.0 - t_tensor).clamp_min(1e-8)
+            elif stype == "cosine":
+                a, s, _ = get_cosine_params(
+                    t_tensor.view(1, 1), cosine_s=float(cfg.get("cosine_s", 0.008))
+                )
+                alpha, sigma = a.squeeze(), s.squeeze()
+            else:
+                a, s = get_ou_params(t_tensor.view(1, 1))
+                alpha, sigma = a.squeeze(), s.squeeze()
+
+            noise = torch.randn_like(z0)
+            z_t = alpha * z0 + sigma * noise
+
+            if getattr(vae, 'time_cond_decoder', False):
+                t_dec = torch.full((num_rows,), tv, device=device)
+            else:
+                t_dec = None
+            decoded = vae.decode(z_t, t=t_dec).cpu()
+            all_panels.append(decoded)
+
+    # Build the grid: rows = x_0, cols = t.  Also prepend a column of originals.
+    # Final grid order: [orig_0, D(z_t1,t1)_0, ..., D(z_tK,tK)_0, orig_1, ...]
+    grid_imgs = []
+    for row_i in range(num_rows):
+        grid_imgs.append(imgs_sub[row_i])  # original x_0
+        for col_j in range(num_cols):
+            grid_imgs.append(all_panels[col_j][row_i])
+    grid_tensor = torch.stack(grid_imgs, dim=0)
+
+    ncol = num_cols + 1  # +1 for the original image column
+    tv_utils.save_image(
+        (grid_tensor + 1) / 2, save_path,
+        nrow=ncol, padding=2, pad_value=0.5,
+    )
+
+    # Also add a small title annotation via matplotlib for the t-labels
+    fig, ax = plt.subplots(1, 1, figsize=(2.0 * ncol, 2.0 * num_rows))
+    from PIL import Image as _PILImage
+    img = _PILImage.open(save_path)
+    ax.imshow(img)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    col_labels = ["x₀"] + [f"t={tv:.3g}" for tv in t_values]
+    # Approximate pixel positions for column labels
+    w = img.width
+    cell_w = w / ncol
+    for ci, lbl in enumerate(col_labels):
+        ax.text(cell_w * (ci + 0.5), 4, lbl, ha="center", va="top",
+                fontsize=8, color="white",
+                bbox=dict(facecolor="black", alpha=0.6, pad=1))
+    fig.tight_layout(pad=0.3)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"    Saved decoder-output grid → {save_path}")
+
+
 # ── VAE ───────────────────────────────────────────────────────────────
 
 """
@@ -1377,6 +1752,10 @@ class VAE(nn.Module):
         # ================================================================
         self.time_cond_decoder = time_cond_decoder
         self.dec_schedule_type = None  # set externally after construction
+        # Default t value used by decode() when time_cond_decoder=True but
+        # t=None is passed — avoids a hard error and keeps the TDD path
+        # in-distribution.  Callers can override via vae._decode_t_default.
+        self._decode_t_default = 1e-4
 
         if time_cond_decoder:
             self.dec_time_emb_dim = dec_time_emb_dim
@@ -1561,14 +1940,19 @@ class VAE(nn.Module):
             h = gate2[:, :, None, None] * h + (1.0 - gate2[:, :, None, None]) * h_up2
 
         elif self.dec_blocks is not None:
-            # --- Legacy non-time-conditioned path (unchanged) ---
+            # --- Legacy non-time-conditioned path (t silently ignored) ---
             for block in self.dec_blocks:
                 h = block(h)
         else:
-            raise RuntimeError(
-                "time_cond_decoder=True but t=None was passed to decode(). "
-                "Provide a time tensor or disable time_cond_decoder."
+            # time_cond_decoder=True but t=None: fall back to t_min so
+            # the TDD path still runs (most in-distribution default).
+            import warnings
+            _t_default = float(getattr(self, '_decode_t_default', 1e-4))
+            warnings.warn(
+                f"time_cond_decoder=True but t=None; defaulting to t={_t_default:.2e}",
+                stacklevel=2,
             )
+            return self.decode(z, t=torch.full((z.shape[0],), _t_default, device=z.device))
 
         out = self.dec_out(h)
         return torch.tanh(out) if self.use_tanh_out else out        # [5]
@@ -3106,15 +3490,11 @@ def evaluate_current_state(
     )
     print(f"  Oracle (unconditional) LSI gap = {lsi_gap_oracle:.6f}")
 
-    mse_gap_eps =  lsi_gap_oracle
-    mse_gap_score =  lsi_gap_oracle
-
-    '''
     # -----------------------------------------------------------------------
-    # MSE gap: learned score net vs oracle (eps-space and score-space)
+    # MSE gap: learned score net vs oracle (eps-space) with per-t breakdown
     # -----------------------------------------------------------------------
-    print("  Computing MSE gap (eps-space) vs oracle...")
-    mse_gap_eps = compute_mse_gap(
+    print("  Computing MSE gap (eps-space) vs oracle (with per-t breakdown)...")
+    mse_gap_eps, mse_t_centres, mse_by_t_bin = compute_mse_gap_by_t(
         unet, oracle_model,
         encoder_mus, encoder_logvars,
         cfg, device,
@@ -3123,22 +3503,55 @@ def evaluate_current_state(
         num_samples=min(2500, target_count),
         batch_size=bs,
         space="eps",
+        num_t_bins=30,
     )
     print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
-    mse_gap_score = mse_gap_eps
-    print("  Computing MSE gap (score-space) vs oracle...")
-    mse_gap_score = compute_mse_gap(
-        unet, oracle_model,
-        encoder_mus, encoder_logvars,
-        cfg, device,
-        labels=None,
-        num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
-        batch_size=bs,
-        space="score",
-    )
-    print(f"  MSE gap (score-space, uncond) = {mse_gap_score:.6f}")
-    '''
+    mse_gap_score = mse_gap_eps  # reuse eps-space value to avoid extra pass
+
+    # -----------------------------------------------------------------------
+    # Set up per-epoch eval directory
+    # -----------------------------------------------------------------------
+    eval_dir = None
+    if results_dir is not None:
+        eval_dir = os.path.join(results_dir, "evals", f"eval_{epoch_idx}")
+        os.makedirs(eval_dir, exist_ok=True)
+
+    # -----------------------------------------------------------------------
+    # Viz I: Reconstruction error vs t (log-log)
+    # -----------------------------------------------------------------------
+    if eval_dir is not None:
+        print("  [Viz I] Plotting reconstruction error vs t ...")
+        plot_recon_error_vs_t(
+            vae, encoder_mus, encoder_logvars, real_imgs,
+            cfg, device,
+            save_path=os.path.join(eval_dir, f"{prefix}_recon_error_vs_t_ep{epoch_idx}.png"),
+            num_t_points=10,
+            num_samples=min(256, target_count),
+            batch_size=bs,
+        )
+
+    # -----------------------------------------------------------------------
+    # Viz II: MSE gap breakdown by t (log-log)
+    # -----------------------------------------------------------------------
+    if eval_dir is not None and unet is not None:
+        print("  [Viz II] Plotting MSE gap by t ...")
+        plot_mse_gap_by_t(
+            mse_t_centres, mse_by_t_bin,
+            save_path=os.path.join(eval_dir, f"{prefix}_mse_gap_by_t_ep{epoch_idx}.png"),
+            cache_key=prefix,
+        )
+
+    # -----------------------------------------------------------------------
+    # Viz III: D(z_t, t) decoder output grid
+    # -----------------------------------------------------------------------
+    if eval_dir is not None:
+        print("  [Viz III] Plotting decoder output grid ...")
+        plot_decoder_output_grid(
+            vae, encoder_mus, encoder_logvars, real_imgs,
+            cfg, device,
+            save_path=os.path.join(eval_dir, f"{prefix}_decoder_grid_ep{epoch_idx}.png"),
+            num_rows=5, num_cols=5, t_upper=0.5,
+        )
 
     # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
@@ -3325,12 +3738,14 @@ def evaluate_current_state(
 
         # Save sample panels for the main sweep
         if method in ("VAE_Rec_eps",) or "rk4" in method or "heun" in method or method == "ddim":
-            if results_dir is not None:
-                samples_dir = os.path.join(results_dir, "samples")
-                os.makedirs(samples_dir, exist_ok=True)
-                save_path = os.path.join(samples_dir, f"{prefix}_{method}_{steps}{config_suffix}_ep{epoch_idx}.png")
+            if eval_dir is not None:
+                save_path = os.path.join(eval_dir, f"{prefix}_{method}_{steps}{config_suffix}_ep{epoch_idx}.png")
+            elif results_dir is not None:
+                save_path = os.path.join(results_dir, "samples", f"{prefix}_{method}_{steps}{config_suffix}_ep{epoch_idx}.png")
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
             else:
                 save_path = os.path.join("samples", f"{prefix}_{method}_{steps}{config_suffix}_ep{epoch_idx}.png")
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
             panel = fake_imgs[:16] if fake_imgs.shape[0] >= 16 else fake_imgs
             tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
 
@@ -3487,10 +3902,8 @@ def evaluate_current_state(
             output_dict[f"div_vae_recon_y{y0}"] = div_recon_y
 
             # Optionally save a recon panel for the class
-            if results_dir is not None:
-                samples_dir = os.path.join(results_dir, "samples")
-                os.makedirs(samples_dir, exist_ok=True)
-                save_path = os.path.join(samples_dir, f"{prefix}_VAE_Rec_eps_0_y{y0}_ep{epoch_idx}.png")
+            if eval_dir is not None:
+                save_path = os.path.join(eval_dir, f"{prefix}_VAE_Rec_eps_0_y{y0}_ep{epoch_idx}.png")
                 panel = fake_imgs_recon_y[:16] if fake_imgs_recon_y.shape[0] >= 16 else fake_imgs_recon_y
                 tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
 
@@ -3598,12 +4011,14 @@ def evaluate_current_state(
                         output_dict[f"div_heun_{steps_str}{suffix}"] = div_y
 
                     # Save panels for conditional methods
-                    if results_dir is not None:
-                        samples_dir = os.path.join(results_dir, "samples")
-                        os.makedirs(samples_dir, exist_ok=True)
-                        save_path = os.path.join(samples_dir, f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
+                    if eval_dir is not None:
+                        save_path = os.path.join(eval_dir, f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
+                    elif results_dir is not None:
+                        save_path = os.path.join(results_dir, "samples", f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
                     else:
                         save_path = os.path.join("samples", f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
                     panel = fake_imgs[:16] if fake_imgs.shape[0] >= 16 else fake_imgs
                     tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
 
@@ -4333,6 +4748,10 @@ def train_vae_cotrained_cond(cfg):
     # Tell the TDD decoder which schedule type to use for log-SNR embedding
     if cfg.get("time_cond_decoder", False):
         vae.dec_schedule_type = str(cfg.get("time_schedule", "log_t")).lower()
+
+    # Set the fallback decode time so that decode(z) without an explicit t
+    # uses t_min (the most in-distribution default for generation).
+    vae._decode_t_default = float(cfg.get("t_min", 1e-4))
 
     # --- Online Models ---
     dit_kwargs = dict(
