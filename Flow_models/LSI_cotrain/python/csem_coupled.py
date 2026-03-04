@@ -1236,7 +1236,7 @@ def plot_recon_error_vs_t(
     ax.set_xlabel("t")
     ax.set_ylabel("Reconstruction MSE")
     ax.set_title("Reconstruction Error vs t")
-    ax.set_ylim(1e-3, 1.0)
+    ax.set_ylim(5e-3, 0.5)
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
@@ -1275,8 +1275,8 @@ def plot_mse_gap_by_t(
     fig, ax = plt.subplots(1, 1, figsize=(6, 4))
     ax.loglog(t_plot, mse_plot, "o-", linewidth=2, markersize=4, color="tab:red")
     ax.set_xlabel("t")
-    ax.set_ylabel("MSE gap (eps-space)")
-    ax.set_title("Score MSE Gap vs t (eps parameterization)")
+    ax.set_ylabel("MSE gap (score-space)")
+    ax.set_title("Score MSE Gap vs t (score parameterization)")
     ax.set_ylim(y_lo, y_hi)
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
@@ -1295,11 +1295,11 @@ def plot_decoder_output_grid(
     save_path: str,
     num_rows: int = 5,
     num_cols: int = 5,
-    t_upper: float = 0.5,
+    t_upper: float = 1.0,
 ):
     """Viz III: D(z_t, t) grid — rows = different x_0, columns = different t.
 
-    ``num_cols`` t values are log-spaced from t_min to ``t_upper``.
+    ``num_cols`` t values are log-uniform from t_min to ``t_upper``.
     ``num_rows`` different x_0's are encoded and noised.
     """
     vae.eval()
@@ -1381,6 +1381,108 @@ def plot_decoder_output_grid(
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"    Saved decoder-output grid → {save_path}")
+
+
+def plot_reverse_trajectory_grid(
+    vae,
+    unet,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    save_path: str,
+    num_rows: int = 5,
+    num_cols: int = 5,
+    t_upper: float = 1.0,
+    steps_per_leg: int = 10,
+    cfg_scale: float = 3.0,
+    class_label: int = 0,
+):
+    """Viz IV: Reverse-trajectory D(z_t, t) grid.
+
+    Each row is an independent noise seed integrated backwards via RK4.
+    Columns correspond to ``num_cols`` log-uniform t values from
+    ``t_upper`` down to ``t_min``.  A fixed class label with CFG is used
+    throughout (rand_token=True semantics).
+
+    Integration is split into sub-intervals of ``steps_per_leg`` RK4 steps
+    each, with the output of one leg fed as ``x_init`` for the next.
+    """
+    if unet is None:
+        print("    [plot_reverse_trajectory_grid] No score net — skipping.")
+        return
+
+    vae.eval()
+    unet.eval()
+
+    t_min = float(cfg["t_min"])
+    t_max = float(cfg["t_max"])
+
+    # Log-uniform snapshot times from t_upper down to t_min
+    t_stops = np.logspace(np.log10(t_upper), np.log10(t_min), num_cols).tolist()
+
+    # Full leg list: first go from t_max → t_stops[0], then between consecutive stops
+    legs = [(t_max, t_stops[0])]
+    for i in range(len(t_stops) - 1):
+        legs.append((t_stops[i], t_stops[i + 1]))
+
+    # Draw initial noise
+    img_size = cfg.get("img_size", 32)
+    latent_spatial = img_size // 4
+    latent_shape = (num_rows, int(cfg["latent_channels"]), latent_spatial, latent_spatial)
+    z = torch.randn(latent_shape, device=device)
+
+    y_batch = torch.full((num_rows,), class_label, device=device, dtype=torch.long)
+
+    # Collect decoded snapshots at each t_stop
+    snapshots = []  # list of [num_rows, C, H, W] tensors (CPU)
+
+    with torch.no_grad():
+        for leg_idx, (t_from, t_to) in enumerate(legs):
+            sampler = UniversalSampler(
+                method="rk4_ode",
+                num_steps=steps_per_leg,
+                t_min=t_to,
+                t_max=t_from,
+                schedule_type=cfg.get("time_schedule", "log_snr"),
+                cosine_s=cfg.get("cosine_s", 0.008),
+                readout_mode="direct",
+            )
+            z, _ = sampler.sample(unet, x_init=z, y=y_batch, cfg_scale=cfg_scale)
+
+            # Decode at this t_stop
+            t_dec = torch.full((num_rows,), t_to, device=device)
+            decoded = vae.decode(z, t=t_dec).cpu()
+            snapshots.append(decoded)
+
+    # Build grid: rows = noise seeds, cols = t-stops (t_upper → t_min)
+    grid_imgs = []
+    for row_i in range(num_rows):
+        for col_j in range(num_cols):
+            grid_imgs.append(snapshots[col_j][row_i])
+    grid_tensor = torch.stack(grid_imgs, dim=0)
+
+    tv_utils.save_image(
+        (grid_tensor + 1) / 2, save_path,
+        nrow=num_cols, padding=2, pad_value=0.5,
+    )
+
+    # Annotate with t-labels via matplotlib
+    fig, ax = plt.subplots(1, 1, figsize=(2.0 * num_cols, 2.0 * num_rows))
+    from PIL import Image as _PILImage
+    img = _PILImage.open(save_path)
+    ax.imshow(img)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    col_labels = [f"t={tv:.3g}" for tv in t_stops]
+    w = img.width
+    cell_w = w / num_cols
+    for ci, lbl in enumerate(col_labels):
+        ax.text(cell_w * (ci + 0.5), 4, lbl, ha="center", va="top",
+                fontsize=8, color="white",
+                bbox=dict(facecolor="black", alpha=0.6, pad=1))
+    fig.tight_layout(pad=0.3)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"    Saved reverse-trajectory grid → {save_path}")
 
 
 # ── VAE ───────────────────────────────────────────────────────────────
@@ -3493,7 +3595,7 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # MSE gap: learned score net vs oracle (eps-space) with per-t breakdown
     # -----------------------------------------------------------------------
-    print("  Computing MSE gap (eps-space) vs oracle (with per-t breakdown)...")
+    print("  Computing MSE gap (score-space) vs oracle (with per-t breakdown)...")
     mse_gap_eps, mse_t_centres, mse_by_t_bin = compute_mse_gap_by_t(
         unet, oracle_model,
         encoder_mus, encoder_logvars,
@@ -3502,11 +3604,11 @@ def evaluate_current_state(
         num_classes=cfg.get("num_classes", None),
         num_samples=min(2500, target_count),
         batch_size=bs,
-        space="eps",
+        space="score",
         num_t_bins=30,
     )
-    print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
-    mse_gap_score = mse_gap_eps  # reuse eps-space value to avoid extra pass
+    print(f"  MSE gap (score-space, uncond) = {mse_gap_eps:.6f}")
+    mse_gap_score = mse_gap_eps  # single pass in score space
 
     # -----------------------------------------------------------------------
     # Set up per-epoch eval directory
@@ -3534,7 +3636,7 @@ def evaluate_current_state(
     # Viz II: MSE gap breakdown by t (log-log)
     # -----------------------------------------------------------------------
     if eval_dir is not None and unet is not None:
-        print("  [Viz II] Plotting MSE gap by t ...")
+        print("  [Viz II] Plotting MSE gap by t (score-space) ...")
         plot_mse_gap_by_t(
             mse_t_centres, mse_by_t_bin,
             save_path=os.path.join(eval_dir, f"{prefix}_mse_gap_by_t_ep{epoch_idx}.png"),
@@ -3550,7 +3652,22 @@ def evaluate_current_state(
             vae, encoder_mus, encoder_logvars, real_imgs,
             cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_decoder_grid_ep{epoch_idx}.png"),
-            num_rows=5, num_cols=5, t_upper=0.5,
+            num_rows=5, num_cols=5, t_upper=1.0,
+        )
+
+    # -----------------------------------------------------------------------
+    # Viz IV: Reverse-trajectory D(z_t, t) grid
+    # -----------------------------------------------------------------------
+    if eval_dir is not None and unet is not None:
+        print("  [Viz IV] Plotting reverse trajectory grid ...")
+        _traj_label = int(cfg.get("eval_class_labels", [0])[0]) \
+            if cfg.get("eval_class_labels") else 0
+        plot_reverse_trajectory_grid(
+            vae, unet, cfg, device,
+            save_path=os.path.join(eval_dir, f"{prefix}_reverse_traj_ep{epoch_idx}.png"),
+            num_rows=5, num_cols=5, t_upper=1.0,
+            steps_per_leg=10, cfg_scale=3.0,
+            class_label=_traj_label,
         )
 
     # -----------------------------------------------------------------------
@@ -5855,10 +5972,9 @@ def main():
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-2,
-        "perc_w": .85,
-        "lpips_mode": "gamma",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
-
+        "kl_w": 1e-3,
+        "perc_w": 1.00,
+        "lpips_mode": "prec_mask",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
 
         # --- PatchGAN discriminator ---
         "gan_w": 0.002,
@@ -5940,7 +6056,7 @@ def main():
         #"snr_downweight": True,
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
