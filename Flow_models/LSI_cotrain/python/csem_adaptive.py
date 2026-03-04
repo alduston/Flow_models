@@ -5595,13 +5595,15 @@ def train_vae_cotrained_cond(cfg):
             tdd_loss = torch.tensor(0.0, device=device)
 
             # --- Oracle TDD for frontier tracker ---
-            # Measures D(z_t, t) vs D(z_0, None) regardless of mse_mode.
-            # IW already computed above (from previous batches' R curve).
+            # Measures the actual training-pipeline decode vs clean decode:
+            #   raw mode:            D(z_t, t)       vs D(z_0, None)
+            #   score/score_detached: D(z_hat_0, t)   vs D(z_0, None)
+            # x_rec already reflects the correct decode for the active mse_mode.
             if frontier_tracker is not None:
                 with torch.no_grad():
-                    x_tdd_noisy = vae.decode(z_t, t) if mse_mode != "raw" else x_rec.detach()
+                    x_tdd_noisy = x_rec.detach()
                     x_tdd_clean = vae.decode(z0)  # D(z_0, None) — FiLM bypassed
-                    oracle_tdd_mse = (x_tdd_noisy.detach() - x_tdd_clean).pow(2).flatten(1).mean(1)  # [B]
+                    oracle_tdd_mse = (x_tdd_noisy - x_tdd_clean).pow(2).flatten(1).mean(1)  # [B]
                     frontier_tracker.update(t.detach(), oracle_tdd_mse)
 
             # --- Perceptual loss (LPIPS) ---
@@ -5829,9 +5831,11 @@ def train_vae_cotrained_cond(cfg):
                       f"max_w={ft_diag['frontier/max_weight']:.3f} "
                       f"entropy_ratio={ft_diag['frontier/entropy_ratio']:.2f}")
             if (ep + 1) % max(eval_freq_cotrain, 10) == 0 and frontier_tracker.is_active:
+                _frontier_eval_dir = os.path.join(results_dir, "evals", f"eval_{ep+1}")
+                os.makedirs(_frontier_eval_dir, exist_ok=True)
                 plot_frontier_diagnostics(
                     frontier_tracker,
-                    os.path.join(results_dir, f"frontier_ep{ep+1}.png"),
+                    os.path.join(_frontier_eval_dir, f"frontier_ep{ep+1}.png"),
                     ep + 1)
 
         if len(mu_stats) > 0:
