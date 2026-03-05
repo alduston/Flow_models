@@ -5714,7 +5714,9 @@ def train_vae_cotrained_cond(cfg):
                 lpips_per = lpips_fn(x_rec_3c, x_3c)
                 # lpips returns [B, 1, 1, 1]; reduce to [B]
                 lpips_per = lpips_per.view(B, -1).mean(dim=1) if lpips_per.dim() > 1 else lpips_per.view(B)
-                if lpips_mode == "snr":
+                if lpips_mode == "uniform":
+                    perc = lpips_per.mean()
+                elif lpips_mode == "snr":
                     # Legacy behavior: scalar SNR weight (optionally enabled by snr_downeight flag) times mean LPIPS.
                     perc = snr_weight * lpips_per.mean()
                 else:
@@ -5738,7 +5740,7 @@ def train_vae_cotrained_cond(cfg):
                             # Fallback if factorized head not available: use gamma-only weighting.
                             perc = (gamma * lpips_per).mean()
                     else:
-                        raise ValueError(f"Unknown lpips_mode: {lpips_mode!r}. Expected 'prec_mask', 'gamma', or 'snr'.")
+                        raise ValueError(f"Unknown lpips_mode: {lpips_mode!r}. Expected 'uniform', 'prec_mask', 'gamma', or 'snr'.")
             else:
                 perc = torch.tensor(0.0, device=device)
 
@@ -6488,7 +6490,7 @@ def main():
         # --- KL and perceptual weights ---
         "kl_w": 1e-3,
         "perc_w": 1.00,
-        "lpips_mode": "prec_mask",  # "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
+        "lpips_mode": "prec_mask",  # "uniform", "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
 
 
         # --- PatchGAN discriminator ---
