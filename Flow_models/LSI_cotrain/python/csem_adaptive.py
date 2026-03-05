@@ -4047,7 +4047,7 @@ def evaluate_current_state(
             vae, encoder_mus, encoder_logvars, real_imgs,
             cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_decoder_grid_ep{epoch_idx}.png"),
-            num_rows=5, num_cols=6, t_upper=1.0, t_values = [.01,.05, .2, .5, 1, 2],
+            num_rows=5, num_cols=7, t_upper=1.0, t_values = [.002, .01, .05, .2, .5, 1, 2],
             unet=unet,
             real_labels=real_labels,
         )
@@ -4062,7 +4062,7 @@ def evaluate_current_state(
         plot_reverse_trajectory_grid(
             vae, unet, cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_reverse_traj_ep{epoch_idx}.png"),
-            num_rows=5, num_cols=6, t_upper=1.0, t_values = [.01, .05, .2, .5, 1, 2],
+            num_rows=5, num_cols=7, t_upper=1.0, t_values = [.002, .01, .05, .2, .5, 1, 2],
             steps_per_leg=10, cfg_scale=3.0,
             class_label=_traj_label,
             frontier_tracker=frontier_tracker,
