@@ -6488,18 +6488,17 @@ def main():
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-3,
+        "kl_w": 1e-6,
         "perc_w": 1.00,
-        "lpips_mode": "prec_mask",  # "uniform", "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
-
+        "lpips_mode": "uniform",  # "uniform", "snr" (legacy), "gamma", or "prec_mask" (requires factorized head)
 
         # --- PatchGAN discriminator ---
-        "gan_w": 0.002,
+        "gan_w": 0.0025,
         "gan_w_tdd_mult": 4.0,
         "disc_time_emb_dim": 128,
         "wiener_alpha_min": 1e-4,
         "wiener_max_var": 1e3,
-        "disc_start_epoch": 1001,
+        "disc_start_epoch": 25,
         "disc_ndf": 64,
         "disc_n_layers": 2,
         "lr_disc": 1e-4,
@@ -6556,17 +6555,17 @@ def main():
         "mse_mode": "raw",               # 'raw', 'score', or 'score_detached'
         "use_latent_norm": True,
         "use_cond_encoder": False,
-        "kl_reg_type": "temporal",
+        "kl_reg_type": "normal",
         "score_w_vae": 0.6,
-        "stiff_w": 1e-9,
+        "stiff_w": 1e-6,
         "score_w": 1.0,
-        "score_w_decode": 0.333,          # Gradient scale: score head ← MSE recon loss
+        "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
         "time_dependent_gan": False,
-        "gan_time_weight": "snr",  # "uniform", "gamma", "snr", or "snr2"
+        "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
         "decode_time": None,             # Decode at this t; defaults to t_min if None
@@ -6582,7 +6581,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
