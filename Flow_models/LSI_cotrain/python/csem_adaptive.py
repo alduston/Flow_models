@@ -343,11 +343,12 @@ class ReconFrontierTracker:
 
     def __init__(self, t_min, t_max, n_bins=100, ema_decay=0.99,
                  floor_weight=0.02, warmup_steps=500, min_counts_per_bin=5,
-                 device=torch.device("cpu")):
+                 smooth_sigma=3.0, device=torch.device("cpu")):
         self.t_min = float(t_min); self.t_max = float(t_max)
         self.n_bins = n_bins; self.ema_decay = ema_decay
         self.floor_weight = floor_weight; self.warmup_steps = warmup_steps
         self.min_counts_per_bin = min_counts_per_bin; self.device = device
+        self.smooth_sigma = smooth_sigma  # Gaussian kernel σ in bins for pre-diff smoothing
         log_edges = torch.linspace(math.log(self.t_min), math.log(self.t_max),
                                    n_bins + 1, device=self.device, dtype=torch.float32)
         self.bin_edges = torch.exp(log_edges)
@@ -380,11 +381,28 @@ class ReconFrontierTracker:
             self.counts[active] += bin_counts[active]
         self.total_updates += 1; self._weights_dirty = True
 
+    @staticmethod
+    def _gaussian_smooth_1d(x: torch.Tensor, sigma: float) -> torch.Tensor:
+        """1-D Gaussian smoothing with reflect-padding (preserves endpoints)."""
+        if sigma <= 0:
+            return x
+        radius = int(math.ceil(3.0 * sigma))
+        ks = 2 * radius + 1
+        grid = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+        kernel = torch.exp(-0.5 * (grid / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        # conv1d expects [B, C, L]
+        x_pad = torch.nn.functional.pad(x.unsqueeze(0).unsqueeze(0),
+                                         (radius, radius), mode="reflect")
+        return torch.nn.functional.conv1d(x_pad, kernel.view(1, 1, ks)).squeeze()
+
     @torch.no_grad()
     def _compute_weights(self):
         if not self._weights_dirty and self._weights_cache is not None:
             return self._weights_cache
         log_R = torch.log(self.R_ema.clamp(min=1e-12))
+        # --- smooth log R in bin-index space before finite-differencing ---
+        log_R = self._gaussian_smooth_1d(log_R, self.smooth_sigma)
         log_t = torch.log(self.bin_centers)
         d_logR = log_R[1:] - log_R[:-1]
         d_logt = log_t[1:] - log_t[:-1]
@@ -1746,7 +1764,7 @@ def plot_reverse_trajectory_grid(
     t_upper: float = 1.0,
     steps_per_leg: int = 10,
     cfg_scale: float = 3.0,
-    class_label: int = 0,
+    class_label: int | list[int] | None = None,
     t_values: list[float] | None = None,
     frontier_tracker=None,
 ):
@@ -1754,8 +1772,13 @@ def plot_reverse_trajectory_grid(
 
     Each row is an independent noise seed integrated backwards via RK4.
     Columns correspond to ``num_cols`` log-uniform t values from
-    ``t_upper`` down to ``t_min``.  A fixed class label with CFG is used
-    throughout (rand_token=True semantics).
+    ``t_upper`` down to ``t_min``.
+
+    class_label behaviour:
+      - int:        all rows use that single class.
+      - list[int]:  rows cycle through the given labels.
+      - None:       rows are assigned ``num_rows`` evenly-spaced classes
+                    from [0, num_classes), giving maximal visual diversity.
 
     Integration is split into sub-intervals of ``steps_per_leg`` RK4 steps
     each, with the output of one leg fed as ``x_init`` for the next.
@@ -1795,7 +1818,18 @@ def plot_reverse_trajectory_grid(
     latent_shape = (num_rows, int(cfg["latent_channels"]), latent_spatial, latent_spatial)
     z = torch.randn(latent_shape, device=device)
 
-    y_batch = torch.full((num_rows,), class_label, device=device, dtype=torch.long)
+    # --- Resolve per-row class labels ---
+    num_classes = int(cfg.get("num_classes", 10))
+    if class_label is None:
+        # Evenly space across available classes for visual diversity
+        row_labels = [int(i * num_classes / num_rows) % num_classes
+                      for i in range(num_rows)]
+    elif isinstance(class_label, (list, tuple)):
+        row_labels = [int(class_label[i % len(class_label)])
+                      for i in range(num_rows)]
+    else:
+        row_labels = [int(class_label)] * num_rows
+    y_batch = torch.tensor(row_labels, device=device, dtype=torch.long)
 
     # Collect decoded snapshots at each t_stop
     snapshots = []  # list of [num_rows, C, H, W] tensors (CPU)
@@ -1851,11 +1885,16 @@ def plot_reverse_trajectory_grid(
     ax.set_xticks([])
     ax.set_yticks([])
     col_labels = [f"t={tv:.3g}" for tv in t_stops]
-    w = img.width
-    cell_w = w / num_cols
+    w = img.width; h = img.height
+    cell_w = w / num_cols; cell_h = h / num_rows
     for ci, lbl in enumerate(col_labels):
         ax.text(cell_w * (ci + 0.5), 4, lbl, ha="center", va="top",
                 fontsize=8, color="white",
+                bbox=dict(facecolor="black", alpha=0.6, pad=1))
+    # Row labels: class index for each row
+    for ri, yl in enumerate(row_labels):
+        ax.text(4, cell_h * (ri + 0.5), f"y={yl}", ha="left", va="center",
+                fontsize=8, color="white", rotation=90,
                 bbox=dict(facecolor="black", alpha=0.6, pad=1))
     fig.tight_layout(pad=0.3)
     fig.savefig(save_path, dpi=150)
@@ -4055,16 +4094,16 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Viz IV: Reverse-trajectory D(z_t, t) grid
     # -----------------------------------------------------------------------
+    cfg_eval_scale = float(cfg.get("cfg_eval_scale", 3.0))
     if eval_dir is not None and unet is not None:
         print("  [Viz IV] Plotting reverse trajectory grid ...")
-        _traj_label = int(cfg.get("eval_class_labels", [0])[0]) \
-            if cfg.get("eval_class_labels") else 0
+        _traj_labels = cfg.get("eval_class_labels", None) or None  # [] → None
         plot_reverse_trajectory_grid(
             vae, unet, cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_reverse_traj_ep{epoch_idx}.png"),
             num_rows=5, num_cols=7, t_upper=1.0, t_values = [.002, .01, .05, .2, .5, 1, 2],
-            steps_per_leg=10, cfg_scale=3.0,
-            class_label=_traj_label,
+            steps_per_leg=10, cfg_scale=cfg_eval_scale,
+            class_label=_traj_labels,
             frontier_tracker=frontier_tracker,
         )
 
@@ -4120,7 +4159,7 @@ def evaluate_current_state(
     # Unconditional evaluation sweep
     # -----------------------------------------------------------------------
 
-    cfg_eval_scale = float(cfg.get("cfg_eval_scale", 2.0))
+    # cfg_eval_scale already read above (from cfg, default 3.0)
     for scfg in configs:
         method = scfg["method"]
         steps = int(scfg.get("steps", 0))
@@ -5226,10 +5265,12 @@ def train_vae_cotrained_cond(cfg):
             floor_weight=float(cfg.get("adaptive_time_floor", 0.02)),
             warmup_steps=int(cfg.get("adaptive_time_warmup", 500)),
             min_counts_per_bin=int(cfg.get("adaptive_time_min_counts", 5)),
+            smooth_sigma=float(cfg.get("adaptive_time_smooth_sigma", 3.0)),
             device=device,
         )
         print(f"--> Adaptive frontier time sampling: ON "
-              f"({frontier_tracker.n_bins} bins, warmup={frontier_tracker.warmup_steps})")
+              f"({frontier_tracker.n_bins} bins, warmup={frontier_tracker.warmup_steps}, "
+              f"smooth_σ={frontier_tracker.smooth_sigma})")
     else:
         print("--> Adaptive frontier time sampling: OFF")
 
@@ -6033,6 +6074,7 @@ def train_vae_cotrained_cond(cfg):
                 floor_weight=float(cfg.get("adaptive_time_floor", 0.02)),
                 warmup_steps=int(cfg.get("adaptive_time_warmup", 500)),
                 min_counts_per_bin=int(cfg.get("adaptive_time_min_counts", 5)),
+                smooth_sigma=float(cfg.get("adaptive_time_smooth_sigma", 3.0)),
                 device=device,
             )
             print("--> Frontier tracker re-initialized for refinement phase")
