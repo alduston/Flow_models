@@ -6734,7 +6734,7 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 5e-4,
+        "t_min": 1e-4,
         "t_max": 3.5,
         "num_train_timesteps": 1200,
         "train_on_mu": False,
@@ -6794,7 +6794,7 @@ def main():
         "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
-        "decode_time": 1e-3,             # Decode at this t; defaults to t_min if None
+        "decode_time": 5e-4,             # Decode at this t; defaults to t_min if None
         #"snr_downweight": True,
 
         # Adaptive frontier time sampling
