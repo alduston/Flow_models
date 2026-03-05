@@ -439,7 +439,9 @@ class ReconFrontierTracker:
 
     @torch.no_grad()
     def make_adaptive_time_grid(self, N: int, device: torch.device,
-                                descending: bool = True) -> torch.Tensor:
+                                descending: bool = True,
+                                t_lo: float | None = None,
+                                t_hi: float | None = None) -> torch.Tensor:
         """Build an N+1-point time grid by inverting the frontier-weight CDF.
 
         Each interval between consecutive grid points carries equal probability
@@ -456,23 +458,33 @@ class ReconFrontierTracker:
         device : torch.device
             Target device for the returned tensor.
         descending : bool
-            If True (default, OU/cosine), grid runs t_max -> t_min.
-            If False (flow matching), grid runs t_min -> t_max.
+            If True (default, OU/cosine), grid runs high -> low.
+            If False (flow matching), grid runs low -> high.
+        t_lo : float | None
+            Lower bound of the sub-interval (defaults to tracker's t_min).
+        t_hi : float | None
+            Upper bound of the sub-interval (defaults to tracker's t_max).
+            When t_lo/t_hi are set, the CDF is restricted to [t_lo, t_hi]
+            so that grid points only fall within the requested range while
+            still respecting the adaptive weight profile.
 
         Returns
         -------
         Tensor of shape [N+1] — adaptive time grid.
         """
+        t_lo = float(t_lo if t_lo is not None else self.t_min)
+        t_hi = float(t_hi if t_hi is not None else self.t_max)
+
         if not self.is_active:
-            # Fallback: log-uniform grid
+            # Fallback: log-uniform grid over the (possibly restricted) interval
             if descending:
                 return torch.logspace(
-                    math.log10(self.t_max), math.log10(self.t_min),
+                    math.log10(t_hi), math.log10(t_lo),
                     N + 1, device=device,
                 )
             else:
                 return torch.logspace(
-                    math.log10(self.t_min), math.log10(self.t_max),
+                    math.log10(t_lo), math.log10(t_hi),
                     N + 1, device=device,
                 )
 
@@ -488,25 +500,48 @@ class ReconFrontierTracker:
 
         log_edges = torch.log(self.bin_edges)                   # [n_bins+1]
 
-        # Query quantiles: N+1 equally-spaced values in [0, 1]
-        quantiles = torch.linspace(0.0, 1.0, N + 1, device=self.device)
+        # --- Restrict to [t_lo, t_hi] sub-interval ---
+        # Find CDF values at the sub-interval endpoints via linear interp
+        log_t_lo = math.log(max(t_lo, self.t_min))
+        log_t_hi = math.log(min(t_hi, self.t_max))
+
+        def _interp_cdf(log_t_val):
+            """Linearly interpolate the CDF at a single log-t value."""
+            idx = torch.searchsorted(log_edges, torch.tensor(log_t_val, device=self.device))
+            idx = idx.clamp(1, self.n_bins)
+            lo_e = log_edges[idx - 1]; hi_e = log_edges[idx]
+            frac = (log_t_val - lo_e) / (hi_e - lo_e + 1e-12)
+            frac = float(frac.clamp(0.0, 1.0))
+            return float(cdf_edges[idx - 1]) + frac * float(cdf_edges[idx] - cdf_edges[idx - 1])
+
+        cdf_lo = _interp_cdf(log_t_lo)
+        cdf_hi = _interp_cdf(log_t_hi)
+
+        # Query quantiles: N+1 equally-spaced values in [cdf_lo, cdf_hi]
+        if cdf_hi - cdf_lo < 1e-12:
+            # Degenerate: no weight in this interval — fall back to log-uniform
+            if descending:
+                return torch.logspace(math.log10(t_hi), math.log10(t_lo), N + 1, device=device)
+            else:
+                return torch.logspace(math.log10(t_lo), math.log10(t_hi), N + 1, device=device)
+
+        quantiles = torch.linspace(cdf_lo, cdf_hi, N + 1, device=self.device)
 
         # Invert CDF via searchsorted + linear interpolation
-        # searchsorted gives the first index where cdf_edges >= quantile
         idx = torch.searchsorted(cdf_edges, quantiles).clamp(1, self.n_bins)
         # Linear interp within each bin
-        cdf_lo = cdf_edges[idx - 1]
-        cdf_hi = cdf_edges[idx]
-        log_t_lo = log_edges[idx - 1]
-        log_t_hi = log_edges[idx]
-        frac = (quantiles - cdf_lo) / (cdf_hi - cdf_lo + 1e-12)
+        cdf_lo_vec = cdf_edges[idx - 1]
+        cdf_hi_vec = cdf_edges[idx]
+        log_t_lo_vec = log_edges[idx - 1]
+        log_t_hi_vec = log_edges[idx]
+        frac = (quantiles - cdf_lo_vec) / (cdf_hi_vec - cdf_lo_vec + 1e-12)
         frac = frac.clamp(0.0, 1.0)
-        log_t_grid = log_t_lo + frac * (log_t_hi - log_t_lo)
+        log_t_grid = log_t_lo_vec + frac * (log_t_hi_vec - log_t_lo_vec)
 
-        t_grid = torch.exp(log_t_grid).clamp(self.t_min, self.t_max)
+        t_grid = torch.exp(log_t_grid).clamp(t_lo, t_hi)
 
         if descending:
-            t_grid = t_grid.flip(0)                             # t_max -> t_min
+            t_grid = t_grid.flip(0)                             # high -> low
 
         return t_grid.to(device)
 
@@ -1713,6 +1748,7 @@ def plot_reverse_trajectory_grid(
     cfg_scale: float = 3.0,
     class_label: int = 0,
     t_values: list[float] | None = None,
+    frontier_tracker=None,
 ):
     """Viz IV: Reverse-trajectory D(z_t, t) grid.
 
@@ -1774,6 +1810,7 @@ def plot_reverse_trajectory_grid(
                 schedule_type=cfg.get("time_schedule", "log_snr"),
                 cosine_s=cfg.get("cosine_s", 0.008),
                 readout_mode="direct",  # keep raw z for chaining
+                frontier_tracker=frontier_tracker,
             )
             z, _ = sampler.sample(unet, x_init=z, y=y_batch, cfg_scale=cfg_scale)
 
@@ -3150,6 +3187,7 @@ class UniversalSampler:
             descending = self.schedule_type not in ("flow", "flow_matching")
             return self.frontier_tracker.make_adaptive_time_grid(
                 self.num_steps, device, descending=descending,
+                t_lo=self.t_min, t_hi=self.t_max,
             )
 
         if self.schedule_type in ("flow", "flow_matching"):
@@ -4027,6 +4065,7 @@ def evaluate_current_state(
             num_rows=5, num_cols=6, t_upper=1.0, t_values = [.01, .05, .2, .5, 1, 2],
             steps_per_leg=10, cfg_scale=3.0,
             class_label=_traj_label,
+            frontier_tracker=frontier_tracker,
         )
 
     # -----------------------------------------------------------------------
@@ -6541,7 +6580,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 1,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
