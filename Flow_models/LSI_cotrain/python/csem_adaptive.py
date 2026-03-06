@@ -261,19 +261,99 @@ def make_beta_schedule(
 
 
 
+def canonicalize_time_schedule(schedule: Any, default: str = "log_snr") -> str:
+    """Normalize user-facing schedule names to the internal canonical names."""
+    if schedule is None:
+        schedule = default
+    s = str(schedule).strip().lower()
+    aliases = {
+        "logt": "log_t",
+        "log_t": "log_t",
+        "log-uniform": "log_t",
+        "log_uniform": "log_t",
+        "loguniform": "log_t",
+        "snr": "log_snr",
+        "logsnr": "log_snr",
+        "log_snr": "log_snr",
+        "linear": "linear",
+        "lin": "linear",
+        "linear_t": "linear",
+        "t_linear": "linear",
+        "flowmatching": "flow_matching",
+        "flow_matching": "flow_matching",
+        "frontier": "frontier",
+        "adaptive": "frontier",
+    }
+    return aliases.get(s, s)
+
+
+def canonicalize_init_mode(init_mode: Any, default: str = "prior") -> str:
+    """Normalize sampler initialization mode names."""
+    if init_mode is None:
+        init_mode = default
+    s = str(init_mode).strip().lower()
+    if s in ("prior", "gaussian", "gauss", "normal"):
+        return "prior"
+    if s in ("oracle", "orcale"):
+        return "oracle"
+    raise ValueError(f"Unknown init_mode={init_mode!r}. Expected 'prior' or 'oracle'.")
+
+
+def get_alpha_sigma_for_schedule(
+    t: torch.Tensor,
+    schedule_type: str = "log_snr",
+    cosine_s: float = 0.008,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return (alpha, sigma) for the requested schedule family at time t."""
+    stype = canonicalize_time_schedule(schedule_type, default="log_snr")
+    if stype == "frontier":
+        raise ValueError("'frontier' is a discretization strategy, not a diffusion family.")
+    if stype in ("flow", "flow_matching"):
+        return get_flow_params(t)
+    if stype == "cosine":
+        a, s, _ = get_cosine_params(t, cosine_s=cosine_s)
+        return a, s
+    return get_ou_params(t)
+
+
+def sample_forward_latent_from_z0(
+    z0: torch.Tensor,
+    t_value: float,
+    schedule_type: str = "log_snr",
+    cosine_s: float = 0.008,
+    noise: torch.Tensor | None = None,
+    generator=None,
+) -> torch.Tensor:
+    """Sample z_t ~ q(z_t | z_0) for the requested schedule family."""
+    if noise is None:
+        if generator is None:
+            noise = torch.randn_like(z0)
+        else:
+            noise = torch.randn(z0.shape, device=z0.device, dtype=z0.dtype, generator=generator)
+    t = torch.full((z0.shape[0], 1, 1, 1), float(t_value), device=z0.device, dtype=z0.dtype)
+    alpha, sigma = get_alpha_sigma_for_schedule(t, schedule_type=schedule_type, cosine_s=cosine_s)
+    return alpha * z0 + sigma * noise
+
+
+def _format_sampler_float_tag(x: float) -> str:
+    s = f"{float(x):.4g}"
+    return s.replace("-", "m").replace(".", "p")
+
+
 def make_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
     """Build a unified discrete schedule of T timesteps.
 
     Config key ``time_schedule`` selects the grid type:
-      - "flow"    : linear flow-matching interpolant on [0,1] (alpha=t, sigma=1-t)
-      - "log_t"   : OU process, grid log-uniform in OU time  (legacy)
-      - "log_snr" : OU process, grid uniform in log-SNR
-      - "cosine"  : VP-cosine process (Nichol & Dhariwal), grid uniform in [0,1]
+      - "flow" / "flow_matching" : linear flow-matching interpolant on [0,1] (alpha=t, sigma=1-t)
+      - "linear"                  : OU process, grid uniform in OU time
+      - "log_t"                   : OU process, grid log-uniform in OU time  (legacy)
+      - "log_snr"                 : OU process, grid uniform in log-SNR
+      - "cosine"                  : VP-cosine process (Nichol & Dhariwal), grid uniform in [0,1]
 
     Returns dict with keys:
         T, times, alpha, sigma, beta, schedule_type, cosine_s
     """
-    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+    stype = canonicalize_time_schedule(cfg.get("time_schedule", "log_snr"), default="log_snr")
     T = int(cfg.get("num_train_timesteps", 1000))
 
     if stype in ("flow", "flow_matching"):
@@ -293,11 +373,13 @@ def make_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.
             "schedule_type": stype, "cosine_s": 0.0,
         }
 
-    if stype in ("log_t", "log_snr"):
+    if stype in ("linear", "log_t", "log_snr"):
         t_min = float(cfg.get("t_min", 2e-5))
         t_max = float(cfg.get("t_max", 2.0))
 
-        if stype == "log_t":
+        if stype == "linear":
+            times = torch.linspace(t_min, t_max, T, device=device, dtype=torch.float32)
+        elif stype == "log_t":
             times = torch.logspace(
                 math.log10(t_min), math.log10(t_max), T,
                 device=device, dtype=torch.float32,
@@ -337,7 +419,7 @@ def make_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.
             "schedule_type": stype, "cosine_s": cosine_s,
         }
 
-    raise ValueError(f"Unknown time_schedule: {stype!r}. Expected 'flow', 'log_t', 'log_snr', or 'cosine'.")
+    raise ValueError(f"Unknown time_schedule: {stype!r}. Expected 'flow', 'flow_matching', 'linear', 'log_t', 'log_snr', or 'cosine'.")
 
 
 # Keep legacy alias
@@ -2757,7 +2839,7 @@ class TimeCondPatchDiscriminator(nn.Module):
         schedule_type: str = "log_t",
     ):
         super().__init__()
-        self.schedule_type = str(schedule_type).lower()
+        self.schedule_type = canonicalize_time_schedule(schedule_type, default="log_snr")
         self.time_emb_dim = int(time_emb_dim)
 
         # Time embedding (match decoder's log-SNR base embedding)
@@ -3344,7 +3426,7 @@ class UniversalSampler:
         self.t_min = float(t_min)
         self.t_max = float(t_max)
         self.method = str(method).lower()
-        self.schedule_type = str(schedule_type).lower()
+        self.schedule_type = canonicalize_time_schedule(schedule_type, default="log_snr")
         self.cosine_s = float(cosine_s)
         self.frontier_tracker = frontier_tracker
 
@@ -3381,7 +3463,7 @@ class UniversalSampler:
         if self.schedule_type == "cosine":
             a, s, _ = get_cosine_params(t_vec, cosine_s=self.cosine_s)
             return a, s
-        # log_t or log_snr — both use OU params
+        # linear / log_t / log_snr — all use OU params
         return get_ou_params(t_vec)
 
     def _get_beta(self, t_vec: torch.Tensor) -> torch.Tensor:
@@ -3422,6 +3504,8 @@ class UniversalSampler:
             lam_grid = torch.linspace(lam_min_val, lam_max_val, N, device=device, dtype=torch.float64)
             times = ou_time_from_logsnr(lam_grid).float()
             return times.clamp(self.t_min, self.t_max)
+        if self.schedule_type == "linear":
+            return torch.linspace(self.t_max, self.t_min, N, device=device)
         # log_t
         return torch.logspace(math.log10(self.t_max), math.log10(self.t_min), N, device=device)
 
@@ -4336,6 +4420,68 @@ def evaluate_current_state(
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4 cond-readout)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True, "readout_mode": "conditional"},
     ])
 
+    def _resolve_sampler_eval_settings(scfg_local: Dict[str, Any]) -> Dict[str, Any]:
+        requested_schedule_raw = scfg_local.get("time_schedule", scfg_local.get("schedule", None))
+        requested_schedule = None if requested_schedule_raw is None else canonicalize_time_schedule(
+            requested_schedule_raw,
+            default=cfg.get("time_schedule", "log_snr"),
+        )
+        use_frontier_grid = requested_schedule == "frontier"
+        if use_frontier_grid:
+            if frontier_tracker is None or not getattr(frontier_tracker, "is_active", False):
+                raise ValueError("Sampler config requested time_schedule='frontier' but no active frontier_tracker is available.")
+            resolved_schedule = canonicalize_time_schedule(cfg.get("time_schedule", "log_snr"), default="log_snr")
+        elif requested_schedule is None:
+            resolved_schedule = canonicalize_time_schedule(cfg.get("time_schedule", "log_snr"), default="log_snr")
+        else:
+            resolved_schedule = requested_schedule
+
+        default_t_min = cfg.get("cosine_t_min", 2e-4) if resolved_schedule == "cosine" else cfg["t_min"]
+        default_t_max = cfg.get("cosine_t_max", 0.9999) if resolved_schedule == "cosine" else cfg["t_max"]
+
+        t_min_val = float(scfg_local.get(
+            "t_min",
+            scfg_local.get("terminal_time", scfg_local.get("t_terminal", default_t_min))
+        ))
+        t_max_val = float(scfg_local.get(
+            "t_max",
+            scfg_local.get("initial_time", scfg_local.get("t_init", scfg_local.get("T_init", scfg_local.get("T_max", default_t_max))))
+        ))
+        if not (t_min_val < t_max_val):
+            raise ValueError(f"Expected sampler t_min < t_max, got t_min={t_min_val}, t_max={t_max_val} for config {scfg_local!r}")
+
+        init_mode = canonicalize_init_mode(
+            scfg_local.get("init_mode", scfg_local.get("terminal_mode", scfg_local.get("into_mode", "prior"))),
+            default="prior",
+        )
+
+        has_overrides = (
+            requested_schedule is not None
+            or ("t_min" in scfg_local) or ("terminal_time" in scfg_local) or ("t_terminal" in scfg_local)
+            or ("t_max" in scfg_local) or ("initial_time" in scfg_local) or ("t_init" in scfg_local) or ("T_init" in scfg_local) or ("T_max" in scfg_local)
+            or ("init_mode" in scfg_local) or ("terminal_mode" in scfg_local) or ("into_mode" in scfg_local)
+        )
+
+        schedule_label = requested_schedule if requested_schedule is not None else resolved_schedule
+        extra_suffix = ""
+        if has_overrides and scfg_local.get("method") != "VAE_Rec_eps":
+            extra_suffix += f"_sched{schedule_label}"
+            if abs(t_min_val - float(default_t_min)) > 1e-12 or abs(t_max_val - float(default_t_max)) > 1e-12:
+                extra_suffix += f"_T{_format_sampler_float_tag(t_max_val)}_t{_format_sampler_float_tag(t_min_val)}"
+            if init_mode != "prior":
+                extra_suffix += f"_{init_mode}"
+
+        return {
+            "requested_schedule": requested_schedule,
+            "schedule_type": resolved_schedule,
+            "t_min": t_min_val,
+            "t_max": t_max_val,
+            "init_mode": init_mode,
+            "frontier_tracker": frontier_tracker if use_frontier_grid else None,
+            "extra_suffix": extra_suffix,
+        }
+
+
     results = []
 
     # -----------------------------------------------------------------------
@@ -4370,11 +4516,12 @@ def evaluate_current_state(
         cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
         use_oracle = bool(scfg.get("use_oracle", False))
         readout_mode = str(scfg.get("readout_mode", "direct"))
+        sampler_eval_settings = _resolve_sampler_eval_settings(scfg)
 
         # Choose which score model to sample with
         score_model = oracle_model if use_oracle else unet
 
-        # Build suffix for naming - include cfg_level and readout_mode if present
+        # Build suffix for naming - include cfg_level / readout_mode / schedule overrides if present
         oracle_tag = "_oracle" if use_oracle else ""
         readout_tag = f"_{readout_mode}" if readout_mode != "direct" else ""
         if use_rand_token:
@@ -4384,6 +4531,7 @@ def evaluate_current_state(
                 config_suffix = f"_randtok{readout_tag}{oracle_tag}"
         else:
             config_suffix = f"{readout_tag}{oracle_tag}"
+        config_suffix = f"{config_suffix}{sampler_eval_settings['extra_suffix']}"
         config_name = f"{method}@{steps}{config_suffix}"
 
         if torch.cuda.is_available():
@@ -4411,20 +4559,24 @@ def evaluate_current_state(
                 sampler_kwargs = dict(
                     method=method,
                     num_steps=steps,
-                    t_min=cfg["t_min"],
-                    t_max=cfg["t_max"],
-                    schedule_type=cfg.get("time_schedule", "log_snr"),
+                    t_min=sampler_eval_settings["t_min"],
+                    t_max=sampler_eval_settings["t_max"],
+                    schedule_type=sampler_eval_settings["schedule_type"],
                     cosine_s=cfg.get("cosine_s", 0.008),
                     readout_mode=readout_mode,
-                    frontier_tracker=frontier_tracker,
+                    frontier_tracker=sampler_eval_settings["frontier_tracker"],
                 )
-                # For cosine schedule, override t_min/t_max with cosine fraction endpoints
-                if cfg.get("time_schedule", "log_snr") == "cosine":
-                    sampler_kwargs["t_min"] = cfg.get("cosine_t_min", 2e-4)
-                    sampler_kwargs["t_max"] = cfg.get("cosine_t_max", 0.9999)
                 if method == "ddim":
+                    schedule_cfg_local = dict(cfg)
+                    schedule_cfg_local["time_schedule"] = sampler_eval_settings["schedule_type"]
+                    if sampler_eval_settings["schedule_type"] == "cosine":
+                        schedule_cfg_local["cosine_t_min"] = sampler_eval_settings["t_min"]
+                        schedule_cfg_local["cosine_t_max"] = sampler_eval_settings["t_max"]
+                    else:
+                        schedule_cfg_local["t_min"] = sampler_eval_settings["t_min"]
+                        schedule_cfg_local["t_max"] = sampler_eval_settings["t_max"]
                     sampler_kwargs.update(
-                        schedule_cfg=cfg,
+                        schedule_cfg=schedule_cfg_local,
                         ddim_eta=float(cfg.get("ddim_eta", 0.0)),
                     )
                 sampler = UniversalSampler(**sampler_kwargs)
@@ -4438,7 +4590,21 @@ def evaluate_current_state(
                         y_batch = rand_token_bank_all[i:i + batch_sz].to(device)
 
                     g_scale = cfg_level if use_rand_token and cfg_level is not None else None
-                    if noise_bank_all is not None:
+
+                    if sampler_eval_settings["init_mode"] == "oracle":
+                        z0_batch = real_latents_A[i:i + batch_sz].to(device)
+                        noise_batch = None
+                        if noise_bank_all is not None:
+                            noise_batch = noise_bank_all[i:i + batch_sz].to(device)
+                        x_init = sample_forward_latent_from_z0(
+                            z0_batch,
+                            t_value=sampler_eval_settings["t_max"],
+                            schedule_type=sampler_eval_settings["schedule_type"],
+                            cosine_s=cfg.get("cosine_s", 0.008),
+                            noise=noise_batch,
+                        )
+                        z_gen, readout_t = sampler.sample(score_model, x_init=x_init, y=y_batch, cfg_scale=g_scale)
+                    elif noise_bank_all is not None:
                         xT = noise_bank_all[i:i + batch_sz].to(device)
                         z_gen, readout_t = sampler.sample(score_model, x_init=xT, y=y_batch, cfg_scale=g_scale)
                     else:
@@ -4489,6 +4655,10 @@ def evaluate_current_state(
             "lsi_gap": lsi_gap,
             "mse_gap_eps": mse_gap_eps if not use_oracle else 0.0,
             "mse_gap_score": mse_gap_score if not use_oracle else 0.0,
+            "time_schedule": sampler_eval_settings["schedule_type"] if method != "VAE_Rec_eps" else None,
+            "t_min": sampler_eval_settings["t_min"] if method != "VAE_Rec_eps" else None,
+            "t_max": sampler_eval_settings["t_max"] if method != "VAE_Rec_eps" else None,
+            "init_mode": sampler_eval_settings["init_mode"] if method != "VAE_Rec_eps" else None,
         })
 
         # Save sample panels for the main sweep
