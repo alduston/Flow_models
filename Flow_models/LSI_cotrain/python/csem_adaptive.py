@@ -7,16 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/16nK1DP3YcQzWikyH5Gmif8XXzWICtY51
 """
 
-! pip install lpips
-! pip install torchmetrics
-! pip install torch-fidelity
-
-
-
-! pip install lpips
-! pip install torchmetrics
-! pip install torch-fidelity
-
 
 # -*- coding: utf-8 -*-
 # csem_fldit.ipynb — CSEM co-training for latent diffusion models
@@ -4513,6 +4503,7 @@ def evaluate_current_state(
 
     # Fixed random token bank: used when sampler config has use_rand_token=True
     rand_token_bank_all = None
+    oracle_latent_source_idx_all = None
     if cfg.get("num_classes", None) is not None:
         num_classes = int(cfg["num_classes"])
         # Use an independent CPU RNG so this bank is stable and does not depend on global seeding state.
@@ -4523,6 +4514,34 @@ def evaluate_current_state(
             low=0, high=num_classes, size=(target_count,), generator=g_tok, dtype=torch.long
         )
         rand_token_bank_all = rand_token_bank_all[sample_indices]
+
+        # For oracle init under CFG / random-token sampling, pre-assign each output slot
+        # a real posterior latent whose class label matches the conditioning label.
+        # This avoids label/init mismatches such as diffusing a dog latent while sampling
+        # with a ship label.
+        g_oracle = torch.Generator(device="cpu")
+        g_oracle.manual_seed(int(cfg.get("seed", 0)) + 2718)
+        class_to_real_idx = {}
+        class_offsets = {}
+        for cls in range(num_classes):
+            cls_idx = torch.nonzero(real_labels == cls, as_tuple=False).view(-1).cpu()
+            if cls_idx.numel() > 0:
+                perm = torch.randperm(cls_idx.numel(), generator=g_oracle)
+                class_to_real_idx[cls] = cls_idx[perm]
+                class_offsets[cls] = 0
+
+        oracle_latent_source_idx_all = torch.empty(target_count, dtype=torch.long)
+        for j in range(target_count):
+            cls = int(rand_token_bank_all[j].item())
+            if cls not in class_to_real_idx:
+                raise ValueError(
+                    f"Oracle init requested class {cls}, but no real examples of that class "
+                    f"exist in the evaluation subset (target_count={target_count})."
+                )
+            pool = class_to_real_idx[cls]
+            ptr = class_offsets[cls]
+            oracle_latent_source_idx_all[j] = pool[ptr % pool.numel()]
+            class_offsets[cls] = ptr + 1
 
     # -----------------------------------------------------------------------
     # Unconditional evaluation sweep
@@ -4614,7 +4633,13 @@ def evaluate_current_state(
                     g_scale = cfg_level if use_rand_token and cfg_level is not None else None
 
                     if sampler_eval_settings["init_mode"] == "oracle":
-                        z0_batch = real_latents_A[i:i + batch_sz].to(device)
+                        if use_rand_token and y_batch is not None:
+                            if oracle_latent_source_idx_all is None:
+                                raise ValueError("oracle init with use_rand_token=True requires oracle_latent_source_idx_all")
+                            src_idx_batch = oracle_latent_source_idx_all[i:i + batch_sz]
+                            z0_batch = real_latents_A[src_idx_batch].to(device)
+                        else:
+                            z0_batch = real_latents_A[i:i + batch_sz].to(device)
                         noise_batch = None
                         if noise_bank_all is not None:
                             noise_batch = noise_bank_all[i:i + batch_sz].to(device)
@@ -7024,7 +7049,7 @@ def main():
 
         # --- Misc ---
         "seed": 42,
-        "load_from_checkpoint": True,
+        "load_from_checkpoint": False,
         "ckpt_dir": "checkpoints",
 
         # --- Comparison Output ---
