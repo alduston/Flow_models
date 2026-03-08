@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -4405,7 +4407,7 @@ def evaluate_current_state(
             vae, encoder_mus, encoder_logvars, real_imgs,
             cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_decoder_grid_ep{epoch_idx}.png"),
-            num_rows=6, num_cols=8, t_upper=1.0, t_values = [.001, .02, .06, .2, .4, .8, 1.6, 2.4],
+            num_rows=6, num_cols=8, t_upper=1.0, t_values = [.01, .1, .25, ..5, .75, 1.0 , 1.5, 1.98],
             unet=unet,
             real_labels=real_labels,
         )
@@ -4420,7 +4422,8 @@ def evaluate_current_state(
         plot_reverse_trajectory_grid(
             vae, unet, cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_reverse_traj_ep{epoch_idx}.png"),
-            num_rows=6, num_cols=8, t_upper=1.0, t_values = [.001, .02, .06, .2, .4, .8, 1.6, 2.4],
+            num_rows=6, num_cols=8, t_upper=1.0, t_values = [.01, .1, .25, ..5, .75, 1.0 , 1.5, 1.98],
+            unet=unet,,
             steps_per_leg=10, cfg_scale=cfg_eval_scale,
             class_label=_traj_labels,
             frontier_tracker=frontier_tracker,
@@ -7000,7 +7003,7 @@ def main():
         "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-2,
+        "kl_w": 1e-3,
         "perc_w": 0.85,
         "lpips_mode": "frontier",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
 
@@ -7085,7 +7088,7 @@ def main():
         "gan_time_weight": "frontier",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
-        "decode_time": 1e-3,             # Decode at this t; defaults to t_min if None
+        "decode_time": 2e-4,             # Decode at this t; defaults to t_min if None
         #"snr_downweight": True,
 
         # Adaptive frontier time sampling
@@ -7098,7 +7101,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
@@ -7172,3 +7175,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
