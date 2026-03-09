@@ -4779,14 +4779,11 @@ def evaluate_current_state(
             #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                  #"init_mode": "oracle", "t_max": 2.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct"},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.0, "readout_mode": "direct", "cfg_mode": "linear_ramp"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 #"init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 2.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.0, "readout_mode": "direct", "cfg_mode": "constant"},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                  "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                  "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct","cfg_mode": "constant" },
-            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4 cond-readout)", "use_rand_token": True, "cfg_level": 3.0, "readout_mode": "conditional"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
     configs.extend([
@@ -7403,7 +7400,7 @@ def main():
 
         # --- Misc ---
         "seed": 42,
-        "load_from_checkpoint": True,
+        "load_from_checkpoint": False,
         "ckpt_dir": "checkpoints",
 
         # --- Comparison Output ---
