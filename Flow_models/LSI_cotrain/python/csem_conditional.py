@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -274,6 +272,25 @@ def canonicalize_init_mode(init_mode: Any, default: str = "prior") -> str:
     if s in ("oracle", "orcale"):
         return "oracle"
     raise ValueError(f"Unknown init_mode={init_mode!r}. Expected 'prior' or 'oracle'.")
+
+
+def canonicalize_cfg_mode(cfg_mode: Any, default: str = "constant") -> str:
+    """Normalize classifier-free guidance schedule mode names."""
+    if cfg_mode is None:
+        cfg_mode = default
+    s = str(cfg_mode).strip().lower()
+    aliases = {
+        "const": "constant",
+        "constant": "constant",
+        "linear-ramp": "linear_ramp",
+        "linear_ramp": "linear_ramp",
+        "linearramp": "linear_ramp",
+        "ramp": "linear_ramp",
+    }
+    out = aliases.get(s, s)
+    if out not in ("constant", "linear_ramp"):
+        raise ValueError(f"Unknown cfg_mode={cfg_mode!r}. Expected 'constant' or 'linear_ramp'.")
+    return out
 
 
 def get_alpha_sigma_for_schedule(
@@ -2006,7 +2023,7 @@ def plot_decoder_output_grid(
     plt.close(fig)
     print(f"    Saved decoder-output grid → {save_path}")
 
-
+'''
 def plot_reverse_trajectory_grid(
     vae,
     unet,
@@ -2154,6 +2171,297 @@ def plot_reverse_trajectory_grid(
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"    Saved reverse-trajectory grid → {save_path}")
+'''
+
+
+
+def plot_reverse_trajectory_grid(
+    vae,
+    unet,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    save_path: str,
+    num_rows: int = 5,
+    num_cols: int = 5,
+    t_upper: float = 1.0,
+    steps_per_leg: int = 10,
+    cfg_scale: float = 3.0,
+    class_label: int | list[int] | None = None,
+    t_values: list[float] | None = None,
+    frontier_tracker=None,
+    save_movie: bool = False,
+):
+    """Viz IV: Reverse-trajectory D(z_t, t) grid.
+
+    Each row is an independent noise seed integrated backwards via RK4.
+    Columns correspond to snapshot times in strictly descending order.
+
+    If save_movie=True, decodes every internal sampler step, saves PNG frames,
+    and writes a movie at steps_per_leg fps.
+    """
+    if unet is None:
+        print("    [plot_reverse_trajectory_grid] No score net — skipping.")
+        return
+
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from PIL import Image as _PILImage
+
+    vae.eval()
+    unet.eval()
+
+    t_min = float(cfg["t_min"])
+    t_max = float(cfg["t_max"])
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+    mse_mode = str(cfg.get("mse_mode", "raw")).lower()
+    use_tweedie = mse_mode in ("score", "score_detached")
+
+    # ------------------------------------------------------------------
+    # Resolve snapshot times and FORCE strictly descending order
+    # ------------------------------------------------------------------
+    if t_values is None:
+        t_stops = np.logspace(np.log10(t_upper), np.log10(t_min), num_cols).tolist()
+    else:
+        # Keep only values inside [t_min, t_max], unique them, then sort descending
+        t_stops = [float(t) for t in t_values if t_min <= float(t) <= t_max]
+        if len(t_stops) == 0:
+            raise ValueError("No t_values remain after clipping to [t_min, t_max].")
+        t_stops = sorted(set(t_stops), reverse=True)
+
+    num_cols = len(t_stops)
+
+    # Legs must also be strictly descending
+    legs = []
+    current_t = t_max
+    for t_stop in t_stops:
+        if t_stop >= current_t:
+            continue
+        legs.append((current_t, t_stop))
+        current_t = t_stop
+
+    if len(legs) == 0:
+        raise ValueError("No valid descending legs could be constructed.")
+
+    # ------------------------------------------------------------------
+    # Initial noise
+    # ------------------------------------------------------------------
+    img_size = cfg.get("img_size", 32)
+    latent_spatial = img_size // 4
+    latent_shape = (num_rows, int(cfg["latent_channels"]), latent_spatial, latent_spatial)
+    z = torch.randn(latent_shape, device=device)
+
+    # ------------------------------------------------------------------
+    # Resolve per-row class labels
+    # ------------------------------------------------------------------
+    num_classes = int(cfg.get("num_classes", 10))
+    if class_label is None:
+        row_labels = [int(i * num_classes / num_rows) % num_classes for i in range(num_rows)]
+    elif isinstance(class_label, (list, tuple)):
+        row_labels = [int(class_label[i % len(class_label)]) for i in range(num_rows)]
+    else:
+        row_labels = [int(class_label)] * num_rows
+    y_batch = torch.tensor(row_labels, device=device, dtype=torch.long)
+
+    snapshots = []
+
+    save_root, _ = os.path.splitext(save_path)
+    frames_dir = f"{save_root}_frames"
+    movie_path = f"{save_root}.mp4"
+    gif_path = f"{save_root}.gif"
+    frame_paths = []
+
+    def _decode_for_viz(z_raw: torch.Tensor, t_scalar: float) -> torch.Tensor:
+        t_vec = torch.full((num_rows,), float(t_scalar), device=device, dtype=z_raw.dtype)
+        if use_tweedie:
+            z_dec = _conditional_tweedie_readout(
+                unet, z_raw, t_vec, y_batch,
+                schedule_type=stype,
+                cosine_s=float(cfg.get("cosine_s", 0.008)),
+            )
+        else:
+            z_dec = z_raw
+        decoded = vae.decode(z_dec, t=t_vec, y=y_batch).cpu()
+        return decoded
+
+    def _step_sampler_once(sampler, x, t_curr, t_next):
+        if sampler.method == "ddim":
+            return sampler.step_ddim(
+                x, t_curr=t_curr, t_next=t_next, unet=unet,
+                y=y_batch, cfg_scale=cfg_scale, generator=None,
+            )
+        elif sampler.method == "rk4_ode":
+            return sampler.step_rk4_ode(x, t_curr, t_next, unet, y=y_batch, cfg_scale=cfg_scale)
+        elif sampler.method == "euler_ode":
+            return sampler.step_euler_ode(x, t_curr, t_next, unet, y=y_batch, cfg_scale=cfg_scale)
+        elif sampler.method == "heun_ode":
+            return sampler.step_heun_ode(x, t_curr, t_next, unet, y=y_batch, cfg_scale=cfg_scale)
+        elif sampler.method == "heun_sde":
+            return sampler.step_heun_sde(x, t_curr, t_next, unet, y=y_batch, cfg_scale=cfg_scale, generator=None)
+        elif sampler.method == "exp_euler_ode":
+            return sampler.step_exp_euler_ode(x, t_curr, t_next, unet, y=y_batch, cfg_scale=cfg_scale)
+        elif sampler.method == "exp_heun_ode":
+            return sampler.step_exp_heun_ode(x, t_curr, t_next, unet, y=y_batch, cfg_scale=cfg_scale)
+        else:
+            raise ValueError(f"Unknown sampling method: {sampler.method}")
+
+    def _save_movie_frame(decoded_batch: torch.Tensor, t_value: float, frame_idx: int) -> str:
+        ensure_dir(frames_dir)
+        frame_path = os.path.join(frames_dir, f"frame_{frame_idx:04d}_t_{float(t_value):.6f}.png")
+
+        tv_utils.save_image(
+            (decoded_batch + 1) / 2,
+            frame_path,
+            nrow=1,
+            padding=2,
+            pad_value=0.5,
+        )
+
+        fig, ax = plt.subplots(1, 1, figsize=(2.4, 2.0 * num_rows))
+        img = _PILImage.open(frame_path)
+        ax.imshow(img)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        h = img.height
+        cell_h = h / num_rows
+
+        ax.text(
+            img.width * 0.5, 4, f"t={float(t_value):.4g}",
+            ha="center", va="top",
+            fontsize=10, color="white",
+            bbox=dict(facecolor="black", alpha=0.65, pad=1),
+        )
+        for ri, yl in enumerate(row_labels):
+            ax.text(
+                4, cell_h * (ri + 0.5), f"y={yl}",
+                ha="left", va="center",
+                fontsize=8, color="white", rotation=90,
+                bbox=dict(facecolor="black", alpha=0.6, pad=1),
+            )
+
+        fig.tight_layout(pad=0.3)
+        fig.savefig(frame_path, dpi=150)
+        plt.close(fig)
+        return frame_path
+
+    with torch.no_grad():
+        frame_idx = 0
+
+        # Optional initial frame at t_max
+        if save_movie:
+            decoded0 = _decode_for_viz(z, t_max)
+            frame_paths.append(_save_movie_frame(decoded0, t_max, frame_idx))
+            frame_idx += 1
+
+        for (t_from, t_to) in legs:
+            sampler = UniversalSampler(
+                method="rk4_ode",
+                num_steps=steps_per_leg,
+                t_min=t_to,
+                t_max=t_from,
+                schedule_type=cfg.get("time_schedule", "log_snr"),
+                cosine_s=cfg.get("cosine_s", 0.008),
+                readout_mode="direct",
+                frontier_tracker=frontier_tracker,
+                cfg_mode=cfg.get("cfg_mode", "constant"),
+            )
+
+            ts = sampler._make_time_grid(device)
+
+            # Safety: enforce descending order inside each leg too
+            ts_list = [float(t.item()) for t in ts]
+            if any(ts_list[i + 1] >= ts_list[i] for i in range(len(ts_list) - 1)):
+                raise RuntimeError(f"Sampler time grid is not strictly descending: {ts_list}")
+
+            for step_i in range(sampler.num_steps):
+                t_curr = ts[step_i]
+                t_next = ts[step_i + 1]
+                z = _step_sampler_once(sampler, z, t_curr, t_next)
+
+                if save_movie:
+                    decoded_step = _decode_for_viz(z, float(t_next.item()))
+                    frame_paths.append(_save_movie_frame(decoded_step, float(t_next.item()), frame_idx))
+                    frame_idx += 1
+
+            decoded_leg_end = _decode_for_viz(z, t_to)
+            snapshots.append(decoded_leg_end)
+
+    # ------------------------------------------------------------------
+    # Static endpoint grid
+    # ------------------------------------------------------------------
+    grid_imgs = []
+    for row_i in range(num_rows):
+        for col_j in range(len(snapshots)):
+            grid_imgs.append(snapshots[col_j][row_i])
+    grid_tensor = torch.stack(grid_imgs, dim=0)
+
+    tv_utils.save_image(
+        (grid_tensor + 1) / 2, save_path,
+        nrow=len(snapshots), padding=2, pad_value=0.5,
+    )
+
+    fig, ax = plt.subplots(1, 1, figsize=(2.0 * len(snapshots), 2.0 * num_rows))
+    img = _PILImage.open(save_path)
+    ax.imshow(img)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    col_labels = [f"t={tv:.3g}" for tv in t_stops[:len(snapshots)]]
+    w = img.width
+    h = img.height
+    cell_w = w / len(snapshots)
+    cell_h = h / num_rows
+
+    for ci, lbl in enumerate(col_labels):
+        ax.text(
+            cell_w * (ci + 0.5), 4, lbl,
+            ha="center", va="top",
+            fontsize=8, color="white",
+            bbox=dict(facecolor="black", alpha=0.6, pad=1),
+        )
+
+    for ri, yl in enumerate(row_labels):
+        ax.text(
+            4, cell_h * (ri + 0.5), f"y={yl}",
+            ha="left", va="center",
+            fontsize=8, color="white", rotation=90,
+            bbox=dict(facecolor="black", alpha=0.6, pad=1),
+        )
+
+    fig.tight_layout(pad=0.3)
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"    Saved reverse-trajectory grid → {save_path}")
+
+    # ------------------------------------------------------------------
+    # Movie
+    # ------------------------------------------------------------------
+    if save_movie and len(frame_paths) > 0:
+        fps = max(1, int(steps_per_leg))
+        try:
+            import imageio.v2 as imageio
+            frames_np = [np.asarray(_PILImage.open(fp).convert("RGB")) for fp in frame_paths]
+            imageio.mimsave(movie_path, frames_np, fps=fps)
+            print(f"    Saved reverse-trajectory movie → {movie_path}")
+            print(f"    Saved per-step frames → {frames_dir}")
+        except Exception as e_mp4:
+            try:
+                frames_pil = [_PILImage.open(fp).convert("P", palette=_PILImage.ADAPTIVE) for fp in frame_paths]
+                duration_ms = int(round(1000.0 / fps))
+                frames_pil[0].save(
+                    gif_path,
+                    save_all=True,
+                    append_images=frames_pil[1:],
+                    duration=duration_ms,
+                    loop=0,
+                )
+                print(f"    Warning: mp4 write failed ({e_mp4}). Saved GIF instead → {gif_path}")
+                print(f"    Saved per-step frames → {frames_dir}")
+            except Exception as e_gif:
+                print(f"    Warning: failed to save movie. mp4 error: {e_mp4}; gif error: {e_gif}")
+                print(f"    Per-step frames were still saved → {frames_dir}")
+
 
 
 # ── VAE ───────────────────────────────────────────────────────────────
@@ -3119,8 +3427,6 @@ class ResBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-
-
 class RMSNorm(nn.Module):
     """RMSNorm with learnable scale (LightningDiT style)."""
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -3453,6 +3759,7 @@ class UniversalSampler:
         readout_mode: str = "direct",
         frontier_tracker: "ReconFrontierTracker | None" = None,
         init_mode: str = "prior",
+        cfg_mode: str = "constant",
     ):
         self.num_steps = int(num_steps)
         self.t_min = float(t_min)
@@ -3462,6 +3769,7 @@ class UniversalSampler:
         self.cosine_s = float(cosine_s)
         self.frontier_tracker = frontier_tracker
         self.init_mode = canonicalize_init_mode(init_mode, default="prior")
+        self.cfg_mode = canonicalize_cfg_mode(cfg_mode, default="constant")
 
         # --- Composed-decoder readout mode ---
         # Controls how z_t at the final integration step is converted to the
@@ -3542,34 +3850,48 @@ class UniversalSampler:
         # log_t
         return torch.logspace(math.log10(self.t_max), math.log10(self.t_min), N, device=device)
 
-    @staticmethod
+    def _resolve_cfg_scale(self, cfg_scale: float | None, t_vec: torch.Tensor) -> torch.Tensor | None:
+        """Return the effective per-sample CFG scale at time ``t_vec``."""
+        if cfg_scale is None:
+            return None
+
+        cfg_scale_val = float(cfg_scale)
+        if self.cfg_mode == "constant":
+            return torch.full_like(t_vec, cfg_scale_val)
+
+        denom = max(self.t_max - self.t_min, 1e-12)
+        ramp = ((t_vec - self.t_min) / denom).clamp(0.0, 1.0)
+        return 1.0 + (cfg_scale_val - 1.0) * ramp
+
     def _predict_eps(
+        self,
         unet,
         x: torch.Tensor,
         t_vec: torch.Tensor,
         y: torch.Tensor | None = None,
         cfg_scale: float | None = None,
     ) -> torch.Tensor:
-        """Classifier-Free Guidance in eps-parameterization."""
+        """Classifier-Free Guidance in eps-parameterization, with optional time-varying CFG."""
         if cfg_scale is None or cfg_scale <= 0.0 or y is None:
             return unet(x, t_vec, y)
 
-        # unconditional branch uses y=None (UNetModel maps to null label internally)
+        cfg_scale_t = self._resolve_cfg_scale(cfg_scale, t_vec)
         eps_uncond = unet(x, t_vec, None)
         eps_cond = unet(x, t_vec, y)
-        return eps_uncond + float(cfg_scale) * (eps_cond - eps_uncond)
+        cfg_scale_t = cfg_scale_t.view(-1, *([1] * (x.ndim - 1)))
+        return eps_uncond + cfg_scale_t * (eps_cond - eps_uncond)
 
     # ---------- factored-head helpers (exponential integrator) ----------
 
-    @staticmethod
     def _predict_components(
+        self,
         unet,
         x: torch.Tensor,
         t_vec: torch.Tensor,
         y: torch.Tensor | None = None,
         cfg_scale: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Predict (eps, lam, nu) from a factored-head model, with optional CFG.
+        """Predict (eps, lam, nu) from a factored-head model, with optional time-varying CFG.
 
         Requires unet.factored_head == True.  The CFG combination is exact
         because eps = lam * z - nu is bilinear in (lam, nu) for fixed z.
@@ -3584,12 +3906,13 @@ class UniversalSampler:
         if cfg_scale is None or cfg_scale <= 0.0 or y is None:
             return unet(x, t_vec, y, return_components=True)
 
+        cfg_scale_t = self._resolve_cfg_scale(cfg_scale, t_vec)
         eps_u, lam_u, nu_u = unet(x, t_vec, None, return_components=True)
         eps_c, lam_c, nu_c = unet(x, t_vec, y, return_components=True)
-        w = float(cfg_scale)
-        eps = eps_u + w * (eps_c - eps_u)
-        lam = lam_u + w * (lam_c - lam_u)
-        nu = nu_u + w * (nu_c - nu_u)
+        cfg_scale_t = cfg_scale_t.view(-1, *([1] * (x.ndim - 1)))
+        eps = eps_u + cfg_scale_t * (eps_c - eps_u)
+        lam = lam_u + cfg_scale_t * (lam_c - lam_u)
+        nu = nu_u + cfg_scale_t * (nu_c - nu_u)
         return eps, lam, nu
 
     @staticmethod
@@ -4286,6 +4609,7 @@ def evaluate_current_state(
         )
     real_features = real_features.to(device)
 
+    '''
     lsi_gap_unet = compute_lsi_gap(
         unet,
         encoder_mus,
@@ -4298,6 +4622,7 @@ def evaluate_current_state(
         num_time_points=50,
         batch_size=bs,
     )
+    '''
 
     # -----------------------------------------------------------------------
     # Oracle score model (exact CSEM over full training set)
@@ -4312,6 +4637,7 @@ def evaluate_current_state(
         ref_chunk_size=4096,
     )
 
+    '''
     lsi_gap_oracle = compute_lsi_gap(
         oracle_model,
         encoder_mus,
@@ -4343,6 +4669,10 @@ def evaluate_current_state(
     )
     print(f"  MSE gap (score-space, uncond) = {mse_gap_eps:.6f}")
     mse_gap_score = mse_gap_eps  # single pass in score space
+    '''
+
+    mse_gap_eps = mse_gap_score = lsi_gap_unet = lsi_gap_oracle = 0.0
+
 
     # -----------------------------------------------------------------------
     # Set up per-epoch eval directory
@@ -4352,7 +4682,8 @@ def evaluate_current_state(
         eval_dir = os.path.join(results_dir, "evals", f"eval_{epoch_idx}")
         os.makedirs(eval_dir, exist_ok=True)
 
-    # -----------------------------------------------------------------------
+  
+    # ----------------------------------------------------------------------
     # Viz I: Reconstruction error vs t (log-log)
     # -----------------------------------------------------------------------
     if eval_dir is not None:
@@ -4397,6 +4728,7 @@ def evaluate_current_state(
             save_path=os.path.join(eval_dir, f"{prefix}_mse_gap_by_t_ep{epoch_idx}.png"),
             cache_key=prefix,
         )
+  
 
     # -----------------------------------------------------------------------
     # Viz IV: D(z_t, t) decoder output grid
@@ -4407,7 +4739,7 @@ def evaluate_current_state(
             vae, encoder_mus, encoder_logvars, real_imgs,
             cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_decoder_grid_ep{epoch_idx}.png"),
-            num_rows=6, num_cols=8, t_upper=1.0, t_values = [.01, .1, .25, ..5, .75, 1.0 , 1.5, 1.98],
+            num_rows=6, num_cols=8, t_upper=1.0, t_values = [.001, .02, .06, .2, .4, .8, 1.6, 2.4],
             unet=unet,
             real_labels=real_labels,
         )
@@ -4422,11 +4754,11 @@ def evaluate_current_state(
         plot_reverse_trajectory_grid(
             vae, unet, cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_reverse_traj_ep{epoch_idx}.png"),
-            num_rows=6, num_cols=8, t_upper=1.0, t_values = [.01, .1, .25, ..5, .75, 1.0 , 1.5, 1.98],
-            unet=unet,,
-            steps_per_leg=10, cfg_scale=cfg_eval_scale,
+            num_rows=6, num_cols=8, t_upper=2.45, t_values = [.001, .02, .06, .2, .4, .8, 1.6, 2.4],
+            steps_per_leg=10, cfg_scale=1.0, #cfg_eval_scale,
             class_label=_traj_labels,
             frontier_tracker=frontier_tracker,
+            save_movie=True,
         )
 
     # -----------------------------------------------------------------------
@@ -4444,9 +4776,15 @@ def evaluate_current_state(
             #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
             #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
             #{"method": "heun_sde",  "steps": 100, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "readout_mode": "direct"},
-            {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.95, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct"},
-
+            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 #"init_mode": "oracle", "t_max": 2.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct"},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.0, "readout_mode": "direct", "cfg_mode": "linear_ramp"},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 2.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
+             
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4 cond-readout)", "use_rand_token": True, "cfg_level": 3.0, "readout_mode": "conditional"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
@@ -4455,10 +4793,12 @@ def evaluate_current_state(
         #{"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 1.5, "use_oracle": True},
         #{"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
         #{"method": "rk4_ode", "steps":25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True, "readout_mode": "direct"},
-        {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.95, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
-        {"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "oracle", "t_max": 1.95, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
+        {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 "init_mode": "prior", "t_max": 1.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True, "cfg_mode": "linear_ramp"},
+        {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 "init_mode": "prior", "t_max": 1.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
+        #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 #"init_mode": "oracle", "t_max": 2.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
     ])
 
     def _resolve_sampler_eval_settings(scfg_local: Dict[str, Any]) -> Dict[str, Any]:
@@ -4554,6 +4894,7 @@ def evaluate_current_state(
         desc = scfg.get("desc", "")
         use_rand_token = bool(scfg.get("use_rand_token", False))
         cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
+        cfg_mode = canonicalize_cfg_mode(scfg.get("cfg_mode", cfg.get("cfg_mode", "constant")), default="constant")
         use_oracle = bool(scfg.get("use_oracle", False))
         readout_mode = str(scfg.get("readout_mode", "direct"))
         sampler_eval_settings = _resolve_sampler_eval_settings(scfg)
@@ -4564,13 +4905,14 @@ def evaluate_current_state(
         # Build suffix for naming - include cfg_level and readout_mode if present
         oracle_tag = "_oracle" if use_oracle else ""
         readout_tag = f"_{readout_mode}" if readout_mode != "direct" else ""
+        cfg_mode_tag = f"_{cfg_mode}" if cfg_mode != "constant" else ""
         if use_rand_token:
             if cfg_level is not None:
-                config_suffix = f"_randtok_cfg{cfg_level}{readout_tag}{oracle_tag}"
+                config_suffix = f"_randtok_cfg{cfg_level}{cfg_mode_tag}{readout_tag}{oracle_tag}"
             else:
-                config_suffix = f"_randtok{readout_tag}{oracle_tag}"
+                config_suffix = f"_randtok{cfg_mode_tag}{readout_tag}{oracle_tag}"
         else:
-            config_suffix = f"{readout_tag}{oracle_tag}"
+            config_suffix = f"{cfg_mode_tag}{readout_tag}{oracle_tag}"
         config_suffix += sampler_eval_settings["extra_suffix"]
         config_name = f"{method}@{steps}{config_suffix}"
 
@@ -4607,6 +4949,7 @@ def evaluate_current_state(
                     readout_mode=readout_mode,
                     frontier_tracker=sampler_eval_settings["frontier_tracker"],
                     init_mode=sampler_eval_settings["init_mode"],
+                    cfg_mode=cfg_mode,
                 )
                 if method == "ddim":
                     schedule_cfg_local = dict(cfg)
@@ -4701,6 +5044,7 @@ def evaluate_current_state(
             "t_min": sampler_eval_settings["t_min"] if method != "VAE_Rec_eps" else None,
             "t_max": sampler_eval_settings["t_max"] if method != "VAE_Rec_eps" else None,
             "init_mode": sampler_eval_settings["init_mode"] if method != "VAE_Rec_eps" else None,
+            "cfg_mode": cfg_mode if method != "VAE_Rec_eps" else None,
         })
 
         # Save sample panels for the main sweep
@@ -4770,9 +5114,10 @@ def evaluate_current_state(
         eval_class_labels = [int(eval_class_labels)]
 
     cfg_eval_scale = float(cfg.get("cfg_eval_scale", 3.0))
+    cond_cfg_mode = canonicalize_cfg_mode(cfg.get("cfg_mode", "constant"), default="constant")
 
     if unet is not None and eval_class_labels:
-        print(f"  Conditional eval on labels: {list(eval_class_labels)} (CFG scale={cfg_eval_scale:g})")
+        print(f"  Conditional eval on labels: {list(eval_class_labels)} (CFG scale={cfg_eval_scale:g}, cfg_mode={cond_cfg_mode})")
         noise_bank_all = None
         if fixed_noise_bank is not None:
             noise_bank_all = fixed_noise_bank[sample_indices]
@@ -4881,8 +5226,13 @@ def evaluate_current_state(
             # ---------------------------------------------------------------
             for method, steps, desc in [("heun_ode", 20, "Baseline (Heun)"), ("rk4_ode", 10, "Smoothness (RK4)")]:
                 for g_scale in [0.0, cfg_eval_scale]:
-                    tag = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
-                    mode = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
+                    if g_scale <= 0.0:
+                        tag = "cond"
+                        mode = "cond"
+                    else:
+                        cfg_mode_suffix = f"_{cond_cfg_mode}" if cond_cfg_mode != "constant" else ""
+                        tag = f"cfg{g_scale:g}{cfg_mode_suffix}"
+                        mode = f"cfg{g_scale:g}{cfg_mode_suffix}"
 
                     sampler_kwargs_cond = dict(
                         method=method,
@@ -4893,6 +5243,7 @@ def evaluate_current_state(
                         cosine_s=cfg.get("cosine_s", 0.008),
                         readout_mode="direct",  # Conditional eval uses direct readout by default
                         frontier_tracker=frontier_tracker,
+                        cfg_mode=cond_cfg_mode,
                     )
                     if cfg.get("time_schedule", "log_snr") == "cosine":
                         sampler_kwargs_cond["t_min"] = cfg.get("cosine_t_min", 2e-4)
@@ -6999,11 +7350,11 @@ def main():
         "attn_zero_init": False,         # [7] standard init on VAE attention
 
         # --- Learning Rates ---
-        "lr_vae": 2.5e-4,
-        "lr_ldm": 1e-4,
+        "lr_vae": 5e-4,
+        "lr_ldm": 2e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-3,
+        "kl_w": 1e-4,
         "perc_w": 0.85,
         "lpips_mode": "frontier",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
 
@@ -7027,7 +7378,7 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 2e-4,
+        "t_min": 2e-5,
         "t_max": 2.0,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
@@ -7040,6 +7391,7 @@ def main():
         # --- CFG ---
         "cfg_label_dropout": 0.1,
         "cfg_eval_scale": 3.0,
+        "cfg_mode": "linear_ramp",   # "constant" or "linear_ramp"
         "eval_class_labels": [],
         "class_decoder": True,
 
@@ -7050,7 +7402,7 @@ def main():
 
         # --- Misc ---
         "seed": 42,
-        "load_from_checkpoint": False,
+        "load_from_checkpoint": True,
         "ckpt_dir": "checkpoints",
 
         # --- Comparison Output ---
@@ -7088,7 +7440,7 @@ def main():
         "gan_time_weight": "frontier",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
-        "decode_time": 2e-4,             # Decode at this t; defaults to t_min if None
+        "decode_time": 1e-4,             # Decode at this t; defaults to t_min if None
         #"snr_downweight": True,
 
         # Adaptive frontier time sampling
@@ -7101,7 +7453,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
@@ -7175,4 +7527,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
