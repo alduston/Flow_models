@@ -4784,7 +4784,8 @@ def evaluate_current_state(
                  #"init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 2.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                  "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
-             
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct","cfg_mode": "constant" },
             #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4 cond-readout)", "use_rand_token": True, "cfg_level": 3.0, "readout_mode": "conditional"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
@@ -4794,9 +4795,9 @@ def evaluate_current_state(
         #{"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
         #{"method": "rk4_ode", "steps":25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True, "readout_mode": "direct"},
         {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True, "cfg_mode": "linear_ramp"},
-        {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True, "cfg_mode": "linear_ramp"},
+        #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 #"init_mode": "prior", "t_max": 1.98, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
         #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                  #"init_mode": "oracle", "t_max": 2.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
     ])
