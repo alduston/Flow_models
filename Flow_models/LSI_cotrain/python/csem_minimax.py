@@ -7363,7 +7363,7 @@ def main():
         # --- KL and perceptual weights ---
         "kl_w": 1e-4,
         "perc_w": 0.85,
-        "lpips_mode": "frontier",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
+        "lpips_mode": "uniform",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
 
         # --- Frontier-gated perceptual loss settings (used when lpips_mode="frontier" or gan_time_weight="frontier") ---
         "frontier_R_cutoff": 0.05,    # R(t) threshold: LPIPS/GAN gated off where R(t) > cutoff
@@ -7380,7 +7380,7 @@ def main():
         "disc_n_layers": 2,
         "lr_disc": 1e-4,
         "gan_logit_clamp": 10.0,            # Clamp D logits in G loss to prevent divergence
-        "gan_time_weight": "frontier",  # "uniform", "frontier", "gamma", "snr", or "snr2"
+        "gan_time_weight": "uniform",  # "uniform", "frontier", "gamma", "snr", or "snr2"
 
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
@@ -7444,9 +7444,9 @@ def main():
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
         # Time-dependent decoder (TDD)
-        "time_cond_decoder": True,
+        "time_cond_decoder": False,
         "time_dependent_gan": False,
-        "gan_time_weight": "frontier",  # "uniform", "gamma", "snr", or "snr2"
+        "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
         "decode_time": 1e-4,             # Decode at this t; defaults to t_min if None
