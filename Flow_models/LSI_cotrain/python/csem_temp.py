@@ -7457,11 +7457,11 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 2.5e-5,
-        "t_max": 2.5,
+        "t_min": 2.0e-5,
+        "t_max": 2.0,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
-        "temporal_variance_scale": 0.3,
+        "temporal_variance_scale": 0.0,
         "temporal_perturb_type": "log",  # "base" perturbs t, "log" perturbs log(t)
 
         # --- Cosine VP schedule settings (only used when time_schedule="cosine") ---
@@ -7534,7 +7534,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 10 epochs during cotrain
+        "eval_freq_cotrain": 100,    # Eval every 10 epochs during cotrain
         "eval_freq_refine": 100,     # Eval every 10 epochs during refine
     })
 
