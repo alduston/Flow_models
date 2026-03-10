@@ -2023,158 +2023,6 @@ def plot_decoder_output_grid(
     plt.close(fig)
     print(f"    Saved decoder-output grid → {save_path}")
 
-'''
-def plot_reverse_trajectory_grid(
-    vae,
-    unet,
-    cfg: Dict[str, Any],
-    device: torch.device,
-    save_path: str,
-    num_rows: int = 5,
-    num_cols: int = 5,
-    t_upper: float = 1.0,
-    steps_per_leg: int = 10,
-    cfg_scale: float = 3.0,
-    class_label: int | list[int] | None = None,
-    t_values: list[float] | None = None,
-    frontier_tracker=None,
-):
-    """Viz IV: Reverse-trajectory D(z_t, t) grid.
-
-    Each row is an independent noise seed integrated backwards via RK4.
-    Columns correspond to ``num_cols`` log-uniform t values from
-    ``t_upper`` down to ``t_min``.
-
-    class_label behaviour:
-      - int:        all rows use that single class.
-      - list[int]:  rows cycle through the given labels.
-      - None:       rows are assigned ``num_rows`` evenly-spaced classes
-                    from [0, num_classes), giving maximal visual diversity.
-
-    Integration is split into sub-intervals of ``steps_per_leg`` RK4 steps
-    each, with the output of one leg fed as ``x_init`` for the next.
-
-    When mse_mode is 'score' or 'score_detached', the decoder was trained on
-    Tweedie-denoised z_hat_0, not raw z_t.  In that case we apply a
-    single-model conditional Tweedie readout at each snapshot before decoding,
-    while keeping raw z for continued ODE integration.
-    """
-    if unet is None:
-        print("    [plot_reverse_trajectory_grid] No score net — skipping.")
-        return
-
-    vae.eval()
-    unet.eval()
-
-    t_min = float(cfg["t_min"])
-    t_max = float(cfg["t_max"])
-    stype = str(cfg.get("time_schedule", "log_snr")).lower()
-    mse_mode = str(cfg.get("mse_mode", "raw")).lower()
-    use_tweedie = mse_mode in ("score", "score_detached")
-
-    # Log-uniform snapshot times from t_upper down to t_min
-    if t_values is None:
-      t_stops = np.logspace(np.log10(t_upper), np.log10(t_min), num_cols).tolist()
-    else:
-      t_stops = t_values
-
-    # Full leg list: first go from t_max → t_stops[0], then between consecutive stops
-    legs = [(t_max, t_stops[0])]
-    for i in range(len(t_stops) - 1):
-        legs.append((t_stops[i], t_stops[i + 1]))
-
-    # Draw initial noise
-    img_size = cfg.get("img_size", 32)
-    latent_spatial = img_size // 4
-    latent_shape = (num_rows, int(cfg["latent_channels"]), latent_spatial, latent_spatial)
-    z = torch.randn(latent_shape, device=device)
-
-    # --- Resolve per-row class labels ---
-    num_classes = int(cfg.get("num_classes", 10))
-    if class_label is None:
-        # Evenly space across available classes for visual diversity
-        row_labels = [int(i * num_classes / num_rows) % num_classes
-                      for i in range(num_rows)]
-    elif isinstance(class_label, (list, tuple)):
-        row_labels = [int(class_label[i % len(class_label)])
-                      for i in range(num_rows)]
-    else:
-        row_labels = [int(class_label)] * num_rows
-    y_batch = torch.tensor(row_labels, device=device, dtype=torch.long)
-
-    # Collect decoded snapshots at each t_stop
-    snapshots = []  # list of [num_rows, C, H, W] tensors (CPU)
-
-    with torch.no_grad():
-        for leg_idx, (t_from, t_to) in enumerate(legs):
-            sampler = UniversalSampler(
-                method="rk4_ode",
-                num_steps=steps_per_leg,
-                t_min=t_to,
-                t_max=t_from,
-                schedule_type=cfg.get("time_schedule", "log_snr"),
-                cosine_s=cfg.get("cosine_s", 0.008),
-                readout_mode="direct",  # keep raw z for chaining
-                frontier_tracker=frontier_tracker,
-            )
-            z, _ = sampler.sample(unet, x_init=z, y=y_batch, cfg_scale=cfg_scale)
-
-            # Conditional Tweedie readout for visualization when decoder
-            # was trained on z_hat_0 (mse_mode='score'/'score_detached')
-            if use_tweedie:
-                t_vec = torch.full((num_rows,), t_to, device=device)
-                z_dec = _conditional_tweedie_readout(
-                    unet, z, t_vec, y_batch,
-                    schedule_type=stype,
-                    cosine_s=float(cfg.get("cosine_s", 0.008)),
-                )
-            else:
-                z_dec = z
-
-            # Decode at this t_stop
-            t_dec = torch.full((num_rows,), t_to, device=device)
-            decoded = vae.decode(z_dec, t=t_dec, y=y_batch).cpu()
-            snapshots.append(decoded)
-
-    # Build grid: rows = noise seeds, cols = t-stops (t_upper → t_min)
-    grid_imgs = []
-    for row_i in range(num_rows):
-        for col_j in range(num_cols):
-            grid_imgs.append(snapshots[col_j][row_i])
-    grid_tensor = torch.stack(grid_imgs, dim=0)
-
-    tv_utils.save_image(
-        (grid_tensor + 1) / 2, save_path,
-        nrow=num_cols, padding=2, pad_value=0.5,
-    )
-
-    # Annotate with t-labels via matplotlib
-    fig, ax = plt.subplots(1, 1, figsize=(2.0 * num_cols, 2.0 * num_rows))
-    from PIL import Image as _PILImage
-    img = _PILImage.open(save_path)
-    ax.imshow(img)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    col_labels = [f"t={tv:.3g}" for tv in t_stops]
-    w = img.width; h = img.height
-    cell_w = w / num_cols; cell_h = h / num_rows
-    for ci, lbl in enumerate(col_labels):
-        ax.text(cell_w * (ci + 0.5), 4, lbl, ha="center", va="top",
-                fontsize=8, color="white",
-                bbox=dict(facecolor="black", alpha=0.6, pad=1))
-    # Row labels: class index for each row
-    for ri, yl in enumerate(row_labels):
-        ax.text(4, cell_h * (ri + 0.5), f"y={yl}", ha="left", va="center",
-                fontsize=8, color="white", rotation=90,
-                bbox=dict(facecolor="black", alpha=0.6, pad=1))
-    fig.tight_layout(pad=0.3)
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-    print(f"    Saved reverse-trajectory grid → {save_path}")
-'''
-
-
-
 def plot_reverse_trajectory_grid(
     vae,
     score_model,
@@ -2195,9 +2043,23 @@ def plot_reverse_trajectory_grid(
     """Viz V: Reverse-trajectory D(z_t, t) grid.
 
     Works with either the learned score net or OracleScoreModel.
-    If plot_path_norms=True, also saves:
-        <save_root>_path_norms.png
-    showing per-row curves of ||D(z_t,t) - D(z_ref,t_ref)||_2 vs t on log-log axes.
+
+    Static grid:
+        Columns correspond to the requested snapshot times in strictly
+        descending order.
+
+    Optional path-norm plot:
+        If plot_path_norms=True, additionally saves
+            <save_root>_path_norms.png
+        showing per-row curves of
+            ||D(z_t,t) - D(z_{t_min}, t_min)||_2
+        vs t on log-log axes.
+
+    Notes:
+    - The reverse path is always traced all the way down to t_min so that
+      D(z_{t_min}, t_min) is available as the reference for the norm plot.
+    - The reference point itself is excluded from the displayed norm plot
+      to avoid the artificial log-scale plunge caused by plotting zero.
     """
     if score_model is None:
         print("    [plot_reverse_trajectory_grid] No score model — skipping.")
@@ -2219,21 +2081,30 @@ def plot_reverse_trajectory_grid(
     use_tweedie = mse_mode in ("score", "score_detached")
 
     # ------------------------------------------------------------------
-    # Resolve snapshot times and force strictly descending order
+    # Resolve snapshot times for the static grid (descending)
     # ------------------------------------------------------------------
     if t_values is None:
-        t_stops = np.logspace(np.log10(t_upper), np.log10(t_min), num_cols).tolist()
+        upper = min(float(t_upper), t_max)
+        if upper <= t_min:
+            raise ValueError(f"t_upper={t_upper} must exceed t_min={t_min}.")
+        snapshot_t_stops = np.logspace(np.log10(upper), np.log10(t_min), num_cols).tolist()
     else:
-        t_stops = [float(t) for t in t_values if t_min <= float(t) <= t_max]
-        if len(t_stops) == 0:
+        snapshot_t_stops = [float(t) for t in t_values if t_min <= float(t) <= t_max]
+        if len(snapshot_t_stops) == 0:
             raise ValueError("No t_values remain after clipping to [t_min, t_max].")
-        t_stops = sorted(set(t_stops), reverse=True)
+        snapshot_t_stops = sorted(set(snapshot_t_stops), reverse=True)
 
-    num_cols = len(t_stops)
+    # ------------------------------------------------------------------
+    # Trace times for the reverse path:
+    # force inclusion of t_min for the path-norm reference.
+    # Keep grid snapshots unchanged unless user explicitly included t_min.
+    # ------------------------------------------------------------------
+    trace_t_stops = sorted(set(snapshot_t_stops + [t_min]), reverse=True)
 
+    # Construct strictly descending legs
     legs = []
     current_t = t_max
-    for t_stop in t_stops:
+    for t_stop in trace_t_stops:
         if t_stop >= current_t:
             continue
         legs.append((current_t, t_stop))
@@ -2241,6 +2112,8 @@ def plot_reverse_trajectory_grid(
 
     if len(legs) == 0:
         raise ValueError("No valid descending legs could be constructed.")
+
+    snapshot_t_set = set(snapshot_t_stops)
 
     # ------------------------------------------------------------------
     # Initial noise
@@ -2262,7 +2135,10 @@ def plot_reverse_trajectory_grid(
         row_labels = [int(class_label)] * num_rows
     y_batch = torch.tensor(row_labels, device=device, dtype=torch.long)
 
-    snapshots = []
+    # ------------------------------------------------------------------
+    # Outputs / bookkeeping
+    # ------------------------------------------------------------------
+    snapshots_by_t = {}
 
     save_root, _ = os.path.splitext(save_path)
     frames_dir = f"{save_root}_frames"
@@ -2271,14 +2147,17 @@ def plot_reverse_trajectory_grid(
     path_norms_path = f"{save_root}_path_norms.png"
     frame_paths = []
 
-    path_times = []
-    path_decoded = []
+    path_times: list[float] = []
+    path_decoded: list[torch.Tensor] = []
 
     def _decode_for_viz(z_raw: torch.Tensor, t_scalar: float) -> torch.Tensor:
         t_vec = torch.full((num_rows,), float(t_scalar), device=device, dtype=z_raw.dtype)
         if use_tweedie:
             z_dec = _conditional_tweedie_readout(
-                score_model, z_raw, t_vec, y_batch,
+                score_model,
+                z_raw,
+                t_vec,
+                y_batch,
                 schedule_type=stype,
                 cosine_s=float(cfg.get("cosine_s", 0.008)),
             )
@@ -2352,6 +2231,9 @@ def plot_reverse_trajectory_grid(
         plt.close(fig)
         return frame_path
 
+    # ------------------------------------------------------------------
+    # Integrate reverse path
+    # ------------------------------------------------------------------
     with torch.no_grad():
         frame_idx = 0
 
@@ -2394,33 +2276,42 @@ def plot_reverse_trajectory_grid(
                         frame_paths.append(_save_movie_frame(decoded_step, float(t_next.item()), frame_idx))
                         frame_idx += 1
 
+            # Decode exact leg endpoint for snapshot bookkeeping
             decoded_leg_end = _decode_for_viz(z, t_to)
-            snapshots.append(decoded_leg_end)
+            if t_to in snapshot_t_set:
+                snapshots_by_t[float(t_to)] = decoded_leg_end
 
     # ------------------------------------------------------------------
-    # Static endpoint grid
+    # Static endpoint grid (requested snapshot times only)
     # ------------------------------------------------------------------
+    snapshot_times_present = [t for t in snapshot_t_stops if float(t) in snapshots_by_t]
+    if len(snapshot_times_present) == 0:
+        raise RuntimeError("No snapshot endpoints were collected for the static grid.")
+
     grid_imgs = []
     for row_i in range(num_rows):
-        for col_j in range(len(snapshots)):
-            grid_imgs.append(snapshots[col_j][row_i])
+        for t_snap in snapshot_times_present:
+            grid_imgs.append(snapshots_by_t[float(t_snap)][row_i])
     grid_tensor = torch.stack(grid_imgs, dim=0)
 
     tv_utils.save_image(
-        (grid_tensor + 1) / 2, save_path,
-        nrow=len(snapshots), padding=2, pad_value=0.5,
+        (grid_tensor + 1) / 2,
+        save_path,
+        nrow=len(snapshot_times_present),
+        padding=2,
+        pad_value=0.5,
     )
 
-    fig, ax = plt.subplots(1, 1, figsize=(2.0 * len(snapshots), 2.0 * num_rows))
+    fig, ax = plt.subplots(1, 1, figsize=(2.0 * len(snapshot_times_present), 2.0 * num_rows))
     img = _PILImage.open(save_path)
     ax.imshow(img)
     ax.set_xticks([])
     ax.set_yticks([])
 
-    col_labels = [f"t={tv:.3g}" for tv in t_stops[:len(snapshots)]]
+    col_labels = [f"t={tv:.3g}" for tv in snapshot_times_present]
     w = img.width
     h = img.height
-    cell_w = w / len(snapshots)
+    cell_w = w / len(snapshot_times_present)
     cell_h = h / num_rows
 
     for ci, lbl in enumerate(col_labels):
@@ -2445,32 +2336,54 @@ def plot_reverse_trajectory_grid(
     print(f"    Saved reverse-trajectory grid -> {save_path}")
 
     # ------------------------------------------------------------------
-    # Path norms
+    # Path norms:
+    # plot ||D(z_t,t) - D(z_{t_min}, t_min)||_2 for all traced points,
+    # excluding the final reference point itself to avoid a fake log-drop.
     # ------------------------------------------------------------------
     if plot_path_norms and len(path_decoded) >= 2:
         path_stack = torch.stack(path_decoded, dim=0)   # [K, R, C, H, W]
-        ref = path_stack[-1]                            # final decoded state on traced path
-        path_norms = (path_stack - ref.unsqueeze(0)).flatten(2).norm(dim=2).cpu().numpy()  # [K, R]
         t_arr = np.asarray(path_times, dtype=np.float64)
 
-        order = np.argsort(t_arr)  # ascending for plotting
-        t_plot = np.clip(t_arr[order], 1e-12, None)
-        norm_plot = np.clip(path_norms[order], 1e-12, None)
+        # Use final traced point as the reference; by construction this is t_min.
+        ref = path_stack[-1]  # [R, C, H, W]
 
-        fig, ax = plt.subplots(1, 1, figsize=(7.0, 4.8))
-        for ri, yl in enumerate(row_labels):
-            ax.loglog(t_plot, norm_plot[:, ri], linewidth=1.6, label=f"row {ri+1} (y={yl})")
+        path_norms = (
+            (path_stack - ref.unsqueeze(0))
+            .flatten(2)
+            .norm(dim=2)
+            .cpu()
+            .numpy()
+        )  # [K, R]
 
-        ax.set_xlabel("t")
-        ax.set_ylabel(r"$\|D(z_t,t) - D(z_{\mathrm{ref}}, t_{\mathrm{ref}})\|_2$")
-        ax.set_title("Reverse-path decoder continuity")
-        ax.grid(True, which="both", alpha=0.3)
-        ax.invert_xaxis()
-        ax.legend(fontsize=8, ncol=2)
-        fig.tight_layout()
-        fig.savefig(path_norms_path, dpi=150)
-        plt.close(fig)
-        print(f"    Saved reverse-path norm plot -> {path_norms_path}")
+        # Sort by t ascending for plotting
+        order = np.argsort(t_arr)
+        t_plot_all = t_arr[order]
+        norm_plot_all = path_norms[order]
+
+        # Exclude the reference point itself (the final t_min point).
+        ref_tol = max(1e-14, 1e-8 * t_min)
+        mask = t_plot_all > (t_min + ref_tol)
+
+        t_plot = np.clip(t_plot_all[mask], 1e-12, None)
+        norm_plot = np.clip(norm_plot_all[mask], 1e-12, None)
+
+        if len(t_plot) > 0:
+            fig, ax = plt.subplots(1, 1, figsize=(7.0, 4.8))
+            for ri, yl in enumerate(row_labels):
+                ax.loglog(t_plot, norm_plot[:, ri], linewidth=1.6, label=f"row {ri+1} (y={yl})")
+
+            ax.set_xlabel("t")
+            ax.set_ylabel(r"$\|D(z_t,t) - D(z_{t_{\min}}, t_{\min})\|_2$")
+            ax.set_title("Reverse-path decoder continuity")
+            ax.grid(True, which="both", alpha=0.3)
+            ax.invert_xaxis()
+            ax.legend(fontsize=8, ncol=2)
+            fig.tight_layout()
+            fig.savefig(path_norms_path, dpi=150)
+            plt.close(fig)
+            print(f"    Saved reverse-path norm plot -> {path_norms_path}")
+        else:
+            print("    Warning: no valid non-reference points remained for path-norm plot.")
 
     # ------------------------------------------------------------------
     # Movie
