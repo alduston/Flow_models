@@ -4645,7 +4645,7 @@ def evaluate_current_state(
         eval_dir = os.path.join(results_dir, "evals", f"eval_{epoch_idx}")
         os.makedirs(eval_dir, exist_ok=True)
 
-
+    '''
     # ----------------------------------------------------------------------
     # Viz I: Reconstruction error vs t (log-log)
     # -----------------------------------------------------------------------
@@ -4684,7 +4684,7 @@ def evaluate_current_state(
     # -----------------------------------------------------------------------
     # Viz III: MSE gap breakdown by t (log-log)
     # -----------------------------------------------------------------------
-    '''
+  
     if eval_dir is not None and unet is not None:
         print("  [Viz III] Plotting MSE gap by t (score-space) ...")
         plot_mse_gap_by_t(
@@ -4692,7 +4692,7 @@ def evaluate_current_state(
             save_path=os.path.join(eval_dir, f"{prefix}_mse_gap_by_t_ep{epoch_idx}.png"),
             cache_key=prefix,
         )
-    '''
+   
 
     # -----------------------------------------------------------------------
     # Viz IV: D(z_t, t) decoder output grid
@@ -4743,6 +4743,8 @@ def evaluate_current_state(
             save_movie=True,
             plot_path_norms=True,
         )
+    '''
+        
     # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
     # -----------------------------------------------------------------------
@@ -4760,12 +4762,12 @@ def evaluate_current_state(
             #{"method": "heun_sde",  "steps": 100, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "readout_mode": "direct"},
             #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                  #"init_mode": "oracle", "t_max": 2.45, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 #"init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.0, "readout_mode": "direct",},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-5, "cfg_level": 1.0, "readout_mode": "direct",},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct"},
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-5, "cfg_level": 3.0, "readout_mode": "direct","cfg_mode": "linear_ramp" },
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-5, "cfg_level": 3.0, "readout_mode": "direct"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
     configs.extend([
@@ -4774,7 +4776,7 @@ def evaluate_current_state(
         #{"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True},
         #{"method": "rk4_ode", "steps":25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": 3.0, "use_oracle": True, "readout_mode": "direct"},
         {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
+                 "init_mode": "prior", "t_max": 1.98, "t_min": 1e-5, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
         #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                  #"init_mode": "prior", "t_max": 1.98, "t_min": 1e-3, "cfg_level": 3.0, "readout_mode": "direct", "use_oracle": True},
         #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
@@ -6907,7 +6909,7 @@ def train_vae_cotrained_cond(cfg):
 
 
     # ===========================================================================
-    # REFINEMENT STAGE: Freeze VAE, train only score networks
+    # REFINEMENT STAGE: Freeze encoder, train score networks + decoder
     # ===========================================================================
     epochs_refine = cfg.get("epochs_refine", 20)
     lr_refine = cfg.get("lr_refine", 1e-4)
@@ -6915,7 +6917,7 @@ def train_vae_cotrained_cond(cfg):
     if epochs_refine > 0:
         print(f"\n--> Starting Refinement Stage ({epochs_refine} epochs, lr={lr_refine})...")
 
-        # Re-initialize frontier tracker for refinement (VAE now frozen)
+        # Re-initialize frontier tracker for refinement
         if frontier_tracker is not None:
             frontier_tracker = ReconFrontierTracker(
                 t_min=float(cfg["t_min"]), t_max=float(cfg["t_max"]),
@@ -6929,20 +6931,27 @@ def train_vae_cotrained_cond(cfg):
             )
             print("--> Frontier tracker re-initialized for refinement phase")
 
-        vae.eval()
+        # Freeze the encoder, unfreeze only the decoder.
         for p in vae.parameters():
             p.requires_grad = False
+        decoder_params = []
+        for name, p in vae.named_parameters():
+            if name.startswith("dec_"):
+                p.requires_grad = True
+                decoder_params.append(p)
 
         opt_lsi_refine = optim.AdamW(unet_lsi.parameters(), lr=lr_refine, weight_decay=1e-4, betas=(0.9, float(cfg.get("adam_beta2", 0.95))))
         opt_control_refine = optim.AdamW(unet_control.parameters(), lr=lr_refine, weight_decay=1e-4, betas=(0.9, float(cfg.get("adam_beta2", 0.95))))
+        opt_dec_refine = optim.AdamW(decoder_params, lr=lr_refine, weight_decay=1e-4, betas=(0.9, float(cfg.get("adam_beta2", 0.95))))
 
         # --- Cosine LR Schedulers (refine phase) ---
         sched_lsi_refine = CosineAnnealingLR(opt_lsi_refine, T_max=epochs_refine, eta_min=1e-7)
         sched_control_refine = CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=1e-7)
+        sched_dec_refine = CosineAnnealingLR(opt_dec_refine, T_max=epochs_refine, eta_min=1e-7)
 
         for ep in range(epochs_refine):
-            unet_lsi.train(); unet_control.train()
-            metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control", "aux_lam", "aux_nu"]}
+            vae.train(); unet_lsi.train(); unet_control.train()
+            metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control", "aux_lam", "aux_nu", "recon", "perc", "gan_d", "gan_g", "div", "stiff", "tdd"]}
 
             for x, y in tqdm(train_l, desc=f"Refine Ep {ep+1}", leave=False):
                 x = x.to(device)
@@ -6959,6 +6968,11 @@ def train_vae_cotrained_cond(cfg):
                     y_in = y
 
                 use_cond_enc = bool(cfg.get("use_cond_encoder", False))
+                use_tdd = bool(cfg.get("time_cond_decoder", False))
+                use_tdd_decode = bool(cfg.get("time_cond_decode", cfg.get("time_cond_decoder", False)))
+                use_tdd_gan = use_tdd and use_tdd_decode and bool(cfg.get("time_dependent_gan", True))
+                refine_temporal_variance_scale = 0.0
+
                 with torch.no_grad():
                     mu, logvar = vae.encode(x, y=y_in if use_cond_enc else None)
                     logvar = torch.clamp(logvar, min=-30.0, max=20.0)
@@ -6992,31 +7006,37 @@ def train_vae_cotrained_cond(cfg):
 
                 noise = torch.randn_like(z0)
                 z_t = alpha * z0 + sigma * noise
+                z_t_mse = z_t
+                if refine_temporal_variance_scale > 0.0 and mse_mode == "raw":
+                    delta_t = refine_temporal_variance_scale * torch.randn_like(t)
+                    if temporal_perturb_type == "log":
+                        tau = torch.exp(torch.log(t.clamp_min(float(cfg["t_min"]))) + delta_t)
+                    else:
+                        tau = t + delta_t
+                    tau = tau.clamp(min=float(cfg["t_min"]), max=float(cfg["t_max"]))
+                    alpha_mse, sigma_mse = get_alpha_sigma_for_schedule(
+                        tau.view(B, 1, 1, 1),
+                        schedule_type=cfg.get("time_schedule", "log_snr"),
+                        cosine_s=float(cfg.get("cosine_s", 0.008)),
+                    )
+                    z_t_mse = alpha_mse * z0 + sigma_mse * noise
                 if cfg.get("train_on_mu", False):
                     z_mu_t = alpha * mu + sigma * noise
                 else:
                     z_mu_t = z_t
 
-                # --- LSI Score Training (eps-parameterization) ---
+                # --- Score Training (refine) ---
                 cos_w = float(cfg.get("cosine_w", 1.0))
                 var_0 = torch.exp(logvar)
                 mu_t = alpha * mu
                 var_t = (alpha ** 2) * var_0 + (sigma ** 2)
-
                 resid = (z_t - mu_t) / (var_t + 1e-8)
                 eps_target_lsi = sigma * resid  # E[eps | z_t, x]
 
-                # --- Oracle TDD for frontier tracker (refine: VAE frozen) ---
                 frontier_iw_refine = None
-                if frontier_tracker is not None:
-                    with torch.no_grad():
-                        x_rec_tdd = vae.decode(z_t, t, y=y_in)
-                        x_clean_tdd = vae.decode(z0, y=y_in)
-                        oracle_tdd_mse = (x_rec_tdd - x_clean_tdd).pow(2).flatten(1).mean(1)
-                        frontier_tracker.update(t.detach(), oracle_tdd_mse)
-                    if bool(cfg.get("frontier_correct_score", False)):
-                        ref = "uniform" if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching") else "log_uniform"
-                        frontier_iw_refine = frontier_tracker.importance_weights(t, reference=ref)
+                if frontier_tracker is not None and bool(cfg.get("frontier_correct_score", False)):
+                    ref = "uniform" if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching") else "log_uniform"
+                    frontier_iw_refine = frontier_tracker.importance_weights(t, reference=ref)
 
                 use_factored = bool(getattr(unet_lsi, "factored_head", False))
                 if use_factored:
@@ -7034,7 +7054,6 @@ def train_vae_cotrained_cond(cfg):
                     aux_loss_lam = torch.tensor(0.0, device=device)
                     aux_loss_nu  = torch.tensor(0.0, device=device)
 
-                # Score MSE with optional importance weighting (refine)
                 if frontier_iw_refine is not None:
                     per_sample_mse_lsi = (eps_pred_lsi - eps_target_lsi).pow(2).flatten(1).mean(1)
                     loss_mse_lsi = (frontier_iw_refine * per_sample_mse_lsi).mean()
@@ -7043,7 +7062,6 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
-                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
                     score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
 
                 opt_lsi_refine.zero_grad()
@@ -7051,12 +7069,10 @@ def train_vae_cotrained_cond(cfg):
                 nn.utils.clip_grad_norm_(unet_lsi.parameters(), 1.0)
                 opt_lsi_refine.step()
 
-                # --- EMA Update (LSI) ---
                 with torch.no_grad():
                     for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
                         p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
-                # --- Control (eps baseline) ---
                 eps_target_control = noise
                 if cfg.get("train_on_mu", False):
                     eps_pred_control = unet_control(z_mu_t, t, y_in)
@@ -7076,15 +7092,147 @@ def train_vae_cotrained_cond(cfg):
                 nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
                 opt_control_refine.step()
 
-                # --- EMA Update (Control) ---
                 with torch.no_grad():
                     for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
                         p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+
+                # --- Decoder refinement path ---
+                # Keep TDD / non-TDD behavior matched to cotrain, but fully detach the score
+                # contribution so decoder and score head do not backprop through one another.
+                if use_tdd_decode:
+                    if mse_mode in ("score", "score_detached"):
+                        z_hat_0_det = (z_t - sigma * eps_pred_lsi.detach()) / (alpha + 1e-8)
+                        x_rec = vae.decode(z_hat_0_det, t, y=y_in)
+                        x_rec_mse = x_rec
+                    else:
+                        x_rec = vae.decode(z_t, t, y=y_in)
+                        if refine_temporal_variance_scale > 0.0:
+                            x_rec_mse = vae.decode(z_t_mse, t, y=y_in)
+                        else:
+                            x_rec_mse = x_rec
+                else:
+                    x_rec = vae.decode(z0, y=y_in)
+                    x_rec_mse = x_rec
+
+                recon = decode_w * F.mse_loss(x_rec_mse, x)
+
+                # --- Oracle TDD for frontier tracker ---
+                if use_tdd_decode and frontier_tracker is not None:
+                    with torch.no_grad():
+                        x_tdd_noisy = x_rec.detach()
+                        x_tdd_clean = vae.decode(z0, y=y_in)
+                        oracle_tdd_mse = (x_tdd_noisy - x_tdd_clean).pow(2).flatten(1).mean(1)
+                        frontier_tracker.update(t.detach(), oracle_tdd_mse)
+
+                # --- Perceptual loss (LPIPS) ---
+                lpips_mode = str(cfg.get("lpips_mode", "snr")).lower()
+                if LPIPS_AVAILABLE:
+                    x_3c = x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
+                    x_rec_3c = x_rec.repeat(1, 3, 1, 1) if x_rec.shape[1] == 1 else x_rec
+                    lpips_per = lpips_fn(x_rec_3c, x_3c)
+                    lpips_per = lpips_per.view(B, -1).mean(dim=1) if lpips_per.dim() > 1 else lpips_per.view(B)
+                    if not use_tdd_decode:
+                        perc = lpips_per.mean()
+                    elif lpips_mode == "uniform":
+                        perc = lpips_per.mean()
+                    elif lpips_mode == "snr":
+                        snr_weight = (alpha.view(B, 1, 1, 1) ** 2).mean() if bool(cfg.get("snr_downeight", False)) else (alpha.view(B, 1, 1, 1) ** 2).mean()**0
+                        perc = snr_weight * lpips_per.mean()
+                    elif lpips_mode == "frontier":
+                        R_cutoff = float(cfg.get("frontier_R_cutoff", 0.05))
+                        R_tau = float(cfg.get("frontier_R_tau", 1.0))
+                        if frontier_tracker is not None and frontier_tracker.is_active:
+                            frontier_gate = frontier_tracker.perceptual_weights(t, R_cutoff=R_cutoff, temperature=R_tau)
+                            perc = (frontier_gate * lpips_per).mean()
+                        else:
+                            gamma = (alpha ** 2) / ((alpha ** 2) + (sigma ** 2) + 1e-12)
+                            gamma = gamma.view(B, -1).mean(dim=1)
+                            perc = (gamma * lpips_per).mean()
+                    else:
+                        gamma = (alpha ** 2) / ((alpha ** 2) + (sigma ** 2) + 1e-12)
+                        gamma = gamma.view(B, -1).mean(dim=1)
+                        if lpips_mode in ("gamma", "prec_mask"):
+                            perc = (gamma * lpips_per).mean()
+                        else:
+                            raise ValueError(f"Unknown lpips_mode: {lpips_mode!r}. Expected 'uniform', 'frontier', 'prec_mask', 'gamma', or 'snr'.")
+                else:
+                    perc = torch.tensor(0.0, device=device)
+
+                # --- PatchGAN adversarial loss ---
+                use_gan = gan_w_eff > 0.0 and disc is not None and (ep + 1) >= disc_start_epoch
+                if use_gan:
+                    if use_tdd_gan:
+                        with torch.no_grad():
+                            x_real = wiener_reference_x0(
+                                x,
+                                alpha,
+                                sigma,
+                                alpha_min=float(cfg.get("wiener_alpha_min", 1e-4)),
+                                max_var=float(cfg.get("wiener_max_var", 1e3)),
+                            ).clamp(-1.0, 1.0)
+
+                        logits_real = disc(x_real, t)
+                        logits_fake = disc(x_rec.detach(), t)
+                        d_loss = hinge_d_loss(logits_real, logits_fake)
+                        opt_disc.zero_grad()
+                        d_loss.backward()
+                        opt_disc.step()
+
+                        g_logits = disc(x_rec, t).clamp(-gan_logit_clamp, gan_logit_clamp)
+                        g_loss = hinge_g_loss(g_logits)
+                    else:
+                        logits_real = disc(x)
+                        logits_fake = disc(x_rec.detach())
+                        d_loss = hinge_d_loss(logits_real, logits_fake)
+                        opt_disc.zero_grad()
+                        d_loss.backward()
+                        opt_disc.step()
+                        g_logits = disc(x_rec).clamp(-gan_logit_clamp, gan_logit_clamp)
+                        g_loss = hinge_g_loss(g_logits)
+
+                    gan_time_mode = "uniform" if not use_tdd_decode else str(cfg.get("gan_time_weight", "uniform")).lower()
+                    if gan_time_mode != "uniform" and use_tdd_decode:
+                        if gan_time_mode == "frontier":
+                            R_cutoff = float(cfg.get("frontier_R_cutoff", 0.05))
+                            R_tau = float(cfg.get("frontier_R_tau", 1.0))
+                            if frontier_tracker is not None and frontier_tracker.is_active:
+                                gan_frontier_gate = frontier_tracker.perceptual_weights(t, R_cutoff=R_cutoff, temperature=R_tau)
+                                g_loss_per_sample = -g_logits.mean(dim=list(range(1, g_logits.dim())))
+                                g_loss = (gan_frontier_gate * g_loss_per_sample).mean()
+                            else:
+                                snr = (alpha ** 2) / (sigma ** 2 + 1e-12)
+                                gan_tw = snr / (snr + 1.0)
+                                g_loss = g_loss * gan_tw.view(B, -1).mean().detach()
+                        else:
+                            snr = (alpha ** 2) / (sigma ** 2 + 1e-12)
+                            if gan_time_mode == "gamma":
+                                gan_tw = snr / (snr + 1.0)
+                            elif gan_time_mode == "snr":
+                                gan_tw = snr
+                            elif gan_time_mode == "snr2":
+                                gan_tw = snr ** 2
+                            else:
+                                raise ValueError(f"Unknown gan_time_weight: {gan_time_mode!r}. Expected 'uniform', 'frontier', 'gamma', 'snr', or 'snr2'.")
+                            g_loss = g_loss * gan_tw.view(B, -1).mean().detach()
+                else:
+                    d_loss = torch.tensor(0.0, device=device)
+                    g_loss = torch.tensor(0.0, device=device)
+
+                loss_dec_refine = recon + cfg["perc_w"] * perc + gan_w_eff * g_loss
+
+                opt_dec_refine.zero_grad()
+                loss_dec_refine.backward()
+                nn.utils.clip_grad_norm_(decoder_params, 1.0)
+                opt_dec_refine.step()
 
                 metrics_refine["score_lsi"] += score_loss_lsi.item()
                 metrics_refine["score_control"] += score_loss_control.item()
                 metrics_refine["aux_lam"] += aux_loss_lam.item()
                 metrics_refine["aux_nu"] += aux_loss_nu.item()
+                metrics_refine["recon"] += recon.item()
+                metrics_refine["perc"] += perc.item()
+                metrics_refine["gan_d"] += d_loss.item()
+                metrics_refine["gan_g"] += g_loss.item()
 
             # --- Log Refinement Epoch ---
             n_batches = len(train_l)
@@ -7092,23 +7240,30 @@ def train_vae_cotrained_cond(cfg):
             epoch_metrics = {
                 "epoch": global_epoch,
                 "stage": "refine",
-                "loss": 0.0,  # No joint loss in refinement
-                "recon": 0.0,
+                "loss": 0.0,
+                "recon": metrics_refine["recon"] / n_batches,
                 "kl": 0.0,
                 "score_lsi": metrics_refine["score_lsi"] / n_batches,
                 "score_control": metrics_refine["score_control"] / n_batches,
                 "aux_lam": metrics_refine["aux_lam"] / n_batches,
                 "aux_nu": metrics_refine["aux_nu"] / n_batches,
-                "perc": 0.0,
+                "div": 0.0,
+                "perc": metrics_refine["perc"] / n_batches,
+                "stiff": 0.0,
+                "gan_d": metrics_refine["gan_d"] / n_batches,
+                "gan_g": metrics_refine["gan_g"] / n_batches,
+                "tdd": 0.0,
             }
             loss_records.append(epoch_metrics)
 
-            print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
-                  f"Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f}")
+            print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | "
+                  f"AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f} | Rec: {epoch_metrics['recon']:.4f} | "
+                  f"Perc: {epoch_metrics['perc']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f}")
 
             # --- Step cosine LR schedulers ---
             sched_lsi_refine.step()
             sched_control_refine.step()
+            sched_dec_refine.step()
 
             if (ep + 1) % eval_freq_refine == 0:
                 # For refine phase:
@@ -7172,7 +7327,6 @@ def train_vae_cotrained_cond(cfg):
                 save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
                 save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
                 save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
-
     # --- Save Checkpoints ---
     save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
     save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
@@ -7359,7 +7513,7 @@ def main():
 
         # --- Aux gauge-fix losses for factored DiT head ---
         "aux_head_w": 0.0025,
-        "div_w": -0.0008,
+        "div_w": -0.001,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
@@ -7381,7 +7535,7 @@ def main():
         "lr_ldm": 2e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-3,
+        "kl_w": 7e-4,
         "perc_w": 0.85,
         "lpips_mode": "frontier",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
 
@@ -7472,7 +7626,6 @@ def main():
         "time_dependent_gan": False,
         "lpips_mode": "uniform",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
         "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
-        #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
         "decode_time": 1e-5,             # Decode at this t; defaults to t_min if None
         #"snr_downweight": True,
@@ -7524,6 +7677,7 @@ def main():
         "time_cond_decode": False,
         "time_dependent_gan": False,
         "gan_time_weight": "uniform",
+        "lpips_mode": "uniform"
         "w_decode_time": 0.0,
 
         # Adaptive frontier time sampling — disabled for independent baseline
