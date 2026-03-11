@@ -7463,7 +7463,7 @@ def main():
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
         "time_dependent_gan": False,
-        "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
+        "gan_time_weight": "frontier",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
         "decode_time": 1e-4,             # Decode at this t; defaults to t_min if None
