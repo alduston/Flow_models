@@ -6006,7 +6006,8 @@ def train_vae_cotrained_cond(cfg):
     print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
 
     # --- Adaptive Frontier Time Sampler ---
-    use_adaptive_time = bool(cfg.get("adaptive_time", False))
+    time_cond_decode_global = bool(cfg.get("time_cond_decode", cfg.get("time_cond_decoder", False)))
+    use_adaptive_time = bool(cfg.get("adaptive_time", False)) and time_cond_decode_global
     frontier_tracker = None
     if use_adaptive_time:
         frontier_tracker = ReconFrontierTracker(
@@ -6229,7 +6230,8 @@ def train_vae_cotrained_cond(cfg):
     disc_start_epoch = int(cfg.get("disc_start_epoch", 0))
     gan_logit_clamp = float(cfg.get("gan_logit_clamp", 10.0))
     use_tdd_global = bool(cfg.get("time_cond_decoder", False))
-    use_tdd_gan_global = use_tdd_global and bool(cfg.get("time_dependent_gan", True))
+    use_tdd_decode_global = bool(cfg.get("time_cond_decode", cfg.get("time_cond_decoder", False)))
+    use_tdd_gan_global = use_tdd_global and use_tdd_decode_global and bool(cfg.get("time_dependent_gan", True))
     gan_w_eff = gan_w * (gan_w_tdd_mult if use_tdd_gan_global else 1.0)
 
     if gan_w_eff > 0.0:
@@ -6313,7 +6315,8 @@ def train_vae_cotrained_cond(cfg):
             # --- Conditional geometry correction (ResidualGaussianAdapter) ---
             use_cond_enc = bool(cfg.get("use_cond_encoder", False))
             use_tdd =  bool(cfg.get("time_cond_decoder", False))
-            use_tdd_gan = use_tdd and bool(cfg.get("time_dependent_gan", True))
+            use_tdd_decode = bool(cfg.get("time_cond_decode", cfg.get("time_cond_decoder", False)))
+            use_tdd_gan = use_tdd and use_tdd_decode and bool(cfg.get("time_dependent_gan", True))
 
             mu, logvar = vae.encode(x, y=y_in if use_cond_enc else None)
             logvar = torch.clamp(logvar, min=-30.0, max=20.0)
@@ -6326,7 +6329,7 @@ def train_vae_cotrained_cond(cfg):
                 logvar_stats.append(logvar.detach())
 
             # --- Time / forward process (BEFORE decode) ---
-            if frontier_tracker is not None and frontier_tracker.is_active:
+            if use_tdd_decode and frontier_tracker is not None and frontier_tracker.is_active:
                 # Adaptive frontier sampling
                 if use_ddim_times:
                     t_idx = frontier_tracker.sample_discrete(B, ou_sched["times"], device)
@@ -6486,38 +6489,37 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_ctrl = (1.0 - F.cosine_similarity(eps_pred_control.flatten(1), eps_target_control.flatten(1), dim=1)).mean()
                 score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
 
-            # --- Decode from z_t (or z_hat_0) with time-dependent decoder ---
-            # The decoder input is consistent across ALL losses (MSE, LPIPS, GAN).
-            # Only the gradient path through the score head differs by mode:
-            #
-            #   'raw':            D(z_t, t) everywhere.
-            #   'score':          D(z_hat_0, t) everywhere.
-            #                     Score head receives grad from MSE only (L2 info
-            #                     channel identity) — NOT from LPIPS / GAN.
-            #                     → two decoder fwd passes with different detach.
-            #   'score_detached': D(z_hat_0_det, t) everywhere.
-            #                     Score head sees no decoder gradients at all;
-            #                     trained exclusively by CSEM score distillation.
-            if mse_mode in ("score", "score_detached") and not freeze_score_in_cotrain:
-                # Detached z_hat_0 (used by LPIPS/GAN in 'score', everything in 'score_detached')
-                z_hat_0_det = (z_t - sigma * eps_pred_lsi.detach()) / (alpha + 1e-8)
+            # --- Decoder loss-evaluation path ---
+            # time_cond_decoder controls whether the decoder *can* use t.
+            # time_cond_decode controls whether recon / LPIPS / GAN are evaluated
+            # on the noisy state z_t (TDD behavior) or on the clean latent z_0.
+            if use_tdd_decode:
+                # TDD path: recon / LPIPS / GAN are evaluated on the time-t decode.
+                if mse_mode in ("score", "score_detached") and not freeze_score_in_cotrain:
+                    # Detached z_hat_0 (used by LPIPS/GAN in 'score', everything in 'score_detached')
+                    z_hat_0_det = (z_t - sigma * eps_pred_lsi.detach()) / (alpha + 1e-8)
 
-                if mse_mode == "score":
-                    # Attached path — score head feels MSE gradient only
-                    z_hat_0_att = (z_t - sigma * eps_pred_lsi) / (alpha + 1e-8)
-                    x_rec_mse = vae.decode(z_hat_0_att, t, y=y_in)
-                    # Detached path — LPIPS / GAN (decoder still gets grad, score head shielded)
-                    x_rec = vae.decode(z_hat_0_det, t, y=y_in)
-                else:  # score_detached
-                    x_rec = vae.decode(z_hat_0_det, t, y=y_in)
-                    x_rec_mse = x_rec  # same tensor, score fully detached
-            else:
-                # raw mode — no score preprocessing
-                x_rec = vae.decode(z_t, t, y=y_in)
-                if temporal_variance_scale > 0.0:
-                    x_rec_mse = vae.decode(z_t_mse, t, y=y_in)
+                    if mse_mode == "score":
+                        # Attached path — score head feels MSE gradient only
+                        z_hat_0_att = (z_t - sigma * eps_pred_lsi) / (alpha + 1e-8)
+                        x_rec_mse = vae.decode(z_hat_0_att, t, y=y_in)
+                        # Detached path — LPIPS / GAN (decoder still gets grad, score head shielded)
+                        x_rec = vae.decode(z_hat_0_det, t, y=y_in)
+                    else:  # score_detached
+                        x_rec = vae.decode(z_hat_0_det, t, y=y_in)
+                        x_rec_mse = x_rec  # same tensor, score fully detached
                 else:
-                    x_rec_mse = x_rec
+                    # raw mode — no score preprocessing
+                    x_rec = vae.decode(z_t, t, y=y_in)
+                    if temporal_variance_scale > 0.0:
+                        x_rec_mse = vae.decode(z_t_mse, t, y=y_in)
+                    else:
+                        x_rec_mse = x_rec
+            else:
+                # Non-TDD loss path: score is still trained at (z_t, t), but image losses
+                # are evaluated on the clean latent z_0.
+                x_rec = vae.decode(z0, y=y_in)
+                x_rec_mse = x_rec
 
             # --- Asymmetric MSE weighting ---
             # In 'score' mode, the MSE couples both the score head (via z_hat_0_att)
@@ -6546,7 +6548,7 @@ def train_vae_cotrained_cond(cfg):
             else:
                 stiff_pen = torch.tensor(0.0, device=device)
 
-            # --- TDD loss removed: all reconstruction losses now applied directly to D(z_t, t) ---
+            # --- TDD auxiliary loss removed ---
             tdd_loss = torch.tensor(0.0, device=device)
 
             # --- Oracle TDD for frontier tracker ---
@@ -6554,7 +6556,7 @@ def train_vae_cotrained_cond(cfg):
             #   raw mode:            D(z_t, t)       vs D(z_0, None)
             #   score/score_detached: D(z_hat_0, t)   vs D(z_0, None)
             # x_rec already reflects the correct decode for the active mse_mode.
-            if frontier_tracker is not None:
+            if use_tdd_decode and frontier_tracker is not None:
                 with torch.no_grad():
                     x_tdd_noisy = x_rec.detach()
                     x_tdd_clean = vae.decode(z0, y=y_in)  # D(z_0, y) with null-token fallback
@@ -6569,7 +6571,9 @@ def train_vae_cotrained_cond(cfg):
                 lpips_per = lpips_fn(x_rec_3c, x_3c)
                 # lpips returns [B, 1, 1, 1]; reduce to [B]
                 lpips_per = lpips_per.view(B, -1).mean(dim=1) if lpips_per.dim() > 1 else lpips_per.view(B)
-                if lpips_mode == "uniform":
+                if not use_tdd_decode:
+                    perc = lpips_per.mean()
+                elif lpips_mode == "uniform":
                     perc = lpips_per.mean()
                 elif lpips_mode == "snr":
                     # Legacy behavior: scalar SNR weight (optionally enabled by snr_downeight flag) times mean LPIPS.
@@ -6650,8 +6654,8 @@ def train_vae_cotrained_cond(cfg):
                     g_logits = disc(x_rec).clamp(-gan_logit_clamp, gan_logit_clamp)
                     g_loss = hinge_g_loss(g_logits)
                 # --- GAN generator time weighting ---
-                gan_time_mode = str(cfg.get("gan_time_weight", "uniform")).lower()
-                if gan_time_mode != "uniform" and use_tdd:
+                gan_time_mode = "uniform" if not use_tdd_decode else str(cfg.get("gan_time_weight", "uniform")).lower()
+                if gan_time_mode != "uniform" and use_tdd_decode:
                     if gan_time_mode == "frontier":
                         # Frontier-informed gating: same R(t) gate as LPIPS.
                         # Per-sample weighting: samples at high t (large R) get near-zero GAN weight.
@@ -7398,11 +7402,13 @@ def main():
         "gan_logit_clamp": 10.0,            # Clamp D logits in G loss to prevent divergence
         "gan_time_weight": "frontier",  # "uniform", "frontier", "gamma", "snr", or "snr2"
 
+        
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
         "t_min": 2.0e-5,
         "t_max": 2.0,
+
         "num_train_timesteps": 1000,
         "train_on_mu": False,
         "temporal_variance_scale": 0.0,
@@ -7461,16 +7467,18 @@ def main():
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
         # Time-dependent decoder (TDD)
-        "time_cond_decoder": True,
+        "time_cond_decoder": False,
+        "time_cond_decode": False,
         "time_dependent_gan": False,
-        "gan_time_weight": "frontier",  # "uniform", "gamma", "snr", or "snr2"
+        "lpips_mode": "uniform",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
+        "gan_time_weight": "uniform",  # "uniform", "gamma", "snr", or "snr2"
         #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
-        "decode_time": 1e-4,             # Decode at this t; defaults to t_min if None
+        "decode_time": 1e-5,             # Decode at this t; defaults to t_min if None
         #"snr_downweight": True,
 
         # Adaptive frontier time sampling
-        "adaptive_time": True,              # enable decoder-informed time weighting
+        "adaptive_time": False,              # enable decoder-informed time weighting
         "adaptive_time_nbins": 200,         # log-spaced bins over [t_min, t_max]
         "adaptive_time_ema": 0.9975,          # EMA decay for R(t) tracker
         "adaptive_time_floor": 0.02,        # minimum weight fraction (prevents starvation)
@@ -7512,7 +7520,8 @@ def main():
         "div_w": 0.0,
 
         # Time-dependent decoder (TDD) — disabled for independent baseline
-        "time_cond_decoder": True,
+        "time_cond_decoder": False,
+        "time_cond_decode": False,
         "time_dependent_gan": False,
         "gan_time_weight": "uniform",
         "w_decode_time": 0.0,
