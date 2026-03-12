@@ -6475,7 +6475,7 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
-                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
                     score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
 
                 if cfg.get("train_on_mu", False):
@@ -6756,7 +6756,7 @@ def train_vae_cotrained_cond(cfg):
                     loss_cos = (1.0 - F.cosine_similarity(eps_pred_lsi_tracking.flatten(1), eps_target_lsi_det.flatten(1), dim=1)).mean()
                     tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
                     if use_factored:
-                        #tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
+                        tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
                         tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr)
 
 
@@ -7512,7 +7512,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.0025,
+        "aux_head_w": 0.001,
         "div_w": -0.001,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
