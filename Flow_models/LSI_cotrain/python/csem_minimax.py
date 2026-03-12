@@ -7667,21 +7667,21 @@ def main():
         "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
         "use_cond_encoder": False,         # No conditional encoder
         "kl_reg_type": "temporal",           # Standard KL to N(0,I)
-        "kl_w": 1e-3,
+        "kl_w": 5e-4,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
         "div_w": 0.0,
 
         # Time-dependent decoder (TDD) — disabled for independent baseline
-        "time_cond_decoder": False,
-        "time_cond_decode": False,
+        "time_cond_decoder": True,
+        "time_cond_decode": True,
         "time_dependent_gan": False,
-        "gan_time_weight": "uniform",
-        "lpips_mode": "uniform"
+        "gan_time_weight": "frontier",
+        "lpips_mode": "frontier"
         "w_decode_time": 0.0,
 
         # Adaptive frontier time sampling — disabled for independent baseline
-        "adaptive_time": False,
+        "adaptive_time": True,
 
         # Eval frequency (no eval during VAE phase, eval during refine)
         "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
