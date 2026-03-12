@@ -6458,7 +6458,7 @@ def train_vae_cotrained_cond(cfg):
                     aux_loss_lam = F.mse_loss(lam_pred, lam_tgt)
                     aux_loss_nu  = F.mse_loss(nu_pred,  nu_tgt)
                     if div_w != 0.0:
-                        eps_safe = 1e-4
+                        eps_safe = 1e-3
                         mu_consensus = nu_pred.detach() / (lam_pred.detach() + eps_safe)
                         div_loss = F.mse_loss(mu_t, mu_consensus)
                 else:
