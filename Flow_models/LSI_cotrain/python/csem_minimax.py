@@ -1,7 +1,7 @@
 from __future__ import annotations 
 from torch._higher_order_ops import out_dtype
 import math
-import os
+import osd
 import random
 import numpy as np
 from typing import Any, Dict, Tuple
@@ -7842,7 +7842,6 @@ def main():
         "master_results_dir": "run_results_comparison",
     }
 
-
     # === CO-TRAINED CONFIG ===
     # 200 cotrain epochs (VAE + LDM joint) + 50 refine epochs = 250 LDM epochs total
     cfg_cotrain = cfg_shared.copy()
@@ -7917,7 +7916,7 @@ def main():
         "kl_w": 1e-3,
         "cotrain_head": "lsi",             # Doesn't matter when frozen
         "score_w": 1.0,
-        "div_mode": "head_ratio",
+        "div_mode": "direct",
         "div_w": 0.0,
 
         # Time-dependent decoder (TDD) — disabled for independent baseline
