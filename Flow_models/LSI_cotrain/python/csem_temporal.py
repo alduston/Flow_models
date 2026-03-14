@@ -7136,12 +7136,25 @@ def train_vae_cotrained_cond(cfg):
     cotrain_head = cfg.get("cotrain_head", "lsi")
     aux_head_w = float(cfg.get("aux_head_w", 0.05))
     div_w = float(cfg.get("div_w", -0.001))
+    w_temp = float(cfg.get("w_temp", 0.0))
     freeze_score_in_cotrain = cfg.get("freeze_score_in_cotrain", False)
     if div_w != 0.0 and div_mode in ("head_ratio", "tweedie") and not bool(getattr(unet_lsi, "factored_head", False)):
         raise ValueError(
             "div_w != 0 with div_mode in {'head_ratio', 'tweedie'} requires factored_head=True "
             "because those diversity losses use the factorized natural-parameter heads (nu / lambda)."
         )
+    if w_temp != 0.0:
+        if not bool(getattr(unet_lsi, "factored_head", False)):
+            raise ValueError(
+                "w_temp != 0 requires factored_head=True because the temporal regularity loss "
+                "uses the factorized precision head to build the stop-gradient reference rate."
+            )
+        schedule_type = canonicalize_time_schedule(cfg.get("time_schedule", "log_snr"), default="log_snr")
+        if schedule_type in ("flow", "flow_matching", "cosine"):
+            raise ValueError(
+                f"w_temp != 0 currently supports only OU-family schedules ('linear', 'log_t', 'log_snr'); "
+                f"got time_schedule={schedule_type!r}."
+            )
 
     # --- Asymmetric decode MSE weights ---
     score_w_decode = float(cfg.get("score_w_decode", 0.5))
@@ -7272,7 +7285,7 @@ def train_vae_cotrained_cond(cfg):
     for ep in range(cfg["epochs_vae"]):
         vae.train(); unet_lsi.train(); unet_control.train()
         if unet_diversity is not None: unet_diversity.train()
-        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "aux_lam", "aux_nu", "div", "perc", "stiff", "gan_d", "gan_g", "tdd"]}
+        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "aux_lam", "aux_nu", "div", "temp", "perc", "stiff", "gan_d", "gan_g", "tdd"]}
         mu_stats = []
         logvar_stats = []
 
@@ -7484,6 +7497,29 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_ctrl = (1.0 - F.cosine_similarity(eps_pred_control.flatten(1), eps_target_control.flatten(1), dim=1)).mean()
                 score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
 
+            temp_loss = torch.tensor(0.0, device=device)
+            if (not freeze_score_in_cotrain) and w_temp != 0.0:
+                sigma_safe = sigma.clamp_min(1e-8)
+                resid_t = z_t - mu_t
+                comp_score = -resid_t / (var_t + 1e-8)
+
+                mu_dot_t = -mu_t
+                var_dot_t = -2.0 * (alpha ** 2) * var_0 + 2.0 * (sigma ** 2)
+
+                temporal_log_growth = (
+                    (resid_t * mu_dot_t) / (var_t + 1e-8)
+                    - 0.5 * (resid_t.pow(2) * var_dot_t) / ((var_t + 1e-8) ** 2)
+                    - 0.5 * var_dot_t / (var_t + 1e-8)
+                ).flatten(1).sum(dim=1)
+
+                pf_velocity = (z_t - eps_pred_lsi.detach() / sigma_safe).detach()
+                spatial_log_growth = (pf_velocity * comp_score).flatten(1).sum(dim=1)
+                delta_i = spatial_log_growth + temporal_log_growth
+
+                latent_dim = z_t[0].numel()
+                delta_bar_ref = float(latent_dim) + (lam_pred.detach() / sigma_safe).flatten(1).sum(dim=1)
+                temp_loss = F.mse_loss(delta_i, delta_bar_ref)
+
             # --- Decoder-side loss routing ---
             # time_cond_decode controls whether decoder-side losses are applied at
             # the sampled diffused latent/state (z_t, t) or at the clean latent z_0.
@@ -7693,9 +7729,9 @@ def train_vae_cotrained_cond(cfg):
                 # Co-training mode: include score loss
                 score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
                 if cotrain_head == "lsi":
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + div_w*div_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + div_w*div_loss + w_temp*temp_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
                 else:  # cotrain_head == "control"
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + div_w*div_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + div_w*div_loss + w_temp*temp_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
 
             opt_joint.zero_grad()
             loss_joint.backward()
@@ -7788,6 +7824,7 @@ def train_vae_cotrained_cond(cfg):
             metrics["aux_lam"] += aux_loss_lam.item()
             metrics["aux_nu"] += aux_loss_nu.item()
             metrics["div"] += div_loss.item()
+            metrics["temp"] += temp_loss.item()
             metrics["perc"] += perc.item()
             metrics["stiff"] += stiff_pen.item()
             metrics["gan_d"] += d_loss.item()
@@ -7807,6 +7844,7 @@ def train_vae_cotrained_cond(cfg):
             "aux_lam": metrics["aux_lam"] / n_batches,
             "aux_nu": metrics["aux_nu"] / n_batches,
             "div": metrics["div"] / n_batches,
+            "temp": metrics["temp"] / n_batches,
             "perc": metrics["perc"] / n_batches,
             "stiff": metrics["stiff"] / n_batches,
             "gan_d": metrics["gan_d"] / n_batches,
@@ -7815,7 +7853,7 @@ def train_vae_cotrained_cond(cfg):
         }
         loss_records.append(epoch_metrics)
 
-        print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f} | Div: {epoch_metrics['div']:.4f} | "
+        print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f} | Div: {epoch_metrics['div']:.4f} | Temp: {epoch_metrics['temp']:.4f} | "
               f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
               f"Stiff: {epoch_metrics['stiff']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | TDD: {epoch_metrics['tdd']:.4f}")
 
@@ -8252,6 +8290,7 @@ def train_vae_cotrained_cond(cfg):
                 "score_control": metrics_refine["score_control"] / n_batches,
                 "aux_lam": metrics_refine["aux_lam"] / n_batches,
                 "aux_nu": metrics_refine["aux_nu"] / n_batches,
+                "temp": 0.0,
                 "perc": metrics_refine["perc"] / n_batches,
                 "gan_d": metrics_refine["gan_d"] / n_batches,
                 "gan_g": metrics_refine["gan_g"] / n_batches,
@@ -8526,6 +8565,7 @@ def main():
         "aux_head_w": 0.001,
         "div_mode": "direct",
         "div_w": 1e-6,
+        "w_temp": 0.0,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
@@ -8627,6 +8667,7 @@ def main():
         "stiff_w": 1e-6,
         "score_w": 1.0,
         "div_w": -0.015,
+        "w_temp": 0.01,
         "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
