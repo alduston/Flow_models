@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-"""csem_fldit.ipynb
-
-
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -4912,7 +4908,6 @@ def main():
 
         # Time-dependent decoder (TDD)
         "time_cond_decoder": True,
-        #"w_decode_time": 0.1,
         "dec_time_emb_dim": 128,
         "decode_time": None,             # Decode at this t; defaults to t_min if None
 
