@@ -905,6 +905,35 @@ def compute_sw2(
     return w2.item()
 
 # NOTE: MMD computation removed (we only use fixed sliced-W2 in evaluation).
+def compute_projected_diversity_loss(
+    mu_live: torch.Tensor,
+    mu_consensus: torch.Tensor,
+    eps_hat: torch.Tensor | None = None,
+    *,
+    project_div: bool = False,
+    eps_safe: float = 1e-8,
+) -> torch.Tensor:
+    """Diversity residual loss used by Minimax CSEM.
+
+    When project_div=False, this reproduces the existing isotropic mean-estimation
+    diversity loss via elementwise MSE between the live diffused mean and the chosen
+    consensus proxy.
+
+    When project_div=True, it instead measures the squared projection of the same
+    residual onto the stop-grad, per-sample normalized denoising direction.
+    """
+    if not project_div:
+        return F.mse_loss(mu_live, mu_consensus)
+
+    if eps_hat is None:
+        raise ValueError("project_div=True requires an eps_hat tensor for the denoising direction.")
+
+    delta_flat = (mu_live - mu_consensus).flatten(1)
+    d_hat_flat = eps_hat.detach().flatten(1)
+    d_hat_flat = d_hat_flat / (d_hat_flat.norm(dim=1, keepdim=True) + eps_safe)
+    proj = (delta_flat * d_hat_flat).sum(dim=1)
+    return (proj ** 2).mean()
+
 def compute_diversity(imgs: torch.Tensor, lpips_fn: Any) -> float:
     """
     Computes pairwise LPIPS diversity.
@@ -7136,25 +7165,13 @@ def train_vae_cotrained_cond(cfg):
     cotrain_head = cfg.get("cotrain_head", "lsi")
     aux_head_w = float(cfg.get("aux_head_w", 0.05))
     div_w = float(cfg.get("div_w", -0.001))
-    w_temp = float(cfg.get("w_temp", 0.0))
+    project_div = bool(cfg.get("project_div", False))
     freeze_score_in_cotrain = cfg.get("freeze_score_in_cotrain", False)
     if div_w != 0.0 and div_mode in ("head_ratio", "tweedie") and not bool(getattr(unet_lsi, "factored_head", False)):
         raise ValueError(
             "div_w != 0 with div_mode in {'head_ratio', 'tweedie'} requires factored_head=True "
             "because those diversity losses use the factorized natural-parameter heads (nu / lambda)."
         )
-    if w_temp != 0.0:
-        if not bool(getattr(unet_lsi, "factored_head", False)):
-            raise ValueError(
-                "w_temp != 0 requires factored_head=True because the temporal regularity loss "
-                "uses the factorized precision head to build the stop-gradient reference rate."
-            )
-        schedule_type = canonicalize_time_schedule(cfg.get("time_schedule", "log_snr"), default="log_snr")
-        if schedule_type in ("flow", "flow_matching", "cosine"):
-            raise ValueError(
-                f"w_temp != 0 currently supports only OU-family schedules ('linear', 'log_t', 'log_snr'); "
-                f"got time_schedule={schedule_type!r}."
-            )
 
     # --- Asymmetric decode MSE weights ---
     score_w_decode = float(cfg.get("score_w_decode", 0.5))
@@ -7285,7 +7302,7 @@ def train_vae_cotrained_cond(cfg):
     for ep in range(cfg["epochs_vae"]):
         vae.train(); unet_lsi.train(); unet_control.train()
         if unet_diversity is not None: unet_diversity.train()
-        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "aux_lam", "aux_nu", "div", "temp", "perc", "stiff", "gan_d", "gan_g", "tdd"]}
+        metrics = {k: 0.0 for k in ["loss", "recon", "kl", "score_lsi", "score_control", "aux_lam", "aux_nu", "div", "perc", "stiff", "gan_d", "gan_g", "tdd"]}
         mu_stats = []
         logvar_stats = []
 
@@ -7433,19 +7450,47 @@ def train_vae_cotrained_cond(cfg):
             # Control head predicts the sampled eps directly.
             eps_target_control = noise
 
+            mu_pred_direct = None
+            mu_consensus = None
+            eps_for_div = None
+
             if div_mode == "direct" and unet_diversity is not None:
                 mu_pred_direct = unet_diversity(z_t.detach(), t, y_in)
                 div_head_loss = F.mse_loss(mu_pred_direct, mu_t.detach())
-                if div_w != 0.0:
-                    div_loss = F.mse_loss(mu_t, mu_pred_direct.detach())
+
+            use_factored = bool(getattr(unet_lsi, "factored_head", False))
+            need_div_direction = (div_w != 0.0) and project_div
+            need_lsi_div_outputs = (div_w != 0.0) and (div_mode in ("head_ratio", "tweedie"))
+            need_detached_lsi_for_div = freeze_score_in_cotrain and (need_div_direction or need_lsi_div_outputs)
 
             if freeze_score_in_cotrain:
+                if need_detached_lsi_for_div:
+                    with torch.no_grad():
+                        if use_factored:
+                            eps_pred_lsi_div, lam_pred_div, nu_pred_div = unet_lsi(
+                                z_t, t, y_in,
+                                return_components=True,
+                                detach_components=True,
+                            )
+                            if div_mode == "head_ratio":
+                                eps_safe = 1e-3
+                                mu_consensus = nu_pred_div.detach() / (lam_pred_div.detach() + eps_safe)
+                            elif div_mode == "tweedie":
+                                alpha_det = alpha.detach()
+                                sigma_det = sigma.detach()
+                                eps_hat_det = eps_pred_lsi_div.detach()
+                                z0_tweedie_det = (z_t.detach() - sigma_det * eps_hat_det) / (alpha_det + 1e-8)
+                                mu_consensus = alpha_det * z0_tweedie_det
+                            eps_for_div = eps_pred_lsi_div.detach()
+                        else:
+                            eps_pred_lsi_div = unet_lsi(z_t, t, y_in)
+                            eps_for_div = eps_pred_lsi_div.detach()
+
                 score_loss_lsi = torch.tensor(0.0, device=device)
                 score_loss_control = torch.tensor(0.0, device=device)
                 aux_loss_lam = torch.tensor(0.0, device=device)
                 aux_loss_nu  = torch.tensor(0.0, device=device)
             else:
-                use_factored = bool(getattr(unet_lsi, "factored_head", False))
                 if use_factored:
                     eps_pred_lsi, lam_pred, nu_pred = unet_lsi(
                         z_t, t, y_in,
@@ -7456,6 +7501,7 @@ def train_vae_cotrained_cond(cfg):
                     nu_tgt  = (lam_tgt * mu_t.detach())
                     aux_loss_lam = F.mse_loss(lam_pred, lam_tgt)
                     aux_loss_nu  = F.mse_loss(nu_pred,  nu_tgt)
+                    eps_for_div = eps_pred_lsi.detach()
                     if div_w != 0.0 and div_mode in ("head_ratio", "tweedie"):
                         if div_mode == "head_ratio":
                             eps_safe = 1e-3
@@ -7466,9 +7512,9 @@ def train_vae_cotrained_cond(cfg):
                             eps_hat_det = eps_pred_lsi.detach()
                             z0_tweedie_det = (z_t.detach() - sigma_det * eps_hat_det) / (alpha_det + 1e-8)
                             mu_consensus = alpha_det * z0_tweedie_det
-                        div_loss = F.mse_loss(mu_t, mu_consensus)
                 else:
                     eps_pred_lsi = unet_lsi(z_t, t, y_in)
+                    eps_for_div = eps_pred_lsi.detach()
                     aux_loss_lam = torch.tensor(0.0, device=device)
                     aux_loss_nu  = torch.tensor(0.0, device=device)
 
@@ -7497,28 +7543,16 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_ctrl = (1.0 - F.cosine_similarity(eps_pred_control.flatten(1), eps_target_control.flatten(1), dim=1)).mean()
                 score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
 
-            temp_loss = torch.tensor(0.0, device=device)
-            if (not freeze_score_in_cotrain) and w_temp != 0.0:
-                sigma_safe = sigma.clamp_min(1e-8)
-                resid_t = z_t - mu_t
-                comp_score = -resid_t / (var_t + 1e-8)
-
-                mu_dot_t = -mu_t
-                var_dot_t = -2.0 * (alpha ** 2) * var_0 + 2.0 * (sigma ** 2)
-
-                temporal_log_growth = (
-                    (resid_t * mu_dot_t) / (var_t + 1e-8)
-                    - 0.5 * (resid_t.pow(2) * var_dot_t) / ((var_t + 1e-8) ** 2)
-                    - 0.5 * var_dot_t / (var_t + 1e-8)
-                ).flatten(1).sum(dim=1)
-
-                pf_velocity = (z_t - eps_pred_lsi.detach() / sigma_safe).detach()
-                spatial_log_growth = (pf_velocity * comp_score).flatten(1).sum(dim=1)
-                delta_i = spatial_log_growth + temporal_log_growth
-
-                latent_dim = z_t[0].numel()
-                delta_bar_ref = float(latent_dim) + (lam_pred.detach() / sigma_safe).flatten(1).sum(dim=1)
-                temp_loss = F.mse_loss(delta_i, delta_bar_ref)
+            if div_w != 0.0:
+                if div_mode == "direct" and mu_pred_direct is not None:
+                    mu_consensus = mu_pred_direct.detach()
+                if mu_consensus is not None:
+                    div_loss = compute_projected_diversity_loss(
+                        mu_t,
+                        mu_consensus,
+                        eps_hat=eps_for_div,
+                        project_div=project_div,
+                    )
 
             # --- Decoder-side loss routing ---
             # time_cond_decode controls whether decoder-side losses are applied at
@@ -7729,9 +7763,9 @@ def train_vae_cotrained_cond(cfg):
                 # Co-training mode: include score loss
                 score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
                 if cotrain_head == "lsi":
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + div_w*div_loss + w_temp*temp_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_lsi + div_w*div_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
                 else:  # cotrain_head == "control"
-                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + div_w*div_loss + w_temp*temp_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
+                    loss_joint = recon + cfg["perc_w"]*perc + cfg["kl_w"]*kl + score_w_vae*score_loss_control + div_w*div_loss + stiff_w*stiff_pen + gan_w_eff*g_loss
 
             opt_joint.zero_grad()
             loss_joint.backward()
@@ -7824,7 +7858,6 @@ def train_vae_cotrained_cond(cfg):
             metrics["aux_lam"] += aux_loss_lam.item()
             metrics["aux_nu"] += aux_loss_nu.item()
             metrics["div"] += div_loss.item()
-            metrics["temp"] += temp_loss.item()
             metrics["perc"] += perc.item()
             metrics["stiff"] += stiff_pen.item()
             metrics["gan_d"] += d_loss.item()
@@ -7844,7 +7877,6 @@ def train_vae_cotrained_cond(cfg):
             "aux_lam": metrics["aux_lam"] / n_batches,
             "aux_nu": metrics["aux_nu"] / n_batches,
             "div": metrics["div"] / n_batches,
-            "temp": metrics["temp"] / n_batches,
             "perc": metrics["perc"] / n_batches,
             "stiff": metrics["stiff"] / n_batches,
             "gan_d": metrics["gan_d"] / n_batches,
@@ -7853,7 +7885,7 @@ def train_vae_cotrained_cond(cfg):
         }
         loss_records.append(epoch_metrics)
 
-        print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f} | Div: {epoch_metrics['div']:.4f} | Temp: {epoch_metrics['temp']:.4f} | "
+        print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f} | Div: {epoch_metrics['div']:.4f} | "
               f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
               f"Stiff: {epoch_metrics['stiff']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | TDD: {epoch_metrics['tdd']:.4f}")
 
@@ -8290,7 +8322,6 @@ def train_vae_cotrained_cond(cfg):
                 "score_control": metrics_refine["score_control"] / n_batches,
                 "aux_lam": metrics_refine["aux_lam"] / n_batches,
                 "aux_nu": metrics_refine["aux_nu"] / n_batches,
-                "temp": 0.0,
                 "perc": metrics_refine["perc"] / n_batches,
                 "gan_d": metrics_refine["gan_d"] / n_batches,
                 "gan_g": metrics_refine["gan_g"] / n_batches,
@@ -8564,8 +8595,8 @@ def main():
         # --- Aux gauge-fix losses for factored DiT head ---
         "aux_head_w": 0.001,
         "div_mode": "direct",
-        "div_w": 1e-6,
-        "w_temp": 0.0,
+        "project_div": True,
+        "div_w": -.025,
 
         # --- Auxiliary encoder noise channels (0 disables) ---
         "aux_d": 0,
@@ -8667,7 +8698,6 @@ def main():
         "stiff_w": 1e-6,
         "score_w": 1.0,
         "div_w": -0.015,
-        "w_temp": 0.01,
         "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
