@@ -8710,7 +8710,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 40,    # Eval every 100 epochs during cotrain
+        "eval_freq_cotrain": 100,    # Eval every 100 epochs during cotrain
         "eval_freq_refine": 20,     # Eval every 100 epochs during refine
 
     })
