@@ -8703,14 +8703,14 @@ def main():
         # Adaptive frontier time sampling
         "adaptive_time": True,              # enable decoder-informed time weighting
         "adaptive_time_nbins": 200,         # log-spaced bins over [t_min, t_max]
-        "adaptive_time_ema": 0.9975,          # EMA decay for R(t) tracker
+        "adaptive_time_ema": 0.9975,          # EMA decay for R(t) tracke0
         "adaptive_time_floor": 0.02,        # minimum weight fraction (prevents starvation)
         "adaptive_time_warmup": 500,        # update() calls before activation
         "adaptive_time_min_counts": 5,      # min samples per bin before activation
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 5,    # Eval every 100 epochs during cotrain
+        "eval_freq_cotrain": 40,    # Eval every 100 epochs during cotrain
         "eval_freq_refine": 20,     # Eval every 100 epochs during refine
 
     })
