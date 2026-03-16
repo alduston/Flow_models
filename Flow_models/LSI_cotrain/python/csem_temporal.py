@@ -7857,7 +7857,7 @@ def train_vae_cotrained_cond(cfg):
         }
         loss_records.append(epoch_metrics)
 
-        print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f} | Div: {epoch_metrics['div']:.4f} | "
+        print(f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f} | Div: {epoch_metrics['div']:.4f} | TempDiv: {epoch_metrics['temp_div']:.4f} | "
               f"Rec: {epoch_metrics['recon']:.4f} | KL: {epoch_metrics['kl']:.4f} | Perc: {epoch_metrics['perc']:.4f} | "
               f"Stiff: {epoch_metrics['stiff']:.4f} | GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | TDD: {epoch_metrics['tdd']:.4f}")
 
@@ -8671,7 +8671,7 @@ def main():
         "stiff_w": 1e-6,
         "score_w": 1.0,
         "div_w": -0.02,
-        "temp_w": 0.005,
+        "temp_w": 0.002,
         "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
@@ -8694,7 +8694,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 50,    # Eval every 100 epochs during cotrain
+        "eval_freq_cotrain": 20,    # Eval every 100 epochs during cotrain
         "eval_freq_refine": 50,     # Eval every 100 epochs during refine
     })
 
