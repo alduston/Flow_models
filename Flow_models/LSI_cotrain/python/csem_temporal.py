@@ -8671,7 +8671,7 @@ def main():
         "stiff_w": 1e-6,
         "score_w": 1.0,
         "div_w": -0.02,
-        "temp_w": 0.02,
+        "temp_w": 0.005,
         "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
