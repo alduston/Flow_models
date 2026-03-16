@@ -8565,9 +8565,9 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.001,
+        "aux_head_w": 0.0004,
         "div_mode": "direct",
-        "project_div": False,
+        "project_div": True,
         "div_w": 1e-6,
         "temp_w": 0.0,
 
@@ -8653,8 +8653,8 @@ def main():
     cfg_cotrain = cfg_shared.copy()
     cfg_cotrain.update({
         # Training schedule
-        "epochs_vae": 600,          # Cotrain phase: VAE + LDM joint training
-        "epochs_refine": 60,        # Refine phase: LDM-only on frozen VAE
+        "epochs_vae": 800,          # Cotrain phase: VAE + LDM joint training
+        "epochs_refine": 100,        # Refine phase: LDM-only on frozen VAE
         "lr_refine": 1e-5,
 
         # Score head gaussian factored param
@@ -8694,8 +8694,8 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 100,    # Eval every 100 epochs during cotrain
-        "eval_freq_refine": 20,     # Eval every 100 epochs during refine
+        "eval_freq_cotrain": 50,    # Eval every 100 epochs during cotrain
+        "eval_freq_refine": 50,     # Eval every 100 epochs during refine
     })
 
 
