@@ -5704,16 +5704,16 @@ def evaluate_current_state(
     if unet is not None:
          configs.extend([
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 1.0, "readout_mode": "direct"},
+                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.0, "readout_mode": "direct"},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
+                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.8, "readout_mode": "direct"},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct"},
+                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 3.0, "readout_mode": "direct"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
     configs.extend([
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
+                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.8, "readout_mode": "direct"},
     ])
 
     def _resolve_sampler_eval_settings(scfg_local: Dict[str, Any]) -> Dict[str, Any]:
@@ -8615,7 +8615,7 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1.8e-5,
+        "t_min": 1.0e-3,
         "t_max": 1.8,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
@@ -8682,7 +8682,7 @@ def main():
         "lpips_mode": "frontier",        # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
         "gan_time_weight": "frontier",   # "uniform", "gamma", "snr", or "snr2"
         "dec_time_emb_dim": 128,
-        "decode_time": 1e-4,             # Decode at this t; defaults to t_min if None
+        "decode_time": 1e-2,             # Decode at this t; defaults to t_min if None
 
         # Adaptive frontier time sampling
         "adaptive_time": True,              # enable decoder-informed time weighting
