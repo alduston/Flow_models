@@ -5703,33 +5703,17 @@ def evaluate_current_state(
     ]
     if unet is not None:
          configs.extend([
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-            #        "init_mode": "oracle", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-            #        "init_mode": "oracle", "t_max": 1.58, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-            #        "init_mode": "oracle", "t_max": 1.18, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-            #        "init_mode": "oracle", "t_max": .88, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-            #        "init_mode": "oracle", "t_max": .48, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                    "init_mode": "oracle", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 1.0, "readout_mode": "direct"},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
+                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 3.0, "readout_mode": "direct"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
     configs.extend([
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-            #        "init_mode": "oracle", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-            #        "init_mode": "oracle", "t_max": 1.58, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-            #       "init_mode": "oracle", "t_max": 1.18, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-            #       "init_mode": "oracle", "t_max": .88, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-            #        "init_mode": "oracle", "t_max": .48, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
-            {"method": "rk4_ode",  "steps": 20, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-                    "init_mode": "oracle", "t_max": 1.98, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
+            {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
+                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-4, "cfg_level": 1.8, "readout_mode": "direct"},
     ])
 
     def _resolve_sampler_eval_settings(scfg_local: Dict[str, Any]) -> Dict[str, Any]:
@@ -8631,8 +8615,8 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 2.0e-5,
-        "t_max": 2.0,
+        "t_min": 1.8e-5,
+        "t_max": 1.8,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
         "temporal_variance_scale": 0.0,
@@ -8686,8 +8670,8 @@ def main():
         "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-        "div_w": -0.025,
-        "temp_w": 0.025,
+        "div_w": -0.02,
+        "temp_w": 0.02,
         "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
@@ -8712,7 +8696,6 @@ def main():
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 100,    # Eval every 100 epochs during cotrain
         "eval_freq_refine": 20,     # Eval every 100 epochs during refine
-
     })
 
 
