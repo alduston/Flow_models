@@ -5704,11 +5704,11 @@ def evaluate_current_state(
     if unet is not None:
          configs.extend([
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.0, "readout_mode": "direct"},
+                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.0, "readout_mode": "direct"},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
                     "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.8, "readout_mode": "direct"},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                    "init_mode": "oracle", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 3.0, "readout_mode": "direct"},
+                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 3.0, "readout_mode": "direct"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
     configs.extend([
