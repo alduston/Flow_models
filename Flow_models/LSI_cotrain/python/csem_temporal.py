@@ -8591,7 +8591,7 @@ def main():
         "lr_ldm": 2e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 1e-3,
+        "kl_w": 2e-3,
         "perc_w": 0.85,
         "lpips_mode": "frontier",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
 
@@ -8671,7 +8671,7 @@ def main():
         "stiff_w": 1e-6,
         "score_w": 1.0,
         "div_w": -0.02,
-        "temp_w": 0.002,
+        "temp_w": 0.001,
         "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
@@ -8694,7 +8694,7 @@ def main():
         "frontier_correct_score": False,     # IW-correct score loss back to log-uniform
 
         # Eval frequency (eval during both phases)
-        "eval_freq_cotrain": 20,    # Eval every 100 epochs during cotrain
+        "eval_freq_cotrain": 50,    # Eval every 100 epochs during cotrain
         "eval_freq_refine": 50,     # Eval every 100 epochs during refine
     })
 
