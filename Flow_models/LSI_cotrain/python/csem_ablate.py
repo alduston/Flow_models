@@ -5396,8 +5396,8 @@ def evaluate_current_state(
         plot_reverse_trajectory_grid(
             vae, unet, cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_reverse_traj_ep{epoch_idx}.png"),
-            num_rows=6, num_cols=8, t_upper=1.99 , t_values =  [.01, .05, .15, .4, .7, 1.0, 1.5, 1.99],
-            t_max=2.00, steps_per_leg=10, cfg_scale=3.0, #cfg_eval_scale,
+            num_rows=6, num_cols=8, t_upper=1.5 , t_values =  [.01, .05, .15, .4, .7, 1.0, 1.25, 1.5],
+            t_max=1.5, steps_per_leg=10, cfg_scale=3.0, 
             class_label=_traj_labels,
             frontier_tracker=frontier_tracker,
             save_movie=True,
@@ -5405,7 +5405,7 @@ def evaluate_current_state(
             oracle_z0_bank=oracle_z0_bank,
             oracle_noise_bank=oracle_noise_bank,
             oracle_label_bank=oracle_label_bank,
-            init_mode="oracle",
+            init_mode="prior",
         )
 
     # -----------------------------------------------------------------------
@@ -5417,9 +5417,9 @@ def evaluate_current_state(
         plot_reverse_trajectory_grid(
             vae, oracle_model, cfg, device,
             save_path=os.path.join(eval_dir, f"{prefix}_reverse_traj_oracle_ep{epoch_idx}.png"),
-            num_rows=6, num_cols=8, t_upper= 1.99,
-            t_values =  [.01, .05, .15, .4, .7, 1.0, 1.5, 1.99],
-            t_max = 2.00,
+            num_rows=6, num_cols=8, t_upper= 1.5,
+            t_values =  [.01, .05, .15, .4, .7, 1.0, 1.25, 1.5],
+            t_max = 1.5,
             steps_per_leg=10, cfg_scale=3.0,
             class_label=_traj_labels,
             frontier_tracker=frontier_tracker,
@@ -5428,7 +5428,7 @@ def evaluate_current_state(
             oracle_z0_bank=oracle_z0_bank,
             oracle_noise_bank=oracle_noise_bank,
             oracle_label_bank=oracle_label_bank,
-            init_mode="oracle",
+            init_mode="prior",
         )
 
     # -----------------------------------------------------------------------
@@ -5495,17 +5495,13 @@ def evaluate_current_state(
     ]
     if unet is not None:
          configs.extend([
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-            #        "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.0, "readout_mode": "direct"},
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.8, "readout_mode": "direct"},
-            #{"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t",
-            #        "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 3.0, "readout_mode": "direct"},
+                    "init_mode": "prior", "t_max": 1.5, "t_min": 3e-5, "cfg_level": 3.0, "readout_mode": "direct"},
         ])
     # Oracle sampler configs (same steps / CFG levels as the NN)
     configs.extend([
             {"method": "rk4_ode",  "steps": 30, "desc": "RandToken (RK4)", "use_rand_token": True,"time_schedule": "log_t", "use_oracle": True,
-                    "init_mode": "prior", "t_max": 1.75, "t_min": 1e-2, "cfg_level": 1.8, "readout_mode": "direct"},
+                    "init_mode": "prior", "t_max": 1.5, "t_min": 3e-5, "cfg_level": 3.0, "readout_mode": "direct"},
     ])
 
     def _resolve_sampler_eval_settings(scfg_local: Dict[str, Any]) -> Dict[str, Any]:
@@ -8402,7 +8398,7 @@ def main():
         "disc_n_layers": 2,
         "lr_disc": 1e-4,
         "gan_logit_clamp": 10.0,            # Clamp D logits in G loss to prevent divergence
-        "gan_time_weight": "frontier",  # "uniform", "frontier", "gamma", "snr", or "snr2"
+        "gan_time_weight": "uniform",  # "uniform", "frontier", "gamma", "snr", or "snr2"
 
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
