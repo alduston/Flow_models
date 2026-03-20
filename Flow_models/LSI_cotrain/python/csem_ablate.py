@@ -7585,8 +7585,8 @@ def train_vae_cotrained_cond(cfg):
                     loss_cos = (1.0 - F.cosine_similarity(eps_pred_lsi_tracking.flatten(1), eps_target_lsi_det.flatten(1), dim=1)).mean()
                     tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
                     if use_factored:
-                        tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
-                        #tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr)
+                        #tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
+                        tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr)
 
 
                 opt_tracking.zero_grad()
@@ -7903,8 +7903,8 @@ def train_vae_cotrained_cond(cfg):
                 loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
-                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
-                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
+                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
 
                 opt_lsi_refine.zero_grad()
                 score_loss_lsi.backward()
@@ -8345,7 +8345,7 @@ def main():
         # --- DiT / Transformer settings (LightningDiT-style) ---
         "dit_patch_size": 1,        # patch_size=1 => 8x8 latents -> 64 tokens
         "dit_hidden_dim": 384,
-        "dit_depth": 10,
+        "dit_depth": 12,
         "dit_num_heads": 6,
         "dit_mlp_ratio": 4.0,
         "dit_dropout": 0.0,
@@ -8357,7 +8357,7 @@ def main():
         "cosine_w": 0.0,
 
         # --- Aux gauge-fix losses for factored DiT head ---
-        "aux_head_w": 0.0004,
+        "aux_head_w": 0.0025,
         "div_mode": "direct",
         "project_div": True,
         "div_w": 1e-6,
@@ -8379,13 +8379,13 @@ def main():
         "attn_zero_init": False,         # [7] standard init on VAE attention
 
         # --- Learning Rates ---
-        "lr_vae": 5e-4,
-        "lr_ldm": 2e-4,
+        "lr_vae": 2.5e-4,
+        "lr_ldm": 1e-4,
 
         # --- KL and perceptual weights ---
-        "kl_w": 6e-3,
+        "kl_w": 1e-6,
         "perc_w": 0.85,
-        "lpips_mode": "frontier",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
+        "lpips_mode": "uniform",  # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
 
         # --- Frontier-gated perceptual loss settings (used when lpips_mode="frontier" or gan_time_weight="frontier") ---
         "frontier_R_cutoff": 0.05,    # R(t) threshold: LPIPS/GAN gated off where R(t) > cutoff
@@ -8407,8 +8407,8 @@ def main():
         # --- Diffusion Settings ---
         "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
         "use_ddim_times": True,
-        "t_min": 1.0e-3,
-        "t_max": 1.8,
+        "t_min": 3.0e-5,
+        "t_max": 1.5,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
         "temporal_variance_scale": 0.0,
@@ -8424,7 +8424,7 @@ def main():
         "cfg_eval_scale": 3.0,
         "cfg_mode": "constant",   # "constant" or "linear_ramp"
         "eval_class_labels": [],
-        "class_decoder": True,
+        "class_decoder": False,
 
         # --- Evaluation & Logging ---
         "use_fixed_eval_banks": True,
@@ -8458,12 +8458,12 @@ def main():
         "mse_mode": "raw",               # 'raw', 'score', or 'score_detached'
         "use_latent_norm": True,
         "use_cond_encoder": False,
-        "kl_reg_type": "temporal",
+        "kl_reg_type": "normal",
         "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-        "div_w": -0.02,
-        "temp_w": 0.01,
+        "div_w": -0.00,
+        "temp_w": 0.00,
         "score_w_decode": 0.0,          # Gradient scale: score head ← MSE recon loss
         "decode_w": 1.0,                   # Gradient scale: decoder   ← MSE recon loss
 
@@ -8471,13 +8471,13 @@ def main():
         "time_cond_decoder": True,
         "time_cond_decode": True,
         "time_dependent_gan": False,
-        "lpips_mode": "frontier",        # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
-        "gan_time_weight": "frontier",   # "uniform", "gamma", "snr", or "snr2"
+        "lpips_mode": "uniform",        # "uniform", "snr" (legacy), "gamma", "frontier", or "prec_mask"
+        "gan_time_weight": "uniform",   # "uniform", "gamma", "snr", or "snr2"
         "dec_time_emb_dim": 128,
-        "decode_time": 1e-2,             # Decode at this t; defaults to t_min if None
+        "decode_time": None,             # Decode at this t; defaults to t_min if None
 
         # Adaptive frontier time sampling
-        "adaptive_time": True,              # enable decoder-informed time weighting
+        "adaptive_time": False,              # enable decoder-informed time weighting
         "adaptive_time_nbins": 200,         # log-spaced bins over [t_min, t_max]
         "adaptive_time_ema": 0.9975,          # EMA decay for R(t) tracke0
         "adaptive_time_floor": 0.02,        # minimum weight fraction (prevents starvation)
@@ -8487,14 +8487,14 @@ def main():
 
         # Eval frequency (eval during both phases)
         "eval_freq_cotrain": 100,    # Eval every 100 epochs during cotrain
-        "eval_freq_refine": 50,     # Eval every 100 epochs during refine
+        "eval_freq_refine": 100,     # Eval every 100 epochs during refine
     })
 
 
     # === INDEPENDENT CONFIG ===
     # 50 VAE-only epochs (no eval) + 250 refine epochs = 250 LDM epochs total
     cfg_indep = cfg_cotrain.copy()
-    cfg_indep.update({"div_w": 0.0})
+    cfg_indep.update({"temp_w": 0.0})
 
     '''
     cfg_indep.update({
