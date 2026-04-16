@@ -30,7 +30,7 @@ x = np.linspace(0, 1, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
 # Matérn-like covariance for smooth coefficient fields
-ell = 0.20
+ell = 0.1
 sigma_prior = 1.0
 dists = cdist(coords, coords)
 C = sigma_prior**2 * np.exp(-dists / ell)
@@ -102,8 +102,8 @@ print("Initializing JAX Poisson coefficient physics engine...")
 # ==========================================
 N = 32
 dimension_of_PoI = N ** 2
-num_observation = 100
-num_truncated_series = 32
+num_observation = 25
+num_truncated_series = 64
 try:
     df_Basis = pd.read_csv('data/Basis.csv', header=None)
     df_obs = pd.read_csv('data/obs_locations.csv', header=None)
@@ -444,7 +444,7 @@ print(f"Global Dtype set to: {torch.get_default_dtype()}")
 print(f"Device: {device}")
 # Configuration for Poisson coefficient inversion
 ACTIVE_DIM = num_truncated_series  # Latent dimension (KL modes)
-NOISE_STD = 0.00005               # Observation noise std
+NOISE_STD = 0.00002               # Observation noise std
 # Hessian spectral band for HLSI (Section 5.3: Spectral band truncation)
 HESS_MIN = 1e-4   # Lower bound: eigenvalues below this are too sloppy
 HESS_MAX = 1e6    # Upper bound: eigenvalues above this are too stiff
