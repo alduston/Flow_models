@@ -2302,7 +2302,7 @@ PRECOMP_NS = {
 
 DEFAULT_N_GEN_NS = 500
 
-SAMPLER_CONFIGS = OrderedDict([
+SAMPLER_CONFIGS_NS = OrderedDict([
     (
         'MALA (prior)',
         {
