@@ -1964,8 +1964,8 @@ SAMPLER_CONFIGS = OrderedDict([
         {
             'init': 'prior',
             'init_steps': 0,
-            'mala_steps': 32,
-            'mala_burnin': 12,
+            'mala_steps': 500,
+            'mala_burnin': 100,
             'mala_dt': 1e-4,
             'is_reference': True,
         },
