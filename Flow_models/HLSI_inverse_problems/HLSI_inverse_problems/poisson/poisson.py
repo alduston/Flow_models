@@ -103,7 +103,7 @@ print("Initializing JAX Poisson coefficient physics engine...")
 N = 32
 dimension_of_PoI = N ** 2
 num_observation = 25
-num_truncated_series = 64
+num_truncated_series = 48
 try:
     df_Basis = pd.read_csv('data/Basis.csv', header=None)
     df_obs = pd.read_csv('data/obs_locations.csv', header=None)
