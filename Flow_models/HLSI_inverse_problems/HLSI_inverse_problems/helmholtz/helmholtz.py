@@ -2675,7 +2675,7 @@ alpha_true_np = 0.95 * np.random.randn(ACTIVE_DIM) * mode_decay
 
 y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
-NOISE_STD = 2.15e-4
+NOISE_STD = 5e-4
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
 
 print(f"Forward-data std = {np.std(y_clean_np):.4e}")
