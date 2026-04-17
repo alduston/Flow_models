@@ -154,7 +154,15 @@ x_1d = jnp.linspace(0.0, 1.0, N)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
 h = 1.0 / (N - 1)
 Q_FLOOR = 0.15
-SOURCE_FIELD = 1.0 + 0.35 * jnp.sin(2.0 * jnp.pi * X_grid) * jnp.sin(2.0 * jnp.pi * Y_grid)
+SOURCE_FIELD = (
+    0.18
+    + 1.15 * jnp.exp(-(((X_grid - 0.18) ** 2) / (2.0 * 0.050 ** 2)
+                       + ((Y_grid - 0.22) ** 2) / (2.0 * 0.070 ** 2)))
+    + 0.95 * jnp.exp(-(((X_grid - 0.72) ** 2) / (2.0 * 0.085 ** 2)
+                       + ((Y_grid - 0.32) ** 2) / (2.0 * 0.055 ** 2)))
+    + 1.05 * jnp.exp(-(((X_grid - 0.56) ** 2) / (2.0 * 0.060 ** 2)
+                       + ((Y_grid - 0.78) ** 2) / (2.0 * 0.065 ** 2)))
+)
 
 _int_mask = jnp.zeros((N, N), dtype=bool)
 _int_mask = _int_mask.at[1:-1, 1:-1].set(True)
@@ -226,15 +234,35 @@ def solve_full_state(alpha):
 
 
 def make_structured_truth_coefficients(latent_dim=num_truncated_series):
-    """Build a structured synthetic coefficient field and project its raw field into the KL basis."""
+    """Build a multi-scale synthetic coefficient field and project its raw field into the KL basis."""
     X_np = np.array(X_grid)
     Y_np = np.array(Y_grid)
-    raw_truth = (
-        1.10 * np.exp(-((X_np - 0.28) ** 2 + (Y_np - 0.38) ** 2) / (2.0 * 0.085 ** 2))
-        - 0.95 * np.exp(-((X_np - 0.74) ** 2 + (Y_np - 0.67) ** 2) / (2.0 * 0.11 ** 2))
-        + 0.45 * np.cos(2.0 * np.pi * X_np) * np.sin(2.0 * np.pi * Y_np)
-        + 0.25 * np.sin(4.0 * np.pi * (X_np - 0.25 * Y_np))
-    )
+
+    blob_specs = [
+        ( 1.10, 0.14, 0.18, 0.040, 0.055),
+        (-0.95, 0.29, 0.74, 0.060, 0.050),
+        ( 0.90, 0.41, 0.33, 0.050, 0.045),
+        (-1.05, 0.52, 0.57, 0.055, 0.070),
+        ( 0.80, 0.66, 0.20, 0.045, 0.040),
+        (-0.85, 0.76, 0.78, 0.050, 0.055),
+        ( 0.72, 0.83, 0.48, 0.035, 0.060),
+        ( 0.65, 0.58, 0.86, 0.055, 0.040),
+    ]
+
+    raw_truth = np.zeros_like(X_np, dtype=np.float64)
+    for amp, cx, cy, sx, sy in blob_specs:
+        raw_truth += amp * np.exp(
+            -(((X_np - cx) ** 2) / (2.0 * sx ** 2) + ((Y_np - cy) ** 2) / (2.0 * sy ** 2))
+        )
+
+    ridge_1_center = 0.22 + 0.07 * np.sin(2.0 * np.pi * Y_np)
+    ridge_2_center = 0.80 - 0.62 * X_np
+    raw_truth += 1.05 * np.exp(-((X_np - ridge_1_center) ** 2) / (2.0 * 0.018 ** 2))
+    raw_truth += -0.95 * np.exp(-((Y_np - ridge_2_center) ** 2) / (2.0 * 0.020 ** 2))
+
+    raw_truth += 0.30 * np.sin(8.0 * np.pi * X_np + 2.5 * np.pi * Y_np)
+    raw_truth += 0.24 * np.cos(6.0 * np.pi * (X_np - 0.35 * Y_np))
+
     B = np.array(Basis)[:, :latent_dim]
     coeffs, *_ = np.linalg.lstsq(B, raw_truth.reshape(-1), rcond=None)
     return coeffs.astype(np.float64), raw_truth.astype(np.float64)
