@@ -493,7 +493,7 @@ print(f"Device: {device}")
 
 # Configuration for acoustic full-waveform inversion
 ACTIVE_DIM = num_truncated_series
-NOISE_REL = 0.005
+NOISE_REL = 0.01
 PLOT_NORMALIZER = 'best'    # sampler label/display name, or 'best'
 
 # Hessian spectral band for HLSI
@@ -3403,75 +3403,192 @@ plt.tight_layout()
 plt.show()
 
 # ==========================================
-# FIGURE 2: SOURCE-0 SHOT GATHERS
+# FIGURE 2: ALL-SOURCE SHOT GATHERS + AGGREGATE RMS RESIDUALS
 # ==========================================
 
-print('\nVisualizing shot gathers for source 0...')
+print('\nVisualizing shot gathers for all sources plus all-shot RMS summaries...')
 
-clean_gather_s0 = true_meas[0]
-obs_gather_s0 = obs_meas[0]
-
-if has_true_field:
-    gather_reference = clean_gather_s0
-else:
-    gather_reference = unpack_measurement_vector(np.array(solve_forward(jnp.array(metrics[vis_anchor_key]['mean_latent']))))[0]
-
-gather_vlim = float(np.percentile(np.abs(gather_reference), 99.2))
-resid_vlim = max(1e-12, float(np.percentile(np.abs(obs_gather_s0 - clean_gather_s0), 99.2)))
+true_meas = np.asarray(true_meas)
+obs_meas = np.asarray(obs_meas)
 extent = [receiver_x_positions[0], receiver_x_positions[-1], record_times_np[0], record_times_np[-1]]
 
-fig2, axes2 = plt.subplots(2, n_cols, figsize=(4.2 * n_cols, 8.5), sharey='row')
+# Precompute mean-latent predicted gathers once per method so the all-source
+# panel and the spectral diagnostics remain consistent.
+predicted_meas_by_label = OrderedDict()
+for label in methods_to_plot:
+    samps_clean = get_valid_samples(samples_helm[label])
+    if samps_clean.shape[0] < 10:
+        predicted_meas_by_label[label] = None
+        continue
+    mean_lat = np.mean(samps_clean, axis=0)[:d_lat]
+    gather_pred_all = unpack_measurement_vector(np.array(solve_forward(jnp.array(mean_lat))))
+    predicted_meas_by_label[label] = gather_pred_all
 
-im_g0 = axes2[0, 0].imshow(
-    clean_gather_s0.T, cmap='seismic', origin='lower', aspect='auto',
-    vmin=-gather_vlim, vmax=gather_vlim, extent=extent,
-)
-axes2[0, 0].set_title('Ground Truth\nShot gather (src 0)', fontsize=14)
-axes2[0, 0].set_xlabel('Receiver x', fontsize=12)
-axes2[0, 0].set_ylabel('Time', fontsize=12)
-plt.colorbar(im_g0, ax=axes2[0, 0], fraction=0.046, pad=0.04)
+# Use a single symmetric scale for all per-source signed gather panels and a
+# separate symmetric scale for signed residual panels.
+all_signed_gathers = [true_meas, obs_meas - true_meas]
+for pred_all in predicted_meas_by_label.values():
+    if pred_all is not None:
+        all_signed_gathers.append(pred_all)
+        all_signed_gathers.append(pred_all - true_meas)
 
-im_r0 = axes2[1, 0].imshow(
-    (obs_gather_s0 - clean_gather_s0).T, cmap='seismic', origin='lower', aspect='auto',
-    vmin=-resid_vlim, vmax=resid_vlim, extent=extent,
+gather_vlim = max(1e-12, float(np.percentile(np.abs(np.concatenate([x.ravel() for x in all_signed_gathers if x is not None])), 99.2)))
+resid_vlim = max(1e-12, float(np.percentile(np.abs(np.concatenate([(obs_meas - true_meas).ravel()] + [(pred_all - true_meas).ravel() for pred_all in predicted_meas_by_label.values() if pred_all is not None])), 99.2)))
+
+# Aggregate all-shot RMS summaries collapse the source dimension using RMS, so
+# they are nonnegative and highlight where residual energy persists over the
+# acquisition rather than allowing signed cancellations across shots.
+clean_rms = np.sqrt(np.mean(true_meas ** 2, axis=0))
+obs_clean_rms_resid = np.sqrt(np.mean((obs_meas - true_meas) ** 2, axis=0))
+pred_rms_by_label = OrderedDict()
+rms_resid_by_label = OrderedDict()
+for label, pred_all in predicted_meas_by_label.items():
+    if pred_all is None:
+        pred_rms_by_label[label] = None
+        rms_resid_by_label[label] = None
+    else:
+        pred_rms_by_label[label] = np.sqrt(np.mean(pred_all ** 2, axis=0))
+        rms_resid_by_label[label] = np.sqrt(np.mean((pred_all - true_meas) ** 2, axis=0))
+
+agg_gather_vmax = max(
+    1e-12,
+    float(np.percentile(np.abs(np.concatenate([clean_rms.ravel()] + [x.ravel() for x in pred_rms_by_label.values() if x is not None])), 99.2))
 )
-axes2[1, 0].set_title('Noisy - clean\n(data residual)', fontsize=14)
-axes2[1, 0].set_xlabel('Receiver x', fontsize=12)
-axes2[1, 0].set_ylabel('Time', fontsize=12)
-plt.colorbar(im_r0, ax=axes2[1, 0], fraction=0.046, pad=0.04)
+agg_resid_vmax = max(
+    1e-12,
+    float(np.percentile(np.abs(np.concatenate([obs_clean_rms_resid.ravel()] + [x.ravel() for x in rms_resid_by_label.values() if x is not None])), 99.2))
+)
+
+n_panel_rows = 2 * (N_SOURCES + 1)
+fig2, axes2 = plt.subplots(
+    n_panel_rows, n_cols,
+    figsize=(4.15 * n_cols, 2.18 * n_panel_rows),
+    sharex='col', sharey='row'
+)
+
+panel_row_titles = []
+for src_idx in range(N_SOURCES):
+    panel_row_titles.extend([
+        f'Source-{src_idx} shot gather',
+        f'Source-{src_idx} residual',
+    ])
+panel_row_titles.extend([
+    'All-shot RMS gather',
+    'All-shot RMS residual',
+])
+
+for src_idx in range(N_SOURCES):
+    row_g = 2 * src_idx
+    row_r = row_g + 1
+    clean_gather = true_meas[src_idx]
+    obs_gather = obs_meas[src_idx]
+
+    im_g0 = axes2[row_g, 0].imshow(
+        clean_gather.T, cmap='seismic', origin='lower', aspect='auto',
+        vmin=-gather_vlim, vmax=gather_vlim, extent=extent,
+    )
+    axes2[row_g, 0].set_title(f'Ground Truth\nShot gather (src {src_idx})', fontsize=12)
+    axes2[row_g, 0].set_ylabel('Time', fontsize=11)
+    if src_idx == N_SOURCES - 1:
+        axes2[row_g, 0].set_xlabel('Receiver x', fontsize=11)
+    plt.colorbar(im_g0, ax=axes2[row_g, 0], fraction=0.046, pad=0.04)
+
+    im_r0 = axes2[row_r, 0].imshow(
+        (obs_gather - clean_gather).T, cmap='seismic', origin='lower', aspect='auto',
+        vmin=-resid_vlim, vmax=resid_vlim, extent=extent,
+    )
+    axes2[row_r, 0].set_title('Noisy - clean\n(data residual)', fontsize=12)
+    axes2[row_r, 0].set_ylabel('Time', fontsize=11)
+    if src_idx == N_SOURCES - 1:
+        axes2[row_r, 0].set_xlabel('Receiver x', fontsize=11)
+    plt.colorbar(im_r0, ax=axes2[row_r, 0], fraction=0.046, pad=0.04)
+
+    for i, label in enumerate(methods_to_plot):
+        col = i + 1
+        pred_all = predicted_meas_by_label[label]
+        if pred_all is None:
+            axes2[row_g, col].axis('off')
+            axes2[row_r, col].axis('off')
+            continue
+
+        gather_pred = pred_all[src_idx]
+        resid = gather_pred - clean_gather
+
+        axes2[row_g, col].imshow(
+            gather_pred.T, cmap='seismic', origin='lower', aspect='auto',
+            vmin=-gather_vlim, vmax=gather_vlim, extent=extent,
+        )
+        axes2[row_g, col].set_title(f"{display_names.get(label, label)}\nShot gather", fontsize=12)
+        if src_idx == N_SOURCES - 1:
+            axes2[row_g, col].set_xlabel('Receiver x', fontsize=11)
+
+        axes2[row_r, col].imshow(
+            resid.T, cmap='seismic', origin='lower', aspect='auto',
+            vmin=-resid_vlim, vmax=resid_vlim, extent=extent,
+        )
+        axes2[row_r, col].set_title('Pred - clean residual', fontsize=12)
+        if src_idx == N_SOURCES - 1:
+            axes2[row_r, col].set_xlabel('Receiver x', fontsize=11)
+
+# Aggregate all-shot RMS block at the bottom.
+agg_row_g = 2 * N_SOURCES
+agg_row_r = agg_row_g + 1
+
+im_ag0 = axes2[agg_row_g, 0].imshow(
+    clean_rms.T, cmap='magma', origin='lower', aspect='auto',
+    vmin=0.0, vmax=agg_gather_vmax, extent=extent,
+)
+axes2[agg_row_g, 0].set_title('Ground Truth\nAll-shot RMS gather', fontsize=12)
+axes2[agg_row_g, 0].set_ylabel('Time', fontsize=11)
+axes2[agg_row_g, 0].set_xlabel('Receiver x', fontsize=11)
+plt.colorbar(im_ag0, ax=axes2[agg_row_g, 0], fraction=0.046, pad=0.04)
+
+im_ar0 = axes2[agg_row_r, 0].imshow(
+    obs_clean_rms_resid.T, cmap='magma', origin='lower', aspect='auto',
+    vmin=0.0, vmax=agg_resid_vmax, extent=extent,
+)
+axes2[agg_row_r, 0].set_title('Noisy - clean\nAll-shot RMS residual', fontsize=12)
+axes2[agg_row_r, 0].set_ylabel('Time', fontsize=11)
+axes2[agg_row_r, 0].set_xlabel('Receiver x', fontsize=11)
+plt.colorbar(im_ar0, ax=axes2[agg_row_r, 0], fraction=0.046, pad=0.04)
 
 for i, label in enumerate(methods_to_plot):
     col = i + 1
-    samps_clean = get_valid_samples(samples_helm[label])
-    if samps_clean.shape[0] < 10:
-        axes2[0, col].axis('off')
-        axes2[1, col].axis('off')
+    pred_rms = pred_rms_by_label[label]
+    resid_rms = rms_resid_by_label[label]
+    if pred_rms is None:
+        axes2[agg_row_g, col].axis('off')
+        axes2[agg_row_r, col].axis('off')
         continue
 
-    mean_lat = np.mean(samps_clean, axis=0)[:d_lat]
-    gather_pred = unpack_measurement_vector(np.array(solve_forward(jnp.array(mean_lat))))[0]
-    resid = gather_pred - clean_gather_s0
-    resid_vlim = max(resid_vlim, float(np.percentile(np.abs(resid), 99.2)))
-
-    axes2[0, col].imshow(
-        gather_pred.T, cmap='seismic', origin='lower', aspect='auto',
-        vmin=-gather_vlim, vmax=gather_vlim, extent=extent,
+    axes2[agg_row_g, col].imshow(
+        pred_rms.T, cmap='magma', origin='lower', aspect='auto',
+        vmin=0.0, vmax=agg_gather_vmax, extent=extent,
     )
-    axes2[0, col].set_title(f"{display_names.get(label, label)}\nShot gather", fontsize=14)
-    axes2[0, col].set_xlabel('Receiver x', fontsize=12)
+    axes2[agg_row_g, col].set_title(f"{display_names.get(label, label)}\nAll-shot RMS gather", fontsize=12)
+    axes2[agg_row_g, col].set_xlabel('Receiver x', fontsize=11)
 
-    axes2[1, col].imshow(
-        resid.T, cmap='seismic', origin='lower', aspect='auto',
-        vmin=-resid_vlim, vmax=resid_vlim, extent=extent,
+    axes2[agg_row_r, col].imshow(
+        resid_rms.T, cmap='magma', origin='lower', aspect='auto',
+        vmin=0.0, vmax=agg_resid_vmax, extent=extent,
     )
-    axes2[1, col].set_title('Pred - clean residual', fontsize=14)
-    axes2[1, col].set_xlabel('Receiver x', fontsize=12)
+    axes2[agg_row_r, col].set_title('Pred - clean\nAll-shot RMS residual', fontsize=12)
+    axes2[agg_row_r, col].set_xlabel('Receiver x', fontsize=11)
+
+# Put row labels on the left margin for readability in the large 10x10 grid.
+for r, row_name in enumerate(panel_row_titles):
+    axes2[r, 0].annotate(
+        row_name,
+        xy=(-0.16, 0.5), xycoords='axes fraction',
+        va='center', ha='right', rotation=90, fontsize=12,
+    )
 
 for ax in axes2.ravel():
     ax.set_aspect('auto')
 
 plt.suptitle(
-    'Source-0 acoustic shot gathers and residual images', fontsize=16, y=1.03,
+    f'All-source acoustic shot gathers and residual images ({N_SOURCES} sources + all-shot RMS aggregate)',
+    fontsize=16, y=1.002,
 )
 plt.tight_layout()
 plt.show()
