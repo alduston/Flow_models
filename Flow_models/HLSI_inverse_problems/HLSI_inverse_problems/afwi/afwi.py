@@ -493,7 +493,7 @@ print(f"Device: {device}")
 
 # Configuration for acoustic full-waveform inversion
 ACTIVE_DIM = num_truncated_series
-NOISE_REL = 0.01
+NOISE_REL = 0.005
 PLOT_NORMALIZER = 'best'    # sampler label/display name, or 'best'
 
 # Hessian spectral band for HLSI
@@ -3598,6 +3598,10 @@ plt.show()
 # ==========================================
 
 print('\nVisualizing source-0 amplitude/phase diagnostics...')
+
+# Reuse the precomputed all-shot gather tensors from Figure 2 and extract source 0.
+clean_gather_s0 = np.asarray(true_meas[0])
+obs_gather_s0 = np.asarray(obs_meas[0])
 
 freqs = np.fft.rfftfreq(N_RECORD_STEPS, d=DT * RECORD_STRIDE)
 clean_spec = np.fft.rfft(clean_gather_s0, axis=1)
