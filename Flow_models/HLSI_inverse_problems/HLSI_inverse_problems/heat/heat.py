@@ -2882,24 +2882,28 @@ methods_to_plot = [label for label in samples_darcy.keys() if label in mean_fiel
 n_cols = len(methods_to_plot) + 1
 vis_anchor_key = reference_key if reference_key in mean_fields else next(iter(mean_fields.keys()))
 
-# Normalize the conductivity panel using the reference/MALA sampler rather than
-# the worst exploding method. This keeps the error/uncertainty rows informative
-# when a single sampler (often Blend or CE-PoU variants) blows up.
-ref_vis_samples = get_valid_samples(samples_darcy[vis_anchor_key])[:1000] if vis_anchor_key in samples_darcy else np.empty((0, d_lat))
-if ref_vis_samples.shape[0] > 0:
-    ref_vis_fields = reconstruct_log_conductivity(ref_vis_samples[:, :d_lat])
-    ref_vis_mean = np.mean(ref_vis_fields, axis=0)
-    ref_vis_std = np.std(ref_vis_fields, axis=0)
-    vmin = float(min(np.min(true_field), np.min(ref_vis_fields)))
-    vmax = float(max(np.max(true_field), np.max(ref_vis_fields)))
-    max_err = max(1e-12, float(np.abs(ref_vis_mean - true_field).max()))
-    max_std = max(1e-12, float(ref_vis_std.max()))
+# Match the legacy heat_hlsi plotting logic: use the ground-truth field for
+# the conductivity color normalization, but anchor the error / uncertainty
+# scale to the reference sampler when available so blow-up methods do not wash
+# out the stable ones.
+vmin = float(true_field.min())
+vmax = float(true_field.max())
+
+if vis_anchor_key in samples_darcy and vis_anchor_key in mean_fields:
+    anchor_vis_samps = get_valid_samples(samples_darcy[vis_anchor_key])[:1000]
+    if anchor_vis_samps.shape[0] > 0:
+        anchor_vis_fields = reconstruct_log_conductivity(anchor_vis_samps[:, :d_lat])
+        max_err = max(1e-12, float(np.abs(mean_fields[vis_anchor_key] - true_field).max()))
+        max_std = max(1e-12, float(np.std(anchor_vis_fields, axis=0).max()))
+    else:
+        max_err, max_std = 1e-12, 1e-12
 else:
-    vmin = float(np.min(true_field))
-    vmax = float(np.max(true_field))
-    max_err = max(1e-12, max(float(np.abs(mean_fields[label] - true_field).max()) for label in methods_to_plot))
-    max_std = 1e-12
+    max_err, max_std = 1e-12, 1e-12
+
+if vis_anchor_key not in mean_fields:
     for label in methods_to_plot:
+        mean_f = mean_fields[label]
+        max_err = max(max_err, float(np.abs(mean_f - true_field).max()))
         samps = get_valid_samples(samples_darcy[label])[:500]
         if samps.shape[0] > 0:
             fields = reconstruct_log_conductivity(samps[:, :d_lat])
@@ -2907,47 +2911,59 @@ else:
 
 # --- Figure 1: Conductivity reconstruction ---
 fig, axes = plt.subplots(4, n_cols, figsize=(4 * n_cols, 14))
-im0 = axes[0, 0].imshow(true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
-axes[0, 0].scatter(obs_col, obs_row, c='lime', s=18, marker='.', alpha=0.7, label='Sensors')
+im0 = axes[0, 0].imshow(
+    true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='bicubic'
+)
 axes[0, 0].set_title('Ground Truth Log-Conductivity', fontsize=18)
 axes[0, 0].axis('off')
 plt.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
-axes[1, 0].axis('off')
-axes[2, 0].axis('off')
-axes[3, 0].imshow(true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+
+axes[3, 0].imshow(
+    true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='bicubic'
+)
 axes[3, 0].set_title('Ground Truth', fontsize=14)
 axes[3, 0].axis('off')
+axes[1, 0].axis('off')
+axes[2, 0].axis('off')
 
 for i, label in enumerate(methods_to_plot):
     col = i + 1
     mean_f = mean_fields[label]
-    axes[0, col].imshow(mean_f, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
-    axes[0, col].scatter(obs_col, obs_row, c='lime', s=18, marker='.', alpha=0.4)
-    axes[0, col].set_title(f"{display_names.get(label, label)} Mean Posterior", fontsize=14)
+
+    axes[0, col].imshow(
+        mean_f, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='bicubic'
+    )
+    axes[0, col].set_title(f"{display_names.get(label, label)} Mean Posterior", fontsize=18)
     axes[0, col].axis('off')
 
     err_f = np.abs(mean_f - true_field)
-    axes[1, col].imshow(err_f, cmap='inferno', origin='lower', vmin=0, vmax=max_err)
-    axes[1, col].set_title(f"Error Map(Max: {err_f.max():.2f})", fontsize=12)
+    axes[1, col].imshow(
+        err_f, cmap='inferno', origin='lower', vmin=0, vmax=max_err, interpolation='bicubic'
+    )
+    axes[1, col].set_title(f"Error Map(Max: {err_f.max():.2f})", fontsize=16)
     axes[1, col].axis('off')
 
     samps = get_valid_samples(samples_darcy[label])[:1000]
     if samps.shape[0] > 0:
         fields = reconstruct_log_conductivity(samps[:, :d_lat])
         std_f = np.std(fields, axis=0)
-        samp_f = fields[-1]
     else:
+        fields = None
         std_f = np.zeros_like(true_field)
-        samp_f = None
 
-    im_std = axes[2, col].imshow(std_f, cmap='viridis', origin='lower', vmin=0, vmax=max_std)
-    axes[2, col].set_title(r'Uncertainty $\sigma$', fontsize=12)
+    im_std = axes[2, col].imshow(
+        std_f, cmap='viridis', origin='lower', vmin=0, vmax=max_std, interpolation='bicubic'
+    )
+    axes[2, col].set_title(r'Uncertainty $\sigma$', fontsize=16)
     axes[2, col].axis('off')
     plt.colorbar(im_std, ax=axes[2, col], fraction=0.046, pad=0.04)
 
-    if samp_f is not None:
-        im_samp = axes[3, col].imshow(samp_f, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
-        axes[3, col].set_title('Random Sample', fontsize=12)
+    if fields is not None and samps.shape[0] > 0:
+        samp_f = fields[-1]
+        im_samp = axes[3, col].imshow(
+            samp_f, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation='bicubic'
+        )
+        axes[3, col].set_title('Random Sample', fontsize=14)
         axes[3, col].axis('off')
         plt.colorbar(im_samp, ax=axes[3, col], fraction=0.046, pad=0.04)
     else:
