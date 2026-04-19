@@ -498,7 +498,7 @@ print(f"Device: {device}")
 
 # Configuration for acoustic full-waveform inversion
 ACTIVE_DIM = num_truncated_series
-NOISE_REL = 0.005
+NOISE_REL = 0.05
 PLOT_NORMALIZER = 'best'    # sampler label/display name, or 'best'
 
 # Hessian spectral band for HLSI
