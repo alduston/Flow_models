@@ -314,8 +314,8 @@ mean_final_states = {}
 norm_true_uT = np.linalg.norm(true_uT) + 1e-12
 
 print('\n=== Allen–Cahn field/state metrics ===')
-print(f"{'Method':<24} | {'IC RelL2(%)':<12} | {'RMSE_a':<12} | {'StateRel':<12} | {'SensorRel':<12}")
-print('-' * 95)
+print(f"{'Method':<24} | {'IC RelL2(%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'StateRel':<12} | {'SensorRel':<12}")
+print('-' * 109)
 for label in [lab for lab in samples.keys() if lab in mean_fields]:
     mean_latent = np.asarray(metrics[label]['mean_latent'])
     mean_uT = solve_state_field(mean_latent, t=OBS_TIME)
@@ -325,7 +325,7 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
     metrics[label]['RelL2_final'] = final_rel
     ic_rel_l2_pct = 100.0 * float(metrics[label]['RelL2_field'])
     print(
-        f"{display_names.get(label, label):<24} | {ic_rel_l2_pct:<12.4f} | "
+        f"{display_names.get(label, label):<24} | {ic_rel_l2_pct:<12.4f} | {metrics[label].get('Pearson_field', float('nan')):<10.4f} | "
         f"{metrics[label]['RMSE_alpha']:<12.4e} | {final_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
     )
 
