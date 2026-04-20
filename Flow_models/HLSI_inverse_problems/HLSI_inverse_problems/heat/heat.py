@@ -126,7 +126,7 @@ h = 1.0 / (G - 1)
 x_1d = jnp.linspace(0.0, 1.0, G)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
 source_field = 20.0 * jnp.ones((G, G), dtype=jnp.float64)
-NOISE_STD = 0.01
+NOISE_STD = 0.05
 
 free_mask = jnp.array(free_mask_np)
 free_rows_np, free_cols_np = np.where(free_mask_np)
