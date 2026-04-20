@@ -461,10 +461,183 @@ save_reproducibility_log(
 # ==========================================
 
 def _overlay_sensors(ax):
-    ax.scatter(obs_col, obs_row, c='cyan', s=18, marker='.', alpha=0.7)
+    # Match the lighter advection-diffusion overlay styling rather than the
+    # older large cyan markers that dominate the 16x16 heat fields.
+    ax.scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.7)
 
 
-fig_field, axes_field = plot_field_reconstruction_grid(
+def plot_smoothed_field_reconstruction_grid(samples_dict, mean_fields, reconstruct_field_fn,
+                                            display_names=None,
+                                            true_field=None,
+                                            plot_normalizer_key=None,
+                                            reference_bottom_panel=None,
+                                            reference_bottom_title='Reference',
+                                            methods_to_plot=None,
+                                            field_cmap='viridis',
+                                            sample_cmap=None,
+                                            bottom_cmap=None,
+                                            overlay_reference_fn=None,
+                                            overlay_method_fn=None,
+                                            suptitle=None,
+                                            field_name='field',
+                                            n_sample_max=1000,
+                                            interpolation='bicubic'):
+    """Heat-specific reconstruction grid with smooth interpolation.
+
+    The shared helper in sampling.py renders the native 16x16 arrays directly,
+    which makes the heat reconstructions look blocky after the refactor. Keep
+    the shared normalization / layout logic, but smooth the displayed images so
+    this plot visually matches the advect_diff presentation more closely.
+    """
+    if len(mean_fields) == 0:
+        raise ValueError('mean_fields is empty.')
+    if display_names is None:
+        display_names = {label: label for label in samples_dict.keys()}
+    if methods_to_plot is None:
+        methods_to_plot = [label for label in samples_dict.keys() if label in mean_fields]
+    if sample_cmap is None:
+        sample_cmap = field_cmap
+    if bottom_cmap is None:
+        bottom_cmap = field_cmap
+
+    n_cols = len(methods_to_plot) + 1
+    fig, axes = plt.subplots(4, n_cols, figsize=(4 * n_cols, 14))
+    has_true_field = true_field is not None
+    vis_anchor_key = plot_normalizer_key if plot_normalizer_key in mean_fields else next(iter(mean_fields.keys()))
+    vis_anchor_title = display_names.get(vis_anchor_key, vis_anchor_key)
+    vis_reference_field = np.asarray(true_field if has_true_field else mean_fields[vis_anchor_key])
+    vis_reference_bottom = np.asarray(reference_bottom_panel if reference_bottom_panel is not None else vis_reference_field)
+
+    vmin = float(np.min(vis_reference_field))
+    vmax = float(np.max(vis_reference_field))
+
+    max_std = 1e-12
+    if vis_anchor_key in samples_dict and vis_anchor_key in mean_fields:
+        anchor_vis_samps = get_valid_samples(samples_dict[vis_anchor_key])[:n_sample_max]
+        if anchor_vis_samps.shape[0] > 0:
+            anchor_vis_fields = np.asarray(reconstruct_field_fn(anchor_vis_samps))
+            max_std = max(1e-12, float(np.std(anchor_vis_fields, axis=0).max()))
+    if has_true_field:
+        max_err = max(1e-12, float(np.abs(mean_fields[vis_anchor_key] - vis_reference_field).max()))
+    else:
+        max_err = max(
+            1e-12,
+            max(float(np.abs(mean_fields[label] - vis_reference_field).max()) for label in methods_to_plot),
+        )
+
+    im0 = axes[0, 0].imshow(
+        vis_reference_field,
+        cmap=field_cmap,
+        origin='lower',
+        vmin=vmin,
+        vmax=vmax,
+        interpolation=interpolation,
+    )
+    if overlay_reference_fn is not None:
+        overlay_reference_fn(axes[0, 0])
+    axes[0, 0].set_title(
+        f"Ground Truth\n{field_name}" if has_true_field else f"Normalizer\n{vis_anchor_title} {field_name}",
+        fontsize=18,
+    )
+    axes[0, 0].axis('off')
+    plt.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+    axes[1, 0].axis('off')
+    axes[2, 0].axis('off')
+    axes[3, 0].imshow(
+        vis_reference_bottom,
+        cmap=bottom_cmap,
+        origin='lower',
+        vmin=vmin,
+        vmax=vmax,
+        interpolation=interpolation,
+    )
+    if overlay_reference_fn is not None:
+        overlay_reference_fn(axes[3, 0])
+    axes[3, 0].set_title(reference_bottom_title, fontsize=14)
+    axes[3, 0].axis('off')
+
+    for i, label in enumerate(methods_to_plot):
+        col = i + 1
+        mean_f = np.asarray(mean_fields[label])
+        axes[0, col].imshow(
+            mean_f,
+            cmap=field_cmap,
+            origin='lower',
+            vmin=vmin,
+            vmax=vmax,
+            interpolation=interpolation,
+        )
+        if overlay_method_fn is not None:
+            overlay_method_fn(axes[0, col])
+        axes[0, col].set_title(f"{display_names.get(label, label)}\nMean Posterior", fontsize=18)
+        axes[0, col].axis('off')
+
+        err_f = np.abs(mean_f - vis_reference_field)
+        axes[1, col].imshow(
+            err_f,
+            cmap='inferno',
+            origin='lower',
+            vmin=0,
+            vmax=max_err,
+            interpolation=interpolation,
+        )
+        if overlay_method_fn is not None:
+            overlay_method_fn(axes[1, col])
+        err_title = (
+            f"Error Map\n(Max: {err_f.max():.2f})"
+            if has_true_field else f"Deviation from {vis_anchor_title}\n(Max: {err_f.max():.2f})"
+        )
+        axes[1, col].set_title(err_title, fontsize=16)
+        axes[1, col].axis('off')
+
+        samps = get_valid_samples(samples_dict[label])[:n_sample_max]
+        if samps.shape[0] > 0:
+            fields = np.asarray(reconstruct_field_fn(samps))
+            std_f = np.std(fields, axis=0)
+        else:
+            fields = None
+            std_f = np.zeros_like(vis_reference_field)
+        im_std = axes[2, col].imshow(
+            std_f,
+            cmap='viridis',
+            origin='lower',
+            vmin=0,
+            vmax=max_std,
+            interpolation=interpolation,
+        )
+        if overlay_method_fn is not None:
+            overlay_method_fn(axes[2, col])
+        axes[2, col].set_title('Posterior std', fontsize=16)
+        axes[2, col].axis('off')
+        plt.colorbar(im_std, ax=axes[2, col], fraction=0.046, pad=0.04)
+
+        if fields is not None and samps.shape[0] > 0:
+            samp_f = fields[-1]
+            im_samp = axes[3, col].imshow(
+                samp_f,
+                cmap=sample_cmap,
+                origin='lower',
+                vmin=vmin,
+                vmax=vmax,
+                interpolation=interpolation,
+            )
+            if overlay_method_fn is not None:
+                overlay_method_fn(axes[3, col])
+            axes[3, col].set_title('Random posterior sample', fontsize=14)
+            axes[3, col].axis('off')
+            plt.colorbar(im_samp, ax=axes[3, col], fraction=0.046, pad=0.04)
+        else:
+            axes[3, col].axis('off')
+
+    if suptitle is not None:
+        plt.suptitle(suptitle, fontsize=18, y=1.02)
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
+
+
+fig_field, axes_field = plot_smoothed_field_reconstruction_grid(
     samples,
     mean_fields,
     reconstruct_log_conductivity,
