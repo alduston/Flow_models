@@ -49,7 +49,7 @@ x = np.linspace(0.0, 1.0, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
 
-ell = 0.2
+ell = 0.12
 sigma_prior = 1.0
 q_max = 100
 
@@ -284,15 +284,13 @@ samples = pipeline['samples']
 ess_logs = pipeline['ess_logs']
 sampler_run_info = pipeline['sampler_run_info']
 display_names = pipeline['display_names']
-reference_key = pipeline['reference_key']
-reference_title = pipeline['reference_title']
 
 summarize_sampler_run(sampler_run_info)
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 
 metrics = compute_latent_metrics(
     samples,
-    reference_key,
+    'MALA (prior)',
     alpha_true_np,
     prior_model,
     lik_model,
@@ -371,7 +369,6 @@ plot_pca_histograms(
     samples,
     alpha_true_np,
     display_names=display_names,
-    reference_key=reference_key,
 )
 
 results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(
@@ -380,7 +377,7 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
     n_ref=N_REF,
     target_name='Darcy flow log-permeability',
     display_names=display_names,
-    reference_name=reference_title,
+    reference_name=display_names.get('MALA (prior)', 'Prior'),
 )
 
 save_reproducibility_log(
@@ -416,8 +413,6 @@ save_reproducibility_log(
         'obs_indices': obs_indices,
         'obs_locations': obs_locations,
         'obs_row': obs_row,
-        'reference_key': reference_key,
-        'reference_title': reference_title,
         'sampler_run_info': sampler_run_info,
         'sigma_prior': sigma_prior,
         'ell': ell,
@@ -437,7 +432,7 @@ n_cols = len(methods_to_plot) + 1
 # --- Figure 1: Log-permeability reconstruction ---
 fig, axes = plt.subplots(4, n_cols, figsize=(4 * n_cols, 14))
 
-vis_anchor_key = reference_key if reference_key in mean_fields else next(iter(mean_fields.keys()))
+vis_anchor_key = 'MALA (prior)' if 'MALA (prior)' in mean_fields else next(iter(mean_fields.keys()))
 
 vmin = float(np.min(true_field))
 vmax = float(np.max(true_field))
