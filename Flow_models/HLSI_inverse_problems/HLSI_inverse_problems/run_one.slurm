@@ -3,7 +3,7 @@
 #SBATCH -p rtx
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 6:00:00
+#SBATCH -t 2:00:00
 #SBATCH -o slurm-%j.out
 #SBATCH --mail-user=alois.duston@utexas.edu
 #SBATCH --mail-type=END,FAIL
