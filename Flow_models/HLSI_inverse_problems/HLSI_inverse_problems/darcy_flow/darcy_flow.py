@@ -131,7 +131,7 @@ obs_locations = jnp.array(obs_raw, dtype=int)
 # ==========================================
 jax.config.update("jax_enable_x64", True)
 
-NOISE_STD = 0.005
+NOISE_STD = 0.002
 
 h = 1.0 / (N - 1)
 x_1d = jnp.linspace(0.0, 1.0, N)
