@@ -379,8 +379,8 @@ mean_solution_states = {}
 norm_true_solution = np.linalg.norm(true_solution) + 1e-12
 
 print('\n=== Poisson physical-space metrics ===')
-print(f"{'Method':<24} | {'Coeff RelL2(%)':<16} | {'RMSE_a':<12} | {'SolutionRel':<12} | {'SensorRel':<12}")
-print('-' * 96)
+print(f"{'Method':<24} | {'Coeff RelL2(%)':<16} | {'Pearson':<10} | {'RMSE_a':<12} | {'SolutionRel':<12} | {'SensorRel':<12}")
+print('-' * 109)
 for label in [lab for lab in samples.keys() if lab in mean_fields]:
     mean_latent = np.asarray(metrics[label]['mean_latent'])
     mean_solution = solve_solution_field(mean_latent)
@@ -391,7 +391,7 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
     coeff_rel_pct = 100.0 * float(metrics[label]['RelL2_field'])
     print(
         f"{display_names.get(label, label):<24} | {coeff_rel_pct:<16.4f} | "
-        f"{metrics[label]['RMSE_alpha']:<12.4e} | {solution_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
+        f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {solution_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
     )
 
 plot_normalizer_key = resolve_plot_normalizer(
