@@ -346,8 +346,8 @@ sensor_residuals = {}
 norm_true_temperature = np.linalg.norm(true_temperature_field) + 1e-12
 
 print('\n=== Heat-equation physical-space metrics ===')
-print(f"{'Method':<24} | {'LogCond RelL2(%)':<18} | {'RMSE_a':<12} | {'TempRel':<12} | {'SensorRel':<12}")
-print('-' * 100)
+print(f"{'Method':<24} | {'LogCond RelL2(%)':<18} | {'Pearson':<10} | {'RMSE_a':<12} | {'TempRel':<12} | {'SensorRel':<12}")
+print('-' * 114)
 for label in [lab for lab in samples.keys() if lab in mean_fields]:
     mean_latent = np.asarray(metrics[label]['mean_latent'])
     mean_temperature = solve_temperature_field(mean_latent)
@@ -362,7 +362,7 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
     metrics[label]['RelL2_temperature'] = temperature_rel
     logcond_rel_pct = 100.0 * float(metrics[label]['RelL2_field'])
     print(
-        f"{display_names.get(label, label):<24} | {logcond_rel_pct:<18.4f} | "
+        f"{display_names.get(label, label):<24} | {logcond_rel_pct:<18.4f} | {metrics[label].get('Pearson_field', float('nan')):<10.4f} | "
         f"{metrics[label]['RMSE_alpha']:<12.4e} | {temperature_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
     )
 
