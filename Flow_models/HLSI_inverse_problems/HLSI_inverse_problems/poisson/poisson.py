@@ -50,7 +50,7 @@ x = np.linspace(0.0, 1.0, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
 
-ELL = 0.10
+ELL = 0.09
 SIGMA_PRIOR = 1.0
 Q_MAX = 100
 
@@ -67,7 +67,7 @@ np.savetxt('data/PoissonCoeff_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # 1. Configuration / data files
 # ==========================================
 num_observation_generated = 100
-num_observation = 25
+num_observation = 40
 num_truncated_series = 48
 seed = 42
 
