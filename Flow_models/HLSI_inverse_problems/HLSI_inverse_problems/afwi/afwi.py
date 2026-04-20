@@ -514,13 +514,13 @@ mean_fields, metrics = compute_field_summary_metrics(
 )
 
 print('\n=== Acoustic FWI field/data metrics ===')
-print(f"{'Method':<24} | {'RelL2_c (%)':<12} | {'RMSE_a':<12} | {'FwdRel':<12}")
-print('-' * 70)
+print(f"{'Method':<24} | {'RelL2_c (%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FwdRel':<12}")
+print('-' * 84)
 norm_true = np.linalg.norm(true_field) + 1e-12
 for label in mean_fields:
     data = metrics[label]
     inv_rel_l2_pct = 100.0 * data['RelL2_field']
-    print(f"{display_names.get(label, label):<24} | {inv_rel_l2_pct:<12.4f} | {data['RMSE_alpha']:<12.4e} | {data['FwdRelErr']:<12.4e}")
+    print(f"{display_names.get(label, label):<24} | {inv_rel_l2_pct:<12.4f} | {data['Pearson_field']:<10.4f} | {data['RMSE_alpha']:<12.4e} | {data['FwdRelErr']:<12.4e}")
 
 plot_normalizer_key = resolve_plot_normalizer(
     PLOT_NORMALIZER,
