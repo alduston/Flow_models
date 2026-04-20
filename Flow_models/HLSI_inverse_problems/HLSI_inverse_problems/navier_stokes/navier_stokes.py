@@ -221,7 +221,7 @@ reference_title = pipeline['reference_title']
 summarize_sampler_run(sampler_run_info)
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 metrics = compute_latent_metrics(samples, reference_key, alpha_true_np, prior_model, lik_model, posterior_score_fn, display_names=display_names)
-plot_pca_histograms(samples, alpha_true_np, display_names=display_names, reference_key=reference_key)
+plot_pca_histograms(samples, alpha_true_np, display_names=display_names)
 
 Basis_np = np.array(Basis)
 obs_locs_np = np.array(obs_locations)
