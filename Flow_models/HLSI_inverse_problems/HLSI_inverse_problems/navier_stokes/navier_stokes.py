@@ -22,6 +22,7 @@ import torch
 from sampling import (
     GaussianPrior,
     compute_latent_metrics,
+    pearson_corr_array,
     configure_sampling,
     get_valid_samples,
     init_run_results,
@@ -252,8 +253,8 @@ norm_true = np.linalg.norm(true_field) + 1e-12
 norm_y_clean = np.linalg.norm(y_clean_np) + 1e-12
 
 print('\n=== Physical Parameter Space Metrics (Initial Vorticity + Forward) ===')
-print(f"{'Method':<24} | {'Inv RelL2(%)':<12} | {'RMSE_alpha':<12} | {'FwdRelErr':<12}")
-print('-' * 76)
+print(f"{'Method':<24} | {'Inv RelL2(%)':<12} | {'Pearson':<10} | {'RMSE_alpha':<12} | {'FwdRelErr':<12}")
+print('-' * 90)
 mean_fields = {}
 mean_final_fields = {}
 sensor_residuals = {}
@@ -275,9 +276,10 @@ for label, samps in samples.items():
         RMSE_alpha=float(np.sqrt(np.mean((mean_latent - alpha_true_np) ** 2))),
         RMSE_field=float(np.sqrt(np.mean((mean_field - true_field) ** 2))),
         RelL2_field=float(np.linalg.norm(mean_field - true_field) / norm_true),
+        Pearson_field=pearson_corr_array(mean_field, true_field),
         FwdRelErr=fwd_rel,
     ))
-    print(f"{display_names.get(label, label):<24} | {inv_rel_l2_pct:<12.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {fwd_rel:<12.4e}")
+    print(f"{display_names.get(label, label):<24} | {inv_rel_l2_pct:<12.4f} | {metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {fwd_rel:<12.4e}")
 
 results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(metrics, sampler_run_info, n_ref=N_REF, target_name='Navier-Stokes inversion', display_names=display_names, reference_name=reference_title)
 
