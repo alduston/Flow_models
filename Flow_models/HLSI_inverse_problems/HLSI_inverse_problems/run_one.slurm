@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J hlsi
-#SBATCH -p rtx
+#SBATCH -p gh
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -t 2:00:00
@@ -22,14 +22,14 @@ echo "== Host: $(hostname)"
 echo "== TACC_SYSTEM: ${TACC_SYSTEM:-unknown}"
 echo "== Start time: $(date)"
 
-# --- Frontera modules (must match how the venv was built) ---
+# --- VISTA modules (must match how the venv was built) ---
 module purge
-module load gcc/9.1.0
-module load python3/3.9.2
+module load gcc/13.2.0
+module load python3/3.11.8
 python3 -V
 
-# --- persistent venv on Frontera ---
-VENV_DIR="/work2/10812/ald4435/frontera/venvs/flow_frontera_py39/"
+# --- persistent venv on Vista ---
+VENV_DIR="/work/10812/ald4435/vista/venvs/flow_vista_py3118"
 if [ ! -d "$VENV_DIR" ]; then
   echo "[error] Expected venv at $VENV_DIR not found."
   exit 2
@@ -41,7 +41,7 @@ echo "== Which python: $(which python)"
 # --- base dir and target ---
 # Default to the directory from which sbatch was called; this should be the
 # repo root that contains sampling.py and the per-experiment subdirectories.
-BASEDIR="${SLURM_SUBMIT_DIR:-/work2/10812/ald4435/frontera/Flow_models/Flow_models/HLSI_inverse_problems/HLSI_inverse_problems_frontera}"
+BASEDIR="${SLURM_SUBMIT_DIR:-/work2/10812/ald4435/frontera/Flow_models/Flow_models/HLSI_inverse_problems/HLSI_inverse_problems}"
 PROB_DIR="$BASEDIR/$PROB"
 TARGET="$PROB_DIR/${PROB}.py"
 export PYTHONPATH="$BASEDIR:${PYTHONPATH:-}"
