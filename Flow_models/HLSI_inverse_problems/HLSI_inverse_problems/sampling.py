@@ -1489,6 +1489,17 @@ def rmse_array(x_hat, x_true):
     return float(np.sqrt(np.mean((x_hat - x_true) ** 2)))
 
 
+def pearson_corr_array(x_hat, x_true, eps=1e-12):
+    x_hat = np.asarray(x_hat, dtype=np.float64).reshape(-1)
+    x_true = np.asarray(x_true, dtype=np.float64).reshape(-1)
+    x_hat_centered = x_hat - np.mean(x_hat)
+    x_true_centered = x_true - np.mean(x_true)
+    denom = np.linalg.norm(x_hat_centered) * np.linalg.norm(x_true_centered)
+    if denom <= eps:
+        return float(1.0 if np.linalg.norm(x_hat - x_true) <= eps else np.nan)
+    return float(np.dot(x_hat_centered, x_true_centered) / denom)
+
+
 def sliced_wasserstein_distance(X_a, X_b, num_projections=500, p=2):
     n_a = X_a.shape[0]
     n_b = X_b.shape[0]
@@ -2559,6 +2570,7 @@ def compute_field_summary_metrics(samples_dict, metrics, alpha_true_np, true_fie
             mean_latent=mean_latent,
             RMSE_alpha=rmse_alpha,
             RMSE_field=rmse_array(mean_field, true_field),
+            Pearson_field=pearson_corr_array(mean_field, true_field),
             RelL2_field=rel_l2_field,
             FwdRelErr=fwd_rel,
         ))
@@ -2601,7 +2613,7 @@ def build_results_dataframes(metrics_dict, run_info_dict, n_ref, target_name,
         display_names = {label: label for label in run_info_dict.keys()}
     metric_rows = [
         'RMSE_alpha', 'RelL2_alpha', 'MMD_to_reference', 'KSD', 'KLdiag',
-        'RMSE_field', 'RelL2_field', 'FwdRelErr',
+        'RMSE_field', 'Pearson_field', 'RelL2_field', 'FwdRelErr',
     ]
     ordered_methods = [label for label in run_info_dict.keys() if label in metrics_dict]
     results_df = pd.DataFrame(index=metric_rows, columns=ordered_methods, dtype=np.float64)
