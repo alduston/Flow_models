@@ -160,7 +160,7 @@ def solve_forward(alpha):
 # Shared sampling config
 # ==========================================
 ACTIVE_DIM = num_truncated_series
-NOISE_STD = 0.01
+NOISE_STD = 0.005
 HESS_MIN = 1e-4
 HESS_MAX = 1e6
 GNL_PILOT_N = 1024
