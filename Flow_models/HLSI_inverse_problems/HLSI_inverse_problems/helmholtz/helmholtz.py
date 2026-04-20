@@ -414,11 +414,11 @@ mean_fields, metrics = compute_field_summary_metrics(
 )
 
 print('\n=== Helmholtz field/data metrics ===')
-print(f"{'Method':<24} | {'RelL2_q (%)':<12} | {'RMSE_a':<12} | {'FwdRel':<12}")
-print('-' * 70)
+print(f"{'Method':<24} | {'RelL2_q (%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FwdRel':<12}")
+print('-' * 84)
 for label in mean_fields:
     data = metrics[label]
-    print(f"{display_names.get(label, label):<24} | {100.0 * data['RelL2_field']:<12.4f} | {data['RMSE_alpha']:<12.4e} | {data['FwdRelErr']:<12.4e}")
+    print(f"{display_names.get(label, label):<24} | {100.0 * data['RelL2_field']:<12.4f} | {data.get('Pearson_field', float('nan')):<10.4f} | {data['RMSE_alpha']:<12.4e} | {data['FwdRelErr']:<12.4e}")
 
 plot_normalizer_key = resolve_plot_normalizer(PLOT_NORMALIZER, list(mean_fields.keys()), display_names=display_names, metrics_dict=metrics, fallback=reference_key, best_metric_keys=('RelL2_field', 'IC RelL2(%)', 'RelL2_q(%)'))
 plot_normalizer_title = display_names.get(plot_normalizer_key, plot_normalizer_key)
