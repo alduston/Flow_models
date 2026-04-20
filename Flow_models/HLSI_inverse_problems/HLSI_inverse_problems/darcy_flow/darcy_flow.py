@@ -318,8 +318,8 @@ mean_permeabilities = {}
 norm_true_pressure = np.linalg.norm(true_pressure) + 1e-12
 
 print('\n=== Darcy physical-space metrics ===')
-print(f"{'Method':<24} | {'LogPerm RelL2(%)':<18} | {'RMSE_a':<12} | {'PressureRel':<12} | {'SensorRel':<12}")
-print('-' * 100)
+print(f"{'Method':<24} | {'LogPerm RelL2(%)':<18} | {'Pearson':<10} | {'RMSE_a':<12} | {'PressureRel':<12} | {'SensorRel':<12}")
+print('-' * 113)
 for label in [lab for lab in samples.keys() if lab in mean_fields]:
     mean_latent = np.asarray(metrics[label]['mean_latent'])
     mean_pressure = solve_pressure_field(mean_latent)
@@ -332,7 +332,7 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
     logperm_rel_pct = 100.0 * float(metrics[label]['RelL2_field'])
     print(
         f"{display_names.get(label, label):<24} | {logperm_rel_pct:<18.4f} | "
-        f"{metrics[label]['RMSE_alpha']:<12.4e} | {pressure_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
+        f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {pressure_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
     )
 
 plot_normalizer_key = resolve_plot_normalizer(
