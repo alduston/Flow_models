@@ -29,10 +29,8 @@ from sampling import (
     init_run_results,
     make_physics_likelihood,
     make_posterior_score_fn,
-    plot_field_reconstruction_grid,
     plot_mean_ess_logs,
     plot_pca_histograms,
-    resolve_plot_normalizer,
     rmse_array,
     run_standard_sampler_pipeline,
     save_reproducibility_log,
@@ -42,7 +40,7 @@ from sampling import (
 )
 
 # ==========================================
-# 0. KL basis generation
+# 0. KL basis generation (match old script)
 # ==========================================
 os.makedirs('data', exist_ok=True)
 
@@ -51,12 +49,12 @@ x = np.linspace(0.0, 1.0, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
 
-ELL = 0.2
-SIGMA_PRIOR = 1.0
+ell = 0.2
+sigma_prior = 1.0
 q_max = 100
 
 dists = cdist(coords, coords)
-C = SIGMA_PRIOR ** 2 * np.exp(-dists / ELL)
+C = sigma_prior ** 2 * np.exp(-dists / ell)
 eigvals, eigvecs = np.linalg.eigh(C)
 idx = np.argsort(eigvals)[::-1]
 eigvals = eigvals[idx]
@@ -65,15 +63,13 @@ Basis_Modes = eigvecs[:, :q_max] * np.sqrt(eigvals[:q_max])
 np.savetxt('data/Darcy_Basis_Modes.csv', Basis_Modes, delimiter=',')
 
 # ==========================================
-# 1. Configuration / data files
+# 1. Configuration / data files (follow old I/O path exactly)
 # ==========================================
 num_observation = 100
 num_truncated_series = 32
 seed = 42
 
-basis_truncated = Basis_Modes[:, :num_truncated_series]
 dimension_of_PoI = N * N
-num_modes_available = Basis_Modes.shape[1]
 
 interior_mask = np.ones((N, N), dtype=bool)
 interior_mask[0, :] = False
@@ -87,16 +83,53 @@ obs_indices = np.array(
     jax.random.choice(key, interior_indices, shape=(num_observation,), replace=False)
 )
 
+# Load / truncate / resave exactly like the old script rather than using the
+# in-memory eigendecomposition directly. This keeps the modular version aligned
+# with the old data-generation path.
+df_modes = pd.read_csv('data/Darcy_Basis_Modes.csv', header=None)
+if isinstance(df_modes.iloc[0, 0], str):
+    df_modes = pd.read_csv('data/Darcy_Basis_Modes.csv')
+
+modes_raw = df_modes.to_numpy().flatten()
+num_modes_available = modes_raw.size // dimension_of_PoI
+full_basis = modes_raw.reshape((dimension_of_PoI, num_modes_available))
+basis_truncated = full_basis[:, :num_truncated_series]
+
 pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
 pd.DataFrame(obs_indices).to_csv('data/obs_locations.csv', index=False, header=False)
+
+# Match old script's reload-from-disk path too.
+df_Basis = pd.read_csv('data/Basis.csv', header=None)
+df_obs = pd.read_csv('data/obs_locations.csv', header=None)
+
+basis_raw = df_Basis.to_numpy().flatten()
+if basis_raw.size % dimension_of_PoI == 1:
+    basis_raw = basis_raw[1:]
+basis_raw = basis_raw.astype(np.float64)
+
+if basis_raw.size % dimension_of_PoI != 0:
+    raise ValueError(
+        f"Basis file size {basis_raw.size} is not divisible by grid size {dimension_of_PoI}."
+    )
+
+num_modes_in_file = basis_raw.size // dimension_of_PoI
+full_basis = np.reshape(basis_raw, (dimension_of_PoI, num_modes_in_file))
+Basis = jnp.array(full_basis[:, :num_truncated_series], dtype=jnp.float64)
+
+obs_raw = df_obs.to_numpy().flatten()
+if obs_raw.size == num_observation + 1:
+    obs_raw = obs_raw[1:]
+obs_raw = obs_raw.astype(int)
+if obs_raw.size > num_observation:
+    obs_raw = obs_raw[:num_observation]
+elif obs_raw.size < num_observation:
+    raise ValueError(f"Obs file only has {obs_raw.size} locations, need {num_observation}.")
+obs_locations = jnp.array(obs_raw, dtype=int)
 
 # ==========================================
 # 2. Physics: Darcy flow
 # ==========================================
 jax.config.update("jax_enable_x64", True)
-
-Basis = jnp.array(basis_truncated, dtype=jnp.float64)
-obs_locations = jnp.array(obs_indices, dtype=int)
 
 NOISE_STD = 0.005
 
@@ -148,7 +181,7 @@ def _assemble_darcy_vectorized(k_field):
     A = A.at[idx, nbr_N].add(jnp.where(nbr_N >= 0, -c_N, 0.0))
     A = A.at[idx, nbr_S].add(jnp.where(nbr_S >= 0, -c_S, 0.0))
 
-    rhs = f_darcy[ir, ic]
+    rhs = f_darcy[_int_rows, _int_cols]
     return A, rhs
 
 
@@ -178,7 +211,6 @@ def solve_full_pressure(alpha):
 # Shared sampling configuration
 # ==========================================
 ACTIVE_DIM = num_truncated_series
-PLOT_NORMALIZER = 'best'
 HESS_MIN = 1e-4
 HESS_MAX = 1e6
 GNL_PILOT_N = 1024
@@ -200,7 +232,7 @@ configure_sampling(
     gnl_stiff_lambda_cut=GNL_STIFF_LAMBDA_CUT,
     gnl_use_dominant_particle_newton=GNL_USE_DOMINANT_PARTICLE_NEWTON,
 )
-run_ctx = init_run_results('darcy_flow_hlsi')
+run_ctx = init_run_results('darcy_wc_ce_hlsi')
 
 # ==========================================
 # 3. Experiment execution
@@ -335,22 +367,11 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
         f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {pressure_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
     )
 
-plot_normalizer_key = resolve_plot_normalizer(
-    PLOT_NORMALIZER,
-    list(mean_fields.keys()),
-    display_names=display_names,
-    metrics_dict=metrics,
-    fallback=reference_key,
-    best_metric_keys=('RelL2_field',),
-)
-plot_normalizer_title = display_names.get(plot_normalizer_key, plot_normalizer_key)
 plot_pca_histograms(
     samples,
     alpha_true_np,
     display_names=display_names,
-    normalizer=plot_normalizer_key,
-    metrics_dict=metrics,
-    fallback_key=reference_key,
+    reference_key=reference_key,
 )
 
 results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(
@@ -367,65 +388,133 @@ save_reproducibility_log(
     config={
         'seed': seed,
         'ACTIVE_DIM': ACTIVE_DIM,
-        'N_REF': N_REF,
         'BUILD_GNL_BANKS': BUILD_GNL_BANKS,
-        'PLOT_NORMALIZER': PLOT_NORMALIZER,
-        'HESS_MIN': HESS_MIN,
+        'C': C,
+        'DEFAULT_N_GEN': DEFAULT_N_GEN,
+        'GNL_PILOT_N': GNL_PILOT_N,
+        'GNL_STIFF_LAMBDA_CUT': GNL_STIFF_LAMBDA_CUT,
+        'GNL_USE_DOMINANT_PARTICLE_NEWTON': GNL_USE_DOMINANT_PARTICLE_NEWTON,
         'HESS_MAX': HESS_MAX,
+        'HESS_MIN': HESS_MIN,
+        'N': N,
         'NOISE_STD': NOISE_STD,
+        'N_REF': N_REF,
+        'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
+        'USE_GAUSS_NEWTON_HESSIAN': True,
+        'X': X,
+        'Y': Y,
+        'd_lat': ACTIVE_DIM,
+        'dimension_of_PoI': dimension_of_PoI,
+        'display_names': display_names,
+        'interior_indices': interior_indices,
+        'interior_mask': interior_mask,
+        'n_int': n_int,
+        'num_modes_available': num_modes_available,
         'num_observation': num_observation,
         'num_truncated_series': num_truncated_series,
-        'num_modes_available': num_modes_available,
-        'ELL': ELL,
-        'SIGMA_PRIOR': SIGMA_PRIOR,
-        'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
+        'obs_col': obs_col,
+        'obs_indices': obs_indices,
+        'obs_locations': obs_locations,
+        'obs_row': obs_row,
+        'reference_key': reference_key,
+        'reference_title': reference_title,
+        'sampler_run_info': sampler_run_info,
+        'sigma_prior': sigma_prior,
+        'ell': ell,
     },
     extra_sections={
         'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path},
-        'summary_stats': {
-            'reference_key': reference_key,
-            'reference_title': reference_title,
-            'plot_normalizer_key': plot_normalizer_key,
-            'plot_normalizer_title': plot_normalizer_title,
-            'num_methods_evaluated': len(results_df.columns),
-            'num_methods_with_samples': len(samples),
-            'num_methods_with_mean_fields': len(mean_fields),
-            'num_methods_with_mean_pressures': len(mean_pressures),
-            'num_methods_with_ess_logs': len(ess_logs),
-        },
     },
 )
 
 # ==========================================
-# 4. Problem-specific visualization
+# 4. Problem-specific visualization (restore old layout / scaling)
 # ==========================================
+print('\nVisualizing Darcy field reconstructions...')
+methods_to_plot = [label for label in samples.keys() if label in mean_fields]
+n_cols = len(methods_to_plot) + 1
 
-def _overlay_sensors(ax):
-    ax.scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.7)
+# --- Figure 1: Log-permeability reconstruction ---
+fig, axes = plt.subplots(4, n_cols, figsize=(4 * n_cols, 14))
 
+vis_anchor_key = reference_key if reference_key in mean_fields else next(iter(mean_fields.keys()))
 
-fig_field, axes_field = plot_field_reconstruction_grid(
-    samples,
-    mean_fields,
-    reconstruct_log_permeability,
-    display_names=display_names,
-    true_field=true_field,
-    plot_normalizer_key=plot_normalizer_key,
-    reference_bottom_panel=true_field,
-    reference_bottom_title='Ground Truth\nLog-permeability $m(x)$',
-    field_cmap='RdBu_r',
-    sample_cmap='RdBu_r',
-    bottom_cmap='RdBu_r',
-    overlay_reference_fn=_overlay_sensors,
-    overlay_method_fn=_overlay_sensors,
-    suptitle=f'Inverse Darcy flow (d={ACTIVE_DIM}): log-permeability reconstruction',
-    field_name='Log-permeability $m(x)$',
-)
+vmin = float(np.min(true_field))
+vmax = float(np.max(true_field))
+
+if vis_anchor_key in samples and vis_anchor_key in mean_fields:
+    anchor_vis_samps = get_valid_samples(samples[vis_anchor_key])[:1000]
+    if anchor_vis_samps.shape[0] > 0:
+        anchor_vis_fields = reconstruct_log_permeability(anchor_vis_samps[:, :ACTIVE_DIM])
+        max_err = max(1e-12, float(np.abs(mean_fields[vis_anchor_key] - true_field).max()))
+        max_std = max(1e-12, float(np.std(anchor_vis_fields, axis=0).max()))
+    else:
+        max_err = 1e-12
+        max_std = 1e-12
+else:
+    max_err = 1e-12
+    max_std = 1e-12
+
+im0 = axes[0, 0].imshow(true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+axes[0, 0].scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.7, label='Sensors')
+axes[0, 0].set_title('Ground Truth\nLog-Permeability $m(x)$', fontsize=18)
+axes[0, 0].axis('off')
+plt.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+axes[3, 0].imshow(true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+axes[3, 0].set_title('Ground Truth', fontsize=14)
+axes[3, 0].axis('off')
+axes[1, 0].axis('off')
+axes[2, 0].axis('off')
+
+if vis_anchor_key not in mean_fields:
+    max_err = 1e-12
+    max_std = 1e-12
+    for label in methods_to_plot:
+        mean_f = mean_fields[label]
+        max_err = max(max_err, np.abs(mean_f - true_field).max())
+        samps = get_valid_samples(samples[label])[:500]
+        if samps.shape[0] > 0:
+            fields = reconstruct_log_permeability(samps[:, :ACTIVE_DIM])
+            max_std = max(max_std, np.std(fields, axis=0).max())
+
+for i, label in enumerate(methods_to_plot):
+    col = i + 1
+    mean_f = mean_fields[label]
+
+    axes[0, col].imshow(mean_f, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+    axes[0, col].scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.5)
+    axes[0, col].set_title(f"{display_names.get(label, label)}\nMean Posterior", fontsize=18)
+    axes[0, col].axis('off')
+
+    err_f = np.abs(mean_f - true_field)
+    axes[1, col].imshow(err_f, cmap='inferno', origin='lower', vmin=0, vmax=max_err)
+    axes[1, col].set_title(f"Error Map\n(Max: {err_f.max():.2f})", fontsize=16)
+    axes[1, col].axis('off')
+
+    samps = get_valid_samples(samples[label])[:1000]
+    if samps.shape[0] > 0:
+        fields = reconstruct_log_permeability(samps[:, :ACTIVE_DIM])
+        std_f = np.std(fields, axis=0)
+    else:
+        std_f = np.zeros_like(true_field)
+    axes[2, col].imshow(std_f, cmap='viridis', origin='lower', vmin=0, vmax=max_std)
+    axes[2, col].set_title(f"Uncertainty\n(Max std: {std_f.max():.2f})", fontsize=16)
+    axes[2, col].axis('off')
+
+    if samps.shape[0] > 0:
+        sample_field = reconstruct_log_permeability(samps[:1, :ACTIVE_DIM])[0]
+        axes[3, col].imshow(sample_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+        axes[3, col].set_title('Posterior Sample', fontsize=14)
+    else:
+        axes[3, col].text(0.5, 0.5, 'No valid\nsamples', ha='center', va='center', transform=axes[3, col].transAxes)
+    axes[3, col].axis('off')
+
+plt.suptitle(f'Inverse Darcy flow (d={ACTIVE_DIM})', fontsize=22, y=1.01)
+plt.tight_layout()
 plt.show()
 
 print('\nVisualizing pressure fields...')
-methods_to_plot = [label for label in samples.keys() if label in mean_fields]
-n_cols = len(methods_to_plot) + 1
 fig2, axes2 = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
 
 true_pmin = float(np.min(true_pressure))
@@ -448,11 +537,7 @@ for i, label in enumerate(methods_to_plot):
     axes2[col].set_title(f"{display_names.get(label, label)}\nPressure", fontsize=14)
     axes2[col].axis('off')
 
-plt.suptitle(
-    f'Inverse Darcy flow (d={ACTIVE_DIM}): pressure field',
-    fontsize=16,
-    y=1.05,
-)
+plt.suptitle(f'Inverse Darcy flow (d={ACTIVE_DIM}): pressure field', fontsize=16, y=1.05)
 plt.tight_layout()
 plt.show()
 
@@ -476,11 +561,7 @@ for i, label in enumerate(methods_to_plot):
     axes3[col].set_title(f"{display_names.get(label, label)}\n$k(x)=e^{{m(x)}}$", fontsize=14)
     axes3[col].axis('off')
 
-plt.suptitle(
-    f'Inverse Darcy flow (d={ACTIVE_DIM}): permeability field',
-    fontsize=16,
-    y=1.05,
-)
+plt.suptitle(f'Inverse Darcy flow (d={ACTIVE_DIM}): permeability field', fontsize=16, y=1.05)
 plt.tight_layout()
 plt.show()
 
