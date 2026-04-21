@@ -12,6 +12,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 import gc
 import math
 import platform
+import random
 import shutil
 import time
 from collections import OrderedDict
@@ -146,10 +147,27 @@ def init_run_results(run_prefix: str, root: str = 'run_results'):
     global RUN_TIMESTAMP, RUN_RESULTS_ROOT, RUN_RESULTS_DIR, RUN_RESULTS_STEM, _PLOT_SAVE_COUNTER
     RUN_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
     RUN_RESULTS_ROOT = root
-    RUN_RESULTS_DIR = os.path.join(RUN_RESULTS_ROOT, f'{run_prefix}_{RUN_TIMESTAMP}')
-    RUN_RESULTS_STEM = f'{run_prefix}_{RUN_TIMESTAMP}'
+
+    os.makedirs(RUN_RESULTS_ROOT, exist_ok=True)
+
+    # Append a random 3-digit suffix so batched jobs started at nearly the same
+    # time do not overwrite one another. If a collision still occurs, resample.
+    for _ in range(1000):
+        run_suffix = f'{random.randint(0, 999):03d}'
+        run_name = f'{run_prefix}_{RUN_TIMESTAMP}_{run_suffix}'
+        run_dir = os.path.join(RUN_RESULTS_ROOT, run_name)
+        if not os.path.exists(run_dir):
+            RUN_RESULTS_DIR = run_dir
+            RUN_RESULTS_STEM = run_name
+            break
+    else:
+        raise RuntimeError(
+            f'Could not find a unique run-results directory for prefix={run_prefix!r} '
+            f'under {RUN_RESULTS_ROOT!r} after 1000 attempts.'
+        )
+
     _PLOT_SAVE_COUNTER = 0
-    os.makedirs(RUN_RESULTS_DIR, exist_ok=True)
+    os.makedirs(RUN_RESULTS_DIR, exist_ok=False)
     return {
         'run_timestamp': RUN_TIMESTAMP,
         'run_results_root': RUN_RESULTS_ROOT,
