@@ -266,36 +266,6 @@ SAMPLER_CONFIGS = OrderedDict([
     ('CE-HLSI', {'init': 'CE-HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-WC-HLSI', {'init': 'CE-HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-PoU-HLSI', {'init': 'CE-HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('DT-CE-HLSI', {
-        'init': 'DT-CE-HLSI', 'init_weights': 'L',
-        'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0,
-        'log_mean_ess': True,
-        'dt_ce_c_sig': 1.0,
-        'dt_ce_power': 1.0,
-        'dt_ce_rho_max': 1.0,
-        'dt_ce_eps': 1e-8,
-        'dt_ce_query_trust': False,
-    }),
-    ('DT-CE-WC-HLSI', {
-        'init': 'DT-CE-HLSI', 'init_weights': 'WC',
-        'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0,
-        'log_mean_ess': True,
-        'dt_ce_c_sig': 1.0,
-        'dt_ce_power': 1.0,
-        'dt_ce_rho_max': 1.0,
-        'dt_ce_eps': 1e-8,
-        'dt_ce_query_trust': False,
-    }),
-    ('DT-CE-PoU-HLSI', {
-        'init': 'DT-CE-HLSI', 'init_weights': 'PoU',
-        'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0,
-        'log_mean_ess': True,
-        'dt_ce_c_sig': 1.0,
-        'dt_ce_power': 1.0,
-        'dt_ce_rho_max': 1.0,
-        'dt_ce_eps': 1e-8,
-        'dt_ce_query_trust': False,
-    }),
 ])
 
 pipeline = run_standard_sampler_pipeline(
