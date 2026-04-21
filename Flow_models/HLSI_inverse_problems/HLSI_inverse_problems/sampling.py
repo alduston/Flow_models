@@ -1151,8 +1151,8 @@ def eval_score_batched(y, t, X_ref_cpu, s0_ref_cpu, log_lik_ref_cpu,
 def _get_ce_hlsi_gate_eigenbasis(P_bar, et2, var_t):
     """
     Given the SNIS-averaged posterior Hessian P_bar [M, d, d],
-    returns the gate eigenvalues and eigenvectors for the
-    certainty-equivalent CE-HLSI gate
+    returns the raw eigenvalues, CE gate eigenvalues, and eigenvectors for
+    the certainty-equivalent CE-HLSI gate
 
         A_bar = e^{-2t} (e^{-2t} I + v_t P_bar)^{-1}.
 
@@ -1162,9 +1162,145 @@ def _get_ce_hlsi_gate_eigenbasis(P_bar, et2, var_t):
         A_k = e^{-2t} / (e^{-2t} + v_t * lam_k).
     """
     lam, V = torch.linalg.eigh(P_bar)
-    lam = lam.clamp(min=1e-6)
-    gate_eig = et2 / (et2 + var_t * lam)
-    return gate_eig, V
+    lam_safe = lam.clamp(min=1e-6)
+    gate_eig = et2 / (et2 + var_t * lam_safe)
+    return lam, gate_eig, V
+
+
+def _get_component_gate_dense_or_spectral(P_batch, gated_chunk, et2, var_t):
+    """
+    Return the componentwise HLSI attenuation matrices
+
+        A_i(t) = e^{-2t} (e^{-2t} I + v_t P_i)^{-1},
+
+    using the already-available spectral data when present. Outside each
+    component's trusted band, we set the gate to zero so the component falls
+    back to Tweedie in those directions, matching the existing HLSI rule.
+    """
+    if gated_chunk is not None:
+        eigvecs = gated_chunk['eigvecs']
+        eigvals = torch.clamp(gated_chunk['eigvals'], min=0.0)
+        trusted = gated_chunk['trusted']
+        gate_eig = et2 / (et2 + var_t * eigvals)
+        gate_eig = torch.where(trusted, gate_eig, torch.zeros_like(gate_eig))
+        A_batch = torch.einsum('bij,bj,bkj->bik', eigvecs, gate_eig, eigvecs)
+        return A_batch
+
+    d = P_batch.shape[-1]
+    I = torch.eye(d, device=P_batch.device, dtype=P_batch.dtype).unsqueeze(0)
+    system = et2 * I + var_t * P_batch
+    A_batch = torch.linalg.solve(system, et2 * I.expand_as(P_batch))
+    return 0.5 * (A_batch + A_batch.transpose(-1, -2))
+
+
+def eval_dt_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
+                                    P_ref_cpu, s0_post_ref_cpu,
+                                    gated_info=None, batch_size=REF_STREAM_BATCH,
+                                    dt_ce_c_sig=1.0, dt_ce_power=1.0,
+                                    dt_ce_rho_max=1.0, dt_ce_eps=1e-8,
+                                    dt_ce_query_trust=False):
+    """
+    Directionally tempered CE-HLSI.
+
+    This keeps the same active SNIS weights used by CE-HLSI (plain L, WC, or
+    PoU via the caller-provided log-weight tensor), but replaces the single
+    certainty-equivalent gate by a directionwise interpolation between:
+
+        (i)  the usual CE gate built from the averaged precision P_bar, and
+        (ii) the averaged componentwise gate, measured along the query-local
+             eigendirections of P_bar.
+
+    The interpolation weight is a local directional distrust score built from
+    the weighted variance of the CE-blended signal d_i = a_i - b_i, where
+    a_i = s0_i / e^{-t} and b_i is the componentwise Tweedie signal.
+    """
+    t_val = _canonicalize_time(t)
+    et = math.exp(-t_val)
+    et2 = et * et
+    var_t = 1.0 - math.exp(-2.0 * t_val)
+    inv_v = 1.0 / var_t
+
+    w = get_posterior_snis_weights(
+        y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size)
+
+    m_query, d = y.shape
+    mu_x = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    s_tsi_num = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    P_bar = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
+
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        P_batch = P_ref_cpu[sl].to(y.device, non_blocking=True)
+
+        mu_x += torch.einsum('mb,bd->md', w_batch, X_batch)
+        s_tsi_num += torch.einsum('mb,bd->md', w_batch, s0_batch)
+        P_bar += torch.einsum('mb,bij->mij', w_batch, P_batch)
+
+        del w_batch, X_batch, s0_batch, P_batch
+
+    s_twd = -inv_v * (y - et * mu_x)
+    s_tsi = (1.0 / et) * s_tsi_num
+    diff = s_tsi - s_twd
+
+    lam_bar, gate_bar_eig, V = _get_ce_hlsi_gate_eigenbasis(P_bar, et2, var_t)
+    diff_eig = torch.einsum('mji,mj->mi', V, diff)
+
+    delta_second = torch.zeros_like(diff_eig)
+    gate_avg_eig = torch.zeros_like(gate_bar_eig)
+
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        P_batch = P_ref_cpu[sl].to(y.device, non_blocking=True)
+
+        gated_chunk = None
+        if gated_info is not None:
+            gated_chunk = {
+                'eigvecs': gated_info['eigvecs'][sl].to(y.device, non_blocking=True),
+                'eigvals': gated_info['eigvals'][sl].to(y.device, non_blocking=True),
+                'trusted': gated_info['trusted'][sl].to(y.device, non_blocking=True),
+            }
+
+        A_batch = _get_component_gate_dense_or_spectral(P_batch, gated_chunk, et2, var_t)
+
+        twd_chunk = -inv_v * (y.unsqueeze(1) - et * X_batch.unsqueeze(0))
+        tsi_chunk = (1.0 / et) * s0_batch.unsqueeze(0)
+        delta_chunk = tsi_chunk - twd_chunk
+
+        for k in range(d):
+            u_k = V[:, :, k]
+            delta_proj = torch.einsum('mi,mbi->mb', u_k, delta_chunk)
+            delta_second[:, k] += torch.sum(w_batch * (delta_proj ** 2), dim=1)
+
+            Au_k = torch.einsum('bij,mj->mbi', A_batch, u_k)
+            gate_dir = torch.einsum('mi,mbi->mb', u_k, Au_k)
+            gate_avg_eig[:, k] += torch.sum(w_batch * gate_dir, dim=1)
+
+        del w_batch, X_batch, s0_batch, P_batch, A_batch, twd_chunk, tsi_chunk, delta_chunk
+        if gated_chunk is not None:
+            del gated_chunk
+
+    var_dir = torch.clamp(delta_second - diff_eig ** 2, min=0.0)
+    distrust = var_dir / (var_dir + dt_ce_c_sig * (diff_eig ** 2) + dt_ce_eps)
+    distrust = torch.clamp(distrust, min=0.0, max=1.0)
+    if dt_ce_power != 1.0:
+        distrust = distrust ** dt_ce_power
+    if dt_ce_rho_max is not None:
+        distrust = torch.clamp(distrust, max=float(dt_ce_rho_max))
+
+    gate_dt_eig = (1.0 - distrust) * gate_bar_eig + distrust * gate_avg_eig
+    if dt_ce_query_trust:
+        query_trusted = (lam_bar >= HESS_MIN) & (lam_bar <= HESS_MAX)
+        gate_dt_eig = torch.where(query_trusted, gate_dt_eig, gate_bar_eig)
+
+    A_diff = torch.einsum('mij,mj->mi', V, gate_dt_eig * diff_eig)
+    score = s_twd + A_diff
+    return score
 
 
 def eval_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
@@ -1219,7 +1355,7 @@ def eval_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
     s_twd = -(1.0 / var_t) * (y - et * mu_x)
     s_tsi = (1.0 / et) * s_tsi_num
 
-    gate_eig, V = _get_ce_hlsi_gate_eigenbasis(P_bar, et2, var_t)
+    _, gate_eig, V = _get_ce_hlsi_gate_eigenbasis(P_bar, et2, var_t)
 
     diff = s_tsi - s_twd
     diff_eig = torch.einsum('mji,mj->mi', V, diff)
@@ -1248,10 +1384,13 @@ def compute_pou_weighted_denominator_score(y, t, X_ref, log_lik_ref,
 
 def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
                       P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
-                      grad_log_pou_denom_ref=None):
+                      grad_log_pou_denom_ref=None,
+                      dt_ce_c_sig=1.0, dt_ce_power=1.0,
+                      dt_ce_rho_max=1.0, dt_ce_eps=1e-8,
+                      dt_ce_query_trust=False):
     """
     No-CFG wrapper: returns only the conditional/posterior score estimate.
-    mode in {'tweedie', 'blend_posterior', 'hlsi_posterior', 'ce_hlsi'}.
+    mode in {'tweedie', 'blend_posterior', 'hlsi_posterior', 'ce_hlsi', 'dt_ce_hlsi'}.
     Stage-A PoU is realized by selecting a PoU-adjusted local bank; there is no
     additional query-time denominator subtraction here.
     """
@@ -1289,6 +1428,16 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
         score = eval_ce_hlsi_posterior_score(
             y, t_val, X_ref, log_lik_ref, P_ref, s0_post_ref,
             gated_info=gated_info, batch_size=REF_STREAM_BATCH)
+
+    elif mode == 'dt_ce_hlsi':
+        if P_ref is None:
+            raise ValueError("mode='dt_ce_hlsi' requires P_ref.")
+        score = eval_dt_ce_hlsi_posterior_score(
+            y, t_val, X_ref, log_lik_ref, P_ref, s0_post_ref,
+            gated_info=gated_info, batch_size=REF_STREAM_BATCH,
+            dt_ce_c_sig=dt_ce_c_sig, dt_ce_power=dt_ce_power,
+            dt_ce_rho_max=dt_ce_rho_max, dt_ce_eps=dt_ce_eps,
+            dt_ce_query_trust=dt_ce_query_trust)
 
     elif mode == 'leaf_hlsi':
         if P_ref is None or mu_ref is None:
@@ -1355,7 +1504,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                      P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
                      steps=40, dim=15, log_mean_ess=False, x_init=None,
                      t_max=2.0, t_min=10 ** (-2.0),
-                     grad_log_pou_denom_ref=None):
+                     grad_log_pou_denom_ref=None,
+                     dt_ce_c_sig=1.0, dt_ce_power=1.0,
+                     dt_ce_rho_max=1.0, dt_ce_eps=1e-8,
+                     dt_ce_query_trust=False):
     if x_init is None:
         y = torch.randn(n_samples, dim, device=device, dtype=torch.float64)
     else:
@@ -1388,7 +1540,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
         s_cur = get_score_wrapper(y, t_cur, mode, X_ref, s0_post_ref, log_lik_ref,
                                   P_ref=P_ref, mu_ref=mu_ref, gated_info=gated_info,
                                   init_weights=init_weights,
-                                  grad_log_pou_denom_ref=grad_log_pou_denom_ref)
+                                  grad_log_pou_denom_ref=grad_log_pou_denom_ref,
+                                  dt_ce_c_sig=dt_ce_c_sig, dt_ce_power=dt_ce_power,
+                                  dt_ce_rho_max=dt_ce_rho_max, dt_ce_eps=dt_ce_eps,
+                                  dt_ce_query_trust=dt_ce_query_trust)
         d_cur = y + 2.0 * s_cur
 
         z = torch.randn_like(y)
@@ -1397,7 +1552,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
         s_next = get_score_wrapper(y_hat, t_next, mode, X_ref, s0_post_ref, log_lik_ref,
                                    P_ref=P_ref, mu_ref=mu_ref, gated_info=gated_info,
                                    init_weights=init_weights,
-                                   grad_log_pou_denom_ref=grad_log_pou_denom_ref)
+                                   grad_log_pou_denom_ref=grad_log_pou_denom_ref,
+                                   dt_ce_c_sig=dt_ce_c_sig, dt_ce_power=dt_ce_power,
+                                   dt_ce_rho_max=dt_ce_rho_max, dt_ce_eps=dt_ce_eps,
+                                   dt_ce_query_trust=dt_ce_query_trust)
         d_next = y_hat + 2.0 * s_next
 
         y = y + 0.5 * (d_cur + d_next) * dt + math.sqrt(2.0 * dt.item()) * z
@@ -2079,6 +2237,9 @@ INIT_ALIASES = {
     _normalize_sampler_key('ce-hlsi'): 'ce_hlsi',
     _normalize_sampler_key('ce_hlsi'): 'ce_hlsi',
     _normalize_sampler_key('ce hlsi'): 'ce_hlsi',
+    _normalize_sampler_key('dt-ce-hlsi'): 'dt_ce_hlsi',
+    _normalize_sampler_key('dt_ce_hlsi'): 'dt_ce_hlsi',
+    _normalize_sampler_key('dt ce hlsi'): 'dt_ce_hlsi',
     _normalize_sampler_key('leaf-hlsi'): 'leaf_hlsi',
     _normalize_sampler_key('leaf_hlsi'): 'leaf_hlsi',
     _normalize_sampler_key('leaf hlsi'): 'leaf_hlsi',
@@ -2094,6 +2255,7 @@ INIT_DISPLAY_NAMES = {
     'blend_posterior': 'Blend',
     'hlsi_posterior': 'HLSI',
     'ce_hlsi': 'CE-HLSI',
+    'dt_ce_hlsi': 'DT-CE-HLSI',
     'leaf_hlsi': 'Leaf-HLSI',
     'leaf_ce_hlsi': 'Leaf-CE-HLSI',
     'mala': 'MALA',
@@ -2132,6 +2294,12 @@ LEGACY_INIT_SPECS = {
     _normalize_sampler_key('ce-pou-hlsi'): ('ce_hlsi', 'PoU'),
     _normalize_sampler_key('ce_pou_hlsi'): ('ce_hlsi', 'PoU'),
     _normalize_sampler_key('ce pou hlsi'): ('ce_hlsi', 'PoU'),
+    _normalize_sampler_key('dt-ce-wc-hlsi'): ('dt_ce_hlsi', 'WC'),
+    _normalize_sampler_key('dt_ce_wc_hlsi'): ('dt_ce_hlsi', 'WC'),
+    _normalize_sampler_key('dt ce wc hlsi'): ('dt_ce_hlsi', 'WC'),
+    _normalize_sampler_key('dt-ce-pou-hlsi'): ('dt_ce_hlsi', 'PoU'),
+    _normalize_sampler_key('dt_ce_pou_hlsi'): ('dt_ce_hlsi', 'PoU'),
+    _normalize_sampler_key('dt ce pou hlsi'): ('dt_ce_hlsi', 'PoU'),
     _normalize_sampler_key('leaf-wc-hlsi'): ('leaf_hlsi', 'WC'),
     _normalize_sampler_key('leaf_wc_hlsi'): ('leaf_hlsi', 'WC'),
     _normalize_sampler_key('leaf wc hlsi'): ('leaf_hlsi', 'WC'),
@@ -2188,6 +2356,10 @@ def format_sampler_display_name(init_mode, init_weights='L'):
         return 'CE-WC-HLSI'
     if init_mode == 'ce_hlsi' and init_weights == 'PoU':
         return 'CE-PoU-HLSI'
+    if init_mode == 'dt_ce_hlsi' and init_weights == 'WC':
+        return 'DT-CE-WC-HLSI'
+    if init_mode == 'dt_ce_hlsi' and init_weights == 'PoU':
+        return 'DT-CE-PoU-HLSI'
     if init_mode == 'leaf_hlsi' and init_weights == 'WC':
         return 'Leaf-WC-HLSI'
     if init_mode == 'leaf_hlsi' and init_weights == 'PoU':
@@ -2346,6 +2518,11 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('mala_burnin', 0)
     cfg.setdefault('mala_dt', 5e-4)
     cfg.setdefault('is_reference', False)
+    cfg.setdefault('dt_ce_c_sig', 1.0)
+    cfg.setdefault('dt_ce_power', 1.0)
+    cfg.setdefault('dt_ce_rho_max', 1.0)
+    cfg.setdefault('dt_ce_eps', 1e-8)
+    cfg.setdefault('dt_ce_query_trust', False)
 
     if cfg['init'] == 'prior' and cfg['init_steps'] != 0:
         print(f"[normalize_sampler_config] '{label}': init='prior' ignores "
@@ -2387,6 +2564,9 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
             log_mean_ess=cfg['log_mean_ess'],
             t_max=cfg['init_tmax'], t_min=cfg['init_tmin'],
             grad_log_pou_denom_ref=bank.get('grad_log_pou_denom_ref'),
+            dt_ce_c_sig=cfg['dt_ce_c_sig'], dt_ce_power=cfg['dt_ce_power'],
+            dt_ce_rho_max=cfg['dt_ce_rho_max'], dt_ce_eps=cfg['dt_ce_eps'],
+            dt_ce_query_trust=cfg['dt_ce_query_trust'],
         )
         if cfg['log_mean_ess']:
             init_samples, ess_trace = init_out
@@ -2609,6 +2789,7 @@ def results_method_family(label, info):
         'blend_posterior': 'Blend',
         'hlsi_posterior': 'HLSI',
         'ce_hlsi': 'CE-HLSI',
+    'dt_ce_hlsi': 'DT-CE-HLSI',
         'gnl_hlsi': 'HLSI',
         'gnl_ce_hlsi': 'CE-HLSI',
     }
