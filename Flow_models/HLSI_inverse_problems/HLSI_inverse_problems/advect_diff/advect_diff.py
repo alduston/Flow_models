@@ -23,6 +23,7 @@ from scipy.spatial.distance import cdist
 from sampling import (
     GaussianPrior,
     compute_field_summary_metrics,
+    compute_heldout_predictive_metrics,
     compute_latent_metrics,
     configure_sampling,
     get_valid_samples,
@@ -68,6 +69,7 @@ np.savetxt('data/AdvecDiff_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # 1. Configuration / data files
 # ==========================================
 num_observation = 120
+num_holdout_observation = 120
 num_truncated_series = 32
 seed = 42
 
@@ -76,12 +78,18 @@ num_modes_available = Basis_Modes.shape[1]
 basis_truncated = Basis_Modes[:, :num_truncated_series]
 
 key = jax.random.PRNGKey(seed)
-obs_indices = np.array(
+obs_indices_train = np.array(
     jax.random.choice(key, jnp.arange(dimension_of_PoI), shape=(num_observation,), replace=False)
 )
+remaining_indices = np.setdiff1d(np.arange(dimension_of_PoI), obs_indices_train)
+key_holdout = jax.random.PRNGKey(seed + 1)
+obs_indices_holdout = np.array(
+    jax.random.choice(key_holdout, jnp.array(remaining_indices), shape=(num_holdout_observation,), replace=False)
+)
+obs_indices = obs_indices_train
 
 pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
-pd.DataFrame(obs_indices).to_csv('data/obs_locations.csv', index=False, header=False)
+pd.DataFrame(obs_indices_train).to_csv('data/obs_locations.csv', index=False, header=False)
 
 # ==========================================
 # 2. Physics: periodic advection-diffusion
@@ -89,7 +97,9 @@ pd.DataFrame(obs_indices).to_csv('data/obs_locations.csv', index=False, header=F
 jax.config.update("jax_enable_x64", True)
 
 Basis = jnp.array(basis_truncated, dtype=jnp.float64)
-obs_locations = jnp.array(obs_indices, dtype=int)
+obs_locations_train = jnp.array(obs_indices_train, dtype=int)
+obs_locations_holdout = jnp.array(obs_indices_holdout, dtype=int)
+obs_locations = obs_locations_train
 
 x_1d = jnp.linspace(0.0, 1.0, N, endpoint=False)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
@@ -120,7 +130,14 @@ def _propagate_advection_diffusion(u0_field, t=OBS_TIME):
 def solve_forward(alpha):
     u0 = jnp.reshape(Basis @ alpha, (N, N))
     uT = _propagate_advection_diffusion(u0, OBS_TIME)
-    return uT.reshape(-1)[obs_locations]
+    return uT.reshape(-1)[obs_locations_train]
+
+
+@jax.jit
+def solve_forward_holdout(alpha):
+    u0 = jnp.reshape(Basis @ alpha, (N, N))
+    uT = _propagate_advection_diffusion(u0, OBS_TIME)
+    return uT.reshape(-1)[obs_locations_holdout]
 
 
 @jax.jit
@@ -187,6 +204,10 @@ alpha_true_np, true_u0_target = make_structured_truth_coefficients(ACTIVE_DIM)
 y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
+y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
+
+batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -319,12 +340,25 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    batched_forward_eval_fn=lambda a_batch: np.asarray(
+        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+    ),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+)
+
 mean_final_states = {}
 norm_true_uT = np.linalg.norm(true_uT) + 1e-12
 
 print('\n=== Advection-diffusion field/state metrics ===')
-print(f"{'Method':<24} | {'IC RelL2(%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FinalRel':<12} | {'SensorRel':<12}")
-print('-' * 108)
+print(f"{'Method':<24} | {'IC RelL2(%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FinalRel':<12} | {'SensorRel':<12} | {'HeldoutNLL':<12} | {'HeldoutZ2':<12}")
+print('-' * 135)
 for label in [lab for lab in samples.keys() if lab in mean_fields]:
     mean_latent = np.asarray(metrics[label]['mean_latent'])
     mean_uT = solve_state_field(mean_latent, t=OBS_TIME)
@@ -336,7 +370,8 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
     print(
         f"{display_names.get(label, label):<24} | {ic_rel_l2_pct:<12.4f} | "
         f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | "
-        f"{final_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
+        f"{final_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e} | "
+        f"{metrics[label].get('HeldoutPredNLL', np.nan):<12.4e} | {metrics[label].get('HeldoutStdResSq', np.nan):<12.4e}"
     )
 
 plot_normalizer_key = resolve_plot_normalizer(
@@ -378,6 +413,7 @@ save_reproducibility_log(
         'HESS_MAX': HESS_MAX,
         'NOISE_STD': NOISE_STD,
         'num_observation': num_observation,
+        'num_holdout_observation': num_holdout_observation,
         'num_truncated_series': num_truncated_series,
         'num_modes_available': num_modes_available,
         'OBS_TIME': OBS_TIME,
