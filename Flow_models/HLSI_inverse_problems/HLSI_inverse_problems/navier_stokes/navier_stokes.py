@@ -44,7 +44,7 @@ from sampling import (
 # ==========================================
 N = 32
 num_observation = 120
-num_holdout_observation = 120
+num_holdout_observation = 30
 num_truncated_series = 32
 num_modes_available = 100
 seed = 42
