@@ -21,6 +21,7 @@ import torch
 
 from sampling import (
     GaussianPrior,
+    compute_heldout_predictive_metrics,
     compute_field_summary_metrics,
     compute_latent_metrics,
     configure_sampling,
@@ -111,6 +112,22 @@ free_mask_np = build_free_mask(GRID_SIZE, ROOT_EDGE)
 free_index_np = np.where(free_mask_np.ravel())[0].astype(np.int64)
 pd.DataFrame(free_index_np).to_csv('data/free_index.csv', index=False, header=False)
 
+_train_obs_indices_set = set(int(i) for i in np.asarray(obs_indices).tolist())
+_holdout_candidate_indices = np.array(
+    [int(i) for i in free_index_np.tolist() if int(i) not in _train_obs_indices_set],
+    dtype=int,
+)
+_holdout_rng = np.random.default_rng(seed + 137)
+n_holdout_observation = min(len(np.asarray(obs_indices)), _holdout_candidate_indices.size)
+if n_holdout_observation > 0:
+    heldout_obs_indices = np.sort(
+        _holdout_rng.choice(_holdout_candidate_indices, size=n_holdout_observation, replace=False)
+    ).astype(int)
+else:
+    heldout_obs_indices = np.array([], dtype=int)
+
+pd.DataFrame(heldout_obs_indices).to_csv('data/heldout_obs_locations.csv', index=False, header=False)
+
 # ==========================================
 # 1. Physics: bespoke mixed-BC heat equation
 # ==========================================
@@ -119,6 +136,7 @@ jax.config.update("jax_enable_x64", True)
 DIMENSION_OF_POI = GRID_SIZE ** 2
 Basis = jnp.array(basis_truncated, dtype=jnp.float64)
 obs_locations = jnp.array(obs_indices, dtype=int)
+heldout_obs_locations = jnp.array(heldout_obs_indices, dtype=int)
 free_index = jnp.array(free_index_np, dtype=int)
 
 G = GRID_SIZE
@@ -204,6 +222,12 @@ def solve_forward(alpha):
     return w_full.reshape(-1)[obs_locations]
 
 
+@jax.jit
+def solve_forward_holdout(alpha):
+    w_full = solve_forward_full(alpha)
+    return w_full.reshape(-1)[heldout_obs_locations]
+
+
 # ==========================================
 # Shared sampling configuration
 # ==========================================
@@ -243,6 +267,8 @@ np.random.seed(seed)
 alpha_true_np = np.random.randn(ACTIVE_DIM) * 0.5
 y_clean_np = np.array(solve_forward(jnp.array(alpha_true_np)))
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
+y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -374,6 +400,18 @@ mean_temperature_fields = {}
 sensor_residuals = {}
 norm_true_temperature = np.linalg.norm(true_temperature_field) + 1e-12
 
+_batched_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+    batched_forward_eval_fn=lambda alphas: np.array(_batched_solve_forward_holdout(jnp.array(alphas))),
+)
+
 print('\n=== Heat-equation physical-space metrics ===')
 print(f"{'Method':<24} | {'LogCond RelL2(%)':<18} | {'Pearson':<10} | {'RMSE_a':<12} | {'TempRel':<12} | {'SensorRel':<12}")
 print('-' * 114)
@@ -441,6 +479,8 @@ save_reproducibility_log(
         'prior_length_scale': prior_length_scale,
         'SIGMA_PRIOR': SIGMA_PRIOR,
         'n_free': int(n_free),
+        'n_holdout_observation': int(heldout_obs_indices.size),
+        'heldout_obs_indices': heldout_obs_indices,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
     },
     extra_sections={
