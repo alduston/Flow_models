@@ -47,11 +47,11 @@ os.makedirs('data', exist_ok=True)
 
 GRID_SIZE = 16
 N = 15  # legacy latent dimension symbol used in prior files / old logs
-num_observation = 10
-num_truncated_series = 15
-num_modes_available = 15
+num_observation = 30
+num_truncated_series = 24
+num_modes_available = 24
 seed = 42
-prior_length_scale = 0.18
+prior_length_scale = 0.1
 ROOT_EDGE = 'top'
 SIGMA_PRIOR = 1.0
 
@@ -126,7 +126,7 @@ h = 1.0 / (G - 1)
 x_1d = jnp.linspace(0.0, 1.0, G)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
 source_field = 20.0 * jnp.ones((G, G), dtype=jnp.float64)
-NOISE_STD = 0.05
+NOISE_STD = 0.0075
 
 free_mask = jnp.array(free_mask_np)
 free_rows_np, free_cols_np = np.where(free_mask_np)
@@ -209,7 +209,7 @@ def solve_forward(alpha):
 # ==========================================
 ACTIVE_DIM = num_truncated_series
 PLOT_NORMALIZER = 'best'
-HESS_MIN = 1e-4
+HESS_MIN = 1e-6
 HESS_MAX = 1e6
 GNL_PILOT_N = 1024
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
