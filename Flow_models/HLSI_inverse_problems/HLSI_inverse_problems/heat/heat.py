@@ -256,6 +256,7 @@ lik_model, lik_aux = make_physics_likelihood(
 )
 posterior_score_fn = make_posterior_score_fn(lik_model)
 
+'''
 SAMPLER_CONFIGS = OrderedDict([
     ('MALA (prior)', {'init': 'prior', 'init_steps': 0, 'mala_steps': 500, 'mala_burnin': 100, 'mala_dt': 1e-4, 'is_reference': True}),
     ('Tweedie', {'init': 'tweedie', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
@@ -267,6 +268,99 @@ SAMPLER_CONFIGS = OrderedDict([
     ('CE-WC-HLSI', {'init': 'CE-HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-PoU-HLSI', {'init': 'CE-HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
 ])
+'''
+
+SAMPLER_CONFIGS = OrderedDict([
+    ('MALA (prior)', {'init': 'prior', 'init_steps': 0, 'mala_steps': 500, 'mala_burnin': 100, 'mala_dt': 1e-4, 'is_reference': True}),
+    #('Tweedie', {'init': 'tweedie', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('Blend', {'init': 'blend', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': False}),
+
+    ('HLSI', {'init': 'HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('WC-HLSI', {'init': 'HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('PoU-HLSI', {'init': 'HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+    ('CE-HLSI', {'init': 'CE-HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('CE-WC-HLSI', {'init': 'CE-HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('CE-PoU-HLSI', {'init': 'CE-HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+    # Principled HLSI <-> CE-HLSI interpolation, L weights
+    ('Gate-25-HLSI', {
+        'init': 'GATE-HLSI',
+        'init_weights': 'L',
+        'gate_rho': 0.25,
+        'gate_beta': 1.0,
+        'gate_kappa': 0.0,
+        'gate_topk': 64,
+        'init_steps': 200,
+        'mala_steps': 0,
+        'mala_burnin': 0,
+        'log_mean_ess': True,
+    }),
+    ('Gate-50-HLSI', {
+        'init': 'GATE-HLSI',
+        'init_weights': 'L',
+        'gate_rho': 0.50,
+        'gate_beta': 1.0,
+        'gate_kappa': 0.0,
+        'gate_topk': 64,
+        'init_steps': 200,
+        'mala_steps': 0,
+        'mala_burnin': 0,
+        'log_mean_ess': True,
+    }),
+    ('Gate-75-HLSI', {
+        'init': 'GATE-HLSI',
+        'init_weights': 'L',
+        'gate_rho': 0.75,
+        'gate_beta': 1.0,
+        'gate_kappa': 0.0,
+        'gate_topk': 64,
+        'init_steps': 200,
+        'mala_steps': 0,
+        'mala_burnin': 0,
+        'log_mean_ess': True,
+    }),
+
+    # Same interpolation, WC weights
+    ('Gate-25-WC-HLSI', {
+        'init': 'GATE-HLSI',
+        'init_weights': 'WC',
+        'gate_rho': 0.25,
+        'gate_beta': 1.0,
+        'gate_kappa': 0.0,
+        'gate_topk': 64,
+        'init_steps': 200,
+        'mala_steps': 0,
+        'mala_burnin': 0,
+        'log_mean_ess': True,
+    }),
+    ('Gate-50-WC-HLSI', {
+        'init': 'GATE-HLSI',
+        'init_weights': 'WC',
+        'gate_rho': 0.50,
+        'gate_beta': 1.0,
+        'gate_kappa': 0.0,
+        'gate_topk': 64,
+        'init_steps': 200,
+        'mala_steps': 0,
+        'mala_burnin': 0,
+        'log_mean_ess': True,
+    }),
+    ('Gate-75-WC-HLSI', {
+        'init': 'GATE-HLSI',
+        'init_weights': 'WC',
+        'gate_rho': 0.75,
+        'gate_beta': 1.0,
+        'gate_kappa': 0.0,
+        'gate_topk': 64,
+        'init_steps': 200,
+        'mala_steps': 0,
+        'mala_burnin': 0,
+        'log_mean_ess': True,
+    }),
+])
+
+
 
 pipeline = run_standard_sampler_pipeline(
     prior_model,
