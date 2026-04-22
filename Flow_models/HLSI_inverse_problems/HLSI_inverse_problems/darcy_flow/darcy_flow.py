@@ -49,7 +49,7 @@ x = np.linspace(0.0, 1.0, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
 
-ell = 0.12
+ell = 0.1
 sigma_prior = 1.0
 q_max = 100
 
@@ -65,7 +65,7 @@ np.savetxt('data/Darcy_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # ==========================================
 # 1. Configuration / data files (follow old I/O path exactly)
 # ==========================================
-num_observation = 100
+num_observation = 120
 num_truncated_series = 32
 seed = 42
 
@@ -131,7 +131,7 @@ obs_locations = jnp.array(obs_raw, dtype=int)
 # ==========================================
 jax.config.update("jax_enable_x64", True)
 
-NOISE_STD = 0.002
+NOISE_STD = 0.001
 
 h = 1.0 / (N - 1)
 x_1d = jnp.linspace(0.0, 1.0, N)
