@@ -25,6 +25,7 @@ from sampling import (
     GaussianPrior,
     build_results_dataframes,
     compute_field_summary_metrics,
+    compute_heldout_predictive_metrics,
     compute_latent_metrics,
     configure_sampling,
     device,
@@ -72,6 +73,7 @@ np.savetxt('data/AcousticFWI_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # CONFIGURATION GENERATOR (ACOUSTIC FWI)
 # ==========================================
 num_truncated_series = 32
+num_holdout_observation = 256
 seed = 42
 
 BACKGROUND_VELOCITY = 1.0
@@ -137,6 +139,9 @@ source_time_series = np.tile(source_wavelet[None, :], (N_SOURCES, 1))
 record_step_indices_np = np.arange(0, N_TIME_STEPS, RECORD_STRIDE, dtype=int)
 record_times_np = times_np[record_step_indices_np]
 N_RECORD_STEPS = record_step_indices_np.size
+holdout_step_indices_np = np.setdiff1d(np.arange(N_TIME_STEPS, dtype=int), record_step_indices_np)
+holdout_times_np = times_np[holdout_step_indices_np]
+N_HOLDOUT_RECORD_STEPS = holdout_step_indices_np.size
 
 ii, jj = np.meshgrid(np.arange(N), np.arange(N), indexing='ij')
 dist_to_edge = np.minimum.reduce([ii, jj, (N - 1) - ii, (N - 1) - jj]).astype(np.float64)
@@ -156,6 +161,12 @@ pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False
 pd.DataFrame(receiver_flat_indices).to_csv('data/obs_locations.csv', index=False, header=False)
 pd.DataFrame(source_centers, columns=['x', 'y']).to_csv('data/source_locations.csv', index=False)
 
+key_holdout = jax.random.PRNGKey(seed + 1)
+num_holdout_candidates = N_SOURCES * N_RECEIVERS * N_HOLDOUT_RECORD_STEPS
+obs_indices_holdout = np.array(
+    jax.random.choice(key_holdout, jnp.arange(num_holdout_candidates), shape=(num_holdout_observation,), replace=False)
+)
+
 # ==========================================
 # Physics engine
 # ==========================================
@@ -167,6 +178,8 @@ source_patterns_jax = jnp.array(source_patterns, dtype=jnp.float64)
 source_time_series_jax = jnp.array(source_time_series, dtype=jnp.float64)
 damping_field_jax = jnp.array(damping_field, dtype=jnp.float64)
 record_step_indices_jax = jnp.array(record_step_indices_np, dtype=int)
+holdout_step_indices_jax = jnp.array(holdout_step_indices_np, dtype=int)
+obs_indices_holdout_jax = jnp.array(obs_indices_holdout, dtype=int)
 
 h = 1.0 / (N - 1)
 ZERO_FIELD = jnp.zeros((N, N), dtype=jnp.float64)
@@ -225,11 +238,45 @@ def _simulate_single_shot_gather(velocity_field, source_idx):
 
 
 @jax.jit
+def _simulate_single_shot_gather_holdout(velocity_field, source_idx):
+    c2 = velocity_field ** 2
+    src_spatial = source_patterns_jax[source_idx]
+    src_time = source_time_series_jax[source_idx]
+
+    def step(carry, src_amp):
+        u_prev, u_curr = carry
+        lap = _laplacian_dirichlet(u_curr)
+        forcing = src_amp * src_spatial
+        numer = (
+            2.0 * u_curr
+            - (1.0 - 0.5 * DT * damping_field_jax) * u_prev
+            + (DT ** 2) * (c2 * lap + forcing)
+        )
+        u_next = numer / (1.0 + 0.5 * DT * damping_field_jax)
+        u_next = _enforce_zero_boundary(u_next)
+        rec = u_next.reshape(-1)[receiver_indices_jax]
+        return (u_curr, u_next), rec
+
+    (_, _), rec_all = jax.lax.scan(step, (ZERO_FIELD, ZERO_FIELD), src_time)
+    rec_sub = rec_all[holdout_step_indices_jax, :]
+    return rec_sub.T
+
+
+@jax.jit
 def solve_forward(alpha):
     _, velocity_field = _alpha_to_raw_and_velocity(alpha)
     shot_ids = jnp.arange(N_SOURCES)
     gathers = jax.vmap(lambda s_idx: _simulate_single_shot_gather(velocity_field, s_idx))(shot_ids)
     return _flatten_measurements_by_source(gathers)
+
+
+@jax.jit
+def solve_forward_holdout(alpha):
+    _, velocity_field = _alpha_to_raw_and_velocity(alpha)
+    shot_ids = jnp.arange(N_SOURCES)
+    gathers = jax.vmap(lambda s_idx: _simulate_single_shot_gather_holdout(velocity_field, s_idx))(shot_ids)
+    holdout_vec = _flatten_measurements_by_source(gathers)
+    return holdout_vec[obs_indices_holdout_jax]
 
 
 @jax.jit
@@ -302,6 +349,16 @@ y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
 NOISE_STD = 0.05 * np.std(y_clean_np)
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
+y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
+
+def batched_solve_forward_holdout_np(a_batch, chunk_size=8):
+    a_batch = np.asarray(a_batch, dtype=np.float64)
+    outs = []
+    for i in range(0, a_batch.shape[0], chunk_size):
+        chunk = jnp.asarray(a_batch[i:i + chunk_size], dtype=jnp.float64)
+        outs.append(np.asarray(jax.vmap(solve_forward_holdout)(chunk)))
+    return np.concatenate(outs, axis=0)
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -540,14 +597,28 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    batched_forward_eval_fn=batched_solve_forward_holdout_np,
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+)
+
 print('\n=== Acoustic FWI field/data metrics ===')
-print(f"{'Method':<24} | {'RelL2_c (%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FwdRel':<12}")
-print('-' * 84)
+print(f"{'Method':<24} | {'RelL2_c (%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FwdRel':<12} | {'HeldoutNLL':<12} | {'HeldoutZ2':<12}")
+print('-' * 135)
 norm_true = np.linalg.norm(true_field) + 1e-12
 for label in mean_fields:
     data = metrics[label]
     inv_rel_l2_pct = 100.0 * data['RelL2_field']
-    print(f"{display_names.get(label, label):<24} | {inv_rel_l2_pct:<12.4f} | {data['Pearson_field']:<10.4f} | {data['RMSE_alpha']:<12.4e} | {data['FwdRelErr']:<12.4e}")
+    print(
+        f"{display_names.get(label, label):<24} | {inv_rel_l2_pct:<12.4f} | {data['Pearson_field']:<10.4f} | {data['RMSE_alpha']:<12.4e} | {data['FwdRelErr']:<12.4e} | "
+        f"{data.get('HeldoutPredNLL', np.nan):<12.4e} | {data.get('HeldoutStdResSq', np.nan):<12.4e}"
+    )
 
 plot_normalizer_key = resolve_plot_normalizer(
     PLOT_NORMALIZER,
@@ -587,6 +658,7 @@ config_dict = {
     'HESS_MAX': HESS_MAX,
     'NOISE_STD': NOISE_STD,
     'num_observation': num_observation,
+    'num_holdout_observation': num_holdout_observation,
     'num_truncated_series': num_truncated_series,
     'num_modes_available': num_modes_available,
     'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
