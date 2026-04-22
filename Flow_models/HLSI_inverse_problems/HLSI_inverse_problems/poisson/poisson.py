@@ -67,9 +67,9 @@ np.savetxt('data/PoissonCoeff_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # ==========================================
 # 1. Configuration / data files
 # ==========================================
-num_observation_generated = 100
-num_observation = 80
-num_truncated_series = 48
+num_observation_generated = 80
+num_observation = 70
+num_truncated_series = 32
 seed = 42
 
 dimension_of_PoI = N * N
