@@ -23,6 +23,7 @@ from scipy.spatial.distance import cdist
 from sampling import (
     GaussianPrior,
     compute_field_summary_metrics,
+    compute_heldout_predictive_metrics,
     compute_latent_metrics,
     configure_sampling,
     get_valid_samples,
@@ -66,6 +67,7 @@ np.savetxt('data/Darcy_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # 1. Configuration / data files (follow old I/O path exactly)
 # ==========================================
 num_observation = 120
+num_holdout_observation = 120
 num_truncated_series = 32
 seed = 42
 
@@ -79,9 +81,15 @@ interior_mask[:, -1] = False
 interior_indices = jnp.array(np.where(interior_mask.ravel())[0])
 
 key = jax.random.PRNGKey(seed)
-obs_indices = np.array(
+obs_indices_train = np.array(
     jax.random.choice(key, interior_indices, shape=(num_observation,), replace=False)
 )
+remaining_interior_indices = np.setdiff1d(np.asarray(interior_indices), obs_indices_train)
+key_holdout = jax.random.PRNGKey(seed + 1)
+obs_indices_holdout = np.array(
+    jax.random.choice(key_holdout, jnp.array(remaining_interior_indices), shape=(num_holdout_observation,), replace=False)
+)
+obs_indices = obs_indices_train
 
 # Load / truncate / resave exactly like the old script rather than using the
 # in-memory eigendecomposition directly. This keeps the modular version aligned
@@ -96,7 +104,7 @@ full_basis = modes_raw.reshape((dimension_of_PoI, num_modes_available))
 basis_truncated = full_basis[:, :num_truncated_series]
 
 pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
-pd.DataFrame(obs_indices).to_csv('data/obs_locations.csv', index=False, header=False)
+pd.DataFrame(obs_indices_train).to_csv('data/obs_locations.csv', index=False, header=False)
 
 # Match old script's reload-from-disk path too.
 df_Basis = pd.read_csv('data/Basis.csv', header=None)
@@ -124,7 +132,9 @@ if obs_raw.size > num_observation:
     obs_raw = obs_raw[:num_observation]
 elif obs_raw.size < num_observation:
     raise ValueError(f"Obs file only has {obs_raw.size} locations, need {num_observation}.")
-obs_locations = jnp.array(obs_raw, dtype=int)
+obs_locations_train = jnp.array(obs_raw, dtype=int)
+obs_locations_holdout = jnp.array(obs_indices_holdout, dtype=int)
+obs_locations = obs_locations_train
 
 # ==========================================
 # 2. Physics: Darcy flow
@@ -193,7 +203,18 @@ def solve_forward(alpha):
     p_int = jnp.linalg.solve(A, rhs)
     p_full = jnp.zeros(N * N, dtype=jnp.float64)
     p_full = p_full.at[int_flat].set(p_int)
-    return p_full[obs_locations]
+    return p_full[obs_locations_train]
+
+
+@jax.jit
+def solve_forward_holdout(alpha):
+    log_k = jnp.reshape(Basis @ alpha, (N, N))
+    k_field = jnp.exp(log_k)
+    A, rhs = _assemble_darcy_vectorized(k_field)
+    p_int = jnp.linalg.solve(A, rhs)
+    p_full = jnp.zeros(N * N, dtype=jnp.float64)
+    p_full = p_full.at[int_flat].set(p_int)
+    return p_full[obs_locations_holdout]
 
 
 @jax.jit
@@ -247,6 +268,10 @@ alpha_true_np = np.random.randn(ACTIVE_DIM) * 0.5
 y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
+y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
+
+batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -370,6 +395,19 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    batched_forward_eval_fn=lambda a_batch: np.asarray(
+        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+    ),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+)
+
 mean_pressures = {}
 mean_permeabilities = {}
 norm_true_pressure = np.linalg.norm(true_pressure) + 1e-12
@@ -389,7 +427,8 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
     logperm_rel_pct = 100.0 * float(metrics[label]['RelL2_field'])
     print(
         f"{display_names.get(label, label):<24} | {logperm_rel_pct:<18.4f} | "
-        f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {pressure_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
+        f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {pressure_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e} | "
+        f"{metrics[label].get('HeldoutPredNLL', np.nan):<12.4e} | {metrics[label].get('HeldoutStdResSq', np.nan):<12.4e}"
     )
 
 plot_pca_histograms(
@@ -435,10 +474,15 @@ save_reproducibility_log(
         'n_int': n_int,
         'num_modes_available': num_modes_available,
         'num_observation': num_observation,
+        'num_holdout_observation': num_holdout_observation,
         'num_truncated_series': num_truncated_series,
         'obs_col': obs_col,
         'obs_indices': obs_indices,
+        'obs_indices_train': obs_indices_train,
+        'obs_indices_holdout': obs_indices_holdout,
         'obs_locations': obs_locations,
+        'obs_locations_train': obs_locations_train,
+        'obs_locations_holdout': obs_locations_holdout,
         'obs_row': obs_row,
         'sampler_run_info': sampler_run_info,
         'sigma_prior': sigma_prior,
