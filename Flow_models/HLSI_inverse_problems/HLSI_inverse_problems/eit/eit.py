@@ -22,6 +22,7 @@ from scipy.spatial.distance import cdist
 
 from sampling import (
     GaussianPrior,
+    compute_heldout_predictive_metrics,
     compute_field_summary_metrics,
     compute_latent_metrics,
     configure_sampling,
@@ -93,6 +94,13 @@ electrode_spacing = n_boundary / N_ELECTRODES
 electrode_boundary_pos = np.round(np.arange(N_ELECTRODES) * electrode_spacing).astype(int)
 electrode_boundary_pos = np.clip(electrode_boundary_pos, 0, n_boundary - 1)
 electrode_flat_indices = boundary_indices_ordered[electrode_boundary_pos]
+_train_electrode_set = set(int(i) for i in electrode_flat_indices.tolist())
+_holdout_electrode_candidates = np.array(
+    [int(i) for i in boundary_indices_ordered.tolist() if int(i) not in _train_electrode_set],
+    dtype=int,
+)
+heldout_electrode_flat_indices = np.array(sorted(_holdout_electrode_candidates.tolist()), dtype=int)
+N_HOLDOUT_ELECTRODES = int(heldout_electrode_flat_indices.size)
 
 boundary_theta = 2.0 * np.pi * np.arange(n_boundary) / n_boundary
 current_patterns = np.zeros((N_CURRENT_PATTERNS, n_boundary), dtype=np.float64)
@@ -104,6 +112,7 @@ basis_truncated = Basis_Modes[:, :num_truncated_series]
 
 pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
 pd.DataFrame(electrode_flat_indices).to_csv('data/obs_locations.csv', index=False, header=False)
+pd.DataFrame(heldout_electrode_flat_indices).to_csv('data/heldout_obs_locations.csv', index=False, header=False)
 
 # ==========================================
 # 2. Physics: EIT forward model
@@ -112,6 +121,7 @@ jax.config.update("jax_enable_x64", True)
 
 Basis = jnp.array(basis_truncated, dtype=jnp.float64)
 obs_locations = jnp.array(electrode_flat_indices, dtype=int)
+heldout_obs_locations = jnp.array(heldout_electrode_flat_indices, dtype=int)
 current_patterns_jax = jnp.array(current_patterns, dtype=jnp.float64)
 boundary_indices_jax = jnp.array(boundary_indices_ordered, dtype=int)
 
@@ -183,6 +193,17 @@ def solve_forward(alpha):
 
 
 @jax.jit
+def solve_forward_holdout(alpha):
+    log_sigma = jnp.reshape(Basis @ alpha, (N, N))
+    sigma_field = jnp.exp(log_sigma)
+    A = _assemble_eit_neumann(sigma_field)
+    U = jnp.linalg.solve(A, _RHS_ALL_PATTERNS)
+    V = U[heldout_obs_locations, :]
+    V = V - jnp.mean(V, axis=0, keepdims=True)
+    return V.T.ravel()
+
+
+@jax.jit
 def solve_single_pattern(alpha, pattern_idx):
     log_sigma = jnp.reshape(Basis @ alpha, (N, N))
     sigma_field = jnp.exp(log_sigma)
@@ -231,6 +252,8 @@ np.random.seed(seed)
 alpha_true_np = np.random.randn(ACTIVE_DIM) * 0.5
 y_clean_np = np.array(solve_forward(jnp.array(alpha_true_np)))
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
+y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -354,6 +377,18 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
+_batched_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+    batched_forward_eval_fn=lambda alphas: np.array(_batched_solve_forward_holdout(jnp.array(alphas))),
+)
+
 print('\n=== EIT field/data metrics ===')
 print(f"{'Method':<24} | {'RelL2_m (%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FwdRel':<12}")
 print('-' * 84)
@@ -407,6 +442,8 @@ save_reproducibility_log(
         'SIGMA_PRIOR': SIGMA_PRIOR,
         'N_CURRENT_PATTERNS': N_CURRENT_PATTERNS,
         'N_ELECTRODES': N_ELECTRODES,
+        'N_HOLDOUT_ELECTRODES': N_HOLDOUT_ELECTRODES,
+        'heldout_electrode_flat_indices': heldout_electrode_flat_indices,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
     },
     extra_sections={
