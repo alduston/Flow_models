@@ -42,11 +42,11 @@ from sampling import (
 # Config generator
 # ==========================================
 N = 32
-num_observation = 100
+num_observation = 120
 num_truncated_series = 32
 num_modes_available = 100
 seed = 42
-prior_length_scale = 0.09
+prior_length_scale = 0.1
 
 os.makedirs('data', exist_ok=True)
 rng = np.random.default_rng(seed)
@@ -160,7 +160,7 @@ def solve_forward(alpha):
 # Shared sampling config
 # ==========================================
 ACTIVE_DIM = num_truncated_series
-NOISE_STD = 0.005
+NOISE_STD = 0.003
 HESS_MIN = 1e-4
 HESS_MAX = 1e6
 GNL_PILOT_N = 1024
