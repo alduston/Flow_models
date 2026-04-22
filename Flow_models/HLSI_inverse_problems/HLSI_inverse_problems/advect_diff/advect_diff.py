@@ -98,7 +98,7 @@ OBS_TIME = 0.5
 DIFFUSIVITY = 2.5e-3
 ADV_VX = 0.90
 ADV_VY = -0.55
-NOISE_STD = 0.2
+NOISE_STD = 0.02
 
 kx_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
 ky_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
