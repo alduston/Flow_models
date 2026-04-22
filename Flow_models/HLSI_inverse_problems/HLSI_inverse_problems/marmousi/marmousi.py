@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import gc
+import json
 import os
 import sys
 import time
@@ -66,21 +67,31 @@ eigvecs = eigvecs[:, idx]
 
 q_max = 100
 Basis_Modes = eigvecs[:, :q_max] * np.sqrt(eigvals[:q_max])
-np.savetxt('data/AcousticFWI_Basis_Modes.csv', Basis_Modes, delimiter=',')
+np.savetxt('data/Marmousi_Basis_Modes.csv', Basis_Modes, delimiter=',')
 
 # ==========================================
-# CONFIGURATION GENERATOR (ACOUSTIC FWI)
+# CONFIGURATION GENERATOR (Marmousi acoustic FWI)
 # ==========================================
 num_truncated_series = 32
 seed = 42
 
-BACKGROUND_VELOCITY = 1.0
-VELOCITY_LOG_PERTURB_SCALE = 0.32
-MODEL_XMIN = 0.10
-MODEL_XMAX = 0.90
-MODEL_YMIN = 0.16
-MODEL_YMAX = 0.88
-MODEL_MASK_SOFTNESS = 0.030
+# Keep the same 32x32 latent/simulation grid as the old AFWI setup so the
+# forward solve remains in the same compute regime, but drive the truth from
+# a cropped/downsampled Marmousi velocity model.
+BACKGROUND_VELOCITY = 2.50  # km/s
+VELOCITY_LOG_PERTURB_SCALE = 0.65
+RAW_TANH_CLIP = 0.98
+
+MARMOUSI_NPY_PATH = os.path.join('data', 'marmousi_vp_20m_851x176.npy')
+MARMOUSI_BIN_PATH = os.path.join('data', 'marmousi_vp_20m_851x176.bin')
+MARMOUSI_META_PATH = os.path.join('data', 'marmousi_vp_20m_851x176_metadata.json')
+
+# Use a broad central crop containing the faulted/high-contrast Marmousi
+# structure, then resize to the same 32x32 grid as the old AFWI example.
+MARM_X_START = 120
+MARM_X_END = 760
+MARM_Z_START = 0
+MARM_Z_END = 176
 
 N_SOURCES = 8
 SOURCE_DEPTH = 0.12
@@ -103,9 +114,10 @@ def _smooth_box_mask(xx, yy, x_lo, x_hi, y_lo, y_hi, softness):
     return sig(xx - x_lo) * sig(x_hi - xx) * sig(yy - y_lo) * sig(y_hi - yy)
 
 
-model_support_mask = _smooth_box_mask(
-    X, Y, MODEL_XMIN, MODEL_XMAX, MODEL_YMIN, MODEL_YMAX, MODEL_MASK_SOFTNESS
-)
+# Unlike the old hand-built AFWI example, the Marmousi-derived model already
+# supplies the desired spatial structure. Use a full-domain support mask so the
+# latent-to-velocity map can represent the crop directly.
+model_support_mask = np.ones_like(X, dtype=np.float64)
 
 source_xs = x[SOURCE_COL_INDICES]
 source_centers = np.column_stack([source_xs, np.full(N_SOURCES, SOURCE_DEPTH)])
@@ -146,7 +158,7 @@ damping_field = SPONGE_MAX_DAMP * sponge_profile ** 2
 num_observation = N_SOURCES * N_RECEIVERS * N_RECORD_STEPS
 dimension_of_PoI = N * N
 
-df_modes = pd.read_csv('data/AcousticFWI_Basis_Modes.csv', header=None)
+df_modes = pd.read_csv('data/Marmousi_Basis_Modes.csv', header=None)
 modes_raw = df_modes.to_numpy().flatten().astype(np.float64)
 num_modes_available = modes_raw.size // dimension_of_PoI
 full_basis = modes_raw.reshape((dimension_of_PoI, num_modes_available))
@@ -155,6 +167,67 @@ basis_truncated = full_basis[:, :num_truncated_series]
 pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
 pd.DataFrame(receiver_flat_indices).to_csv('data/obs_locations.csv', index=False, header=False)
 pd.DataFrame(source_centers, columns=['x', 'y']).to_csv('data/source_locations.csv', index=False)
+
+
+
+def _load_marmousi_velocity_grid_kms():
+    if os.path.exists(MARMOUSI_NPY_PATH):
+        marm_raw = np.load(MARMOUSI_NPY_PATH).astype(np.float64)
+    elif os.path.exists(MARMOUSI_BIN_PATH) and os.path.exists(MARMOUSI_META_PATH):
+        with open(MARMOUSI_META_PATH, 'r') as f:
+            metadata = json.load(f)
+        shape = tuple(metadata['downsampled_shape'])
+        marm_raw = np.fromfile(MARMOUSI_BIN_PATH, dtype=np.float32).reshape(shape).astype(np.float64)
+    else:
+        raise FileNotFoundError(
+            'Could not find a Marmousi model file. Expected one of: '
+            f'{MARMOUSI_NPY_PATH} or ({MARMOUSI_BIN_PATH} with {MARMOUSI_META_PATH}).'
+        )
+
+    # The prep script writes the array in (n_traces, n_samples). Transpose to
+    # (depth, lateral) for the PDE grid used below.
+    if marm_raw.shape[0] > marm_raw.shape[1]:
+        marm_depth_x = marm_raw.T
+    else:
+        marm_depth_x = marm_raw
+
+    return marm_depth_x / 1000.0  # m/s -> km/s
+
+
+def _resize_array_bilinear(arr, out_shape):
+    in_h, in_w = arr.shape
+    out_h, out_w = out_shape
+    if (in_h, in_w) == (out_h, out_w):
+        return arr.copy()
+
+    x_old = np.linspace(0.0, 1.0, in_w)
+    x_new = np.linspace(0.0, 1.0, out_w)
+    tmp = np.empty((in_h, out_w), dtype=np.float64)
+    for i in range(in_h):
+        tmp[i] = np.interp(x_new, x_old, arr[i])
+
+    y_old = np.linspace(0.0, 1.0, in_h)
+    y_new = np.linspace(0.0, 1.0, out_h)
+    out = np.empty((out_h, out_w), dtype=np.float64)
+    for j in range(out_w):
+        out[:, j] = np.interp(y_new, y_old, tmp[:, j])
+    return out
+
+
+def _prepare_marmousi_velocity_truth():
+    marm = _load_marmousi_velocity_grid_kms()
+    crop = marm[MARM_Z_START:MARM_Z_END, MARM_X_START:MARM_X_END]
+    if crop.size == 0:
+        raise ValueError(
+            'Chosen Marmousi crop is empty. Check MARM_{X,Z}_{START,END} against the model shape.'
+        )
+    return _resize_array_bilinear(crop, (N, N)).astype(np.float64)
+
+
+def _velocity_field_to_raw(velocity_field):
+    log_ratio = np.log(np.clip(velocity_field, 1e-8, None) / BACKGROUND_VELOCITY)
+    tanh_arg = np.clip(log_ratio / VELOCITY_LOG_PERTURB_SCALE, -RAW_TANH_CLIP, RAW_TANH_CLIP)
+    return np.arctanh(tanh_arg).astype(np.float64)
 
 # ==========================================
 # Physics engine
@@ -264,7 +337,7 @@ configure_sampling(
     gnl_stiff_lambda_cut=GNL_STIFF_LAMBDA_CUT,
     gnl_use_dominant_particle_newton=GNL_USE_DOMINANT_PARTICLE_NEWTON,
 )
-init_run_results('acoustic_fwi_hlsi')
+init_run_results('marmousi_hlsi')
 
 # ==========================================
 # Experiment execution
@@ -283,20 +356,13 @@ def _project_raw_field_to_latent(raw_field, active_dim=ACTIVE_DIM):
 
 
 
-def _make_synthetic_raw_truth():
-    lens_fast = 1.55 * np.exp(-(((X - 0.33) / 0.10) ** 2 + ((Y - 0.38) / 0.14) ** 2) / 2.0)
-    lens_slow = -1.25 * np.exp(-(((X - 0.68) / 0.12) ** 2 + ((Y - 0.56) / 0.11) ** 2) / 2.0)
-    ridge_center = 0.62 - 0.09 * np.sin(2.1 * np.pi * (X - 0.08))
-    channel = -0.95 * np.exp(-0.5 * ((Y - ridge_center) / 0.050) ** 2) * np.exp(-0.5 * ((X - 0.56) / 0.28) ** 2)
-    ripple = 0.18 * np.sin(2.0 * np.pi * X) * np.sin(1.5 * np.pi * Y)
-    raw = (lens_fast + lens_slow + channel + ripple) * model_support_mask
-    return raw.astype(np.float64)
+def _make_marmousi_target_velocity():
+    return _prepare_marmousi_velocity_truth()
 
 
-raw_truth_np = _make_synthetic_raw_truth()
+marmousi_target_velocity_np = _make_marmousi_target_velocity()
+raw_truth_np = _velocity_field_to_raw(marmousi_target_velocity_np)
 alpha_true_np = _project_raw_field_to_latent(raw_truth_np)
-mode_decay = np.linspace(1.0, 0.65, ACTIVE_DIM)
-alpha_true_np = alpha_true_np + 0.04 * np.random.randn(ACTIVE_DIM) * mode_decay
 
 y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
@@ -524,6 +590,8 @@ def wrapped_phase_residual(phi_pred, phi_true):
 
 true_raw = reconstruct_raw_field(alpha_true_np)[0]
 true_field = latent_to_velocity(alpha_true_np)
+projection_rel_l2_truth = np.linalg.norm(true_field - marmousi_target_velocity_np) / (np.linalg.norm(marmousi_target_velocity_np) + 1e-12)
+print(f"Projected Marmousi truth rel-L2 mismatch on the 32x32 latent grid: {projection_rel_l2_truth:.4%}")
 true_meas = unpack_measurement_vector(y_clean_np)
 obs_meas = unpack_measurement_vector(y_obs_np)
 
@@ -540,7 +608,7 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
-print('\n=== Acoustic FWI field/data metrics ===')
+print('\n=== Marmousi acoustic FWI field/data metrics ===')
 print(f"{'Method':<24} | {'RelL2_c (%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FwdRel':<12}")
 print('-' * 84)
 norm_true = np.linalg.norm(true_field) + 1e-12
@@ -572,7 +640,7 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
     metrics,
     sampler_run_info,
     n_ref=N_REF,
-    target_name='Acoustic FWI',
+    target_name='Marmousi Acoustic FWI',
     display_names=display_names,
     reference_name=reference_title,
 )
@@ -586,6 +654,10 @@ config_dict = {
     'HESS_MIN': HESS_MIN,
     'HESS_MAX': HESS_MAX,
     'NOISE_STD': NOISE_STD,
+    'marmousi_npy_path': MARMOUSI_NPY_PATH,
+    'marmousi_bin_path': MARMOUSI_BIN_PATH,
+    'marmousi_meta_path': MARMOUSI_META_PATH,
+    'marmousi_crop': {'x_start': MARM_X_START, 'x_end': MARM_X_END, 'z_start': MARM_Z_START, 'z_end': MARM_Z_END},
     'num_observation': num_observation,
     'num_truncated_series': num_truncated_series,
     'num_modes_available': num_modes_available,
@@ -593,7 +665,7 @@ config_dict = {
 }
 
 save_reproducibility_log(
-    title='Acoustic FWI HLSI run reproducibility log',
+    title='Marmousi Acoustic FWI HLSI run reproducibility log',
     config=config_dict,
     extra_sections={
         'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path},
@@ -606,6 +678,7 @@ save_reproducibility_log(
             'num_methods_with_samples': len(samples),
             'num_methods_with_mean_fields': len(mean_fields),
             'num_methods_with_ess_logs': len(ess_logs),
+            'projected_truth_rel_l2_mismatch': float(projection_rel_l2_truth),
         },
     },
 )
@@ -614,7 +687,8 @@ save_reproducibility_log(
 def _overlay_field(ax):
     ax.scatter(receiver_col, receiver_row, c='lime', s=10, marker='s', alpha=0.8)
     ax.scatter(source_cols, source_rows, c='cyan', s=40, marker='*', alpha=0.9)
-    ax.contour(model_support_mask_np, levels=[0.5], colors='white', linewidths=0.9)
+    if not np.allclose(model_support_mask_np, 1.0):
+        ax.contour(model_support_mask_np, levels=[0.5], colors='white', linewidths=0.9)
 
 
 fig_field, axes_field = plot_field_reconstruction_grid(
@@ -624,15 +698,15 @@ fig_field, axes_field = plot_field_reconstruction_grid(
     display_names=display_names,
     true_field=true_field,
     plot_normalizer_key=plot_normalizer_key,
-    reference_bottom_panel=true_raw,
-    reference_bottom_title='Ground Truth\nRaw latent field $m(x)$',
+    reference_bottom_panel=marmousi_target_velocity_np,
+    reference_bottom_title='Target Marmousi crop\n(resized to 32x32)',
     field_cmap='viridis',
     sample_cmap='viridis',
-    bottom_cmap='RdBu_r',
+    bottom_cmap='viridis',
     overlay_reference_fn=_overlay_field,
     overlay_method_fn=_overlay_field,
-    suptitle=f'Acoustic FWI (d={ACTIVE_DIM}): velocity reconstruction',
-    field_name='Velocity $c(x)$',
+    suptitle=f'Marmousi acoustic FWI (d={ACTIVE_DIM}): velocity reconstruction',
+    field_name='Velocity $c(x)$ [km/s]',
 )
 axes_field[0, 0].legend(['Receivers', 'Sources'], fontsize=8, loc='upper right')
 plt.show()
@@ -890,7 +964,7 @@ for ax in axes2.ravel():
     ax.set_aspect('auto')
 
 plt.suptitle(
-    f'All-source acoustic shot gathers and residual images ({N_SOURCES} sources + all-shot RMS aggregate)',
+    f'Marmousi all-source acoustic shot gathers and residual images ({N_SOURCES} sources + all-shot RMS aggregate)',
     fontsize=16,
     y=1.002,
 )
@@ -1033,7 +1107,7 @@ fig3.legend(
     bbox_to_anchor=(0.5, 1.03),
 )
 fig3.suptitle(
-    'Source-0 frequency-slice amplitude / phase receiver traces and residuals',
+    'Marmousi source-0 frequency-slice amplitude / phase receiver traces and residuals',
     fontsize=16,
     y=1.10,
 )
@@ -1043,7 +1117,7 @@ plt.show()
 # ==========================================
 # Figure 4: GN curvature spectrum
 # ==========================================
-print('\nVisualizing Gauss-Newton curvature spectrum...')
+print('\nVisualizing Marmousi Gauss-Newton curvature spectrum...')
 fig4, ax4 = plt.subplots(1, 1, figsize=(9, 5))
 true_curv = np.linalg.eigvalsh(-np.array(lik_aux['hess_lik_gn_jax'](jnp.array(alpha_true_np), jnp.array(y_obs_np), NOISE_STD)))
 true_curv = np.clip(np.sort(true_curv)[::-1], 1e-16, None)
@@ -1057,7 +1131,7 @@ ax4.axhline(HESS_MIN, linestyle='--', linewidth=1.5, label='HESS_MIN')
 ax4.axhline(HESS_MAX, linestyle='--', linewidth=1.5, label='HESS_MAX')
 ax4.set_xlabel('Eigenvalue rank', fontsize=13)
 ax4.set_ylabel('Curvature magnitude', fontsize=13)
-ax4.set_title('Acoustic FWI Gauss-Newton curvature spectrum', fontsize=15)
+ax4.set_title('Marmousi acoustic FWI Gauss-Newton curvature spectrum', fontsize=15)
 ax4.grid(True, which='both', alpha=0.25)
 ax4.legend(fontsize=9)
 plt.tight_layout()
