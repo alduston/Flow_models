@@ -272,6 +272,7 @@ y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
 y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
 
 batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
+HELDOUT_BATCH_SIZE = 8
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -395,18 +396,22 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
-metrics = compute_heldout_predictive_metrics(
-    samples,
-    metrics,
-    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
-    batched_forward_eval_fn=lambda a_batch: np.asarray(
-        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
-    ),
-    y_holdout_obs_np=y_holdout_obs_np,
-    noise_std=NOISE_STD,
-    display_names=display_names,
-    min_valid=10,
-)
+try:
+    metrics = compute_heldout_predictive_metrics(
+        samples,
+        metrics,
+        heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+        batched_forward_eval_fn=lambda a_batch: np.asarray(
+            batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+        ),
+        batched_forward_eval_batch_size=HELDOUT_BATCH_SIZE,
+        y_holdout_obs_np=y_holdout_obs_np,
+        noise_std=NOISE_STD,
+        display_names=display_names,
+        min_valid=10,
+    )
+except Exception as exc:
+    print(f"WARNING: held-out predictive metrics failed and will be skipped: {exc}")
 
 mean_pressures = {}
 mean_permeabilities = {}
