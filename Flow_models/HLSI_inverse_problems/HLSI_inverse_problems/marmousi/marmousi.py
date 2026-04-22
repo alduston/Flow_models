@@ -72,7 +72,7 @@ np.savetxt('data/Marmousi_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # ==========================================
 # CONFIGURATION GENERATOR (Marmousi acoustic FWI)
 # ==========================================
-num_truncated_series = 32
+num_truncated_series = 20
 seed = 42
 
 # Keep the same 32x32 latent/simulation grid as the old AFWI setup so the
@@ -88,12 +88,12 @@ MARMOUSI_META_PATH = os.path.join('data', 'marmousi_vp_20m_851x176_metadata.json
 
 # Use a broad central crop containing the faulted/high-contrast Marmousi
 # structure, then resize to the same 32x32 grid as the old AFWI example.
-MARM_X_START = 120
-MARM_X_END = 760
+MARM_X_START = 180
+MARM_X_END = 620
 MARM_Z_START = 0
-MARM_Z_END = 176
+MARM_Z_END = 120
 
-N_SOURCES = 8
+N_SOURCES = 12
 SOURCE_DEPTH = 0.12
 RECEIVER_DEPTH = 0.09
 SOURCE_WIDTH = 0.020
@@ -104,7 +104,7 @@ N_RECEIVERS = RECEIVER_COL_INDICES.size
 N_TIME_STEPS = 240
 DT = 3.5e-3
 RECORD_STRIDE = 4
-RICKER_FREQ = 9.0
+RICKER_FREQ = 5.0
 SPONGE_WIDTH_CELLS = 5
 SPONGE_MAX_DAMP = 18.0
 
@@ -214,6 +214,20 @@ def _resize_array_bilinear(arr, out_shape):
     return out
 
 
+def _smooth_array_local_average(arr, passes=MARM_SMOOTH_PASSES):
+    out = np.asarray(arr, dtype=np.float64).copy()
+    if passes <= 0:
+        return out
+    for _ in range(int(passes)):
+        pad = np.pad(out, ((1, 1), (1, 1)), mode='edge')
+        out = (
+            4.0 * pad[1:-1, 1:-1]
+            + pad[:-2, 1:-1] + pad[2:, 1:-1] + pad[1:-1, :-2] + pad[1:-1, 2:]
+            + 0.5 * (pad[:-2, :-2] + pad[:-2, 2:] + pad[2:, :-2] + pad[2:, 2:])
+        ) / 10.0
+    return out
+
+
 def _prepare_marmousi_velocity_truth():
     marm = _load_marmousi_velocity_grid_kms()
     crop = marm[MARM_Z_START:MARM_Z_END, MARM_X_START:MARM_X_END]
@@ -221,7 +235,9 @@ def _prepare_marmousi_velocity_truth():
         raise ValueError(
             'Chosen Marmousi crop is empty. Check MARM_{X,Z}_{START,END} against the model shape.'
         )
-    return _resize_array_bilinear(crop, (N, N)).astype(np.float64)
+    resized = _resize_array_bilinear(crop, (N, N)).astype(np.float64)
+    smoothed = _smooth_array_local_average(resized, passes=MARM_SMOOTH_PASSES)
+    return smoothed
 
 
 def _velocity_field_to_raw(velocity_field):
@@ -366,7 +382,7 @@ alpha_true_np = _project_raw_field_to_latent(raw_truth_np)
 
 y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
-NOISE_STD = 0.1 * np.std(y_clean_np)
+NOISE_STD = 0.05 * np.std(y_clean_np)
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
@@ -640,7 +656,7 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
     metrics,
     sampler_run_info,
     n_ref=N_REF,
-    target_name='Marmousi Acoustic FWI',
+    target_name='Marmousi Acoustic FWI (easy)',
     display_names=display_names,
     reference_name=reference_title,
 )
@@ -658,6 +674,7 @@ config_dict = {
     'marmousi_bin_path': MARMOUSI_BIN_PATH,
     'marmousi_meta_path': MARMOUSI_META_PATH,
     'marmousi_crop': {'x_start': MARM_X_START, 'x_end': MARM_X_END, 'z_start': MARM_Z_START, 'z_end': MARM_Z_END},
+    'marmousi_smooth_passes': MARM_SMOOTH_PASSES,
     'num_observation': num_observation,
     'num_truncated_series': num_truncated_series,
     'num_modes_available': num_modes_available,
@@ -665,7 +682,7 @@ config_dict = {
 }
 
 save_reproducibility_log(
-    title='Marmousi Acoustic FWI HLSI run reproducibility log',
+    title='Marmousi Acoustic FWI (easy) HLSI run reproducibility log',
     config=config_dict,
     extra_sections={
         'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path},
