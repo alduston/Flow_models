@@ -73,7 +73,7 @@ np.savetxt('data/AcousticFWI_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # CONFIGURATION GENERATOR (ACOUSTIC FWI)
 # ==========================================
 num_truncated_series = 32
-num_holdout_observation = 256
+num_holdout_observation = 64
 seed = 42
 
 BACKGROUND_VELOCITY = 1.0
