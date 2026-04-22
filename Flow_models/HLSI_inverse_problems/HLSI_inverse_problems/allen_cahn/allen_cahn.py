@@ -98,7 +98,7 @@ OBS_TIME = 0.33
 ALLEN_CAHN_EPS = 0.045
 ALLEN_CAHN_DT = 5.0e-4
 ALLEN_CAHN_STEPS = int(round(OBS_TIME / ALLEN_CAHN_DT))
-NOISE_STD = 0.003
+NOISE_STD = 0.01
 
 kx_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
 ky_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
