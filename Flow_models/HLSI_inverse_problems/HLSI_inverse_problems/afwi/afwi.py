@@ -49,7 +49,7 @@ from sampling import (
 # ==========================================
 os.makedirs('data', exist_ok=True)
 
-N = 32
+N = 48
 x = np.linspace(0.0, 1.0, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
@@ -300,7 +300,7 @@ alpha_true_np = alpha_true_np + 0.04 * np.random.randn(ACTIVE_DIM) * mode_decay
 
 y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
-NOISE_STD = 0.1 * np.std(y_clean_np)
+NOISE_STD = 0.05 * np.std(y_clean_np)
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
