@@ -2946,6 +2946,7 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
                                        min_valid=10,
                                        cov_regularization=1e-8,
                                        batched_forward_eval_fn=None,
+                                       batched_forward_eval_batch_size=None,
                                        print_summary=True):
     """
     Add held-out posterior predictive calibration metrics to an existing metrics dict.
@@ -2988,6 +2989,30 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
     obs_noise_var = float(noise_std) ** 2
     base_eye = np.eye(n_holdout, dtype=np.float64)
 
+    def _evaluate_pred_samples(alpha_samples):
+        alpha_samples = np.asarray(alpha_samples, dtype=np.float64)
+        if alpha_samples.ndim != 2:
+            raise ValueError(f'Expected alpha_samples to have shape (n_samples, d); got {alpha_samples.shape}.')
+
+        if batched_forward_eval_fn is None:
+            return np.stack(
+                [np.asarray(heldout_forward_eval_fn(alpha), dtype=np.float64).reshape(-1)
+                 for alpha in alpha_samples],
+                axis=0,
+            )
+
+        batch_size = batched_forward_eval_batch_size
+        if batch_size is None or int(batch_size) <= 0:
+            return np.asarray(batched_forward_eval_fn(alpha_samples), dtype=np.float64)
+
+        batch_size = int(batch_size)
+        pred_chunks = []
+        for start in range(0, alpha_samples.shape[0], batch_size):
+            stop = min(start + batch_size, alpha_samples.shape[0])
+            pred_chunk = np.asarray(batched_forward_eval_fn(alpha_samples[start:stop]), dtype=np.float64)
+            pred_chunks.append(pred_chunk)
+        return np.concatenate(pred_chunks, axis=0) if pred_chunks else np.zeros((0, n_holdout), dtype=np.float64)
+
     def _stable_gaussian_nll(resid, pred_cov, pred_var):
         pred_cov = np.asarray(pred_cov, dtype=np.float64)
         pred_cov = 0.5 * (pred_cov + pred_cov.T)
@@ -3028,30 +3053,50 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
         if samps_clean.shape[0] < min_valid:
             continue
 
+        heldout_warning = None
         try:
-            if batched_forward_eval_fn is not None:
-                pred_samples = np.asarray(batched_forward_eval_fn(samps_clean), dtype=np.float64)
-            else:
-                pred_samples = np.stack(
-                    [np.asarray(heldout_forward_eval_fn(alpha), dtype=np.float64).reshape(-1)
-                     for alpha in samps_clean],
-                    axis=0,
-                )
+            pred_samples = _evaluate_pred_samples(samps_clean)
         except Exception as exc:
-            metrics.setdefault(label, {})
-            metrics[label].update(dict(
-                HeldoutPredNLL=np.nan,
-                HeldoutStdResSq=np.nan,
-                HeldoutStdResRMS=np.nan,
-                HeldoutPredMean=np.full((n_holdout,), np.nan, dtype=np.float64),
-                HeldoutPredVar=np.full((n_holdout,), np.nan, dtype=np.float64),
-                HeldoutPredCovMode='forward_eval_failed',
-                HeldoutPredNumValid=0,
-                HeldoutPredWarning=f'heldout forward eval failed: {exc}',
-            ))
-            if print_summary:
-                print(f"{display_names.get(label, label):<24} | {'nan':<16} | {'nan':<16} | {'nan':<17}")
-            continue
+            if batched_forward_eval_fn is not None and heldout_forward_eval_fn is not None:
+                try:
+                    pred_samples = np.stack(
+                        [np.asarray(heldout_forward_eval_fn(alpha), dtype=np.float64).reshape(-1)
+                         for alpha in samps_clean],
+                        axis=0,
+                    )
+                    heldout_warning = f'batched heldout forward eval failed; fell back to per-sample eval: {exc}'
+                except Exception as exc_fallback:
+                    metrics.setdefault(label, {})
+                    metrics[label].update(dict(
+                        HeldoutPredNLL=np.nan,
+                        HeldoutStdResSq=np.nan,
+                        HeldoutStdResRMS=np.nan,
+                        HeldoutPredMean=np.full((n_holdout,), np.nan, dtype=np.float64),
+                        HeldoutPredVar=np.full((n_holdout,), np.nan, dtype=np.float64),
+                        HeldoutPredCovMode='forward_eval_failed',
+                        HeldoutPredNumValid=0,
+                        HeldoutPredWarning=(
+                            f'heldout forward eval failed; batched error: {exc}; fallback error: {exc_fallback}'
+                        ),
+                    ))
+                    if print_summary:
+                        print(f"{display_names.get(label, label):<24} | {'nan':<16} | {'nan':<16} | {'nan':<17}")
+                    continue
+            else:
+                metrics.setdefault(label, {})
+                metrics[label].update(dict(
+                    HeldoutPredNLL=np.nan,
+                    HeldoutStdResSq=np.nan,
+                    HeldoutStdResRMS=np.nan,
+                    HeldoutPredMean=np.full((n_holdout,), np.nan, dtype=np.float64),
+                    HeldoutPredVar=np.full((n_holdout,), np.nan, dtype=np.float64),
+                    HeldoutPredCovMode='forward_eval_failed',
+                    HeldoutPredNumValid=0,
+                    HeldoutPredWarning=f'heldout forward eval failed: {exc}',
+                ))
+                if print_summary:
+                    print(f"{display_names.get(label, label):<24} | {'nan':<16} | {'nan':<16} | {'nan':<17}")
+                continue
 
         if pred_samples.ndim != 2 or pred_samples.shape[1] != n_holdout:
             raise ValueError(
@@ -3098,11 +3143,14 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
 
         try:
             heldout_pred_nll, cov_mode = _stable_gaussian_nll(resid, pred_cov, pred_var)
-            heldout_warning = None
         except Exception as exc:
             heldout_pred_nll = float(np.nan)
             cov_mode = 'nll_failed'
-            heldout_warning = f'heldout predictive covariance failed: {exc}'
+            extra_warning = f'heldout predictive covariance failed: {exc}'
+            if heldout_warning is None:
+                heldout_warning = extra_warning
+            else:
+                heldout_warning = f'{heldout_warning}; {extra_warning}'
 
         metrics.setdefault(label, {})
         metrics[label].update(dict(
