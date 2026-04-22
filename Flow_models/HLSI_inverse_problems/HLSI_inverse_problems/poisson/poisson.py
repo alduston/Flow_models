@@ -23,6 +23,7 @@ from scipy.spatial.distance import cdist
 from sampling import (
     GaussianPrior,
     compute_field_summary_metrics,
+    compute_heldout_predictive_metrics,
     compute_latent_metrics,
     configure_sampling,
     init_run_results,
@@ -50,7 +51,7 @@ x = np.linspace(0.0, 1.0, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
 
-ELL = 0.09
+ELL = 0.1
 SIGMA_PRIOR = 1.0
 Q_MAX = 100
 
@@ -67,7 +68,7 @@ np.savetxt('data/PoissonCoeff_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # 1. Configuration / data files
 # ==========================================
 num_observation_generated = 100
-num_observation = 40
+num_observation = 80
 num_truncated_series = 48
 seed = 42
 
@@ -86,10 +87,12 @@ key = jax.random.PRNGKey(seed)
 obs_indices_all = np.array(
     jax.random.choice(key, interior_indices, shape=(num_observation_generated,), replace=False)
 )
-obs_indices = obs_indices_all[:num_observation]
+obs_indices_train = obs_indices_all[:num_observation]
+obs_indices_holdout = obs_indices_all[num_observation:]
+obs_indices = obs_indices_train
 
 pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
-pd.DataFrame(obs_indices).to_csv('data/obs_locations.csv', index=False, header=False)
+pd.DataFrame(obs_indices_train).to_csv('data/obs_locations.csv', index=False, header=False)
 
 # ==========================================
 # 2. Physics: Poisson coefficient inversion
@@ -97,9 +100,12 @@ pd.DataFrame(obs_indices).to_csv('data/obs_locations.csv', index=False, header=F
 jax.config.update("jax_enable_x64", True)
 
 Basis = jnp.array(basis_truncated, dtype=jnp.float64)
-obs_locations = jnp.array(obs_indices, dtype=int)
+obs_locations_train = jnp.array(obs_indices_train, dtype=int)
+obs_locations_holdout = jnp.array(obs_indices_holdout, dtype=int)
+obs_locations_all = jnp.array(obs_indices_all, dtype=int)
+obs_locations = obs_locations_train
 
-NOISE_STD = 2.0e-5
+NOISE_STD = 2.5e-5
 
 x_1d = jnp.linspace(0.0, 1.0, N)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
@@ -162,7 +168,7 @@ def coefficient_from_raw(raw_field):
 
 
 @jax.jit
-def solve_forward(alpha):
+def solve_all_sensor_observations(alpha):
     raw_q = raw_field_from_alpha(alpha)
     q_field = coefficient_from_raw(raw_q)
     q_int = q_field[_int_rows, _int_cols]
@@ -170,7 +176,17 @@ def solve_forward(alpha):
     u_int = jnp.linalg.solve(A, RHS_INT)
     u_full = jnp.zeros((N * N,), dtype=jnp.float64)
     u_full = u_full.at[int_flat].set(u_int)
-    return u_full[obs_locations]
+    return u_full[obs_locations_all]
+
+
+@jax.jit
+def solve_forward(alpha):
+    return solve_all_sensor_observations(alpha)[:num_observation]
+
+
+@jax.jit
+def solve_forward_holdout(alpha):
+    return solve_all_sensor_observations(alpha)[num_observation:]
 
 
 @jax.jit
@@ -261,11 +277,18 @@ if torch.cuda.is_available():
 alpha_true_np, raw_truth = make_structured_truth_coefficients(ACTIVE_DIM)
 true_field = np.array(coefficient_from_raw(jnp.array(raw_truth)))
 
-# Keep the same current behavior as the uploaded monolith: use only the first
-# 25 sensors from a 100-sensor random draw, and use a tiny observation noise.
-y_clean = solve_forward(jnp.array(alpha_true_np))
-y_clean_np = np.array(y_clean)
-y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+# Condition on the first num_observation sensors and reserve the remaining
+# generated sensors for held-out posterior predictive calibration checks.
+y_all_clean = solve_all_sensor_observations(jnp.array(alpha_true_np))
+y_all_clean_np = np.array(y_all_clean)
+y_noise_np = np.random.normal(0.0, NOISE_STD, size=y_all_clean_np.shape)
+y_obs_all_np = y_all_clean_np + y_noise_np
+y_clean_np = y_all_clean_np[:num_observation]
+y_obs_np = y_obs_all_np[:num_observation]
+y_holdout_clean_np = y_all_clean_np[num_observation:]
+y_holdout_obs_np = y_obs_all_np[num_observation:]
+
+batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -406,12 +429,25 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    batched_forward_eval_fn=lambda a_batch: np.asarray(
+        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+    ),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+)
+
 mean_solution_states = {}
 norm_true_solution = np.linalg.norm(true_solution) + 1e-12
 
 print('\n=== Poisson physical-space metrics ===')
-print(f"{'Method':<24} | {'Coeff RelL2(%)':<16} | {'Pearson':<10} | {'RMSE_a':<12} | {'SolutionRel':<12} | {'SensorRel':<12}")
-print('-' * 109)
+print(f"{'Method':<24} | {'Coeff RelL2(%)':<16} | {'Pearson':<10} | {'RMSE_a':<12} | {'SolutionRel':<12} | {'SensorRel':<12} | {'HeldoutNLL':<12} | {'HeldoutZ2':<12}")
+print('-' * 137)
 for label in [lab for lab in samples.keys() if lab in mean_fields]:
     mean_latent = np.asarray(metrics[label]['mean_latent'])
     mean_solution = solve_solution_field(mean_latent)
@@ -422,7 +458,8 @@ for label in [lab for lab in samples.keys() if lab in mean_fields]:
     coeff_rel_pct = 100.0 * float(metrics[label]['RelL2_field'])
     print(
         f"{display_names.get(label, label):<24} | {coeff_rel_pct:<16.4f} | "
-        f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {solution_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e}"
+        f"{metrics[label]['Pearson_field']:<10.4f} | {metrics[label]['RMSE_alpha']:<12.4e} | {solution_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e} | "
+        f"{metrics[label].get('HeldoutPredNLL', np.nan):<12.4e} | {metrics[label].get('HeldoutStdResSq', np.nan):<12.4e}"
     )
 
 plot_normalizer_key = resolve_plot_normalizer(
@@ -488,8 +525,10 @@ save_reproducibility_log(
         'sensor_geometry': {
             'interior_only_observations': True,
             'generated_sensor_count': num_observation_generated,
-            'effective_sensor_count': num_observation,
-            'effective_sensor_indices': obs_locs_np.tolist(),
+            'training_sensor_count': num_observation,
+            'holdout_sensor_count': int(len(obs_indices_holdout)),
+            'training_sensor_indices': obs_locs_np.tolist(),
+            'holdout_sensor_indices': np.asarray(obs_indices_holdout).tolist(),
         },
         'source_field': {
             'type': 'three localized sources',
