@@ -21,6 +21,7 @@ import torch
 
 from sampling import (
     GaussianPrior,
+    compute_heldout_predictive_metrics,
     compute_latent_metrics,
     pearson_corr_array,
     configure_sampling,
@@ -43,6 +44,7 @@ from sampling import (
 # ==========================================
 N = 32
 num_observation = 120
+num_holdout_observation = 120
 num_truncated_series = 32
 num_modes_available = 100
 seed = 42
@@ -92,8 +94,11 @@ basis_truncated = full_basis[:, :num_truncated_series]
 basis_modes_path = 'data/NavierStokes_Basis_Modes_generated.csv'
 pd.DataFrame(full_basis).to_csv(basis_modes_path, index=False, header=False)
 pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
-obs_indices = rng.choice(N * N, size=(num_observation,), replace=False)
-pd.DataFrame(obs_indices).to_csv('data/obs_locations.csv', index=False, header=False)
+obs_indices_train = rng.choice(N * N, size=(num_observation,), replace=False)
+remaining_indices = np.setdiff1d(np.arange(N * N), obs_indices_train)
+obs_indices_holdout = rng.choice(remaining_indices, size=(num_holdout_observation,), replace=False)
+obs_indices = obs_indices_train
+pd.DataFrame(obs_indices_train).to_csv('data/obs_locations.csv', index=False, header=False)
 
 # ==========================================
 # Physics
@@ -107,6 +112,7 @@ num_time_steps = int(round(T_end / delta_t))
 
 Basis = jnp.array(basis_truncated)
 obs_locations = jnp.array(obs_indices, dtype=int)
+holdout_locations = jnp.array(obs_indices_holdout, dtype=int)
 
 x_1d = jnp.linspace(0.0, 1.0, N, endpoint=False)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
@@ -156,6 +162,15 @@ def solve_forward(alpha):
     omega_T = solve_forward_full(alpha)
     return omega_T.reshape(-1)[obs_locations]
 
+
+@jax.jit
+def solve_forward_holdout(alpha):
+    omega_T = solve_forward_full(alpha)
+    return omega_T.reshape(-1)[holdout_locations]
+
+
+batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
+
 # ==========================================
 # Shared sampling config
 # ==========================================
@@ -194,6 +209,9 @@ alpha_true_np = np.random.randn(ACTIVE_DIM) * 0.5
 y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
 y_obs_np = y_clean_np + np.random.normal(0, NOISE_STD, size=y_clean_np.shape)
+y_clean_holdout = solve_forward_holdout(jnp.array(alpha_true_np))
+y_clean_holdout_np = np.array(y_clean_holdout)
+y_holdout_obs_np = y_clean_holdout_np + np.random.normal(0, NOISE_STD, size=y_clean_holdout_np.shape)
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, _ = make_physics_likelihood(solve_forward, y_obs_np, NOISE_STD, use_gauss_newton_hessian=True)
@@ -235,6 +253,18 @@ reference_title = pipeline['reference_title']
 summarize_sampler_run(sampler_run_info)
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 metrics = compute_latent_metrics(samples, reference_key, alpha_true_np, prior_model, lik_model, posterior_score_fn, display_names=display_names)
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    batched_forward_eval_fn=lambda a_batch: np.asarray(
+        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+    ),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+)
 plot_pca_histograms(samples, alpha_true_np, display_names=display_names)
 
 Basis_np = np.array(Basis)
@@ -303,6 +333,7 @@ save_reproducibility_log(
         'ACTIVE_DIM': ACTIVE_DIM,
         'N_REF': N_REF,
         'NOISE_STD': NOISE_STD,
+        'num_holdout_observation': num_holdout_observation,
         'HESS_MIN': HESS_MIN,
         'HESS_MAX': HESS_MAX,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
