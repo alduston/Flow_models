@@ -67,7 +67,7 @@ np.savetxt('data/Darcy_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # 1. Configuration / data files (follow old I/O path exactly)
 # ==========================================
 num_observation = 120
-num_holdout_observation = 120
+num_holdout_observation = 30
 num_truncated_series = 32
 seed = 42
 
