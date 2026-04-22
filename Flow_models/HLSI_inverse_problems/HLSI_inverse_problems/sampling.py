@@ -2938,6 +2938,116 @@ def compute_field_summary_metrics(samples_dict, metrics, alpha_true_np, true_fie
     return mean_fields, metrics
 
 
+def compute_heldout_predictive_metrics(samples_dict, metrics,
+                                       heldout_forward_eval_fn,
+                                       y_holdout_obs_np,
+                                       noise_std,
+                                       display_names=None,
+                                       min_valid=10,
+                                       cov_regularization=1e-8,
+                                       batched_forward_eval_fn=None,
+                                       print_summary=True):
+    """
+    Add held-out posterior predictive calibration metrics to an existing metrics dict.
+
+    Metrics added per method:
+      - HeldoutPredNLL: average Gaussian posterior-predictive NLL per held-out sensor
+      - HeldoutStdResSq: mean squared standardized held-out residual
+
+    The predictive distribution is approximated by a Gaussian whose mean/covariance
+    are estimated from posterior predictive samples, with observation noise variance
+    noise_std**2 added on top.
+    """
+    if display_names is None:
+        display_names = {label: label for label in samples_dict.keys()}
+
+    y_holdout_obs_np = np.asarray(y_holdout_obs_np, dtype=np.float64).reshape(-1)
+    n_holdout = int(y_holdout_obs_np.size)
+    if n_holdout == 0:
+        if print_summary:
+            print('\n=== Held-out predictive metrics ===')
+            print('No held-out observations were provided; skipping held-out predictive metrics.')
+        return metrics
+
+    if print_summary:
+        print('\n=== Held-out predictive metrics ===')
+        print(
+            f"{'Method':<24} | {'HeldoutPredNLL':<16} | {'HeldoutStdResSq':<16} | {'HeldoutStdResRMS':<17}"
+        )
+        print('-' * 83)
+
+    obs_noise_var = float(noise_std) ** 2
+    eye = np.eye(n_holdout, dtype=np.float64)
+
+    for label, samps in samples_dict.items():
+        samps_clean = np.asarray(get_valid_samples(samps), dtype=np.float64)
+        if samps_clean.shape[0] < min_valid:
+            continue
+
+        if batched_forward_eval_fn is not None:
+            pred_samples = np.asarray(batched_forward_eval_fn(samps_clean), dtype=np.float64)
+        else:
+            pred_samples = np.stack(
+                [np.asarray(heldout_forward_eval_fn(alpha), dtype=np.float64).reshape(-1)
+                 for alpha in samps_clean],
+                axis=0,
+            )
+
+        if pred_samples.ndim != 2 or pred_samples.shape[1] != n_holdout:
+            raise ValueError(
+                f'Expected predictive samples of shape (n_samples, {n_holdout}), '
+                f'got {pred_samples.shape} for label={label!r}.'
+            )
+
+        pred_mean = np.mean(pred_samples, axis=0)
+        resid = y_holdout_obs_np - pred_mean
+
+        ddof = 1 if pred_samples.shape[0] > 1 else 0
+        pred_var = np.var(pred_samples, axis=0, ddof=ddof) + obs_noise_var
+        pred_var = np.maximum(pred_var, 1e-18)
+        heldout_std_res_sq = float(np.mean((resid ** 2) / pred_var))
+        heldout_std_res_rms = float(np.sqrt(heldout_std_res_sq))
+
+        if pred_samples.shape[0] > 1:
+            pred_cov = np.cov(pred_samples, rowvar=False, ddof=1)
+        else:
+            pred_cov = np.zeros((n_holdout, n_holdout), dtype=np.float64)
+        if pred_cov.ndim == 0:
+            pred_cov = np.array([[float(pred_cov)]], dtype=np.float64)
+        pred_cov = np.asarray(pred_cov, dtype=np.float64) + obs_noise_var * eye
+
+        jitter_scale = max(1.0, float(np.trace(pred_cov)) / max(1, n_holdout))
+        pred_cov_reg = pred_cov + float(cov_regularization) * jitter_scale * eye
+        sign, logdet = np.linalg.slogdet(pred_cov_reg)
+        if not np.isfinite(logdet) or sign <= 0:
+            evals, evecs = np.linalg.eigh(pred_cov_reg)
+            evals = np.clip(evals, a_min=1e-18, a_max=None)
+            logdet = float(np.sum(np.log(evals)))
+            precision_apply = evecs @ ((evecs.T @ resid) / evals)
+        else:
+            precision_apply = np.linalg.solve(pred_cov_reg, resid)
+
+        heldout_pred_nll = float(
+            0.5 * (n_holdout * np.log(2.0 * np.pi) + logdet + resid @ precision_apply) / n_holdout
+        )
+
+        metrics.setdefault(label, {})
+        metrics[label].update(dict(
+            HeldoutPredNLL=heldout_pred_nll,
+            HeldoutStdResSq=heldout_std_res_sq,
+            HeldoutStdResRMS=heldout_std_res_rms,
+            HeldoutPredMean=pred_mean,
+            HeldoutPredVar=np.asarray(pred_var, dtype=np.float64),
+        ))
+
+        if print_summary:
+            print(
+                f"{display_names.get(label, label):<24} | {heldout_pred_nll:<16.6f} | "
+                f"{heldout_std_res_sq:<16.6f} | {heldout_std_res_rms:<17.6f}"
+            )
+
+    return metrics
+
 def results_method_family(label, info):
     raw_init_mode = info.get('init', label)
     label_l = str(label).lower()
@@ -2978,6 +3088,13 @@ def build_results_dataframes(metrics_dict, run_info_dict, n_ref, target_name,
         'RMSE_alpha', 'RelL2_alpha', 'MMD_to_reference', 'KSD', 'KLdiag',
         'RMSE_field', 'Pearson_field', 'RelL2_field', 'FwdRelErr',
     ]
+    for label in run_info_dict.keys():
+        metric_dict = metrics_dict.get(label, {})
+        for metric_name, metric_value in metric_dict.items():
+            if metric_name in metric_rows:
+                continue
+            if np.isscalar(metric_value) or isinstance(metric_value, (np.floating, np.integer)):
+                metric_rows.append(metric_name)
     ordered_methods = [label for label in run_info_dict.keys() if label in metrics_dict]
     results_df = pd.DataFrame(index=metric_rows, columns=ordered_methods, dtype=np.float64)
     results_df.index.name = 'metric'
