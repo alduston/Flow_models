@@ -2957,6 +2957,13 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
     The predictive distribution is approximated by a Gaussian whose mean/covariance
     are estimated from posterior predictive samples, with observation noise variance
     noise_std**2 added on top.
+
+    Robustness notes:
+      - non-finite predictive samples are dropped row-wise
+      - covariance is symmetrized before factorization
+      - Cholesky with escalating jitter is used instead of raw eigh/slogdet
+      - if the full covariance remains numerically unstable, we fall back to a
+        diagonal predictive covariance rather than failing the whole script
     """
     if display_names is None:
         display_names = {label: label for label in samples_dict.keys()}
@@ -2965,33 +2972,86 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
     n_holdout = int(y_holdout_obs_np.size)
     if n_holdout == 0:
         if print_summary:
-            print('\n=== Held-out predictive metrics ===')
+            print('
+=== Held-out predictive metrics ===')
             print('No held-out observations were provided; skipping held-out predictive metrics.')
         return metrics
 
     if print_summary:
-        print('\n=== Held-out predictive metrics ===')
+        print('
+=== Held-out predictive metrics ===')
         print(
             f"{'Method':<24} | {'HeldoutPredNLL':<16} | {'HeldoutStdResSq':<16} | {'HeldoutStdResRMS':<17}"
         )
         print('-' * 83)
 
     obs_noise_var = float(noise_std) ** 2
-    eye = np.eye(n_holdout, dtype=np.float64)
+    base_eye = np.eye(n_holdout, dtype=np.float64)
+
+    def _stable_gaussian_nll(resid, pred_cov, pred_var):
+        pred_cov = np.asarray(pred_cov, dtype=np.float64)
+        pred_cov = 0.5 * (pred_cov + pred_cov.T)
+        pred_cov = np.where(np.isfinite(pred_cov), pred_cov, 0.0)
+        diag_floor = np.maximum(np.asarray(pred_var, dtype=np.float64), 1e-18)
+        pred_cov = pred_cov.copy()
+        pred_cov[np.diag_indices_from(pred_cov)] = np.maximum(
+            pred_cov[np.diag_indices_from(pred_cov)], diag_floor
+        )
+
+        scale = max(1.0, float(np.mean(diag_floor)))
+        jitter = max(float(cov_regularization) * scale, 1e-12)
+        max_tries = 8
+
+        for _ in range(max_tries):
+            cov_try = pred_cov + jitter * base_eye
+            cov_try = 0.5 * (cov_try + cov_try.T)
+            try:
+                chol = np.linalg.cholesky(cov_try)
+                y = np.linalg.solve(chol, resid)
+                precision_apply = np.linalg.solve(chol.T, y)
+                logdet = float(2.0 * np.sum(np.log(np.clip(np.diag(chol), 1e-300, None))))
+                quad = float(resid @ precision_apply)
+                return 0.5 * (n_holdout * np.log(2.0 * np.pi) + logdet + quad) / n_holdout, 'full'
+            except np.linalg.LinAlgError:
+                jitter *= 10.0
+            except FloatingPointError:
+                jitter *= 10.0
+
+        diag_cov = np.maximum(diag_floor + jitter, 1e-18)
+        quad = float(np.sum((resid ** 2) / diag_cov))
+        logdet = float(np.sum(np.log(diag_cov)))
+        nll = 0.5 * (n_holdout * np.log(2.0 * np.pi) + logdet + quad) / n_holdout
+        return nll, 'diag_fallback'
 
     for label, samps in samples_dict.items():
         samps_clean = np.asarray(get_valid_samples(samps), dtype=np.float64)
         if samps_clean.shape[0] < min_valid:
             continue
 
-        if batched_forward_eval_fn is not None:
-            pred_samples = np.asarray(batched_forward_eval_fn(samps_clean), dtype=np.float64)
-        else:
-            pred_samples = np.stack(
-                [np.asarray(heldout_forward_eval_fn(alpha), dtype=np.float64).reshape(-1)
-                 for alpha in samps_clean],
-                axis=0,
-            )
+        try:
+            if batched_forward_eval_fn is not None:
+                pred_samples = np.asarray(batched_forward_eval_fn(samps_clean), dtype=np.float64)
+            else:
+                pred_samples = np.stack(
+                    [np.asarray(heldout_forward_eval_fn(alpha), dtype=np.float64).reshape(-1)
+                     for alpha in samps_clean],
+                    axis=0,
+                )
+        except Exception as exc:
+            metrics.setdefault(label, {})
+            metrics[label].update(dict(
+                HeldoutPredNLL=np.nan,
+                HeldoutStdResSq=np.nan,
+                HeldoutStdResRMS=np.nan,
+                HeldoutPredMean=np.full((n_holdout,), np.nan, dtype=np.float64),
+                HeldoutPredVar=np.full((n_holdout,), np.nan, dtype=np.float64),
+                HeldoutPredCovMode='forward_eval_failed',
+                HeldoutPredNumValid=0,
+                HeldoutPredWarning=f'heldout forward eval failed: {exc}',
+            ))
+            if print_summary:
+                print(f"{display_names.get(label, label):<24} | {'nan':<16} | {'nan':<16} | {'nan':<17}")
+            continue
 
         if pred_samples.ndim != 2 or pred_samples.shape[1] != n_holdout:
             raise ValueError(
@@ -2999,37 +3059,50 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
                 f'got {pred_samples.shape} for label={label!r}.'
             )
 
+        finite_rows = np.all(np.isfinite(pred_samples), axis=1)
+        pred_samples = pred_samples[finite_rows]
+        n_valid_pred = int(pred_samples.shape[0])
+        if n_valid_pred < min_valid:
+            metrics.setdefault(label, {})
+            metrics[label].update(dict(
+                HeldoutPredNLL=np.nan,
+                HeldoutStdResSq=np.nan,
+                HeldoutStdResRMS=np.nan,
+                HeldoutPredMean=np.full((n_holdout,), np.nan, dtype=np.float64),
+                HeldoutPredVar=np.full((n_holdout,), np.nan, dtype=np.float64),
+                HeldoutPredCovMode='insufficient_valid_predictions',
+                HeldoutPredNumValid=n_valid_pred,
+                HeldoutPredWarning='too few finite held-out predictions after filtering',
+            ))
+            if print_summary:
+                print(f"{display_names.get(label, label):<24} | {'nan':<16} | {'nan':<16} | {'nan':<17}")
+            continue
+
         pred_mean = np.mean(pred_samples, axis=0)
         resid = y_holdout_obs_np - pred_mean
 
-        ddof = 1 if pred_samples.shape[0] > 1 else 0
+        ddof = 1 if n_valid_pred > 1 else 0
         pred_var = np.var(pred_samples, axis=0, ddof=ddof) + obs_noise_var
         pred_var = np.maximum(pred_var, 1e-18)
         heldout_std_res_sq = float(np.mean((resid ** 2) / pred_var))
         heldout_std_res_rms = float(np.sqrt(heldout_std_res_sq))
 
-        if pred_samples.shape[0] > 1:
-            pred_cov = np.cov(pred_samples, rowvar=False, ddof=1)
+        if n_valid_pred > 1:
+            centered = pred_samples - pred_mean[None, :]
+            pred_cov = (centered.T @ centered) / float(max(n_valid_pred - 1, 1))
         else:
             pred_cov = np.zeros((n_holdout, n_holdout), dtype=np.float64)
         if pred_cov.ndim == 0:
             pred_cov = np.array([[float(pred_cov)]], dtype=np.float64)
-        pred_cov = np.asarray(pred_cov, dtype=np.float64) + obs_noise_var * eye
+        pred_cov = np.asarray(pred_cov, dtype=np.float64) + obs_noise_var * base_eye
 
-        jitter_scale = max(1.0, float(np.trace(pred_cov)) / max(1, n_holdout))
-        pred_cov_reg = pred_cov + float(cov_regularization) * jitter_scale * eye
-        sign, logdet = np.linalg.slogdet(pred_cov_reg)
-        if not np.isfinite(logdet) or sign <= 0:
-            evals, evecs = np.linalg.eigh(pred_cov_reg)
-            evals = np.clip(evals, a_min=1e-18, a_max=None)
-            logdet = float(np.sum(np.log(evals)))
-            precision_apply = evecs @ ((evecs.T @ resid) / evals)
-        else:
-            precision_apply = np.linalg.solve(pred_cov_reg, resid)
-
-        heldout_pred_nll = float(
-            0.5 * (n_holdout * np.log(2.0 * np.pi) + logdet + resid @ precision_apply) / n_holdout
-        )
+        try:
+            heldout_pred_nll, cov_mode = _stable_gaussian_nll(resid, pred_cov, pred_var)
+            heldout_warning = None
+        except Exception as exc:
+            heldout_pred_nll = float(np.nan)
+            cov_mode = 'nll_failed'
+            heldout_warning = f'heldout predictive covariance failed: {exc}'
 
         metrics.setdefault(label, {})
         metrics[label].update(dict(
@@ -3038,11 +3111,16 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
             HeldoutStdResRMS=heldout_std_res_rms,
             HeldoutPredMean=pred_mean,
             HeldoutPredVar=np.asarray(pred_var, dtype=np.float64),
+            HeldoutPredCovMode=cov_mode,
+            HeldoutPredNumValid=n_valid_pred,
         ))
+        if heldout_warning is not None:
+            metrics[label]['HeldoutPredWarning'] = heldout_warning
 
         if print_summary:
+            nll_print = heldout_pred_nll if np.isfinite(heldout_pred_nll) else float('nan')
             print(
-                f"{display_names.get(label, label):<24} | {heldout_pred_nll:<16.6f} | "
+                f"{display_names.get(label, label):<24} | {nll_print:<16.6f} | "
                 f"{heldout_std_res_sq:<16.6f} | {heldout_std_res_rms:<17.6f}"
             )
 
