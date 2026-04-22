@@ -126,7 +126,7 @@ current_patterns_jax = jnp.array(current_patterns, dtype=jnp.float64)
 boundary_indices_jax = jnp.array(boundary_indices_ordered, dtype=int)
 
 h = 1.0 / (N - 1)
-NOISE_STD = 5e-3
+NOISE_STD = 5e-4
 
 _xface_left = (jnp.arange(N - 1)[:, None] * N + jnp.arange(N)[None, :]).ravel()
 _xface_right = _xface_left + N
