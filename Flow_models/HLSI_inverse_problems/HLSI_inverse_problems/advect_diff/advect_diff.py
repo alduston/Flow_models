@@ -67,7 +67,7 @@ np.savetxt('data/AdvecDiff_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # ==========================================
 # 1. Configuration / data files
 # ==========================================
-num_observation = 100
+num_observation = 120
 num_truncated_series = 32
 seed = 42
 
