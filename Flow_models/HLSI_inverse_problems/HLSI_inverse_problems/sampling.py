@@ -2637,7 +2637,13 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
             cfg.get('init_weights', implied_weights if implied_weights is not None else 'L')
         )
 
-    cfg.setdefault('display_name', format_sampler_display_name(
+    # By default, preserve the exact sampler-config key as the user-facing
+    # method name throughout summaries, metrics tables, and plots. This keeps
+    # distinct gate variants with the same internal canonical init mode from
+    # collapsing onto the same displayed label. Users can still override this by
+    # passing an explicit `display_name` field in the sampler config.
+    cfg.setdefault('display_name', str(label))
+    cfg.setdefault('canonical_display_name', format_sampler_display_name(
         cfg['init'], 'L' if cfg['init'] == 'prior' else cfg['init_weights']))
     cfg.setdefault('init_steps', 0 if cfg['init'] == 'prior' else 200)
     cfg.setdefault('init_tmax', 10.0)
