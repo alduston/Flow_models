@@ -1167,6 +1167,261 @@ def _get_ce_hlsi_gate_eigenbasis(P_bar, et2, var_t):
     return gate_eig, V
 
 
+@dataclass
+class HLSIComponentState:
+    y: torch.Tensor
+    t_val: float
+    et: float
+    et2: float
+    var_t: float
+    alpha: torch.Tensor
+    alpha_top: torch.Tensor
+    alpha_top_norm: torch.Tensor
+    idx_top: torch.Tensor
+    s_twd: torch.Tensor
+    d_top: torch.Tensor
+    metric_points_top: torch.Tensor
+    metric_prec_top: torch.Tensor
+    gate_top: torch.Tensor
+
+
+class BaseHLSIGateLaw:
+    family = 'base'
+
+    def fast_path_kind(self):
+        return None
+
+    def apply(self, component_state: HLSIComponentState):
+        raise NotImplementedError
+
+
+class DiracGateLaw(BaseHLSIGateLaw):
+    family = 'dirac'
+
+    def fast_path_kind(self):
+        return 'dirac'
+
+
+class PosteriorAverageGateLaw(BaseHLSIGateLaw):
+    family = 'posterior_average'
+
+    def fast_path_kind(self):
+        return 'posterior_average'
+
+
+class TemperedLikelihoodGateLaw(BaseHLSIGateLaw):
+    family = 'tempered_likelihood'
+
+    def __init__(self, rho=0.5, beta=1.0, kappa=1.0, topk=64,
+                 metric_source='mu', eps=1e-12):
+        self.rho = float(rho)
+        self.beta = float(beta)
+        self.kappa = float(kappa)
+        self.topk = int(max(1, topk))
+        self.metric_source = str(metric_source).strip().lower()
+        if self.metric_source not in {'mu', 'x'}:
+            raise ValueError(f"Unsupported gate metric_source: {metric_source}")
+        self.eps = float(eps)
+
+    def fast_path_kind(self):
+        if self.rho <= self.eps:
+            return 'dirac'
+        if abs(self.rho - 1.0) <= self.eps and abs(self.beta - 1.0) <= self.eps and abs(self.kappa) <= self.eps:
+            return 'posterior_average'
+        return None
+
+    def _anchor_donor_log_compatibility(self, component_state: HLSIComponentState):
+        diff = component_state.metric_points_top.unsqueeze(1) - component_state.metric_points_top.unsqueeze(2)
+        mahal = torch.einsum('mijd,mide,mije->mij', diff, component_state.metric_prec_top, diff)
+        return -0.5 * mahal
+
+    def apply(self, component_state: HLSIComponentState):
+        fast_path = self.fast_path_kind()
+        if fast_path is not None:
+            raise RuntimeError('TemperedLikelihoodGateLaw.apply was called even though an exact fast path is available.')
+
+        donor_logits = self.beta * torch.log(torch.clamp(component_state.alpha_top_norm, min=self.eps)).unsqueeze(1)
+        if abs(self.kappa) > self.eps:
+            donor_logits = donor_logits + self.kappa * self._anchor_donor_log_compatibility(component_state)
+
+        q_soft = torch.softmax(donor_logits, dim=2)
+        if self.rho < 1.0 - self.eps:
+            eye = torch.eye(q_soft.shape[1], device=q_soft.device, dtype=q_soft.dtype).unsqueeze(0)
+            q = (1.0 - self.rho) * eye + self.rho * q_soft
+        else:
+            q = q_soft
+
+        A_tilde = torch.einsum('mij,mjab->miab', q, component_state.gate_top)
+        corr_top = torch.einsum('miab,mib->mia', A_tilde, component_state.d_top)
+        return component_state.s_twd + torch.einsum('mi,mia->ma', component_state.alpha_top, corr_top)
+
+
+def _materialize_precision_from_gated(gated_chunk):
+    eigvecs = gated_chunk['eigvecs']
+    eigvals = torch.clamp(gated_chunk['eigvals'], min=0.0)
+    trusted = gated_chunk['trusted']
+    active_eig = torch.where(trusted, eigvals, torch.zeros_like(eigvals))
+    return torch.einsum('...ij,...j,...kj->...ik', eigvecs, active_eig, eigvecs)
+
+
+def _materialize_hlsi_gate_from_gated(gated_chunk, et2, var_t):
+    eigvecs = gated_chunk['eigvecs']
+    eigvals = torch.clamp(gated_chunk['eigvals'], min=0.0)
+    trusted = gated_chunk['trusted']
+    gate_eig = torch.where(
+        trusted,
+        et2 / torch.clamp(et2 + var_t * eigvals, min=1e-30),
+        torch.zeros_like(eigvals),
+    )
+    return torch.einsum('...ij,...j,...kj->...ik', eigvecs, gate_eig, eigvecs)
+
+
+def _materialize_hlsi_gate_from_precision(P_chunk, et2, var_t):
+    lam, V = torch.linalg.eigh(0.5 * (P_chunk + P_chunk.transpose(-1, -2)))
+    lam = torch.clamp(lam, min=0.0)
+    gate_eig = et2 / torch.clamp(et2 + var_t * lam, min=1e-30)
+    return torch.einsum('...ij,...j,...kj->...ik', V, gate_eig, V)
+
+
+def _gather_rows_cpu_to_device(source_cpu, row_idx, device_target):
+    row_idx = row_idx.reshape(-1).detach().cpu()
+    gathered = source_cpu.index_select(0, row_idx)
+    new_shape = tuple(row_idx.shape[:-1])
+    return gathered
+
+
+def _gather_topk_cpu_to_device(source_cpu, idx_top, device_target):
+    idx_flat = idx_top.reshape(-1).detach().cpu()
+    gathered = source_cpu.index_select(0, idx_flat)
+    new_shape = tuple(idx_top.shape) + tuple(source_cpu.shape[1:])
+    return gathered.view(*new_shape).to(device_target, non_blocking=True)
+
+
+def _build_hlsi_component_state(y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+                                P_ref_cpu=None, mu_ref_cpu=None, gated_info=None,
+                                gate_law=None, batch_size=REF_STREAM_BATCH):
+    if gate_law is None:
+        raise ValueError('_build_hlsi_component_state requires a gate_law.')
+    if mu_ref_cpu is None:
+        raise ValueError('_build_hlsi_component_state requires mu_ref_cpu.')
+
+    t_val = _canonicalize_time(t)
+    et = math.exp(-t_val)
+    et2 = et * et
+    var_t = 1.0 - math.exp(-2.0 * t_val)
+
+    alpha = get_posterior_snis_weights(y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size)
+    m_query, n_ref = alpha.shape
+    topk = min(max(1, int(getattr(gate_law, 'topk', 64))), n_ref)
+    alpha_top, idx_top = torch.topk(alpha, k=topk, dim=1, largest=True, sorted=False)
+    alpha_top_norm = alpha_top / torch.clamp(alpha_top.sum(dim=1, keepdim=True), min=1e-30)
+
+    d = y.shape[1]
+    mu_x = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    s_tsi_num = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    for i in range(0, n_ref, batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = alpha[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        mu_x += torch.einsum('mb,bd->md', w_batch, X_batch)
+        s_tsi_num += torch.einsum('mb,bd->md', w_batch, s0_batch)
+        del w_batch, X_batch, s0_batch
+
+    s_twd = -(1.0 / var_t) * (y - et * mu_x)
+    s0_top = _gather_topk_cpu_to_device(s0_post_ref_cpu, idx_top, y.device)
+    d_top = s0_top / et - s_twd.unsqueeze(1)
+
+    metric_source = getattr(gate_law, 'metric_source', 'mu')
+    if metric_source == 'x':
+        metric_points_top = _gather_topk_cpu_to_device(X_ref_cpu, idx_top, y.device)
+    else:
+        metric_points_top = _gather_topk_cpu_to_device(mu_ref_cpu, idx_top, y.device)
+
+    if gated_info is not None:
+        gated_top = {
+            'eigvecs': _gather_topk_cpu_to_device(gated_info['eigvecs'], idx_top, y.device),
+            'eigvals': _gather_topk_cpu_to_device(gated_info['eigvals'], idx_top, y.device),
+            'trusted': _gather_topk_cpu_to_device(gated_info['trusted'], idx_top, y.device),
+        }
+        metric_prec_top = _materialize_precision_from_gated(gated_top)
+        gate_top = _materialize_hlsi_gate_from_gated(gated_top, et2, var_t)
+    else:
+        if P_ref_cpu is None:
+            raise ValueError('_build_hlsi_component_state requires either gated_info or P_ref_cpu.')
+        P_top = _gather_topk_cpu_to_device(P_ref_cpu, idx_top, y.device)
+        metric_prec_top = P_top
+        gate_top = _materialize_hlsi_gate_from_precision(P_top, et2, var_t)
+
+    return HLSIComponentState(
+        y=y,
+        t_val=t_val,
+        et=et,
+        et2=et2,
+        var_t=var_t,
+        alpha=alpha,
+        alpha_top=alpha_top,
+        alpha_top_norm=alpha_top_norm,
+        idx_top=idx_top,
+        s_twd=s_twd,
+        d_top=d_top,
+        metric_points_top=metric_points_top,
+        metric_prec_top=metric_prec_top,
+        gate_top=gate_top,
+    )
+
+
+def resolve_hlsi_gate_law(mode, gate_rho=None, gate_beta=None, gate_kappa=None,
+                          gate_topk=64, gate_metric_source='mu'):
+    mode = canonicalize_init_name(mode)
+
+    if mode in {'hlsi_posterior', 'leaf_hlsi', 'gnl_hlsi'}:
+        return DiracGateLaw()
+    if mode in {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi'}:
+        return PosteriorAverageGateLaw()
+    if mode in {'tl_hlsi', 'leaf_tl_hlsi'}:
+        return TemperedLikelihoodGateLaw(
+            rho=0.5 if gate_rho is None else gate_rho,
+            beta=1.0 if gate_beta is None else gate_beta,
+            kappa=1.0 if gate_kappa is None else gate_kappa,
+            topk=64 if gate_topk is None else gate_topk,
+            metric_source=gate_metric_source,
+        )
+
+    raise ValueError(f'No HLSI gate law is defined for mode={mode!r}.')
+
+
+def eval_modular_hlsi_posterior_score(y, t, mode, X_ref_cpu, log_lik_ref_cpu,
+                                      P_ref_cpu, mu_ref_cpu, s0_post_ref_cpu,
+                                      gated_info=None, batch_size=REF_STREAM_BATCH,
+                                      gate_rho=None, gate_beta=None, gate_kappa=None,
+                                      gate_topk=64, gate_metric_source='mu'):
+    gate_law = resolve_hlsi_gate_law(
+        mode,
+        gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
+        gate_topk=gate_topk, gate_metric_source=gate_metric_source,
+    )
+
+    fast_path = gate_law.fast_path_kind()
+    if fast_path == 'dirac':
+        return eval_hlsi_posterior_score(
+            y, t, X_ref_cpu, log_lik_ref_cpu, P_ref_cpu, mu_ref_cpu,
+            gated_info=gated_info, batch_size=batch_size,
+        )
+    if fast_path == 'posterior_average':
+        return eval_ce_hlsi_posterior_score(
+            y, t, X_ref_cpu, log_lik_ref_cpu, P_ref_cpu, s0_post_ref_cpu,
+            gated_info=gated_info, batch_size=batch_size,
+        )
+
+    component_state = _build_hlsi_component_state(
+        y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+        P_ref_cpu=P_ref_cpu, mu_ref_cpu=mu_ref_cpu, gated_info=gated_info,
+        gate_law=gate_law, batch_size=batch_size,
+    )
+    return gate_law.apply(component_state)
+
+
 def eval_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
                                  P_ref_cpu, s0_post_ref_cpu,
                                  gated_info=None, batch_size=REF_STREAM_BATCH,
@@ -1248,12 +1503,20 @@ def compute_pou_weighted_denominator_score(y, t, X_ref, log_lik_ref,
 
 def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
                       P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
-                      grad_log_pou_denom_ref=None):
+                      grad_log_pou_denom_ref=None,
+                      gate_rho=None, gate_beta=None, gate_kappa=None,
+                      gate_topk=64, gate_metric_source='mu'):
     """
     No-CFG wrapper: returns only the conditional/posterior score estimate.
-    mode in {'tweedie', 'blend_posterior', 'hlsi_posterior', 'ce_hlsi'}.
-    Stage-A PoU is realized by selecting a PoU-adjusted local bank; there is no
-    additional query-time denominator subtraction here.
+
+    The HLSI-family branch is modularized into:
+      1. component weights (selected upstream through log_lik_ref / init_weights),
+      2. a reusable per-query component state, and
+      3. a gate law.
+
+    Legacy modes such as HLSI and CE-HLSI remain exact fast paths so existing
+    experiment scripts stay backwards compatible, while TL-HLSI/GATE-HLSI uses
+    the modular gate-law machinery directly.
     """
     t_val = t.item() if isinstance(t, torch.Tensor) else float(t)
     if t_val < 1e-4:
@@ -1269,54 +1532,20 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
             y, t_val, X_ref, s0_post_ref, log_lik_ref,
             batch_size=REF_STREAM_BATCH)
 
-    elif mode == 'hlsi_posterior':
+    elif mode in {
+        'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
+        'gnl_hlsi', 'gnl_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
+    }:
         if P_ref is None or mu_ref is None:
-            raise ValueError("mode='hlsi_posterior' requires P_ref and mu_ref.")
-        score = eval_hlsi_posterior_score(
-            y, t_val, X_ref, log_lik_ref, P_ref, mu_ref,
-            gated_info=gated_info)
-
-    elif mode == 'wc_hlsi':
-        if P_ref is None or mu_ref is None:
-            raise ValueError("mode='wc_hlsi' requires P_ref and mu_ref.")
-        score = eval_hlsi_posterior_score(
-            y, t_val, X_ref, log_lik_ref, P_ref, mu_ref,
-            gated_info=gated_info)
-
-    elif mode == 'ce_hlsi':
-        if P_ref is None:
-            raise ValueError("mode='ce_hlsi' requires P_ref.")
-        score = eval_ce_hlsi_posterior_score(
-            y, t_val, X_ref, log_lik_ref, P_ref, s0_post_ref,
-            gated_info=gated_info, batch_size=REF_STREAM_BATCH)
-
-    elif mode == 'leaf_hlsi':
-        if P_ref is None or mu_ref is None:
-            raise ValueError("mode='leaf_hlsi' requires P_ref and mu_ref.")
-        score = eval_hlsi_posterior_score(
-            y, t_val, X_ref, log_lik_ref, P_ref, mu_ref,
-            gated_info=gated_info)
-
-    elif mode == 'leaf_ce_hlsi':
-        if P_ref is None:
-            raise ValueError("mode='leaf_ce_hlsi' requires P_ref.")
-        score = eval_ce_hlsi_posterior_score(
-            y, t_val, X_ref, log_lik_ref, P_ref, s0_post_ref,
-            gated_info=gated_info, batch_size=REF_STREAM_BATCH)
-
-    elif mode == 'gnl_hlsi':
-        if P_ref is None or mu_ref is None:
-            raise ValueError("mode='gnl_hlsi' requires P_ref and mu_ref.")
-        score = eval_hlsi_posterior_score(
-            y, t_val, X_ref, log_lik_ref, P_ref, mu_ref,
-            gated_info=gated_info)
-
-    elif mode == 'gnl_ce_hlsi':
-        if P_ref is None:
-            raise ValueError("mode='gnl_ce_hlsi' requires P_ref.")
-        score = eval_ce_hlsi_posterior_score(
-            y, t_val, X_ref, log_lik_ref, P_ref, s0_post_ref,
-            gated_info=gated_info, batch_size=REF_STREAM_BATCH)
+            raise ValueError(f"mode={mode!r} requires both P_ref and mu_ref.")
+        score = eval_modular_hlsi_posterior_score(
+            y, t_val, mode,
+            X_ref, log_lik_ref,
+            P_ref, mu_ref, s0_post_ref,
+            gated_info=gated_info, batch_size=REF_STREAM_BATCH,
+            gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
+            gate_topk=gate_topk, gate_metric_source=gate_metric_source,
+        )
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -1355,7 +1584,9 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                      P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
                      steps=40, dim=15, log_mean_ess=False, x_init=None,
                      t_max=2.0, t_min=10 ** (-2.0),
-                     grad_log_pou_denom_ref=None):
+                     grad_log_pou_denom_ref=None,
+                     gate_rho=None, gate_beta=None, gate_kappa=None,
+                     gate_topk=64, gate_metric_source='mu'):
     if x_init is None:
         y = torch.randn(n_samples, dim, device=device, dtype=torch.float64)
     else:
@@ -1388,7 +1619,9 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
         s_cur = get_score_wrapper(y, t_cur, mode, X_ref, s0_post_ref, log_lik_ref,
                                   P_ref=P_ref, mu_ref=mu_ref, gated_info=gated_info,
                                   init_weights=init_weights,
-                                  grad_log_pou_denom_ref=grad_log_pou_denom_ref)
+                                  grad_log_pou_denom_ref=grad_log_pou_denom_ref,
+                                  gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
+                                  gate_topk=gate_topk, gate_metric_source=gate_metric_source)
         d_cur = y + 2.0 * s_cur
 
         z = torch.randn_like(y)
@@ -1397,7 +1630,9 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
         s_next = get_score_wrapper(y_hat, t_next, mode, X_ref, s0_post_ref, log_lik_ref,
                                    P_ref=P_ref, mu_ref=mu_ref, gated_info=gated_info,
                                    init_weights=init_weights,
-                                   grad_log_pou_denom_ref=grad_log_pou_denom_ref)
+                                   grad_log_pou_denom_ref=grad_log_pou_denom_ref,
+                                   gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
+                                   gate_topk=gate_topk, gate_metric_source=gate_metric_source)
         d_next = y_hat + 2.0 * s_next
 
         y = y + 0.5 * (d_cur + d_next) * dt + math.sqrt(2.0 * dt.item()) * z
@@ -2086,6 +2321,22 @@ INIT_ALIASES = {
     _normalize_sampler_key('leaf_ce_hlsi'): 'leaf_ce_hlsi',
     _normalize_sampler_key('leaf ce hlsi'): 'leaf_ce_hlsi',
     _normalize_sampler_key('leaf-ce'): 'leaf_ce_hlsi',
+    _normalize_sampler_key('tl-hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('tl_hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('tl hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('gate-hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('gate_hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('gate hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('mod-hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('mod_hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('mod hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('tempered-likelihood-hlsi'): 'tl_hlsi',
+    _normalize_sampler_key('leaf-tl-hlsi'): 'leaf_tl_hlsi',
+    _normalize_sampler_key('leaf_tl_hlsi'): 'leaf_tl_hlsi',
+    _normalize_sampler_key('leaf tl hlsi'): 'leaf_tl_hlsi',
+    _normalize_sampler_key('leaf-gate-hlsi'): 'leaf_tl_hlsi',
+    _normalize_sampler_key('leaf_gate_hlsi'): 'leaf_tl_hlsi',
+    _normalize_sampler_key('leaf gate hlsi'): 'leaf_tl_hlsi',
 }
 
 INIT_DISPLAY_NAMES = {
@@ -2096,6 +2347,8 @@ INIT_DISPLAY_NAMES = {
     'ce_hlsi': 'CE-HLSI',
     'leaf_hlsi': 'Leaf-HLSI',
     'leaf_ce_hlsi': 'Leaf-CE-HLSI',
+    'tl_hlsi': 'TL-HLSI',
+    'leaf_tl_hlsi': 'Leaf-TL-HLSI',
     'mala': 'MALA',
 }
 
@@ -2144,6 +2397,24 @@ LEGACY_INIT_SPECS = {
     _normalize_sampler_key('leaf-ce-pou-hlsi'): ('leaf_ce_hlsi', 'PoU'),
     _normalize_sampler_key('leaf_ce_pou_hlsi'): ('leaf_ce_hlsi', 'PoU'),
     _normalize_sampler_key('leaf ce pou hlsi'): ('leaf_ce_hlsi', 'PoU'),
+    _normalize_sampler_key('tl-wc-hlsi'): ('tl_hlsi', 'WC'),
+    _normalize_sampler_key('tl_wc_hlsi'): ('tl_hlsi', 'WC'),
+    _normalize_sampler_key('tl wc hlsi'): ('tl_hlsi', 'WC'),
+    _normalize_sampler_key('tl-pou-hlsi'): ('tl_hlsi', 'PoU'),
+    _normalize_sampler_key('tl_pou_hlsi'): ('tl_hlsi', 'PoU'),
+    _normalize_sampler_key('tl pou hlsi'): ('tl_hlsi', 'PoU'),
+    _normalize_sampler_key('gate-wc-hlsi'): ('tl_hlsi', 'WC'),
+    _normalize_sampler_key('gate_wc_hlsi'): ('tl_hlsi', 'WC'),
+    _normalize_sampler_key('gate wc hlsi'): ('tl_hlsi', 'WC'),
+    _normalize_sampler_key('gate-pou-hlsi'): ('tl_hlsi', 'PoU'),
+    _normalize_sampler_key('gate_pou_hlsi'): ('tl_hlsi', 'PoU'),
+    _normalize_sampler_key('gate pou hlsi'): ('tl_hlsi', 'PoU'),
+    _normalize_sampler_key('leaf-tl-wc-hlsi'): ('leaf_tl_hlsi', 'WC'),
+    _normalize_sampler_key('leaf_tl_wc_hlsi'): ('leaf_tl_hlsi', 'WC'),
+    _normalize_sampler_key('leaf tl wc hlsi'): ('leaf_tl_hlsi', 'WC'),
+    _normalize_sampler_key('leaf-tl-pou-hlsi'): ('leaf_tl_hlsi', 'PoU'),
+    _normalize_sampler_key('leaf_tl_pou_hlsi'): ('leaf_tl_hlsi', 'PoU'),
+    _normalize_sampler_key('leaf tl pou hlsi'): ('leaf_tl_hlsi', 'PoU'),
 }
 
 
@@ -2163,6 +2434,26 @@ def canonicalize_init_weights(name):
     if key not in INIT_WEIGHT_ALIASES:
         raise ValueError(f"Unknown init_weights mode: {name}")
     return INIT_WEIGHT_ALIASES[key]
+
+
+
+def canonicalize_gate_metric_source(name):
+    if name is None:
+        return 'mu'
+    key = _normalize_sampler_key(name)
+    metric_aliases = {
+        'mu': 'mu',
+        'mean': 'mu',
+        'posterior mean': 'mu',
+        'local mean': 'mu',
+        'x': 'x',
+        'xref': 'x',
+        'reference': 'x',
+        'reference point': 'x',
+    }
+    if key not in metric_aliases:
+        raise ValueError(f"Unknown gate metric source: {name}")
+    return metric_aliases[key]
 
 
 
@@ -2196,6 +2487,18 @@ def format_sampler_display_name(init_mode, init_weights='L'):
         return 'Leaf-CE-WC-HLSI'
     if init_mode == 'leaf_ce_hlsi' and init_weights == 'PoU':
         return 'Leaf-CE-PoU-HLSI'
+    if init_mode == 'tl_hlsi' and init_weights == 'L':
+        return 'TL-HLSI'
+    if init_mode == 'tl_hlsi' and init_weights == 'WC':
+        return 'TL-WC-HLSI'
+    if init_mode == 'tl_hlsi' and init_weights == 'PoU':
+        return 'TL-PoU-HLSI'
+    if init_mode == 'leaf_tl_hlsi' and init_weights == 'L':
+        return 'Leaf-TL-HLSI'
+    if init_mode == 'leaf_tl_hlsi' and init_weights == 'WC':
+        return 'Leaf-TL-WC-HLSI'
+    if init_mode == 'leaf_tl_hlsi' and init_weights == 'PoU':
+        return 'Leaf-TL-PoU-HLSI'
     return f"{base} [{init_weights}]"
 
 
@@ -2217,7 +2520,7 @@ def get_sampler_precomp_bank(precomp, init_mode):
 def get_sampler_log_weights(init_mode, init_weights, bank):
     init_mode = canonicalize_init_name(init_mode)
     init_weights = canonicalize_init_weights(init_weights)
-    use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi'}
+    use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi', 'leaf_tl_hlsi'}
     if use_leaf and init_weights == 'WC':
         bank_key = 'log_mass_leaf_ref'
     elif use_leaf and init_weights == 'PoU':
@@ -2235,7 +2538,7 @@ def get_sampler_log_weights(init_mode, init_weights, bank):
 def get_sampler_log_weight_name(init_mode, init_weights):
     init_mode = canonicalize_init_name(init_mode)
     init_weights = canonicalize_init_weights(init_weights)
-    use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi'}
+    use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi', 'leaf_tl_hlsi'}
     if use_leaf and init_weights == 'WC':
         return 'log_mass_leaf_ref'
     if use_leaf and init_weights == 'PoU':
@@ -2247,7 +2550,7 @@ def get_sampler_log_weight_name(init_mode, init_weights):
 def select_local_bank(bank, init_mode, init_weights):
     init_mode = canonicalize_init_name(init_mode)
     init_weights = canonicalize_init_weights(init_weights)
-    use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi'}
+    use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi', 'leaf_tl_hlsi'}
 
     if init_weights == 'PoU':
         if use_leaf:
@@ -2347,6 +2650,21 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('mala_dt', 5e-4)
     cfg.setdefault('is_reference', False)
 
+    gate_defaults = {
+        'hlsi_posterior': dict(gate_rho=0.0, gate_beta=1.0, gate_kappa=0.0),
+        'ce_hlsi': dict(gate_rho=1.0, gate_beta=1.0, gate_kappa=0.0),
+        'leaf_hlsi': dict(gate_rho=0.0, gate_beta=1.0, gate_kappa=0.0),
+        'leaf_ce_hlsi': dict(gate_rho=1.0, gate_beta=1.0, gate_kappa=0.0),
+        'tl_hlsi': dict(gate_rho=0.5, gate_beta=1.0, gate_kappa=1.0),
+        'leaf_tl_hlsi': dict(gate_rho=0.5, gate_beta=1.0, gate_kappa=1.0),
+    }
+    for gate_key, gate_val in gate_defaults.get(cfg['init'], {}).items():
+        cfg.setdefault(gate_key, gate_val)
+    cfg.setdefault('gate_topk', 64)
+    cfg['gate_topk'] = int(max(1, cfg['gate_topk']))
+    cfg.setdefault('gate_metric_source', 'mu')
+    cfg['gate_metric_source'] = canonicalize_gate_metric_source(cfg['gate_metric_source'])
+
     if cfg['init'] == 'prior' and cfg['init_steps'] != 0:
         print(f"[normalize_sampler_config] '{label}': init='prior' ignores "
               f"init_steps={cfg['init_steps']}; setting to 0.")
@@ -2387,6 +2705,9 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
             log_mean_ess=cfg['log_mean_ess'],
             t_max=cfg['init_tmax'], t_min=cfg['init_tmin'],
             grad_log_pou_denom_ref=bank.get('grad_log_pou_denom_ref'),
+            gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'),
+            gate_kappa=cfg.get('gate_kappa'), gate_topk=cfg.get('gate_topk', 64),
+            gate_metric_source=cfg.get('gate_metric_source', 'mu'),
         )
         if cfg['log_mean_ess']:
             init_samples, ess_trace = init_out
@@ -2408,6 +2729,12 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     run_info = dict(cfg)
     run_info['init_bank'] = local_bank['bank_name'] if cfg['init'] != 'prior' else 'base'
     run_info['init_log_weights'] = get_sampler_log_weight_name(cfg['init'], cfg['init_weights']) if cfg['init'] != 'prior' else 'prior'
+    if cfg['init'] != 'prior':
+        run_info['gate_family'] = resolve_hlsi_gate_law(
+            cfg['init'],
+            gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'), gate_kappa=cfg.get('gate_kappa'),
+            gate_topk=cfg.get('gate_topk', 64), gate_metric_source=cfg.get('gate_metric_source', 'mu'),
+        ).family if cfg['init'] in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi'} else cfg['init']
     if mala_info is not None:
         run_info.update(mala_info)
 
@@ -2503,9 +2830,19 @@ def summarize_sampler_run(sampler_run_info):
     for label, info in sampler_run_info.items():
         init_mode = info.get('init', 'prior')
         init_weights = info.get('init_weights', 'prior')
+        gate_family = info.get('gate_family', '-')
+        gate_bits = ''
+        if init_mode not in {'prior', 'tweedie', 'blend_posterior'}:
+            gate_bits = (
+                f" | gate={gate_family}"
+                f" | rho={info.get('gate_rho', '-') }"
+                f" | beta={info.get('gate_beta', '-') }"
+                f" | kappa={info.get('gate_kappa', '-') }"
+                f" | topk={info.get('gate_topk', '-') }"
+            )
         print(
             f"{label:<16} -> init={init_mode:<14} | init_weights={init_weights:<5} | "
-            f"weight_tensor={info.get('init_log_weights', 'prior')}"
+            f"weight_tensor={info.get('init_log_weights', 'prior')}{gate_bits}"
         )
 
 
@@ -2611,6 +2948,8 @@ def results_method_family(label, info):
         'ce_hlsi': 'CE-HLSI',
         'gnl_hlsi': 'HLSI',
         'gnl_ce_hlsi': 'CE-HLSI',
+        'tl_hlsi': 'TL-HLSI',
+        'leaf_tl_hlsi': 'Leaf-TL-HLSI',
     }
     return family_map.get(init_mode, str(raw_init_mode))
 
