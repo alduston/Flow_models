@@ -23,6 +23,7 @@ from scipy.spatial.distance import cdist
 from sampling import (
     GaussianPrior,
     compute_field_summary_metrics,
+    compute_heldout_predictive_metrics,
     compute_latent_metrics,
     configure_sampling,
     get_valid_samples,
@@ -75,6 +76,7 @@ SCATTERER_RADIUS = 0.30
 SCATTERER_SOFTNESS = 0.035
 N_SOURCES = 4
 N_RECEIVERS = 72
+N_HOLDOUT_RECEIVERS = None
 SOURCE_WIDTH = 0.05
 
 
@@ -96,7 +98,15 @@ n_boundary = len(boundary_indices_ordered)
 receiver_spacing = n_boundary / N_RECEIVERS
 receiver_boundary_pos = np.round(np.arange(N_RECEIVERS) * receiver_spacing).astype(int)
 receiver_boundary_pos = np.clip(receiver_boundary_pos, 0, n_boundary - 1)
+receiver_boundary_pos = np.unique(receiver_boundary_pos)
 receiver_flat_indices = boundary_indices_ordered[receiver_boundary_pos]
+remaining_boundary_pos = np.setdiff1d(np.arange(n_boundary), receiver_boundary_pos)
+if N_HOLDOUT_RECEIVERS is None:
+    N_HOLDOUT_RECEIVERS = remaining_boundary_pos.size
+else:
+    N_HOLDOUT_RECEIVERS = min(int(N_HOLDOUT_RECEIVERS), remaining_boundary_pos.size)
+holdout_boundary_pos = remaining_boundary_pos[:N_HOLDOUT_RECEIVERS]
+holdout_receiver_flat_indices = boundary_indices_ordered[holdout_boundary_pos]
 rr = np.sqrt((X - 0.5) ** 2 + (Y - 0.5) ** 2)
 support_mask = 1.0 / (1.0 + np.exp((rr - SCATTERER_RADIUS) / SCATTERER_SOFTNESS))
 source_centers = np.array([[0.18, 0.22], [0.82, 0.26], [0.74, 0.82], [0.24, 0.76]], dtype=np.float64)
@@ -114,6 +124,7 @@ for sx, sy in source_centers:
 source_terms = np.stack(source_terms, axis=1)
 
 num_observation = N_SOURCES * 2 * N_RECEIVERS
+num_holdout_observation = N_SOURCES * 2 * N_HOLDOUT_RECEIVERS
 dimension_of_PoI = N * N
 
 df_modes = pd.read_csv('data/Helmholtz_Basis_Modes.csv', header=None)
@@ -131,6 +142,7 @@ jax.config.update("jax_enable_x64", True)
 Basis = jnp.array(basis_truncated)
 support_mask_jax = jnp.array(support_mask, dtype=jnp.float64)
 receiver_indices_jax = jnp.array(receiver_flat_indices, dtype=int)
+holdout_receiver_indices_jax = jnp.array(holdout_receiver_flat_indices, dtype=int)
 boundary_indices_jax = jnp.array(boundary_indices_ordered, dtype=int)
 source_terms_jax = jnp.array(source_terms, dtype=jnp.complex128)
 
@@ -168,6 +180,14 @@ def _flatten_measurements_by_source(meas_complex):
     return jnp.concatenate(parts, axis=0)
 
 
+def _flatten_measurements_by_source_generic(meas_complex, n_receivers):
+    parts = []
+    for s in range(N_SOURCES):
+        parts.append(jnp.real(meas_complex[:n_receivers, s]))
+        parts.append(jnp.imag(meas_complex[:n_receivers, s]))
+    return jnp.concatenate(parts, axis=0)
+
+
 
 def _alpha_to_raw_and_contrast(alpha):
     raw_field = jnp.reshape(Basis @ alpha, (N, N))
@@ -194,6 +214,19 @@ def solve_forward(alpha):
     U_scat = U_total - BACKGROUND_FIELDS
     meas = U_scat[receiver_indices_jax, :]
     return _flatten_measurements_by_source(meas)
+
+
+@jax.jit
+def solve_forward_holdout(alpha):
+    _, _, n2_field = _alpha_to_raw_and_contrast(alpha)
+    A = _assemble_helmholtz_operator(n2_field)
+    U_total = jnp.linalg.solve(A, source_terms_jax)
+    U_scat = U_total - BACKGROUND_FIELDS
+    meas = U_scat[holdout_receiver_indices_jax, :]
+    return _flatten_measurements_by_source_generic(meas, holdout_receiver_indices_jax.shape[0])
+
+
+batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
 
 
 @jax.jit
@@ -253,6 +286,9 @@ y_clean = solve_forward(jnp.array(alpha_true_np))
 y_clean_np = np.array(y_clean)
 NOISE_STD = 1e-4
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+y_clean_holdout = solve_forward_holdout(jnp.array(alpha_true_np))
+y_clean_holdout_np = np.array(y_clean_holdout)
+y_holdout_obs_np = y_clean_holdout_np + np.random.normal(0.0, NOISE_STD, size=y_clean_holdout_np.shape)
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -317,11 +353,25 @@ reference_title = pipeline['reference_title']
 summarize_sampler_run(sampler_run_info)
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 metrics = compute_latent_metrics(samples, reference_key, alpha_true_np, prior_model, lik_model, posterior_score_fn, display_names=display_names)
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    batched_forward_eval_fn=lambda a_batch: np.asarray(
+        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+    ),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+)
 
 Basis_np = np.array(Basis)
 support_mask_np = np.array(support_mask_jax)
 receiver_row = receiver_flat_indices // N
 receiver_col = receiver_flat_indices % N
+holdout_receiver_row = holdout_receiver_flat_indices // N
+holdout_receiver_col = holdout_receiver_flat_indices % N
 
 
 def _nearest_grid_index(xy):
@@ -464,6 +514,8 @@ save_reproducibility_log(
         'HESS_MIN': HESS_MIN,
         'HESS_MAX': HESS_MAX,
         'NOISE_STD': NOISE_STD,
+        'num_holdout_observation': num_holdout_observation,
+        'N_HOLDOUT_RECEIVERS': N_HOLDOUT_RECEIVERS,
         'num_observation': num_observation,
         'num_truncated_series': num_truncated_series,
         'num_modes_available': num_modes_available,
