@@ -1620,7 +1620,7 @@ def _estimate_sampler_pde_eval_counts(cfg, n_ref=0, n_samples=None):
     elif init_mode == 'blend_posterior':
         counts['pde_likelihood_evals'] += n_ref
         counts['pde_score_evals'] += n_ref
-    elif init_mode in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi'}:
+    elif init_mode in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi', 'ref_laplace'}:
         counts['pde_likelihood_evals'] += n_ref
         counts['pde_score_evals'] += n_ref
         counts['pde_gn_hessian_evals'] += n_ref
@@ -1746,46 +1746,76 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
     return y
 
 
-def _build_map_preconditioner_from_reference_bank(bank, prior_model, lik_model, ridge=1e-6):
-    if bank is None:
-        raise ValueError('A reference bank is required to build the MAP preconditioner.')
-    required = ['X_ref', 'log_mass_ref']
-    missing = [k for k in required if k not in bank]
-    if missing:
-        raise KeyError(f"Reference bank is missing {missing}. Available keys: {sorted(bank.keys())}")
+def _build_ref_laplace_component(bank, log_weight_key='log_mass_ref'):
+    """Select the single dominant Ref_Laplace component from a reference bank."""
+    if log_weight_key not in bank:
+        raise KeyError(
+            f"Reference bank is missing '{log_weight_key}'. Available keys: {sorted(bank.keys())}"
+        )
+    log_weights = bank[log_weight_key]
+    if log_weights.ndim != 1:
+        raise ValueError(f"Expected 1D log weights for Ref_Laplace, got shape={tuple(log_weights.shape)}")
 
-    X_ref = bank['X_ref'].to(device=device, dtype=torch.float64)
-    log_mass_ref = bank['log_mass_ref'].to(device=device, dtype=torch.float64)
-    if X_ref.ndim != 2 or log_mass_ref.ndim != 1 or X_ref.shape[0] != log_mass_ref.shape[0]:
-        raise ValueError('Reference bank has inconsistent shapes for X_ref and log_mass_ref.')
-
-    map_idx = int(torch.argmax(log_mass_ref).item())
-    x_map = X_ref[map_idx].clone()
-
-    d = x_map.numel()
-    I = torch.eye(d, device=device, dtype=torch.float64)
-    hess_map = lik_model.hess_log_likelihood(x_map.unsqueeze(0))[0]
-    P_raw = I - 0.5 * (hess_map + hess_map.T)
-
-    evals_raw, evecs = torch.linalg.eigh(P_raw)
-    evals = torch.clamp(evals_raw, min=HESS_MIN, max=HESS_MAX)
-    P = torch.einsum('ij,j,kj->ik', evecs, evals, evecs) + float(ridge) * I
-
-    inv_evals = 1.0 / torch.clamp(evals + float(ridge), min=1e-30)
-    M = torch.einsum('ij,j,kj->ik', evecs, inv_evals, evecs)
-    sqrtM = torch.einsum('ij,j,kj->ik', evecs, torch.sqrt(inv_evals), evecs)
-
-    return {
-        'enabled': True,
-        'map_idx': map_idx,
-        'x_map': x_map.detach().clone(),
-        'precision': P.detach().clone(),
-        'covariance': M.detach().clone(),
-        'sqrt_covariance': sqrtM.detach().clone(),
-        'eigvals_raw': evals_raw.detach().clone(),
-        'eigvals_clamped': evals.detach().clone(),
-        'ridge': float(ridge),
+    best_idx = int(torch.argmax(log_weights).item())
+    component = {
+        'selected_ref_index': best_idx,
+        'selected_log_mass': float(log_weights[best_idx].item()),
+        'x_map': bank['X_ref'][best_idx].to(device=device, dtype=torch.float64),
+        'mean': bank['mu_ref'][best_idx].to(device=device, dtype=torch.float64),
+        'precision': bank['P_ref'][best_idx].to(device=device, dtype=torch.float64),
     }
+    return component
+
+
+def sample_ref_laplace(n_samples, bank, log_weight_key='log_mass_ref'):
+    """
+    Draw samples from the single local Laplace component with the largest
+    approximate posterior mass in the precomputed reference bank.
+    """
+    component = _build_ref_laplace_component(bank, log_weight_key=log_weight_key)
+    mean = component['mean']
+    precision = component['precision']
+    samples = sample_gaussian_from_precision(mean, precision, n_samples)
+    cov_eigs = torch.clamp(torch.linalg.eigvalsh(precision), min=1e-12)
+    info = {
+        'selected_ref_index': component['selected_ref_index'],
+        'selected_log_mass': component['selected_log_mass'],
+        'selected_component_mean_norm': float(torch.linalg.vector_norm(mean).item()),
+        'selected_x_map_norm': float(torch.linalg.vector_norm(component['x_map']).item()),
+        'selected_component_cov_trace': float(torch.sum(torch.reciprocal(cov_eigs)).item()),
+        'score_norm_initial': float('nan'),
+        'score_norm_mean': float('nan'),
+        'score_norm_final': float('nan'),
+        'score_norm_max': float('nan'),
+        'score_norm_num_steps': 0,
+    }
+    return samples, info
+
+
+def _make_frozen_mala_preconditioner(component, ridge=1e-10):
+    """
+    Build a fixed global MALA preconditioner from the same dominant reference
+    component selected by Ref_Laplace.
+    """
+    precision = 0.5 * (component['precision'] + component['precision'].T)
+    evals, evecs = torch.linalg.eigh(precision)
+    evals = torch.clamp(evals, min=max(float(HESS_MIN), float(ridge)))
+    inv_evals = torch.reciprocal(evals)
+    cov = (evecs * inv_evals.unsqueeze(0)) @ evecs.T
+    sqrt_cov = evecs * torch.sqrt(inv_evals).unsqueeze(0)
+    precision_stable = (evecs * evals.unsqueeze(0)) @ evecs.T
+    return {
+        'selected_ref_index': int(component['selected_ref_index']),
+        'selected_log_mass': float(component['selected_log_mass']),
+        'x_map': component['x_map'],
+        'precision': precision_stable,
+        'cov': cov,
+        'sqrt_cov': sqrt_cov,
+    }
+
+
+def _rowwise_quadratic_form(v, precision):
+    return torch.sum(v * (v @ precision), dim=1)
 
 
 def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
@@ -1799,15 +1829,11 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
             raise ValueError('x_init must have shape [n_samples, dim].')
         n_samples = x.shape[0]
 
-    use_precond = preconditioner is not None and bool(preconditioner.get('enabled', True))
+    use_precond = preconditioner is not None
     if use_precond:
-        M = preconditioner['covariance'].to(device=device, dtype=torch.float64)
-        sqrtM = preconditioner['sqrt_covariance'].to(device=device, dtype=torch.float64)
-        P = preconditioner['precision'].to(device=device, dtype=torch.float64)
-    else:
-        M = None
-        sqrtM = None
-        P = None
+        precision = preconditioner['precision'].to(device=device, dtype=torch.float64)
+        cov = preconditioner['cov'].to(device=device, dtype=torch.float64)
+        sqrt_cov = preconditioner['sqrt_cov'].to(device=device, dtype=torch.float64)
 
     log_prior = prior_model.log_prob(x)
     log_lik, grad_lik = lik_model.log_likelihood_and_grad(x)
@@ -1825,12 +1851,13 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
     for i in range(steps):
         noise = torch.randn_like(x)
         if use_precond:
-            drift = dt * (grad_log_post @ M)
-            diffusion = math.sqrt(2.0 * dt) * (noise @ sqrtM.T)
-            x_prop = x + drift + diffusion
+            drift = dt * (grad_log_post @ cov)
+            noise_term = math.sqrt(2.0 * dt) * (noise @ sqrt_cov.T)
+            x_prop = x + drift + noise_term
         else:
             drift = dt * grad_log_post
-            x_prop = x + drift + math.sqrt(2.0 * dt) * noise
+            noise_term = math.sqrt(2.0 * dt) * noise
+            x_prop = x + drift + noise_term
 
         log_prior_prop = prior_model.log_prob(x_prop)
         log_lik_prop, grad_lik_prop = lik_model.log_likelihood_and_grad(x_prop)
@@ -1840,11 +1867,9 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
         grad_log_post_prop = score_prior_prop + grad_lik_prop
 
         if use_precond:
-            resid_fwd = x_prop - x - drift
-            drift_prop = dt * (grad_log_post_prop @ M)
-            resid_bwd = x - x_prop - drift_prop
-            log_q_fwd = -torch.einsum('bi,ij,bj->b', resid_fwd, P, resid_fwd) / (4.0 * dt)
-            log_q_bwd = -torch.einsum('bi,ij,bj->b', resid_bwd, P, resid_bwd) / (4.0 * dt)
+            drift_prop = dt * (grad_log_post_prop @ cov)
+            log_q_fwd = -_rowwise_quadratic_form(x_prop - x - drift, precision) / (4.0 * dt)
+            log_q_bwd = -_rowwise_quadratic_form(x - x_prop - drift_prop, precision) / (4.0 * dt)
         else:
             log_q_fwd = -torch.sum((x_prop - x - drift) ** 2, dim=1) / (4.0 * dt)
             log_q_bwd = -torch.sum((x - x_prop - dt * grad_log_post_prop) ** 2, dim=1) / (4.0 * dt)
@@ -1864,13 +1889,13 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
             accept_count += accept.float().mean().item()
 
         if verbose and (i % 100 == 0):
-            mode_tag = 'Precond-MALA' if use_precond else 'MALA'
-            print(f"{mode_tag} Iteration {i}/{steps}")
+            mode_name = 'Precond-MALA' if use_precond else 'MALA'
+            print(f"{mode_name} Iteration {i}/{steps}")
 
     accept_rate = accept_count / denom_accept
     if verbose:
-        mode_tag = 'Precond-MALA' if use_precond else 'MALA'
-        print(f"{mode_tag} Acceptance: {accept_rate:.2f}")
+        mode_name = 'Precond-MALA' if use_precond else 'MALA'
+        print(f"{mode_name} Acceptance: {accept_rate:.2f}")
 
     info = {
         'acceptance_post_burnin': accept_rate,
@@ -1885,15 +1910,11 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
         'score_norm_num_steps': int(max(0, steps)),
     }
     if use_precond:
-        eigvals_clamped = preconditioner.get('eigvals_clamped')
-        eigvals_raw = preconditioner.get('eigvals_raw')
         info.update({
-            'mala_precond_map_idx': int(preconditioner.get('map_idx', -1)),
-            'mala_precond_ridge': float(preconditioner.get('ridge', 0.0)),
-            'mala_precond_eig_min_raw': float(torch.min(eigvals_raw).item()) if eigvals_raw is not None else np.nan,
-            'mala_precond_eig_max_raw': float(torch.max(eigvals_raw).item()) if eigvals_raw is not None else np.nan,
-            'mala_precond_eig_min': float(torch.min(eigvals_clamped).item()) if eigvals_clamped is not None else np.nan,
-            'mala_precond_eig_max': float(torch.max(eigvals_clamped).item()) if eigvals_clamped is not None else np.nan,
+            'precond_selected_ref_index': int(preconditioner['selected_ref_index']),
+            'precond_selected_log_mass': float(preconditioner['selected_log_mass']),
+            'precond_x_map_norm': float(torch.linalg.vector_norm(preconditioner['x_map']).item()),
+            'precond_trace_cov': float(torch.trace(cov).item()),
         })
     if return_info:
         return x, info
@@ -2499,6 +2520,9 @@ INIT_ALIASES = {
     _normalize_sampler_key('tweedie'): 'tweedie',
     _normalize_sampler_key('blend'): 'blend_posterior',
     _normalize_sampler_key('blend_posterior'): 'blend_posterior',
+    _normalize_sampler_key('ref-laplace'): 'ref_laplace',
+    _normalize_sampler_key('ref_laplace'): 'ref_laplace',
+    _normalize_sampler_key('ref laplace'): 'ref_laplace',
     _normalize_sampler_key('hlsi'): 'hlsi_posterior',
     _normalize_sampler_key('hlsi_posterior'): 'hlsi_posterior',
     _normalize_sampler_key('ce-hlsi'): 'ce_hlsi',
@@ -2533,6 +2557,7 @@ INIT_DISPLAY_NAMES = {
     'prior': 'Prior',
     'tweedie': 'Tweedie',
     'blend_posterior': 'Blend',
+    'ref_laplace': 'Ref_Laplace',
     'hlsi_posterior': 'HLSI',
     'ce_hlsi': 'CE-HLSI',
     'leaf_hlsi': 'Leaf-HLSI',
@@ -2658,6 +2683,8 @@ def parse_init_spec(name):
 def format_sampler_display_name(init_mode, init_weights='L'):
     if init_mode == 'prior':
         return 'Prior'
+    if init_mode == 'ref_laplace':
+        return 'Ref_Laplace'
     base = INIT_DISPLAY_NAMES.get(init_mode, str(init_mode))
     if init_weights == 'L':
         return base
@@ -2822,6 +2849,10 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
 
     if cfg['init'] == 'prior':
         cfg['init_weights'] = 'prior'
+    elif cfg['init'] == 'ref_laplace':
+        cfg['init_weights'] = canonicalize_init_weights(
+            cfg.get('init_weights', implied_weights if implied_weights is not None else 'WC')
+        )
     else:
         cfg['init_weights'] = canonicalize_init_weights(
             cfg.get('init_weights', implied_weights if implied_weights is not None else 'L')
@@ -2835,10 +2866,10 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('display_name', str(label))
     cfg.setdefault('canonical_display_name', format_sampler_display_name(
         cfg['init'], 'L' if cfg['init'] == 'prior' else cfg['init_weights']))
-    cfg.setdefault('init_steps', 0 if cfg['init'] == 'prior' else 200)
+    cfg.setdefault('init_steps', 0 if cfg['init'] in {'prior', 'ref_laplace'} else 200)
     cfg.setdefault('init_tmax', 10.0)
     cfg.setdefault('init_tmin', 10 ** (-2.5))
-    cfg.setdefault('log_mean_ess', cfg['init'] != 'prior')
+    cfg.setdefault('log_mean_ess', cfg['init'] not in {'prior', 'ref_laplace'})
     cfg.setdefault('n_samples', default_n_samples)
     cfg.setdefault('dim', default_dim)
     cfg.setdefault('mala_steps', 0)
@@ -2863,8 +2894,8 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('gate_metric_source', 'mu')
     cfg['gate_metric_source'] = canonicalize_gate_metric_source(cfg['gate_metric_source'])
 
-    if cfg['init'] == 'prior' and cfg['init_steps'] != 0:
-        print(f"[normalize_sampler_config] '{label}': init='prior' ignores "
+    if cfg['init'] in {'prior', 'ref_laplace'} and cfg['init_steps'] != 0:
+        print(f"[normalize_sampler_config] '{label}': init='{cfg['init']}' ignores "
               f"init_steps={cfg['init_steps']}; setting to 0.")
         cfg['init_steps'] = 0
 
@@ -2884,8 +2915,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     print(
         f"  init={cfg['init']} | init_weights={cfg['init_weights']} | "
         f"init_steps={cfg['init_steps']} | mala_steps={cfg['mala_steps']} | "
-        f"mala_burnin={cfg['mala_burnin']} | mala_dt={cfg['mala_dt']} | "
-        f"precond_mala={cfg['precond_mala']}"
+        f"mala_burnin={cfg['mala_burnin']} | mala_dt={cfg['mala_dt']}"
     )
 
     init_samples = None
@@ -2894,7 +2924,15 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     local_bank = None
     init_stage_info = None
 
-    if cfg['init'] != 'prior' and cfg['init_steps'] > 0:
+    if cfg['init'] == 'ref_laplace':
+        bank = get_sampler_precomp_bank(precomp, cfg['init'])
+        local_bank = select_local_bank(bank, 'hlsi_posterior', 'L')
+        init_samples, init_stage_info = sample_ref_laplace(
+            cfg['n_samples'],
+            bank,
+            log_weight_key='log_mass_ref',
+        )
+    elif cfg['init'] != 'prior' and cfg['init_steps'] > 0:
         bank = get_sampler_precomp_bank(precomp, cfg['init'])
         local_bank = select_local_bank(bank, cfg['init'], cfg['init_weights'])
         init_log_weights = get_sampler_log_weights(cfg['init'], cfg['init_weights'], bank)
@@ -2924,10 +2962,13 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     if cfg['mala_steps'] > 0:
         mala_preconditioner = None
         if cfg.get('precond_mala', False):
-            map_bank = precomp.get('base')
-            mala_preconditioner = _build_map_preconditioner_from_reference_bank(
-                map_bank, prior_model, lik_model, ridge=1e-6,
+            ref_laplace_bank = get_sampler_precomp_bank(precomp, 'ref_laplace')
+            ref_laplace_component = _build_ref_laplace_component(
+                ref_laplace_bank,
+                log_weight_key='log_mass_ref',
             )
+            mala_preconditioner = _make_frozen_mala_preconditioner(ref_laplace_component)
+
         final_samples, mala_info = run_mala_sampler(
             cfg['n_samples'], prior_model, lik_model,
             steps=cfg['mala_steps'], dt=cfg['mala_dt'],
@@ -2938,7 +2979,10 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
 
     run_info = dict(cfg)
     run_info['init_bank'] = local_bank['bank_name'] if cfg['init'] != 'prior' and local_bank is not None else 'base'
-    run_info['init_log_weights'] = get_sampler_log_weight_name(cfg['init'], cfg['init_weights']) if cfg['init'] != 'prior' else 'prior'
+    if cfg['init'] == 'ref_laplace':
+        run_info['init_log_weights'] = 'log_mass_ref'
+    else:
+        run_info['init_log_weights'] = get_sampler_log_weight_name(cfg['init'], cfg['init_weights']) if cfg['init'] != 'prior' else 'prior'
     if cfg['init'] != 'prior':
         run_info['gate_family'] = resolve_hlsi_gate_law(
             cfg['init'],
@@ -3067,7 +3111,7 @@ def summarize_sampler_run(sampler_run_info):
         init_weights = info.get('init_weights', 'prior')
         gate_family = info.get('gate_family', '-')
         gate_bits = ''
-        if init_mode not in {'prior', 'tweedie', 'blend_posterior'}:
+        if init_mode not in {'prior', 'tweedie', 'blend_posterior', 'ref_laplace'}:
             gate_bits = (
                 f" | gate={gate_family}"
                 f" | rho={info.get('gate_rho', '-') }"
@@ -3413,6 +3457,7 @@ def results_method_family(label, info):
     family_map = {
         'tweedie': 'Tweedie',
         'blend_posterior': 'Blend',
+        'ref_laplace': 'Ref_Laplace',
         'hlsi_posterior': 'HLSI',
         'ce_hlsi': 'CE-HLSI',
         'gnl_hlsi': 'HLSI',
