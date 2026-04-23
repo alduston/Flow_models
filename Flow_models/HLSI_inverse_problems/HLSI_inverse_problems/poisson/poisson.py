@@ -67,8 +67,8 @@ np.savetxt('data/PoissonCoeff_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # ==========================================
 # 1. Configuration / data files
 # ==========================================
-num_observation_generated = 80
-num_observation = 70
+num_observation_generated = 160
+num_observation = 140
 num_truncated_series = 32
 seed = 42
 
@@ -105,7 +105,7 @@ obs_locations_holdout = jnp.array(obs_indices_holdout, dtype=int)
 obs_locations_all = jnp.array(obs_indices_all, dtype=int)
 obs_locations = obs_locations_train
 
-NOISE_STD = 2.5e-5
+NOISE_STD = 1e-5
 
 x_1d = jnp.linspace(0.0, 1.0, N)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
