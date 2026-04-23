@@ -289,6 +289,7 @@ y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
 y_clean_holdout = solve_forward_holdout(jnp.array(alpha_true_np))
 y_clean_holdout_np = np.array(y_clean_holdout)
 y_holdout_obs_np = y_clean_holdout_np + np.random.normal(0.0, NOISE_STD, size=y_clean_holdout_np.shape)
+HELDOUT_BATCH_SIZE = 1
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -353,18 +354,27 @@ reference_title = pipeline['reference_title']
 summarize_sampler_run(sampler_run_info)
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 metrics = compute_latent_metrics(samples, reference_key, alpha_true_np, prior_model, lik_model, posterior_score_fn, display_names=display_names)
-metrics = compute_heldout_predictive_metrics(
-    samples,
-    metrics,
-    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
-    batched_forward_eval_fn=lambda a_batch: np.asarray(
-        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
-    ),
-    y_holdout_obs_np=y_holdout_obs_np,
-    noise_std=NOISE_STD,
-    display_names=display_names,
-    min_valid=10,
-)
+
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+try:
+    metrics = compute_heldout_predictive_metrics(
+        samples,
+        metrics,
+        heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+        batched_forward_eval_fn=lambda a_batch: np.asarray(
+            batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+        ),
+        batched_forward_eval_batch_size=HELDOUT_BATCH_SIZE,
+        y_holdout_obs_np=y_holdout_obs_np,
+        noise_std=NOISE_STD,
+        display_names=display_names,
+        min_valid=10,
+    )
+except Exception as exc:
+    print(f"WARNING: held-out predictive metrics failed and will be skipped: {exc}")
 
 Basis_np = np.array(Basis)
 support_mask_np = np.array(support_mask_jax)
@@ -514,6 +524,7 @@ save_reproducibility_log(
         'HESS_MIN': HESS_MIN,
         'HESS_MAX': HESS_MAX,
         'NOISE_STD': NOISE_STD,
+        'HELDOUT_BATCH_SIZE': HELDOUT_BATCH_SIZE,
         'num_holdout_observation': num_holdout_observation,
         'N_HOLDOUT_RECEIVERS': N_HOLDOUT_RECEIVERS,
         'num_observation': num_observation,
