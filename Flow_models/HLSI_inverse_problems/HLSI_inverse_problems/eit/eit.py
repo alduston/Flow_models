@@ -70,7 +70,19 @@ np.savetxt('data/EIT_Basis_Modes.csv', Basis_Modes, delimiter=',')
 num_truncated_series = 32
 seed = 42
 N_CURRENT_PATTERNS = 24
-N_ELECTRODES = 120
+
+# Clustered sensor layout: dense coverage on a few boundary arcs and sparse/no
+# coverage elsewhere. This is intended to create locally stiff likelihoods near
+# instrumented regions while preserving genuine posterior ambiguity away from
+# the sensor clusters.
+SENSOR_LAYOUT_NAME = 'clustered_3arc_backbone'
+SENSOR_CLUSTER_SPECS = (
+    {'center_frac': 0.10, 'half_width_frac': 0.08, 'count': 14},
+    {'center_frac': 0.40, 'half_width_frac': 0.08, 'count': 14},
+    {'center_frac': 0.72, 'half_width_frac': 0.08, 'count': 14},
+)
+SENSOR_BACKBONE_COUNT = 6
+N_ELECTRODES = int(sum(spec['count'] for spec in SENSOR_CLUSTER_SPECS) + SENSOR_BACKBONE_COUNT)
 dimension_of_PoI = N * N
 num_modes_available = Basis_Modes.shape[1]
 
@@ -88,11 +100,96 @@ def _ordered_boundary_indices(n):
     return np.array(idx, dtype=int)
 
 
+def _select_evenly_spaced_positions(positions, count):
+    positions = np.array(sorted(set(int(p) for p in np.asarray(positions).tolist())), dtype=int)
+    if count <= 0 or positions.size == 0:
+        return np.array([], dtype=int)
+    if count >= positions.size:
+        return positions.copy()
+
+    raw_idx = np.linspace(0, positions.size - 1, count)
+    selected = []
+    used = set()
+    for idx in np.round(raw_idx).astype(int):
+        idx = int(np.clip(idx, 0, positions.size - 1))
+        pos = int(positions[idx])
+        if pos not in used:
+            selected.append(pos)
+            used.add(pos)
+
+    if len(selected) < count:
+        remaining = np.array([p for p in positions.tolist() if int(p) not in used], dtype=int)
+        if remaining.size > 0:
+            extra = _select_evenly_spaced_positions(remaining, count - len(selected))
+            for pos in extra.tolist():
+                pos = int(pos)
+                if pos not in used:
+                    selected.append(pos)
+                    used.add(pos)
+
+    return np.array(sorted(selected), dtype=int)
+
+
+def _circular_arc_positions(n_boundary, center_frac, half_width_frac):
+    center = float(center_frac % 1.0) * n_boundary
+    positions = np.arange(n_boundary, dtype=float)
+    clockwise = np.mod(positions - center, n_boundary)
+    counterclockwise = np.mod(center - positions, n_boundary)
+    circular_distance = np.minimum(clockwise, counterclockwise)
+    mask = circular_distance <= (float(half_width_frac) * n_boundary)
+    return np.where(mask)[0].astype(int)
+
+
+def _build_clustered_electrode_positions(n_boundary, cluster_specs, backbone_count=0):
+    selected = []
+    used = set()
+    target_count = int(sum(int(spec['count']) for spec in cluster_specs) + int(backbone_count))
+
+    for spec in cluster_specs:
+        arc_positions = _circular_arc_positions(
+            n_boundary,
+            center_frac=spec['center_frac'],
+            half_width_frac=spec['half_width_frac'],
+        )
+        arc_positions = np.array([p for p in arc_positions.tolist() if int(p) not in used], dtype=int)
+        chosen = _select_evenly_spaced_positions(arc_positions, int(spec['count']))
+        for pos in chosen.tolist():
+            pos = int(pos)
+            if pos not in used:
+                selected.append(pos)
+                used.add(pos)
+
+    if backbone_count > 0:
+        remaining = np.array([p for p in range(n_boundary) if p not in used], dtype=int)
+        backbone = _select_evenly_spaced_positions(remaining, int(backbone_count))
+        for pos in backbone.tolist():
+            pos = int(pos)
+            if pos not in used:
+                selected.append(pos)
+                used.add(pos)
+
+    if len(selected) < target_count:
+        remaining = np.array([p for p in range(n_boundary) if p not in used], dtype=int)
+        filler = _select_evenly_spaced_positions(remaining, target_count - len(selected))
+        for pos in filler.tolist():
+            pos = int(pos)
+            if pos not in used:
+                selected.append(pos)
+                used.add(pos)
+
+    return np.array(sorted(selected), dtype=int)
+
+
 boundary_indices_ordered = _ordered_boundary_indices(N)
 n_boundary = len(boundary_indices_ordered)
-electrode_spacing = n_boundary / N_ELECTRODES
-electrode_boundary_pos = np.round(np.arange(N_ELECTRODES) * electrode_spacing).astype(int)
-electrode_boundary_pos = np.clip(electrode_boundary_pos, 0, n_boundary - 1)
+electrode_boundary_pos = _build_clustered_electrode_positions(
+    n_boundary,
+    cluster_specs=SENSOR_CLUSTER_SPECS,
+    backbone_count=SENSOR_BACKBONE_COUNT,
+)
+if electrode_boundary_pos.size != N_ELECTRODES:
+    raise ValueError(f'Expected {N_ELECTRODES} electrodes, got {electrode_boundary_pos.size}')
+
 electrode_flat_indices = boundary_indices_ordered[electrode_boundary_pos]
 _train_electrode_set = set(int(i) for i in electrode_flat_indices.tolist())
 _holdout_electrode_candidates = np.array(
@@ -101,6 +198,12 @@ _holdout_electrode_candidates = np.array(
 )
 heldout_electrode_flat_indices = np.array(sorted(_holdout_electrode_candidates.tolist()), dtype=int)
 N_HOLDOUT_ELECTRODES = int(heldout_electrode_flat_indices.size)
+
+print(
+    f"EIT sensor layout '{SENSOR_LAYOUT_NAME}': {N_ELECTRODES} training sensors across "
+    f"{len(SENSOR_CLUSTER_SPECS)} dense clusters + {SENSOR_BACKBONE_COUNT} backbone sensors; "
+    f"{N_HOLDOUT_ELECTRODES} boundary nodes held out."
+)
 
 boundary_theta = 2.0 * np.pi * np.arange(n_boundary) / n_boundary
 current_patterns = np.zeros((N_CURRENT_PATTERNS, n_boundary), dtype=np.float64)
@@ -255,6 +358,9 @@ y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
 y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
 y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
 
+_batched_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
+HELDOUT_BATCH_SIZE = 2
+
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
     solve_forward,
@@ -377,17 +483,26 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
-_batched_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
-metrics = compute_heldout_predictive_metrics(
-    samples,
-    metrics,
-    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
-    y_holdout_obs_np=y_holdout_obs_np,
-    noise_std=NOISE_STD,
-    display_names=display_names,
-    min_valid=10,
-    batched_forward_eval_fn=lambda alphas: np.array(_batched_solve_forward_holdout(jnp.array(alphas))),
-)
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+try:
+    metrics = compute_heldout_predictive_metrics(
+        samples,
+        metrics,
+        heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+        batched_forward_eval_fn=lambda alpha_batch: np.asarray(
+            _batched_solve_forward_holdout(jnp.asarray(alpha_batch, dtype=jnp.float64))
+        ),
+        batched_forward_eval_batch_size=HELDOUT_BATCH_SIZE,
+        y_holdout_obs_np=y_holdout_obs_np,
+        noise_std=NOISE_STD,
+        display_names=display_names,
+        min_valid=10,
+    )
+except Exception as exc:
+    print(f"WARNING: held-out predictive metrics failed and will be skipped: {exc}")
 
 print('\n=== EIT field/data metrics ===')
 print(f"{'Method':<24} | {'RelL2_m (%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'FwdRel':<12}")
@@ -441,10 +556,15 @@ save_reproducibility_log(
         'ELL': ELL,
         'SIGMA_PRIOR': SIGMA_PRIOR,
         'N_CURRENT_PATTERNS': N_CURRENT_PATTERNS,
+        'SENSOR_LAYOUT_NAME': SENSOR_LAYOUT_NAME,
+        'SENSOR_CLUSTER_SPECS': SENSOR_CLUSTER_SPECS,
+        'SENSOR_BACKBONE_COUNT': SENSOR_BACKBONE_COUNT,
         'N_ELECTRODES': N_ELECTRODES,
         'N_HOLDOUT_ELECTRODES': N_HOLDOUT_ELECTRODES,
+        'electrode_boundary_pos': electrode_boundary_pos,
         'heldout_electrode_flat_indices': heldout_electrode_flat_indices,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
+        'HELDOUT_BATCH_SIZE': HELDOUT_BATCH_SIZE,
     },
     extra_sections={
         'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path},
