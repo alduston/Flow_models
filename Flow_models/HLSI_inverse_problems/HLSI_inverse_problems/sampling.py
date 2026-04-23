@@ -2973,14 +2973,12 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
     n_holdout = int(y_holdout_obs_np.size)
     if n_holdout == 0:
         if print_summary:
-            print('
-=== Held-out predictive metrics ===')
+            print('=== Held-out predictive metrics ===')
             print('No held-out observations were provided; skipping held-out predictive metrics.')
         return metrics
 
     if print_summary:
-        print('
-=== Held-out predictive metrics ===')
+        print('=== Held-out predictive metrics ===')
         print(
             f"{'Method':<24} | {'HeldoutPredNLL':<16} | {'HeldoutStdResSq':<16} | {'HeldoutStdResRMS':<17}"
         )
