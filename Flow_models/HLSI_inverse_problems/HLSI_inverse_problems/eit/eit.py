@@ -69,7 +69,7 @@ np.savetxt('data/EIT_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # ==========================================
 num_truncated_series = 32
 seed = 42
-N_CURRENT_PATTERNS = 24
+N_CURRENT_PATTERNS = 16
 
 # Clustered sensor layout: dense coverage on a few boundary arcs and sparse/no
 # coverage elsewhere. This is intended to create locally stiff likelihoods near
@@ -229,7 +229,7 @@ current_patterns_jax = jnp.array(current_patterns, dtype=jnp.float64)
 boundary_indices_jax = jnp.array(boundary_indices_ordered, dtype=int)
 
 h = 1.0 / (N - 1)
-NOISE_STD = 5e-4
+NOISE_STD = 2e-5
 
 _xface_left = (jnp.arange(N - 1)[:, None] * N + jnp.arange(N)[None, :]).ravel()
 _xface_right = _xface_left + N
