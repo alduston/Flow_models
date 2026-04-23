@@ -1630,6 +1630,8 @@ def _estimate_sampler_pde_eval_counts(cfg, n_ref=0, n_samples=None):
         n_posterior_evals = n_samples * (mala_steps + 1)
         counts['pde_likelihood_evals'] += n_posterior_evals
         counts['pde_score_evals'] += n_posterior_evals
+        if bool(cfg.get('precond_mala', False)):
+            counts['pde_gn_hessian_evals'] += 1
 
     counts['pde_solve_count'] = (
         counts['pde_likelihood_evals']
@@ -1744,8 +1746,51 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
     return y
 
 
+def _build_map_preconditioner_from_reference_bank(bank, prior_model, lik_model, ridge=1e-6):
+    if bank is None:
+        raise ValueError('A reference bank is required to build the MAP preconditioner.')
+    required = ['X_ref', 'log_mass_ref']
+    missing = [k for k in required if k not in bank]
+    if missing:
+        raise KeyError(f"Reference bank is missing {missing}. Available keys: {sorted(bank.keys())}")
+
+    X_ref = bank['X_ref'].to(device=device, dtype=torch.float64)
+    log_mass_ref = bank['log_mass_ref'].to(device=device, dtype=torch.float64)
+    if X_ref.ndim != 2 or log_mass_ref.ndim != 1 or X_ref.shape[0] != log_mass_ref.shape[0]:
+        raise ValueError('Reference bank has inconsistent shapes for X_ref and log_mass_ref.')
+
+    map_idx = int(torch.argmax(log_mass_ref).item())
+    x_map = X_ref[map_idx].clone()
+
+    d = x_map.numel()
+    I = torch.eye(d, device=device, dtype=torch.float64)
+    hess_map = lik_model.hess_log_likelihood(x_map.unsqueeze(0))[0]
+    P_raw = I - 0.5 * (hess_map + hess_map.T)
+
+    evals_raw, evecs = torch.linalg.eigh(P_raw)
+    evals = torch.clamp(evals_raw, min=HESS_MIN, max=HESS_MAX)
+    P = torch.einsum('ij,j,kj->ik', evecs, evals, evecs) + float(ridge) * I
+
+    inv_evals = 1.0 / torch.clamp(evals + float(ridge), min=1e-30)
+    M = torch.einsum('ij,j,kj->ik', evecs, inv_evals, evecs)
+    sqrtM = torch.einsum('ij,j,kj->ik', evecs, torch.sqrt(inv_evals), evecs)
+
+    return {
+        'enabled': True,
+        'map_idx': map_idx,
+        'x_map': x_map.detach().clone(),
+        'precision': P.detach().clone(),
+        'covariance': M.detach().clone(),
+        'sqrt_covariance': sqrtM.detach().clone(),
+        'eigvals_raw': evals_raw.detach().clone(),
+        'eigvals_clamped': evals.detach().clone(),
+        'ridge': float(ridge),
+    }
+
+
 def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
-                     burn_in=200, x_init=None, verbose=True, return_info=False):
+                     burn_in=200, x_init=None, verbose=True, return_info=False,
+                     preconditioner=None):
     if x_init is None:
         x = prior_model.sample(n_samples)
     else:
@@ -1753,6 +1798,16 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
         if x.ndim != 2:
             raise ValueError('x_init must have shape [n_samples, dim].')
         n_samples = x.shape[0]
+
+    use_precond = preconditioner is not None and bool(preconditioner.get('enabled', True))
+    if use_precond:
+        M = preconditioner['covariance'].to(device=device, dtype=torch.float64)
+        sqrtM = preconditioner['sqrt_covariance'].to(device=device, dtype=torch.float64)
+        P = preconditioner['precision'].to(device=device, dtype=torch.float64)
+    else:
+        M = None
+        sqrtM = None
+        P = None
 
     log_prior = prior_model.log_prob(x)
     log_lik, grad_lik = lik_model.log_likelihood_and_grad(x)
@@ -1769,7 +1824,13 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
 
     for i in range(steps):
         noise = torch.randn_like(x)
-        x_prop = x + dt * grad_log_post + math.sqrt(2.0 * dt) * noise
+        if use_precond:
+            drift = dt * (grad_log_post @ M)
+            diffusion = math.sqrt(2.0 * dt) * (noise @ sqrtM.T)
+            x_prop = x + drift + diffusion
+        else:
+            drift = dt * grad_log_post
+            x_prop = x + drift + math.sqrt(2.0 * dt) * noise
 
         log_prior_prop = prior_model.log_prob(x_prop)
         log_lik_prop, grad_lik_prop = lik_model.log_likelihood_and_grad(x_prop)
@@ -1778,8 +1839,15 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
         log_post_prop = log_prior_prop + log_lik_prop
         grad_log_post_prop = score_prior_prop + grad_lik_prop
 
-        log_q_fwd = -torch.sum((x_prop - x - dt * grad_log_post) ** 2, dim=1) / (4.0 * dt)
-        log_q_bwd = -torch.sum((x - x_prop - dt * grad_log_post_prop) ** 2, dim=1) / (4.0 * dt)
+        if use_precond:
+            resid_fwd = x_prop - x - drift
+            drift_prop = dt * (grad_log_post_prop @ M)
+            resid_bwd = x - x_prop - drift_prop
+            log_q_fwd = -torch.einsum('bi,ij,bj->b', resid_fwd, P, resid_fwd) / (4.0 * dt)
+            log_q_bwd = -torch.einsum('bi,ij,bj->b', resid_bwd, P, resid_bwd) / (4.0 * dt)
+        else:
+            log_q_fwd = -torch.sum((x_prop - x - drift) ** 2, dim=1) / (4.0 * dt)
+            log_q_bwd = -torch.sum((x - x_prop - dt * grad_log_post_prop) ** 2, dim=1) / (4.0 * dt)
 
         log_alpha = log_post_prop - log_post + log_q_bwd - log_q_fwd
         accept = torch.log(torch.rand(n_samples, device=device)) < log_alpha
@@ -1796,23 +1864,37 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
             accept_count += accept.float().mean().item()
 
         if verbose and (i % 100 == 0):
-            print(f"MALA Iteration {i}/{steps}")
+            mode_tag = 'Precond-MALA' if use_precond else 'MALA'
+            print(f"{mode_tag} Iteration {i}/{steps}")
 
     accept_rate = accept_count / denom_accept
     if verbose:
-        print(f"MALA Acceptance: {accept_rate:.2f}")
+        mode_tag = 'Precond-MALA' if use_precond else 'MALA'
+        print(f"{mode_tag} Acceptance: {accept_rate:.2f}")
 
     info = {
         'acceptance_post_burnin': accept_rate,
         'steps': steps,
         'burn_in': burn_in,
         'dt': dt,
+        'precond_mala': bool(use_precond),
         'score_norm_initial': score_norm_initial,
         'score_norm_mean': score_norm_sum / float(max(1, steps)),
         'score_norm_final': _mean_vector_norm(grad_log_post),
         'score_norm_max': score_norm_max,
         'score_norm_num_steps': int(max(0, steps)),
     }
+    if use_precond:
+        eigvals_clamped = preconditioner.get('eigvals_clamped')
+        eigvals_raw = preconditioner.get('eigvals_raw')
+        info.update({
+            'mala_precond_map_idx': int(preconditioner.get('map_idx', -1)),
+            'mala_precond_ridge': float(preconditioner.get('ridge', 0.0)),
+            'mala_precond_eig_min_raw': float(torch.min(eigvals_raw).item()) if eigvals_raw is not None else np.nan,
+            'mala_precond_eig_max_raw': float(torch.max(eigvals_raw).item()) if eigvals_raw is not None else np.nan,
+            'mala_precond_eig_min': float(torch.min(eigvals_clamped).item()) if eigvals_clamped is not None else np.nan,
+            'mala_precond_eig_max': float(torch.max(eigvals_clamped).item()) if eigvals_clamped is not None else np.nan,
+        })
     if return_info:
         return x, info
     return x
@@ -2762,6 +2844,8 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('mala_steps', 0)
     cfg.setdefault('mala_burnin', 0)
     cfg.setdefault('mala_dt', 5e-4)
+    cfg.setdefault('precond_mala', False)
+    cfg['precond_mala'] = bool(cfg['precond_mala'])
     cfg.setdefault('is_reference', False)
 
     gate_defaults = {
@@ -2800,7 +2884,8 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     print(
         f"  init={cfg['init']} | init_weights={cfg['init_weights']} | "
         f"init_steps={cfg['init_steps']} | mala_steps={cfg['mala_steps']} | "
-        f"mala_burnin={cfg['mala_burnin']} | mala_dt={cfg['mala_dt']}"
+        f"mala_burnin={cfg['mala_burnin']} | mala_dt={cfg['mala_dt']} | "
+        f"precond_mala={cfg['precond_mala']}"
     )
 
     init_samples = None
@@ -2837,11 +2922,18 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     final_samples = init_samples
     mala_info = None
     if cfg['mala_steps'] > 0:
+        mala_preconditioner = None
+        if cfg.get('precond_mala', False):
+            map_bank = precomp.get('base')
+            mala_preconditioner = _build_map_preconditioner_from_reference_bank(
+                map_bank, prior_model, lik_model, ridge=1e-6,
+            )
         final_samples, mala_info = run_mala_sampler(
             cfg['n_samples'], prior_model, lik_model,
             steps=cfg['mala_steps'], dt=cfg['mala_dt'],
             burn_in=cfg['mala_burnin'],
             x_init=init_samples, verbose=True, return_info=True,
+            preconditioner=mala_preconditioner,
         )
 
     run_info = dict(cfg)
