@@ -1580,13 +1580,73 @@ def compute_mean_ess(y, t, X_ref_cpu, log_lik_ref_cpu, eps=1e-30,
 
 
 
+def _mean_vector_norm(x):
+    if x is None:
+        return float('nan')
+    if x.ndim == 1:
+        return float(torch.linalg.vector_norm(x).item())
+    return float(torch.linalg.vector_norm(x, dim=1).mean().item())
+
+
+def _estimate_sampler_pde_eval_counts(cfg, n_ref=0, n_samples=None):
+    """
+    Lightweight, physics-agnostic accounting proxy for how much PDE-derived
+    information each sampler consumes.
+
+    Conventions:
+      - Tweedie bank: likelihoods only.
+      - Blend bank: likelihoods + scores.
+      - HLSI-family banks: likelihoods + scores + GN Hessian proxies.
+      - MALA: one joint posterior evaluation per chain at initialization and one
+        per proposal step; we count that as one likelihood eval and one score
+        eval each time.
+
+    The aggregate ``pde_solve_count`` is the simple sum of these three counters.
+    This is intentionally a portable solve-accounting proxy rather than a
+    problem-specific wall-clock or adjoint-weighted cost model.
+    """
+    init_mode = canonicalize_init_name(cfg.get('init', 'prior'))
+    n_ref = int(max(0, n_ref or 0))
+    n_samples = int(cfg.get('n_samples', 0) if n_samples is None else n_samples)
+
+    counts = {
+        'pde_likelihood_evals': 0,
+        'pde_score_evals': 0,
+        'pde_gn_hessian_evals': 0,
+    }
+
+    if init_mode == 'tweedie':
+        counts['pde_likelihood_evals'] += n_ref
+    elif init_mode == 'blend_posterior':
+        counts['pde_likelihood_evals'] += n_ref
+        counts['pde_score_evals'] += n_ref
+    elif init_mode in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi'}:
+        counts['pde_likelihood_evals'] += n_ref
+        counts['pde_score_evals'] += n_ref
+        counts['pde_gn_hessian_evals'] += n_ref
+
+    mala_steps = int(max(0, cfg.get('mala_steps', 0)))
+    if mala_steps > 0 and n_samples > 0:
+        n_posterior_evals = n_samples * (mala_steps + 1)
+        counts['pde_likelihood_evals'] += n_posterior_evals
+        counts['pde_score_evals'] += n_posterior_evals
+
+    counts['pde_solve_count'] = (
+        counts['pde_likelihood_evals']
+        + counts['pde_score_evals']
+        + counts['pde_gn_hessian_evals']
+    )
+    return counts
+
+
 def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                      P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
                      steps=40, dim=15, log_mean_ess=False, x_init=None,
                      t_max=2.0, t_min=10 ** (-2.0),
                      grad_log_pou_denom_ref=None,
                      gate_rho=None, gate_beta=None, gate_kappa=None,
-                     gate_topk=64, gate_metric_source='mu'):
+                     gate_topk=64, gate_metric_source='mu',
+                     return_info=False):
     if x_init is None:
         y = torch.randn(n_samples, dim, device=device, dtype=torch.float64)
     else:
@@ -1596,9 +1656,22 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
         n_samples = y.shape[0]
         dim = y.shape[1]
 
+    info = {
+        'score_norm_initial': float('nan'),
+        'score_norm_mean': float('nan'),
+        'score_norm_final': float('nan'),
+        'score_norm_max': float('nan'),
+        'score_norm_num_steps': int(max(0, steps)),
+    }
+
     if steps <= 0:
         if log_mean_ess:
-            return y, {'t': np.array([]), 'mean_ess': np.array([])}
+            ess_trace = {'t': np.array([]), 'mean_ess': np.array([])}
+            if return_info:
+                return y, ess_trace, info
+            return y, ess_trace
+        if return_info:
+            return y, info
         return y
 
     ts = torch.logspace(math.log10(t_max), math.log10(t_min), steps + 1,
@@ -1611,6 +1684,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
             'mean_ess': [compute_mean_ess(y, ts[0].item(), X_ref, log_lik_ref)],
         }
 
+    score_norm_sum = 0.0
+    score_norm_max = 0.0
+    final_score = None
+
     for i in range(steps):
         t_cur = ts[i]
         t_next = ts[i + 1]
@@ -1622,6 +1699,11 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                   grad_log_pou_denom_ref=grad_log_pou_denom_ref,
                                   gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
                                   gate_topk=gate_topk, gate_metric_source=gate_metric_source)
+        cur_norm = _mean_vector_norm(s_cur)
+        if i == 0:
+            info['score_norm_initial'] = cur_norm
+        score_norm_sum += cur_norm
+        score_norm_max = max(score_norm_max, cur_norm)
         d_cur = y + 2.0 * s_cur
 
         z = torch.randn_like(y)
@@ -1641,10 +1723,24 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
             ess_trace['t'].append(t_next.item())
             ess_trace['mean_ess'].append(compute_mean_ess(y, t_next.item(), X_ref, log_lik_ref))
 
+    final_score = get_score_wrapper(y, ts[-1], mode, X_ref, s0_post_ref, log_lik_ref,
+                                    P_ref=P_ref, mu_ref=mu_ref, gated_info=gated_info,
+                                    init_weights=init_weights,
+                                    grad_log_pou_denom_ref=grad_log_pou_denom_ref,
+                                    gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
+                                    gate_topk=gate_topk, gate_metric_source=gate_metric_source)
+    info['score_norm_mean'] = score_norm_sum / float(max(1, steps))
+    info['score_norm_final'] = _mean_vector_norm(final_score)
+    info['score_norm_max'] = max(score_norm_max, info['score_norm_final'])
+
     if log_mean_ess:
         ess_trace = {k: np.array(v) for k, v in ess_trace.items()}
+        if return_info:
+            return y, ess_trace, info
         return y, ess_trace
 
+    if return_info:
+        return y, info
     return y
 
 
@@ -1667,6 +1763,9 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
 
     accept_count = 0.0
     denom_accept = max(1, steps - burn_in)
+    score_norm_initial = _mean_vector_norm(grad_log_post)
+    score_norm_sum = 0.0
+    score_norm_max = score_norm_initial
 
     for i in range(steps):
         noise = torch.randn_like(x)
@@ -1689,6 +1788,10 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
         log_post[accept] = log_post_prop[accept]
         grad_log_post[accept] = grad_log_post_prop[accept]
 
+        step_score_norm = _mean_vector_norm(grad_log_post)
+        score_norm_sum += step_score_norm
+        score_norm_max = max(score_norm_max, step_score_norm)
+
         if i >= burn_in:
             accept_count += accept.float().mean().item()
 
@@ -1704,6 +1807,11 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
         'steps': steps,
         'burn_in': burn_in,
         'dt': dt,
+        'score_norm_initial': score_norm_initial,
+        'score_norm_mean': score_norm_sum / float(max(1, steps)),
+        'score_norm_final': _mean_vector_norm(grad_log_post),
+        'score_norm_max': score_norm_max,
+        'score_norm_num_steps': int(max(0, steps)),
     }
     if return_info:
         return x, info
@@ -2697,6 +2805,9 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
 
     init_samples = None
     ess_trace = None
+    bank = None
+    local_bank = None
+    init_stage_info = None
 
     if cfg['init'] != 'prior' and cfg['init_steps'] > 0:
         bank = get_sampler_precomp_bank(precomp, cfg['init'])
@@ -2714,11 +2825,12 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
             gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'),
             gate_kappa=cfg.get('gate_kappa'), gate_topk=cfg.get('gate_topk', 64),
             gate_metric_source=cfg.get('gate_metric_source', 'mu'),
+            return_info=True,
         )
         if cfg['log_mean_ess']:
-            init_samples, ess_trace = init_out
+            init_samples, ess_trace, init_stage_info = init_out
         else:
-            init_samples = init_out
+            init_samples, init_stage_info = init_out
     else:
         init_samples = prior_model.sample(cfg['n_samples'])
 
@@ -2733,7 +2845,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
         )
 
     run_info = dict(cfg)
-    run_info['init_bank'] = local_bank['bank_name'] if cfg['init'] != 'prior' else 'base'
+    run_info['init_bank'] = local_bank['bank_name'] if cfg['init'] != 'prior' and local_bank is not None else 'base'
     run_info['init_log_weights'] = get_sampler_log_weight_name(cfg['init'], cfg['init_weights']) if cfg['init'] != 'prior' else 'prior'
     if cfg['init'] != 'prior':
         run_info['gate_family'] = resolve_hlsi_gate_law(
@@ -2741,8 +2853,33 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
             gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'), gate_kappa=cfg.get('gate_kappa'),
             gate_topk=cfg.get('gate_topk', 64), gate_metric_source=cfg.get('gate_metric_source', 'mu'),
         ).family if cfg['init'] in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi'} else cfg['init']
+
+    if init_stage_info is not None:
+        for key, value in init_stage_info.items():
+            run_info[f'init_{key}'] = value
     if mala_info is not None:
-        run_info.update(mala_info)
+        for key, value in mala_info.items():
+            if key in {'score_norm_initial', 'score_norm_mean', 'score_norm_final', 'score_norm_max', 'score_norm_num_steps'}:
+                run_info[f'mala_{key}'] = value
+            else:
+                run_info[key] = value
+
+    chosen_score_info = mala_info if mala_info is not None else init_stage_info
+    if chosen_score_info is not None:
+        run_info['score_norm'] = float(chosen_score_info.get('score_norm_final', np.nan))
+        run_info['score_norm_initial'] = float(chosen_score_info.get('score_norm_initial', np.nan))
+        run_info['score_norm_mean'] = float(chosen_score_info.get('score_norm_mean', np.nan))
+        run_info['score_norm_final'] = float(chosen_score_info.get('score_norm_final', np.nan))
+        run_info['score_norm_max'] = float(chosen_score_info.get('score_norm_max', np.nan))
+    else:
+        run_info['score_norm'] = float('nan')
+        run_info['score_norm_initial'] = float('nan')
+        run_info['score_norm_mean'] = float('nan')
+        run_info['score_norm_final'] = float('nan')
+        run_info['score_norm_max'] = float('nan')
+
+    n_ref_local = int(local_bank['X_ref'].shape[0]) if local_bank is not None else 0
+    run_info.update(_estimate_sampler_pde_eval_counts(cfg, n_ref=n_ref_local, n_samples=cfg['n_samples']))
 
     return final_samples.cpu(), ess_trace, run_info
 
@@ -3239,6 +3376,15 @@ def build_results_dataframes(metrics_dict, run_info_dict, n_ref, target_name,
             'mala_steps': int(info.get('mala_steps', info.get('steps', 0))),
             'mala_burnin': int(info.get('mala_burnin', info.get('burn_in', 0))),
             'mala_step_size': float(info.get('mala_dt', info.get('dt', np.nan))),
+            'score_norm': float(info.get('score_norm', np.nan)),
+            'score_norm_initial': float(info.get('score_norm_initial', np.nan)),
+            'score_norm_mean': float(info.get('score_norm_mean', np.nan)),
+            'score_norm_final': float(info.get('score_norm_final', np.nan)),
+            'score_norm_max': float(info.get('score_norm_max', np.nan)),
+            'pde_likelihood_evals': int(info.get('pde_likelihood_evals', 0)),
+            'pde_score_evals': int(info.get('pde_score_evals', 0)),
+            'pde_gn_hessian_evals': int(info.get('pde_gn_hessian_evals', 0)),
+            'pde_solve_count': int(info.get('pde_solve_count', 0)),
             'runtime_seconds': float(info.get('runtime_seconds', np.nan)),
             'reference_method': reference_name,
         })
