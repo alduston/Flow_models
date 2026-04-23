@@ -288,6 +288,7 @@ y_obs_np = y_obs_all_np[:num_observation]
 y_holdout_clean_np = y_all_clean_np[num_observation:]
 y_holdout_obs_np = y_obs_all_np[num_observation:]
 
+HELDOUT_BATCH_SIZE = 4
 batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
@@ -429,18 +430,22 @@ mean_fields, metrics = compute_field_summary_metrics(
     d_lat=ACTIVE_DIM,
 )
 
-metrics = compute_heldout_predictive_metrics(
-    samples,
-    metrics,
-    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
-    batched_forward_eval_fn=lambda a_batch: np.asarray(
-        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
-    ),
-    y_holdout_obs_np=y_holdout_obs_np,
-    noise_std=NOISE_STD,
-    display_names=display_names,
-    min_valid=10,
-)
+try:
+    metrics = compute_heldout_predictive_metrics(
+        samples,
+        metrics,
+        heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+        batched_forward_eval_fn=lambda a_batch: np.asarray(
+            batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+        ),
+        batched_forward_eval_batch_size=HELDOUT_BATCH_SIZE,
+        y_holdout_obs_np=y_holdout_obs_np,
+        noise_std=NOISE_STD,
+        display_names=display_names,
+        min_valid=10,
+    )
+except Exception as e:
+    print(f"WARNING: held-out predictive metrics failed; continuing without them. {type(e).__name__}: {e}")
 
 mean_solution_states = {}
 norm_true_solution = np.linalg.norm(true_solution) + 1e-12
@@ -507,6 +512,7 @@ save_reproducibility_log(
         'ELL': ELL,
         'SIGMA_PRIOR': SIGMA_PRIOR,
         'Q_FLOOR': Q_FLOOR,
+        'HELDOUT_BATCH_SIZE': HELDOUT_BATCH_SIZE,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
     },
     extra_sections={
