@@ -52,7 +52,7 @@ x = np.linspace(0.0, 1.0, N, endpoint=False)
 X, Y = np.meshgrid(x, x, indexing='ij')
 coords = np.column_stack([X.ravel(), Y.ravel()])
 
-ELL = 0.18
+ELL = 0.10
 SIGMA_PRIOR = 1.0
 q_max = 100
 
@@ -68,8 +68,8 @@ np.savetxt('data/AdvecDiff_Basis_Modes.csv', Basis_Modes, delimiter=',')
 # ==========================================
 # 1. Configuration / data files
 # ==========================================
-num_observation = 120
-num_holdout_observation = 120
+num_observation = 25
+num_holdout_observation = 25
 num_truncated_series = 32
 seed = 42
 
@@ -108,7 +108,7 @@ OBS_TIME = 0.5
 DIFFUSIVITY = 2.5e-3
 ADV_VX = 0.90
 ADV_VY = -0.55
-NOISE_STD = 0.02
+NOISE_STD = 0.01
 
 kx_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
 ky_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
