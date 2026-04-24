@@ -35,7 +35,7 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-THIS_DIR = path.dirname(os.path.abspath(__file__))
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -48,27 +48,41 @@ import pandas as pd
 import torch
 from scipy.spatial.distance import cdist
 
-
-from sampling import (
-    GaussianPrior,
-    compute_field_summary_metrics,
-    compute_heldout_predictive_metrics,
-    compute_latent_metrics,
-    configure_sampling,
-    get_valid_samples,
-    init_run_results,
-    make_physics_likelihood,
-    make_posterior_score_fn,
-    plot_mean_ess_logs,
-    plot_pca_histograms,
-    rmse_array,
-    run_standard_sampler_pipeline,
-    save_reproducibility_log,
-    save_results_tables,
-    summarize_sampler_run,
-    zip_run_results_dir,
-)
-
+try:
+    from sampling import (
+        GaussianPrior,
+        compute_field_summary_metrics,
+        compute_heldout_predictive_metrics,
+        compute_latent_metrics,
+        configure_sampling,
+        get_valid_samples,
+        init_run_results,
+        make_physics_likelihood,
+        make_posterior_score_fn,
+        plot_mean_ess_logs,
+        plot_pca_histograms,
+        rmse_array,
+        run_standard_sampler_pipeline,
+        save_reproducibility_log,
+        save_results_tables,
+        summarize_sampler_run,
+        zip_run_results_dir,
+    )
+except Exception:
+    _required_sampling_symbols = [
+        'GaussianPrior', 'compute_field_summary_metrics', 'compute_heldout_predictive_metrics',
+        'compute_latent_metrics', 'configure_sampling', 'get_valid_samples', 'init_run_results',
+        'make_physics_likelihood', 'make_posterior_score_fn', 'plot_mean_ess_logs',
+        'plot_pca_histograms', 'rmse_array', 'run_standard_sampler_pipeline',
+        'save_reproducibility_log', 'save_results_tables', 'summarize_sampler_run',
+        'zip_run_results_dir',
+    ]
+    _missing_sampling_symbols = [name for name in _required_sampling_symbols if name not in globals()]
+    if _missing_sampling_symbols:
+        raise ImportError(
+            'sampling imports failed and these notebook-scope symbols are missing: ' +
+            ', '.join(_missing_sampling_symbols)
+        )
 
 # ==========================================
 # 0. KL basis generation
@@ -77,14 +91,18 @@ os.makedirs('data', exist_ok=True)
 
 jax.config.update("jax_enable_x64", True)
 
-N = 16
+plt.rcParams.setdefault('figure.dpi', 160)
+plt.rcParams.setdefault('savefig.dpi', 300)
+
+# Match the Allen–Cahn ambient plot resolution when possible.
+N = 32
 x = np.linspace(0.0, 1.0, N)
 X, Y = np.meshgrid(x, x)
 coords = np.column_stack([X.ravel(), Y.ravel()])
 
 ell = 0.12
 sigma_prior = 1.0
-q_max = 80
+q_max = 100
 
 dists = cdist(coords, coords)
 C = sigma_prior ** 2 * np.exp(-dists / ell)
@@ -177,6 +195,27 @@ obs_col = obs_locs_np % N
 holdout_locs_np = np.array(obs_locations_holdout)
 holdout_row = holdout_locs_np // N
 holdout_col = holdout_locs_np % N
+
+# Plot-resolution controls: show native 32x32 fields when available; otherwise
+# artificially upscale smaller grids so notebook renders match the Allen–Cahn look.
+PLOT_NATIVE_MIN_RES = 32
+PLOT_UPSCALE_TARGET = 96
+
+
+def _prepare_plot_panel(field, rows=None, cols=None):
+    arr = np.asarray(field)
+    if arr.ndim != 2:
+        return arr, rows, cols, 'nearest'
+    min_side = int(min(arr.shape))
+    if min_side >= PLOT_NATIVE_MIN_RES:
+        return arr, rows, cols, 'nearest'
+
+    factor = int(np.ceil(PLOT_UPSCALE_TARGET / float(min_side)))
+    factor = max(1, factor)
+    up = np.repeat(np.repeat(arr, factor, axis=0), factor, axis=1)
+    row_up = None if rows is None else np.asarray(rows, dtype=np.float64) * factor + 0.5 * (factor - 1)
+    col_up = None if cols is None else np.asarray(cols, dtype=np.float64) * factor + 0.5 * (factor - 1)
+    return up, row_up, col_up, 'nearest'
 
 # ==========================================
 # 2. Physics: generalized neo-Hookean membrane surrogate
@@ -595,6 +634,8 @@ save_reproducibility_log(
         'N_REF': N_REF,
         'PICARD_DAMP': PICARD_DAMP,
         'PICARD_ITERS': PICARD_ITERS,
+        'PLOT_NATIVE_MIN_RES': PLOT_NATIVE_MIN_RES,
+        'PLOT_UPSCALE_TARGET': PLOT_UPSCALE_TARGET,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
         'TRAIN_LOAD_IDS': TRAIN_LOAD_IDS,
         'HELDOUT_LOAD_ID': HELDOUT_LOAD_ID,
@@ -643,13 +684,15 @@ for label in methods_to_plot:
         fields = reconstruct_log_shear(samps[:, :ACTIVE_DIM])
         max_std = max(max_std, float(np.std(fields, axis=0).max()))
 
-im0 = axes[0, 0].imshow(true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
-axes[0, 0].scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.7, label='Train sensors')
-axes[0, 0].scatter(holdout_col, holdout_row, c='cyan', s=8, marker='x', alpha=0.6, label='Held-out sensors')
+true_panel, obs_row_plot, obs_col_plot, field_interp = _prepare_plot_panel(true_field, obs_row, obs_col)
+_, holdout_row_plot, holdout_col_plot, _ = _prepare_plot_panel(true_field, holdout_row, holdout_col)
+im0 = axes[0, 0].imshow(true_panel, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation=field_interp)
+axes[0, 0].scatter(obs_col_plot, obs_row_plot, c='lime', s=8, marker='.', alpha=0.7, label='Train sensors')
+axes[0, 0].scatter(holdout_col_plot, holdout_row_plot, c='cyan', s=8, marker='x', alpha=0.6, label='Held-out sensors')
 axes[0, 0].set_title('Ground Truth\nLog-shear $m(x)$', fontsize=18)
 axes[0, 0].axis('off')
 plt.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
-axes[3, 0].imshow(true_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+axes[3, 0].imshow(true_panel, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation=field_interp)
 axes[3, 0].set_title('Ground Truth', fontsize=14)
 axes[3, 0].axis('off')
 axes[1, 0].axis('off')
@@ -659,13 +702,15 @@ for i, label in enumerate(methods_to_plot):
     col = i + 1
     mean_f = mean_fields[label]
 
-    axes[0, col].imshow(mean_f, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
-    axes[0, col].scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.5)
+    mean_panel, obs_row_panel, obs_col_panel, panel_interp = _prepare_plot_panel(mean_f, obs_row, obs_col)
+    axes[0, col].imshow(mean_panel, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation=panel_interp)
+    axes[0, col].scatter(obs_col_panel, obs_row_panel, c='lime', s=8, marker='.', alpha=0.5)
     axes[0, col].set_title(f"{display_names.get(label, label)}\nMean Posterior", fontsize=18)
     axes[0, col].axis('off')
 
     err_f = np.abs(mean_f - true_field)
-    axes[1, col].imshow(err_f, cmap='inferno', origin='lower', vmin=0, vmax=max_err)
+    err_panel, _, _, _ = _prepare_plot_panel(err_f)
+    axes[1, col].imshow(err_panel, cmap='inferno', origin='lower', vmin=0, vmax=max_err, interpolation=panel_interp)
     axes[1, col].set_title(f"Error Map\n(Max: {err_f.max():.2f})", fontsize=16)
     axes[1, col].axis('off')
 
@@ -675,13 +720,15 @@ for i, label in enumerate(methods_to_plot):
         std_f = np.std(fields, axis=0)
     else:
         std_f = np.zeros_like(true_field)
-    axes[2, col].imshow(std_f, cmap='viridis', origin='lower', vmin=0, vmax=max_std)
+    std_panel, _, _, _ = _prepare_plot_panel(std_f)
+    axes[2, col].imshow(std_panel, cmap='viridis', origin='lower', vmin=0, vmax=max_std, interpolation=panel_interp)
     axes[2, col].set_title(f"Uncertainty\n(Max std: {std_f.max():.2f})", fontsize=16)
     axes[2, col].axis('off')
 
     if samps.shape[0] > 0:
         sample_field = reconstruct_log_shear(samps[:1, :ACTIVE_DIM])[0]
-        axes[3, col].imshow(sample_field, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax)
+        sample_panel, _, _, _ = _prepare_plot_panel(sample_field)
+        axes[3, col].imshow(sample_panel, cmap='RdBu_r', origin='lower', vmin=vmin, vmax=vmax, interpolation=panel_interp)
         axes[3, col].set_title('Posterior Sample', fontsize=14)
     else:
         axes[3, col].text(0.5, 0.5, 'No valid\nsamples', ha='center', va='center', transform=axes[3, col].transAxes)
@@ -696,8 +743,9 @@ fig2, axes2 = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
 
 true_dmin = float(np.min(true_dispmag_holdout))
 true_dmax = float(np.max(true_dispmag_holdout))
-im_true_disp = axes2[0].imshow(true_dispmag_holdout, cmap='viridis', origin='lower', vmin=true_dmin, vmax=true_dmax)
-axes2[0].scatter(holdout_col, holdout_row, c='red', s=12, marker='x', alpha=0.7, label='Held-out sensors')
+true_disp_panel, holdout_row_disp, holdout_col_disp, disp_interp = _prepare_plot_panel(true_dispmag_holdout, holdout_row, holdout_col)
+im_true_disp = axes2[0].imshow(true_disp_panel, cmap='viridis', origin='lower', vmin=true_dmin, vmax=true_dmax, interpolation=disp_interp)
+axes2[0].scatter(holdout_col_disp, holdout_row_disp, c='red', s=12, marker='x', alpha=0.7, label='Held-out sensors')
 axes2[0].set_title('Ground Truth\nHeld-out |u(x)|', fontsize=14)
 axes2[0].axis('off')
 axes2[0].legend(fontsize=8, loc='upper right')
@@ -709,8 +757,9 @@ for i, label in enumerate(methods_to_plot):
     if mean_dispmag is None:
         axes2[col].axis('off')
         continue
-    axes2[col].imshow(mean_dispmag, cmap='viridis', origin='lower', vmin=true_dmin, vmax=true_dmax)
-    axes2[col].scatter(holdout_col, holdout_row, c='red', s=12, marker='x', alpha=0.5)
+    disp_panel, holdout_row_panel, holdout_col_panel, disp_panel_interp = _prepare_plot_panel(mean_dispmag, holdout_row, holdout_col)
+    axes2[col].imshow(disp_panel, cmap='viridis', origin='lower', vmin=true_dmin, vmax=true_dmax, interpolation=disp_panel_interp)
+    axes2[col].scatter(holdout_col_panel, holdout_row_panel, c='red', s=12, marker='x', alpha=0.5)
     axes2[col].set_title(f"{display_names.get(label, label)}\nHeld-out |u(x)|", fontsize=14)
     axes2[col].axis('off')
 
@@ -723,7 +772,8 @@ fig3, axes3 = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
 
 mu_vmin = float(np.min(true_mu))
 mu_vmax = float(np.max(true_mu))
-im_true_mu = axes3[0].imshow(true_mu, cmap='magma', origin='lower', vmin=mu_vmin, vmax=mu_vmax)
+true_mu_panel, _, _, mu_interp = _prepare_plot_panel(true_mu)
+im_true_mu = axes3[0].imshow(true_mu_panel, cmap='magma', origin='lower', vmin=mu_vmin, vmax=mu_vmax, interpolation=mu_interp)
 axes3[0].set_title('Ground Truth\n$\\mu(x)=\\mu_0 e^{m(x)}$', fontsize=14)
 axes3[0].axis('off')
 plt.colorbar(im_true_mu, ax=axes3[0], fraction=0.046, pad=0.04)
@@ -734,7 +784,8 @@ for i, label in enumerate(methods_to_plot):
     if mean_mu is None:
         axes3[col].axis('off')
         continue
-    axes3[col].imshow(mean_mu, cmap='magma', origin='lower', vmin=mu_vmin, vmax=mu_vmax)
+    mean_mu_panel, _, _, mu_panel_interp = _prepare_plot_panel(mean_mu)
+    axes3[col].imshow(mean_mu_panel, cmap='magma', origin='lower', vmin=mu_vmin, vmax=mu_vmax, interpolation=mu_panel_interp)
     axes3[col].set_title(f"{display_names.get(label, label)}\n$\\mu(x)$", fontsize=14)
     axes3[col].axis('off')
 
