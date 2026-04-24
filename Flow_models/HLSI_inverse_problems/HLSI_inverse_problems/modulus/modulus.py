@@ -35,7 +35,7 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-THIS_DIR = os.getcwd() #path.dirname(os.path.abspath(__file__))
+THIS_DIR = path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -48,7 +48,7 @@ import pandas as pd
 import torch
 from scipy.spatial.distance import cdist
 
-'''
+
 from sampling import (
     GaussianPrior,
     compute_field_summary_metrics,
@@ -68,7 +68,7 @@ from sampling import (
     summarize_sampler_run,
     zip_run_results_dir,
 )
-'''
+
 
 # ==========================================
 # 0. KL basis generation
