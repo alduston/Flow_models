@@ -455,9 +455,9 @@ lik_model, lik_aux = make_physics_likelihood(
     y_obs_np,
     NOISE_STD,
     use_gauss_newton_hessian=True,
-    log_batch_size=50,
-    grad_batch_size=25,
-    hess_batch_size=2,
+    log_batch_size=25,
+    grad_batch_size=10,
+    hess_batch_size=1,
 )
 posterior_score_fn = make_posterior_score_fn(lik_model)
 
