@@ -3491,7 +3491,7 @@ def build_results_dataframes(metrics_dict, run_info_dict, n_ref, target_name,
         for metric_name, metric_value in metric_dict.items():
             if metric_name in metric_rows:
                 continue
-            if np.isscalar(metric_value) or isinstance(metric_value, (np.floating, np.integer)):
+            if isinstance(metric_value, (int, float, np.floating, np.integer)) and not isinstance(metric_value, bool):
                 metric_rows.append(metric_name)
     ordered_methods = [label for label in run_info_dict.keys() if label in metrics_dict]
     results_df = pd.DataFrame(index=metric_rows, columns=ordered_methods, dtype=np.float64)
