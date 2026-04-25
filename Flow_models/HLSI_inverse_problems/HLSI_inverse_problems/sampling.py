@@ -972,6 +972,38 @@ def _canonicalize_time(t):
 
 
 def _streaming_max_logw(y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=REF_STREAM_BATCH):
+    return _streaming_max_logw_transition(
+        y, t, X_ref_cpu, log_lik_ref_cpu,
+        batch_size=batch_size, transition_w='ou')
+
+
+def _surrogate_chunk_log_transition(y, t_val, P_chunk, mu_chunk, gated_chunk=None):
+    """
+    Log transition density, up to constants common across components, for
+
+        X_0 | i ~ N(mu_i, P_i^{-1}),
+        Y_t = exp(-t) X_0 + sqrt(1-exp(-2t)) Z.
+
+    This gives Y_t | i ~ N(exp(-t) mu_i, exp(-2t) P_i^{-1} + v_t I).
+    For gated/spectral HLSI banks, we reuse the same trusted-band convention
+    as the diffused PoU-window code.
+    """
+    SigmaInv_chunk, b_chunk, log_norm_chunk = _get_pou_window_chunk_time_mats(
+        t_val, P_chunk, mu_chunk, gated_chunk=gated_chunk)
+    sigma_y = torch.einsum('bij,mj->mbi', SigmaInv_chunk, y)
+    quad_sigma = torch.sum(sigma_y * y.unsqueeze(1), dim=2)
+    cross = torch.einsum('md,bd->mb', y, b_chunk)
+    et = math.exp(t_val * -1.0)
+    mu_t = et * mu_chunk
+    quad_mu = torch.sum(mu_t * b_chunk, dim=1).unsqueeze(0)
+    return log_norm_chunk.unsqueeze(0) - 0.5 * (quad_sigma - 2.0 * cross + quad_mu)
+
+
+def _streaming_max_logw_transition(y, t, X_ref_cpu, log_lik_ref_cpu,
+                                   batch_size=REF_STREAM_BATCH,
+                                   transition_w='ou', P_ref_cpu=None,
+                                   mu_ref_cpu=None, gated_info=None):
+    transition_w = canonicalize_transition_w(transition_w)
     t_val = _canonicalize_time(t)
     et = math.exp(-t_val)
     var_t = 1.0 - math.exp(-2.0 * t_val)
@@ -979,47 +1011,107 @@ def _streaming_max_logw(y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=REF_STREAM_
     m_query = y.shape[0]
     n_ref = X_ref_cpu.shape[0]
     max_log_w = torch.full((m_query,), -float('inf'), device=y.device, dtype=y.dtype)
+    if transition_w == 'surrogate' and mu_ref_cpu is None:
+        raise ValueError("transition_w='surrogate' requires mu_ref_cpu and P_ref_cpu or gated_info.")
 
     for i in range(0, n_ref, batch_size):
-        X_batch = X_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        ll_batch = log_lik_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        mus = et * X_batch
-        diff = y.unsqueeze(1) - mus.unsqueeze(0)
-        dists_sq = torch.sum(diff * diff, dim=2)
-        log_w_batch = -dists_sq / (2.0 * var_t) + ll_batch.unsqueeze(0)
-        current_max = torch.max(log_w_batch, dim=1).values
-        max_log_w = torch.maximum(max_log_w, current_max)
-        del X_batch, ll_batch, mus, diff, dists_sq, log_w_batch, current_max
-
+        sl = slice(i, i + batch_size)
+        ll_batch = log_lik_ref_cpu[sl].to(y.device, non_blocking=True)
+        if transition_w == 'ou':
+            X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+            mus = et * X_batch
+            diff = y.unsqueeze(1) - mus.unsqueeze(0)
+            dists_sq = torch.sum(diff * diff, dim=2)
+            log_trans = -dists_sq / (2.0 * var_t)
+            del X_batch, mus, diff, dists_sq
+        else:
+            mu_chunk = mu_ref_cpu[sl].to(y.device, non_blocking=True)
+            if gated_info is not None:
+                gated_chunk = {
+                    'eigvecs': gated_info['eigvecs'][sl].to(y.device, non_blocking=True),
+                    'eigvals': gated_info['eigvals'][sl].to(y.device, non_blocking=True),
+                    'trusted': gated_info['trusted'][sl].to(y.device, non_blocking=True),
+                }
+                P_chunk = None
+            else:
+                if P_ref_cpu is None:
+                    raise ValueError("transition_w='surrogate' requires P_ref_cpu when gated_info is not supplied.")
+                gated_chunk = None
+                P_chunk = P_ref_cpu[sl].to(y.device, non_blocking=True)
+            log_trans = _surrogate_chunk_log_transition(
+                y, t_val, P_chunk, mu_chunk, gated_chunk=gated_chunk)
+            del mu_chunk
+            if gated_chunk is not None:
+                del gated_chunk
+            if P_chunk is not None:
+                del P_chunk
+        log_w_batch = log_trans + ll_batch.unsqueeze(0)
+        max_log_w = torch.maximum(max_log_w, torch.max(log_w_batch, dim=1).values)
+        del ll_batch, log_trans, log_w_batch
     return t_val, et, var_t, max_log_w
 
+def get_posterior_snis_weights(y, t, X_ref_cpu, log_lik_ref_cpu,
+                               batch_size=REF_STREAM_BATCH,
+                               transition_w='ou', P_ref_cpu=None,
+                               mu_ref_cpu=None, gated_info=None):
+    """
+    Memory-safe two-pass SNIS weights. ``transition_w`` controls only the
+    transition factor in the component responsibilities:
 
-def get_posterior_snis_weights(y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=REF_STREAM_BATCH):
+      - ``ou``:        K_i(y,t) = p_OU(y | x_i)
+      - ``surrogate``: K_i(y,t) = p(y | X_0 ~ N(mu_i, P_i^{-1})) under OU
+
+    The static weights in ``log_lik_ref_cpu`` remain orthogonal to this choice;
+    they can be likelihood, WC mass, PoU mass, leaf-WC mass, etc.
     """
-    Memory-safe two-pass SNIS weights. This still materializes the final [M, N]
-    weight matrix, but avoids the catastrophic [M, N, d] allocation.
-    """
-    t_val, et, var_t, max_log_w = _streaming_max_logw(
-        y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size)
+    transition_w = canonicalize_transition_w(transition_w)
+    t_val, et, var_t, max_log_w = _streaming_max_logw_transition(
+        y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=P_ref_cpu,
+        mu_ref_cpu=mu_ref_cpu, gated_info=gated_info)
 
     chunks = []
     denom_Z = torch.zeros((y.shape[0], 1), device=y.device, dtype=y.dtype)
 
     for i in range(0, X_ref_cpu.shape[0], batch_size):
-        X_batch = X_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        ll_batch = log_lik_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        mus = et * X_batch
-        diff = y.unsqueeze(1) - mus.unsqueeze(0)
-        dists_sq = torch.sum(diff * diff, dim=2)
-        log_w_batch = -dists_sq / (2.0 * var_t) + ll_batch.unsqueeze(0)
+        sl = slice(i, i + batch_size)
+        ll_batch = log_lik_ref_cpu[sl].to(y.device, non_blocking=True)
+        if transition_w == 'ou':
+            X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+            mus = et * X_batch
+            diff = y.unsqueeze(1) - mus.unsqueeze(0)
+            dists_sq = torch.sum(diff * diff, dim=2)
+            log_trans = -dists_sq / (2.0 * var_t)
+            del X_batch, mus, diff, dists_sq
+        else:
+            mu_chunk = mu_ref_cpu[sl].to(y.device, non_blocking=True)
+            if gated_info is not None:
+                gated_chunk = {
+                    'eigvecs': gated_info['eigvecs'][sl].to(y.device, non_blocking=True),
+                    'eigvals': gated_info['eigvals'][sl].to(y.device, non_blocking=True),
+                    'trusted': gated_info['trusted'][sl].to(y.device, non_blocking=True),
+                }
+                P_chunk = None
+            else:
+                if P_ref_cpu is None:
+                    raise ValueError("transition_w='surrogate' requires P_ref_cpu when gated_info is not supplied.")
+                gated_chunk = None
+                P_chunk = P_ref_cpu[sl].to(y.device, non_blocking=True)
+            log_trans = _surrogate_chunk_log_transition(
+                y, t_val, P_chunk, mu_chunk, gated_chunk=gated_chunk)
+            del mu_chunk
+            if gated_chunk is not None:
+                del gated_chunk
+            if P_chunk is not None:
+                del P_chunk
+        log_w_batch = log_trans + ll_batch.unsqueeze(0)
         w_batch = torch.exp(log_w_batch - max_log_w.unsqueeze(1))
         denom_Z += torch.sum(w_batch, dim=1, keepdim=True)
         chunks.append(w_batch)
-        del X_batch, ll_batch, mus, diff, dists_sq, log_w_batch
+        del ll_batch, log_trans, log_w_batch
 
     w = torch.cat(chunks, dim=1)
     return w / torch.clamp(denom_Z, min=1e-30)
-
 
 def eval_blend_posterior_score(y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
                                batch_size=REF_STREAM_BATCH):
@@ -1299,7 +1391,8 @@ def _gather_topk_cpu_to_device(source_cpu, idx_top, device_target):
 
 def _build_hlsi_component_state(y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
                                 P_ref_cpu=None, mu_ref_cpu=None, gated_info=None,
-                                gate_law=None, batch_size=REF_STREAM_BATCH):
+                                gate_law=None, batch_size=REF_STREAM_BATCH,
+                                transition_w='ou'):
     if gate_law is None:
         raise ValueError('_build_hlsi_component_state requires a gate_law.')
     if mu_ref_cpu is None:
@@ -1310,7 +1403,10 @@ def _build_hlsi_component_state(y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cp
     et2 = et * et
     var_t = 1.0 - math.exp(-2.0 * t_val)
 
-    alpha = get_posterior_snis_weights(y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size)
+    alpha = get_posterior_snis_weights(
+        y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=P_ref_cpu,
+        mu_ref_cpu=mu_ref_cpu, gated_info=gated_info)
     m_query, n_ref = alpha.shape
     topk = min(max(1, int(getattr(gate_law, 'topk', 64))), n_ref)
     alpha_top, idx_top = torch.topk(alpha, k=topk, dim=1, largest=True, sorted=False)
@@ -1395,7 +1491,8 @@ def eval_modular_hlsi_posterior_score(y, t, mode, X_ref_cpu, log_lik_ref_cpu,
                                       P_ref_cpu, mu_ref_cpu, s0_post_ref_cpu,
                                       gated_info=None, batch_size=REF_STREAM_BATCH,
                                       gate_rho=None, gate_beta=None, gate_kappa=None,
-                                      gate_topk=64, gate_metric_source='mu'):
+                                      gate_topk=64, gate_metric_source='mu',
+                                      transition_w='ou'):
     gate_law = resolve_hlsi_gate_law(
         mode,
         gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
@@ -1407,25 +1504,27 @@ def eval_modular_hlsi_posterior_score(y, t, mode, X_ref_cpu, log_lik_ref_cpu,
         return eval_hlsi_posterior_score(
             y, t, X_ref_cpu, log_lik_ref_cpu, P_ref_cpu, mu_ref_cpu,
             gated_info=gated_info, batch_size=batch_size,
+            transition_w=transition_w,
         )
     if fast_path == 'posterior_average':
         return eval_ce_hlsi_posterior_score(
             y, t, X_ref_cpu, log_lik_ref_cpu, P_ref_cpu, s0_post_ref_cpu,
-            gated_info=gated_info, batch_size=batch_size,
+            mu_ref_cpu=mu_ref_cpu, gated_info=gated_info, batch_size=batch_size,
+            transition_w=transition_w,
         )
 
     component_state = _build_hlsi_component_state(
         y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
         P_ref_cpu=P_ref_cpu, mu_ref_cpu=mu_ref_cpu, gated_info=gated_info,
-        gate_law=gate_law, batch_size=batch_size,
+        gate_law=gate_law, batch_size=batch_size, transition_w=transition_w,
     )
     return gate_law.apply(component_state)
 
 
 def eval_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
-                                 P_ref_cpu, s0_post_ref_cpu,
+                                 P_ref_cpu, s0_post_ref_cpu, mu_ref_cpu=None,
                                  gated_info=None, batch_size=REF_STREAM_BATCH,
-                                 apply_pou_correction=False):
+                                 apply_pou_correction=False, transition_w='ou'):
     """
     Certainty-Equivalent HLSI with externally supplied SNIS weights.
 
@@ -1451,7 +1550,9 @@ def eval_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
     var_t = 1.0 - math.exp(-2.0 * t_val)
 
     w = get_posterior_snis_weights(
-        y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size)
+        y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=P_ref_cpu,
+        mu_ref_cpu=mu_ref_cpu, gated_info=gated_info)
 
     m_query, d = y.shape
     mu_x = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
@@ -1503,7 +1604,7 @@ def compute_pou_weighted_denominator_score(y, t, X_ref, log_lik_ref,
 
 def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
                       P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
-                      grad_log_pou_denom_ref=None,
+                      transition_w='ou', grad_log_pou_denom_ref=None,
                       gate_rho=None, gate_beta=None, gate_kappa=None,
                       gate_topk=64, gate_metric_source='mu'):
     """
@@ -1545,6 +1646,7 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
             gated_info=gated_info, batch_size=REF_STREAM_BATCH,
             gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
             gate_topk=gate_topk, gate_metric_source=gate_metric_source,
+            transition_w=transition_w,
         )
 
     else:
@@ -1554,9 +1656,13 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
 
 
 def compute_mean_ess(y, t, X_ref_cpu, log_lik_ref_cpu, eps=1e-30,
-                     batch_size=REF_STREAM_BATCH):
-    t_val, et, var_t, max_log_w = _streaming_max_logw(
-        y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size)
+                     batch_size=REF_STREAM_BATCH, transition_w='ou',
+                     P_ref_cpu=None, mu_ref_cpu=None, gated_info=None):
+    transition_w = canonicalize_transition_w(transition_w)
+    t_val, et, var_t, max_log_w = _streaming_max_logw_transition(
+        y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=P_ref_cpu,
+        mu_ref_cpu=mu_ref_cpu, gated_info=gated_info)
 
     del et, var_t  # not needed below, but returned by helper for symmetry.
 
@@ -1564,16 +1670,41 @@ def compute_mean_ess(y, t, X_ref_cpu, log_lik_ref_cpu, eps=1e-30,
     z2 = torch.zeros((y.shape[0], 1), device=y.device, dtype=y.dtype)
 
     for i in range(0, X_ref_cpu.shape[0], batch_size):
-        X_batch = X_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        ll_batch = log_lik_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        mus = math.exp(-t_val) * X_batch
-        diff = y.unsqueeze(1) - mus.unsqueeze(0)
-        dists_sq = torch.sum(diff * diff, dim=2)
-        log_w_batch = -dists_sq / (2.0 * (1.0 - math.exp(-2.0 * t_val))) + ll_batch.unsqueeze(0)
+        sl = slice(i, i + batch_size)
+        ll_batch = log_lik_ref_cpu[sl].to(y.device, non_blocking=True)
+        if transition_w == 'ou':
+            X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+            mus = math.exp(-t_val) * X_batch
+            diff = y.unsqueeze(1) - mus.unsqueeze(0)
+            dists_sq = torch.sum(diff * diff, dim=2)
+            log_trans = -dists_sq / (2.0 * (1.0 - math.exp(-2.0 * t_val)))
+            del X_batch, mus, diff, dists_sq
+        else:
+            mu_chunk = mu_ref_cpu[sl].to(y.device, non_blocking=True)
+            if gated_info is not None:
+                gated_chunk = {
+                    'eigvecs': gated_info['eigvecs'][sl].to(y.device, non_blocking=True),
+                    'eigvals': gated_info['eigvals'][sl].to(y.device, non_blocking=True),
+                    'trusted': gated_info['trusted'][sl].to(y.device, non_blocking=True),
+                }
+                P_chunk = None
+            else:
+                if P_ref_cpu is None:
+                    raise ValueError("transition_w='surrogate' requires P_ref_cpu when gated_info is not supplied.")
+                gated_chunk = None
+                P_chunk = P_ref_cpu[sl].to(y.device, non_blocking=True)
+            log_trans = _surrogate_chunk_log_transition(
+                y, t_val, P_chunk, mu_chunk, gated_chunk=gated_chunk)
+            del mu_chunk
+            if gated_chunk is not None:
+                del gated_chunk
+            if P_chunk is not None:
+                del P_chunk
+        log_w_batch = log_trans + ll_batch.unsqueeze(0)
         w_batch = torch.exp(log_w_batch - max_log_w.unsqueeze(1))
         z1 += torch.sum(w_batch, dim=1, keepdim=True)
         z2 += torch.sum(w_batch ** 2, dim=1, keepdim=True)
-        del X_batch, ll_batch, mus, diff, dists_sq, log_w_batch, w_batch
+        del ll_batch, log_trans, log_w_batch, w_batch
 
     ess_per_particle = (z1 ** 2) / torch.clamp(z2, min=eps)
     return ess_per_particle.mean().item()
@@ -1645,7 +1776,7 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                      P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
                      steps=40, dim=15, log_mean_ess=False, x_init=None,
                      t_max=2.0, t_min=10 ** (-2.0),
-                     grad_log_pou_denom_ref=None,
+                     grad_log_pou_denom_ref=None, transition_w='ou',
                      gate_rho=None, gate_beta=None, gate_kappa=None,
                      gate_topk=64, gate_metric_source='mu',
                      return_info=False):
@@ -1683,7 +1814,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
     if log_mean_ess:
         ess_trace = {
             't': [ts[0].item()],
-            'mean_ess': [compute_mean_ess(y, ts[0].item(), X_ref, log_lik_ref)],
+            'mean_ess': [compute_mean_ess(
+                y, ts[0].item(), X_ref, log_lik_ref,
+                P_ref_cpu=P_ref, mu_ref_cpu=mu_ref, gated_info=gated_info,
+                transition_w=transition_w)],
         }
 
     score_norm_sum = 0.0
@@ -1700,7 +1834,8 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                   init_weights=init_weights,
                                   grad_log_pou_denom_ref=grad_log_pou_denom_ref,
                                   gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
-                                  gate_topk=gate_topk, gate_metric_source=gate_metric_source)
+                                  gate_topk=gate_topk, gate_metric_source=gate_metric_source,
+                                  transition_w=transition_w)
         cur_norm = _mean_vector_norm(s_cur)
         if i == 0:
             info['score_norm_initial'] = cur_norm
@@ -1716,21 +1851,26 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                    init_weights=init_weights,
                                    grad_log_pou_denom_ref=grad_log_pou_denom_ref,
                                    gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
-                                   gate_topk=gate_topk, gate_metric_source=gate_metric_source)
+                                   gate_topk=gate_topk, gate_metric_source=gate_metric_source,
+                                   transition_w=transition_w)
         d_next = y_hat + 2.0 * s_next
 
         y = y + 0.5 * (d_cur + d_next) * dt + math.sqrt(2.0 * dt.item()) * z
 
         if log_mean_ess:
             ess_trace['t'].append(t_next.item())
-            ess_trace['mean_ess'].append(compute_mean_ess(y, t_next.item(), X_ref, log_lik_ref))
+            ess_trace['mean_ess'].append(compute_mean_ess(
+                y, t_next.item(), X_ref, log_lik_ref,
+                P_ref_cpu=P_ref, mu_ref_cpu=mu_ref, gated_info=gated_info,
+                transition_w=transition_w))
 
     final_score = get_score_wrapper(y, ts[-1], mode, X_ref, s0_post_ref, log_lik_ref,
                                     P_ref=P_ref, mu_ref=mu_ref, gated_info=gated_info,
                                     init_weights=init_weights,
                                     grad_log_pou_denom_ref=grad_log_pou_denom_ref,
                                     gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
-                                    gate_topk=gate_topk, gate_metric_source=gate_metric_source)
+                                    gate_topk=gate_topk, gate_metric_source=gate_metric_source,
+                                    transition_w=transition_w)
     info['score_norm_mean'] = score_norm_sum / float(max(1, steps))
     info['score_norm_final'] = _mean_vector_norm(final_score)
     info['score_norm_max'] = max(score_norm_max, info['score_norm_final'])
@@ -2460,21 +2600,20 @@ def eval_pou_coverage_score(y, t, X_ref_cpu, P_ref_cpu, gated_info=None,
 
 def eval_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu, P_ref_cpu, mu_ref_cpu,
                               gated_info=None, batch_size=REF_STREAM_BATCH,
-                              apply_pou_correction=False):
-    t_val, et, var_t, max_log_w = _streaming_max_logw(
-        y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size)
+                              apply_pou_correction=False, transition_w='ou'):
+    transition_w = canonicalize_transition_w(transition_w)
+    t_val, et, var_t, max_log_w = _streaming_max_logw_transition(
+        y, t, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=P_ref_cpu,
+        mu_ref_cpu=mu_ref_cpu, gated_info=gated_info)
     denom_Z = torch.zeros((y.shape[0], 1), device=y.device, dtype=y.dtype)
     term1_num = torch.zeros_like(y)
     term2_num = torch.zeros_like(y)
     for i in range(0, X_ref_cpu.shape[0], batch_size):
-        X_batch = X_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        ll_batch = log_lik_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
-        mus = et * X_batch
-        diff = y.unsqueeze(1) - mus.unsqueeze(0)
-        dists_sq = torch.sum(diff * diff, dim=2)
-        log_w = -dists_sq / (2.0 * var_t) + ll_batch.unsqueeze(0)
-        w_batch = torch.exp(log_w - max_log_w.unsqueeze(1))
-        mu_chunk = mu_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
+        sl = slice(i, i + batch_size)
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        ll_batch = log_lik_ref_cpu[sl].to(y.device, non_blocking=True)
+        mu_chunk = mu_ref_cpu[sl].to(y.device, non_blocking=True)
         if gated_info is not None:
             gated_chunk = {
                 'eigvecs': gated_info['eigvecs'][i:i + batch_size].to(y.device, non_blocking=True),
@@ -2485,13 +2624,25 @@ def eval_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu, P_ref_cpu, mu_re
         else:
             gated_chunk = None
             P_chunk = P_ref_cpu[i:i + batch_size].to(y.device, non_blocking=True)
+        if transition_w == 'ou':
+            mus = et * X_batch
+            diff = y.unsqueeze(1) - mus.unsqueeze(0)
+            dists_sq = torch.sum(diff * diff, dim=2)
+            log_trans = -dists_sq / (2.0 * var_t)
+            del mus, diff, dists_sq
+        else:
+            log_trans = _surrogate_chunk_log_transition(
+                y, t_val, P_chunk, mu_chunk, gated_chunk=gated_chunk)
+        log_w = log_trans + ll_batch.unsqueeze(0)
+        w_batch = torch.exp(log_w - max_log_w.unsqueeze(1))
+
         SigmaInv_chunk, b_chunk = _get_hlsi_chunk_time_mats(
             t_val, P_chunk, mu_chunk, gated_chunk=gated_chunk)
         denom_Z += torch.sum(w_batch, dim=1, keepdim=True)
         term2_num += torch.einsum('mb,bd->md', w_batch, b_chunk)
         sigma_y = torch.einsum('bij,mj->mbi', SigmaInv_chunk, y)
         term1_num += torch.einsum('mb,mbd->md', w_batch, sigma_y)
-        del X_batch, ll_batch, mus, diff, dists_sq, log_w, w_batch
+        del X_batch, ll_batch, log_trans, log_w, w_batch
         del mu_chunk, SigmaInv_chunk, b_chunk, sigma_y
         if gated_chunk is not None:
             del gated_chunk
@@ -2585,6 +2736,27 @@ INIT_WEIGHT_BANK_KEYS = {
     'WC': 'log_mass_ref',
     'PoU': 'log_pou_ref',
 }
+
+
+TRANSITION_WEIGHT_ALIASES = {
+    _normalize_sampler_key('ou'): 'ou',
+    _normalize_sampler_key('target'): 'ou',
+    _normalize_sampler_key('target ou'): 'ou',
+    _normalize_sampler_key('surrogate'): 'surrogate',
+    _normalize_sampler_key('gaussian surrogate'): 'surrogate',
+    _normalize_sampler_key('surrogate gaussian'): 'surrogate',
+    _normalize_sampler_key('mixture'): 'surrogate',
+    _normalize_sampler_key('surrogate mixture'): 'surrogate',
+}
+
+
+def canonicalize_transition_w(name):
+    if name is None:
+        return 'ou'
+    key = _normalize_sampler_key(name)
+    if key in TRANSITION_WEIGHT_ALIASES:
+        return TRANSITION_WEIGHT_ALIASES[key]
+    raise ValueError(f"Unknown transition_w mode: {name!r}. Expected one of: 'ou', 'surrogate'.")
 
 
 LEGACY_INIT_SPECS = {
@@ -2878,6 +3050,7 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('precond_mala', False)
     cfg['precond_mala'] = bool(cfg['precond_mala'])
     cfg.setdefault('is_reference', False)
+    cfg['transition_w'] = canonicalize_transition_w(cfg.get('transition_w', 'ou'))
 
     gate_defaults = {
         'hlsi_posterior': dict(gate_rho=0.0, gate_beta=1.0, gate_kappa=0.0),
@@ -2913,7 +3086,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
 
     print(f"\n=== Running {display_name} ===")
     print(
-        f"  init={cfg['init']} | init_weights={cfg['init_weights']} | "
+        f"  init={cfg['init']} | init_weights={cfg['init_weights']} | transition_w={cfg['transition_w']} | "
         f"init_steps={cfg['init_steps']} | mala_steps={cfg['mala_steps']} | "
         f"mala_burnin={cfg['mala_burnin']} | mala_dt={cfg['mala_dt']}"
     )
@@ -2948,6 +3121,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
             gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'),
             gate_kappa=cfg.get('gate_kappa'), gate_topk=cfg.get('gate_topk', 64),
             gate_metric_source=cfg.get('gate_metric_source', 'mu'),
+            transition_w=cfg.get('transition_w', 'ou'),
             return_info=True,
         )
         if cfg['log_mean_ess']:
@@ -2983,6 +3157,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
         run_info['init_log_weights'] = 'log_mass_ref'
     else:
         run_info['init_log_weights'] = get_sampler_log_weight_name(cfg['init'], cfg['init_weights']) if cfg['init'] != 'prior' else 'prior'
+    run_info['transition_w'] = cfg.get('transition_w', 'ou')
     if cfg['init'] != 'prior':
         run_info['gate_family'] = resolve_hlsi_gate_law(
             cfg['init'],
