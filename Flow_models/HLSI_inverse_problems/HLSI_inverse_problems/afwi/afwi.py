@@ -420,8 +420,6 @@ SAMPLER_CONFIGS = OrderedDict([
     ('PoU-HLSI-Surr', {'init': 'HLSI', 'init_weights': 'PoU', 'transition_w': 'surrogate', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
 ])
 
-])
-
 
 pipeline = run_standard_sampler_pipeline(
     prior_model,
