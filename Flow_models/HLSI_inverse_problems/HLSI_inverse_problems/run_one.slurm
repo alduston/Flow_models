@@ -3,11 +3,10 @@
 #SBATCH -p gh
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 2:00:00
+#SBATCH -t 4:00:00
 #SBATCH -o slurm-%j.out
 #SBATCH --mail-user=alois.duston@utexas.edu
-#SBATCH --mail-type=END,FAIL
-# #SBATCH -A YOUR_TACC_PROJECT
+#SBATCH --mail-type=END,FAIL,START
 
 set -uo pipefail
 
@@ -29,7 +28,7 @@ module load python3/3.11.8
 python3 -V
 
 # --- persistent venv on Vista ---
-VENV_DIR="/work/10812/ald4435/vista/venvs/flow_vista_py3118"
+VENV_DIR="$SCRATCH/venvs/hlsi"
 if [ ! -d "$VENV_DIR" ]; then
   echo "[error] Expected venv at $VENV_DIR not found."
   exit 2
@@ -37,6 +36,17 @@ fi
 source "$VENV_DIR/bin/activate"
 echo "== Python: $(python -V)"
 echo "== Which python: $(which python)"
+
+# --- runtime environment ---
+# Cap CPU threading (Grace has 72 cores; uncapped BLAS/OMP will thrash)
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export NUMEXPR_NUM_THREADS=8
+# Headless matplotlib so plt.show() can never block the job
+export MPLBACKEND=Agg
+# Fail loudly if JAX can't see the GPU instead of silently falling back to CPU
+export JAX_PLATFORMS=cuda
 
 # --- base dir and target ---
 # Default to the directory from which sbatch was called; this should be the
@@ -57,8 +67,8 @@ nvidia-smi || true
 cd "$PROB_DIR"
 echo "== cwd: $(pwd)"
 echo "== target: $TARGET"
-
 echo "== [$(date)] Running $PROB =="
+
 start=$SECONDS
 python -u "$TARGET"
 rc=$?
