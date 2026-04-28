@@ -1,6 +1,7 @@
 import os
 import math
 import time
+from collections import OrderedDict
 import torch
 import numpy as np
 import matplotlib
@@ -548,6 +549,230 @@ def est_blended(y, t, xr, w, gmm, s0_ref=None):
     return (1 - g) * am + g * bm
 
 # ==============================================================
+# Lambda/Gamma-HLSI gate and factorized sampler construction
+# ==============================================================
+def _precision_cache(precomp, xr, hessian_processing='base', lmin=1e-4, lmax=1e6):
+    """
+    Return the PSD local precision objects P_i used by the chosen closure.
+
+    base           : band-clamped positive Hessian precision
+    leaf/adaptive  : leaf-repaired precision, including rescued non-PSD dirs
+    """
+    key = f"_precision_cache::{hessian_processing}::{float(lmin):.3e}::{float(lmax):.3e}"
+    if key in precomp:
+        return precomp[key]
+
+    V = precomp['V']
+    s0 = precomp['s0']
+    lam = precomp['lam']
+
+    if hessian_processing == 'base':
+        p_eig = lam.clamp(min=lmin, max=lmax)
+    elif hessian_processing in ('leaf', 'adaptive_leaf'):
+        p_eig = precomp['rescued_eig'].clamp(min=0.0, max=lmax)
+    else:
+        raise ValueError(f"Unknown hessian_processing={hessian_processing!r}")
+
+    P_mat = torch.einsum('mij,mj,mkj->mik', V, p_eig, V)
+    s0_eig = torch.einsum('mji,mj->mi', V, s0)
+    inv_p_eig = torch.where(p_eig > 1e-30, 1.0 / p_eig.clamp(min=1e-30), torch.zeros_like(p_eig))
+    mu = xr + torch.einsum('mij,mj->mi', V, inv_p_eig * s0_eig)
+    P_mu = torch.einsum('mij,mj->mi', P_mat, mu)
+
+    out = dict(P_eig=p_eig, P=P_mat, mu=mu, P_mu=P_mu, V=V)
+    precomp[key] = out
+    return out
+
+
+def _project_lambda_ge_identity(Lambda, lambda_max=1e6):
+    """Project a batch of Lambda matrices to {Lambda symmetric, Lambda >= I}."""
+    Lambda = 0.5 * (Lambda + Lambda.transpose(-1, -2))
+    eig, V = torch.linalg.eigh(Lambda)
+    eig = eig.clamp(min=1.0, max=lambda_max)
+    return torch.einsum('bij,bj,bkj->bik', V, eig, V)
+
+
+def est_lambda_hlsi(y, t, xr, w, gmm=None, precomp=None,
+                    hessian_processing='base', lmin=1e-4, lmax=1e6,
+                    project_lambda=True, m_reg=1e-8, pinv_rtol=1e-6):
+    """
+    Lambda/Gamma-HLSI gate from the local surrogate regression closure.
+
+    Given the standard CE-HLSI ingredients {x_i, s_i, P_i, rho_i}, this builds
+    M_q = E_q[E E^T] and N_q = E_q[E D^T], solves
+    Lambda_q^* = -N_q^T M_q^dagger, and applies
+    score = Tweedie + (Lambda_q^*)^dagger (TSI - Tweedie).
+    """
+    if precomp is None:
+        if gmm is None:
+            raise ValueError('est_lambda_hlsi needs either gmm or precomp')
+        precomp = precompute_leaf_hlsi(gmm, xr, lmin=lmin, lmax=lmax, p_leaf=P_LEAF)
+
+    a = at(t)
+    v = vt(t)
+    a2 = a ** 2
+    tau = a2 / v
+    B, d = y.shape
+    dtype, device = y.dtype, y.device
+    I = torch.eye(d, dtype=dtype, device=device)
+
+    cache = _precision_cache(precomp, xr, hessian_processing=hessian_processing,
+                             lmin=lmin, lmax=lmax)
+    V = cache['V']
+    p_eig = cache['P_eig']
+    P_mu = cache['P_mu']
+
+    s_twd = est_tweedie(y, t, xr, w)
+    s_tsi = est_tsi(y, t, xr, w, gmm, s0_ref=precomp['s0'])
+    delta = s_tsi - s_twd
+
+    sigma_eig = 1.0 / (p_eig + tau).clamp(min=1e-30)
+    Sigma = torch.einsum('mij,mj,mkj->mik', V, sigma_eig, V)
+
+    rhs = P_mu.unsqueeze(0) + (a / v) * y.unsqueeze(1)
+    rhs_eig = torch.einsum('mji,bmj->bmi', V, rhs)
+    post_mean = torch.einsum('mij,bmj->bmi', V, sigma_eig.unsqueeze(0) * rhs_eig)
+
+    mE = -(y.unsqueeze(1) - a * post_mean) / v
+    Ebar = (w.unsqueeze(-1) * mE).sum(1)
+    dE = mE - Ebar.unsqueeze(1)
+
+    M_within = (a2 / (v ** 2)) * torch.einsum('bm,mij->bij', w, Sigma)
+    M_between = torch.einsum('bm,bmi,bmj->bij', w, dE, dE)
+    M_q = M_within + M_between
+    M_q = 0.5 * (M_q + M_q.transpose(-1, -2))
+
+    mE_eig = torch.einsum('mji,bmj->bmi', V, mE)
+    P_mE = torch.einsum('mij,bmj->bmi', V, p_eig.unsqueeze(0) * mE_eig)
+    K_mE = mE + (1.0 / tau) * P_mE
+
+    Ebar_eig = torch.einsum('mji,bj->bmi', V, Ebar)
+    P_Ebar_components = torch.einsum('mij,bmj->bmi', V, p_eig.unsqueeze(0) * Ebar_eig)
+    Pbar_Ebar = (w.unsqueeze(-1) * P_Ebar_components).sum(1)
+    Kbar_Ebar = Ebar + (1.0 / tau) * Pbar_Ebar
+
+    C_ED_bw = -torch.einsum('bm,bmi,bmj->bij',
+                            w, dE, K_mE - Kbar_Ebar.unsqueeze(1))
+    N_q = -(a / v) * I.unsqueeze(0) + C_ED_bw.transpose(-1, -2)
+
+    if m_reg is not None and m_reg > 0:
+        scale = M_q.diagonal(dim1=-2, dim2=-1).mean(-1).clamp(min=1.0)
+        M_solve = M_q + (m_reg * scale).view(B, 1, 1) * I.unsqueeze(0)
+    else:
+        M_solve = M_q
+
+    M_pinv = torch.linalg.pinv(M_solve, rtol=pinv_rtol)
+    Lambda = -torch.matmul(N_q.transpose(-1, -2), M_pinv)
+
+    if project_lambda:
+        Lambda = _project_lambda_ge_identity(Lambda)
+        eig, U = torch.linalg.eigh(Lambda)
+        gate = torch.einsum('bij,bj,bkj->bik', U, 1.0 / eig.clamp(min=1e-30), U)
+    else:
+        gate = torch.linalg.pinv(Lambda, rtol=pinv_rtol)
+
+    return s_twd + torch.matmul(gate, delta.unsqueeze(-1)).squeeze(-1)
+
+
+DEFAULT_METHODS = ['Leaf-CE-HLSI', 'CE-HLSI', 'HLSI', 'Leaf-Gamma-HLSI', 'Gamma-HLSI']
+
+SAMPLER_CONFIGS = OrderedDict([
+    ('Leaf-CE-HLSI',      {'transition_weights': 'ou',        'hessian_processing': 'leaf',          'gate': 'ce'}),
+    ('CE-HLSI',           {'transition_weights': 'ou',        'hessian_processing': 'base',          'gate': 'ce'}),
+    ('HLSI',              {'transition_weights': 'ou',        'hessian_processing': 'base',          'gate': 'hlsi'}),
+    ('Leaf-Gamma-HLSI',   {'transition_weights': 'ou',        'hessian_processing': 'leaf',          'gate': 'lambda', 'project_lambda': True}),
+    ('Gamma-HLSI',        {'transition_weights': 'ou',        'hessian_processing': 'base',          'gate': 'lambda', 'project_lambda': True}),
+    ('Leaf-Lambda-HLSI',  {'transition_weights': 'ou',        'hessian_processing': 'leaf',          'gate': 'lambda', 'project_lambda': True}),
+    ('Lambda-HLSI',       {'transition_weights': 'ou',        'hessian_processing': 'base',          'gate': 'lambda', 'project_lambda': True}),
+    ('Surrogate-HLSI',    {'transition_weights': 'surrogate', 'hessian_processing': 'base',          'gate': 'hlsi'}),
+    ('Surrogate-CE-HLSI', {'transition_weights': 'surrogate', 'hessian_processing': 'base',          'gate': 'ce'}),
+    ('Surrogate-Gamma-HLSI', {'transition_weights': 'surrogate', 'hessian_processing': 'base',       'gate': 'lambda', 'project_lambda': True}),
+    ('Surrogate-Leaf-CE-HLSI', {'transition_weights': 'surrogate', 'hessian_processing': 'leaf',     'gate': 'ce'}),
+    ('Surrogate-Leaf-Gamma-HLSI', {'transition_weights': 'surrogate', 'hessian_processing': 'leaf',  'gate': 'lambda', 'project_lambda': True}),
+    ('Adaptive Leaf-CE',  {'transition_weights': 'ou',        'hessian_processing': 'adaptive_leaf', 'gate': 'ce'}),
+    ('Adaptive Leaf-Gamma-HLSI', {'transition_weights': 'ou', 'hessian_processing': 'adaptive_leaf', 'gate': 'lambda', 'project_lambda': True}),
+    ('Surrogate-Adaptive Leaf-CE', {'transition_weights': 'surrogate', 'hessian_processing': 'adaptive_leaf', 'gate': 'ce'}),
+    ('Surrogate-Adaptive Leaf-Gamma-HLSI', {'transition_weights': 'surrogate', 'hessian_processing': 'adaptive_leaf', 'gate': 'lambda', 'project_lambda': True}),
+    ('Tweedie',           {'transition_weights': 'ou',        'hessian_processing': 'base',          'gate': 'tweedie'}),
+    ('TSI',               {'transition_weights': 'ou',        'hessian_processing': 'base',          'gate': 'tsi'}),
+    ('Blended',           {'transition_weights': 'ou',        'hessian_processing': 'base',          'gate': 'blend'}),
+    ('Leaf-HLSI',         {'transition_weights': 'ou',        'hessian_processing': 'leaf',          'gate': 'hlsi'}),
+    ('Adaptive Leaf',     {'transition_weights': 'ou',        'hessian_processing': 'adaptive_leaf', 'gate': 'hlsi'}),
+])
+
+
+def _resolve_sampler_config(method):
+    if isinstance(method, str):
+        if method not in SAMPLER_CONFIGS:
+            raise ValueError(f"Unknown sampler method {method!r}. Available: {list(SAMPLER_CONFIGS)}")
+        return method, dict(SAMPLER_CONFIGS[method])
+    if isinstance(method, dict):
+        name = method.get('name') or method.get('label') or method.get('method') or 'custom'
+        cfg = dict(method)
+        cfg.pop('name', None)
+        cfg.pop('label', None)
+        cfg.pop('method', None)
+        return name, cfg
+    raise TypeError(f"Method entries must be strings or dicts, got {type(method)}")
+
+
+def make_sampler_score_fn(method, gmm, xr, precomp, precomp_adaptive=None,
+                          lmin=1e-4, lmax=1e6):
+    """Build a score closure from factorized sampler ingredients."""
+    name, cfg = _resolve_sampler_config(method)
+    hproc = cfg.get('hessian_processing', 'base')
+    gate = cfg.get('gate', 'hlsi')
+    weight_mode = cfg.get('transition_weights', 'ou')
+
+    if hproc == 'adaptive_leaf':
+        pc = precomp_adaptive if precomp_adaptive is not None else precomp
+        leaf_weights = True
+    elif hproc == 'leaf':
+        pc = precomp
+        leaf_weights = True
+    elif hproc == 'base':
+        pc = precomp
+        leaf_weights = False
+    else:
+        raise ValueError(f"Unknown hessian_processing={hproc!r} for {name}")
+
+    def fn(y, t):
+        t = t if isinstance(t, torch.Tensor) else torch.tensor(t, dtype=torch.get_default_dtype(), device=y.device)
+        if weight_mode in ('ou', 'OU', 'snis', 'L'):
+            w = snis_w(y, t, xr)
+        elif weight_mode in ('surrogate', 'Surr', 'surr'):
+            w = surrogate_transition_w(y, t, xr, pc, leaf=leaf_weights, lmin=lmin, lmax=lmax)
+        else:
+            raise ValueError(f"Unknown transition_weights={weight_mode!r} for {name}")
+
+        if gate == 'tweedie':
+            return est_tweedie(y, t, xr, w)
+        if gate == 'tsi':
+            return est_tsi(y, t, xr, w, gmm, s0_ref=pc['s0'])
+        if gate == 'blend':
+            return est_blended(y, t, xr, w, gmm, s0_ref=pc['s0'])
+        if gate == 'hlsi':
+            if hproc in ('leaf', 'adaptive_leaf'):
+                return est_leaf_hlsi(y, t, xr, w, gmm=gmm, precomp=pc, lmin=lmin, lmax=lmax)
+            return est_hlsi(y, t, xr, w, gmm, precomp=pc, lmin=lmin, lmax=lmax)
+        if gate == 'ce':
+            if hproc in ('leaf', 'adaptive_leaf'):
+                return est_leaf_ce_hlsi(y, t, xr, w, gmm=gmm, precomp=pc, lmin=lmin, lmax=lmax)
+            return est_ce_hlsi(y, t, xr, w, gmm, precomp=pc, lmin=lmin, lmax=lmax)
+        if gate in ('lambda', 'gamma', 'Lambda-HLSI', 'Gamma-HLSI'):
+            return est_lambda_hlsi(
+                y, t, xr, w, gmm=gmm, precomp=pc,
+                hessian_processing=hproc,
+                lmin=lmin, lmax=lmax,
+                project_lambda=cfg.get('project_lambda', True),
+                m_reg=cfg.get('m_reg', 1e-8),
+                pinv_rtol=cfg.get('pinv_rtol', 1e-6),
+            )
+        raise ValueError(f"Unknown gate={gate!r} for {name}")
+
+    return name, fn
+
+# ==============================================================
 # Heun-PC reverse SDE + Tweedie denoising
 # ==============================================================
 def heun_sde(score_fn, n, n_steps=120, t_max=3.0, t_min=0.015):
@@ -819,9 +1044,13 @@ def score_rmse_forward_process(score_hat_fn, gmm, n_eval=6000, t_min=0.015, t_ma
 # ==============================================================
 # Run
 # ==============================================================
-def run():
-    eps_list = [1.00, .5,  0.2 ,.08, .025, .01, .003] #, 1e-3, 2e-4]
-    methods = ['Surrogate-Adaptive Leaf-CE', 'Surrogate-Leaf-CE-HLSI', 'Surrogate-HLSI', 'Leaf-CE-HLSI', 'CE-HLSI', 'Leaf-HLSI', 'Blended', 'HLSI', 'Tweedie', 'TSI']
+def run(methods=None):
+    eps_list = [1.00, .5, 0.2, .08, .025, .01, .003] #, 1e-3, 2e-4]
+    if methods is None:
+        methods = list(DEFAULT_METHODS)
+    method_entries = list(methods)
+    methods = [_resolve_sampler_config(m)[0] for m in method_entries]
+
     NR, NS, NT = 200, 10000, 5000
     T_MAX = 3.0
     T_MIN = 0.00025
@@ -837,7 +1066,11 @@ def run():
         xr = gmm.sample(NR)
         xt = gmm.sample(NT)
         true[eps] = xt
+
         precomp = precompute_leaf_hlsi(gmm, xr, lmin=1e-4, lmax=1e6, p_leaf=P_LEAF)
+        # In this X-GMM script, P_LEAF=None already means adaptive finite-difference
+        # leaf precision. Keep a separate object so the config axis is explicit.
+        precomp_adaptive = precompute_leaf_hlsi(gmm, xr, lmin=1e-4, lmax=1e6, p_leaf=None)
 
         if precomp['is_non_psd'].any():
             rescued_vals = precomp['rescued_eig'][precomp['is_non_psd']]
@@ -845,42 +1078,12 @@ def run():
 
         print(f"\n{'=' * 88}")
         print(f"  eps={eps:.0e}  1/eps={1/eps:.0e}  (double-X target, ±45° arms)")
+        print(f"  methods={methods}")
         print(f"{'=' * 88}")
 
-        for m in methods:
-            def mkfn(meth, _xr, _g, _precomp):
-                def fn(y, t):
-                    t = t if isinstance(t, torch.Tensor) else torch.tensor(t, dtype=torch.get_default_dtype())
-                    w = snis_w(y, t, _xr)
-                    if meth == 'Tweedie':
-                        return est_tweedie(y, t, _xr, w)
-                    elif meth == 'TSI':
-                        return est_tsi(y, t, _xr, w, _g, s0_ref=_precomp['s0'])
-                    elif meth == 'HLSI':
-                        return est_hlsi(y, t, _xr, w, _g, precomp=_precomp)
-                    elif meth == 'Surrogate-HLSI':
-                        w_surr = surrogate_transition_w(y, t, _xr, _precomp, leaf=False)
-                        return est_hlsi(y, t, _xr, w_surr, _g, precomp=_precomp)
-                    elif meth == 'Leaf-HLSI':
-                        return est_leaf_hlsi(y, t, _xr, w, precomp=_precomp)
-                    elif meth == 'CE-HLSI':
-                        return est_ce_hlsi(y, t, _xr, w, _g, precomp=_precomp)
-                    elif meth == 'Leaf-CE-HLSI':
-                        return est_leaf_ce_hlsi(y, t, _xr, w, precomp=_precomp)
-                    elif meth == 'Surrogate-Leaf-CE-HLSI':
-                        w_surr = surrogate_transition_w(y, t, _xr, _precomp, leaf=True)
-                        return est_leaf_ce_hlsi(y, t, _xr, w_surr, precomp=_precomp)
-                    elif meth == 'Surrogate-Adaptive Leaf-CE':
-                        # This XS script has one leaf precompute.  With P_LEAF=None
-                        # it is already the adaptive finite-difference leaf bank.
-                        w_surr = surrogate_transition_w(y, t, _xr, _precomp, leaf=True)
-                        return est_leaf_ce_hlsi(y, t, _xr, w_surr, precomp=_precomp)
-                    elif meth == 'Blended':
-                        return est_blended(y, t, _xr, w, _g, s0_ref=_precomp['s0'])
-                    raise ValueError(f"Unknown method {meth}")
-                return fn
-
-            fn = mkfn(m, xr, gmm, precomp)
+        for method_entry, m in zip(method_entries, methods):
+            _, fn = make_sampler_score_fn(method_entry, gmm, xr, precomp, precomp_adaptive,
+                                          lmin=1e-4, lmax=1e6)
             t0 = time.time()
             samp, ms, fail = heun_sde(fn, NS, n_steps=N_TIME_GRID, t_max=T_MAX, t_min=T_MIN)
             dt = time.time() - t0
@@ -922,7 +1125,7 @@ def run():
             )
             tag = "FAIL" if fail else "ok"
             print(
-                f"  {m:<13s} "
+                f"  {m:<20s} "
                 f"MMD={mv:10.6f}  KL={klv:10.6f}  rKL={rklv:10.6f}  NLL={nllv:10.6f}  sW2={sw2v:10.6f}  "
                 f"KSD={ksdv:10.6f}  RMSE={srmsev:10.6f}  |s|={ms:10.1f}  NaN%={np_:5.1f}  [{dt:5.1f}s] {tag}"
             )
@@ -971,12 +1174,24 @@ def plot(data, true, eps_list, methods):
     C = {'Tweedie': '#1f77b4', 'TSI': '#d62728', 'HLSI': '#2ca02c',
          'Surrogate-HLSI': '#98df8a',
          'Leaf-HLSI': '#17becf', 'CE-HLSI': '#9467bd', 'Leaf-CE-HLSI': '#8c564b',
+         'Gamma-HLSI': '#bcbd22', 'Lambda-HLSI': '#bcbd22',
+         'Leaf-Gamma-HLSI': '#e377c2', 'Leaf-Lambda-HLSI': '#e377c2',
+         'Surrogate-Gamma-HLSI': '#dbdb8d',
          'Surrogate-Leaf-CE-HLSI': '#c49c94',
+         'Surrogate-Leaf-Gamma-HLSI': '#f7b6d2',
+         'Adaptive Leaf-CE': '#7f7f7f', 'Adaptive Leaf-Gamma-HLSI': '#c7c7c7',
          'Surrogate-Adaptive Leaf-CE': '#9edae5',
+         'Surrogate-Adaptive Leaf-Gamma-HLSI': '#17becf',
          'Blended': '#ff7f0e'}
     MK = {'Tweedie': 'o', 'TSI': 's', 'HLSI': '^', 'Surrogate-HLSI': '>',
           'Leaf-HLSI': 'P', 'CE-HLSI': 'D', 'Leaf-CE-HLSI': 'X',
-          'Surrogate-Leaf-CE-HLSI': '<', 'Surrogate-Adaptive Leaf-CE': '8',
+          'Gamma-HLSI': '*', 'Lambda-HLSI': '*',
+          'Leaf-Gamma-HLSI': 'p', 'Leaf-Lambda-HLSI': 'p',
+          'Surrogate-Gamma-HLSI': '1',
+          'Surrogate-Leaf-CE-HLSI': '<', 'Surrogate-Leaf-Gamma-HLSI': '2',
+          'Adaptive Leaf-CE': 'd', 'Adaptive Leaf-Gamma-HLSI': 'h',
+          'Surrogate-Adaptive Leaf-CE': '8',
+          'Surrogate-Adaptive Leaf-Gamma-HLSI': '3',
           'Blended': 'v'}
 
     fig, axes = plt.subplots(3, 3, figsize=(22, 14))
@@ -999,7 +1214,7 @@ def plot(data, true, eps_list, methods):
             vals = [data[e][m][key] for e in eps_list]
             if logy:
                 vals = [min(v, 1e2) if np.isfinite(v) else 1e2 for v in vals]
-            ax.plot(eps_list, vals, '-' + MK[m], label=m, color=C[m], ms=8, lw=2)
+            ax.plot(eps_list, vals, '-' + MK.get(m, 'o'), label=m, color=C.get(m, None), ms=8, lw=2)
         ax.set_xscale('log')
         if logy:
             ax.set_yscale('log')
@@ -1114,7 +1329,7 @@ def plot(data, true, eps_list, methods):
             if len(s) > 10:
                 proj = s @ stiff_dir
                 ax.hist(proj, bins=bins, density=True, alpha=.4,
-                        color=C[m], label=m, histtype='step', lw=2)
+                        color=C.get(m, None), label=m, histtype='step', lw=2)
         ax.set_xlabel('Projection onto one diagonal arm', fontsize=11)
         ax.set_ylabel('Density')
         ax.set_title(fr'One-diagonal marginal, $\epsilon$={eps:.0e}')
