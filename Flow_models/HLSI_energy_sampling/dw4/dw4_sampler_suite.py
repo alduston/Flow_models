@@ -61,6 +61,15 @@ from torch.func import vmap, grad as fgrad, hessian as fhessian
 torch.set_default_dtype(torch.float64)
 torch.manual_seed(42)
 
+# Use CUDA automatically when available.  Override with, e.g.,
+#   TORCH_DEVICE=cpu python dw4_sampler_suite_gpu_updated.py
+# or
+#   TORCH_DEVICE=cuda:0 python dw4_sampler_suite_gpu_updated.py
+DEVICE = torch.device(os.environ.get('TORCH_DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu'))
+if DEVICE.type == 'cuda':
+    torch.cuda.manual_seed_all(42)
+print(f"Using device: {DEVICE}")
+
 def _close_fig(fig):
     """Save-compatible close: show inline in Colab, then close."""
     if _IN_COLAB:
@@ -138,7 +147,7 @@ class DW4Target:
     def sample_mala(self, n, step_size=0.025, n_chains=32,
                     burnin=60_000, thin=40, verbose=True):
         d   = self.D
-        x   = torch.randn(n_chains, d) * 0.5
+        x   = torch.randn(n_chains, d, dtype=torch.get_default_dtype(), device=DEVICE) * 0.5
         accept_sum, total = 0, 0
         samples = []
         needed_post = math.ceil(n / n_chains) * thin + 1
@@ -162,7 +171,7 @@ class DW4Target:
             log_q_fwd = -((x_prop - x  - step_size * sx     ) ** 2).sum(-1) / (4.0 * step_size)
             log_q_bwd = -((x      - x_prop - step_size * sx_prop) ** 2).sum(-1) / (4.0 * step_size)
             log_alpha = (lp_prop - lp_x + log_q_bwd - log_q_fwd).clamp(max=0.0)
-            acc  = torch.rand(n_chains) < log_alpha.exp()
+            acc  = torch.rand(n_chains, dtype=x.dtype, device=x.device) < log_alpha.exp()
             mask = acc.unsqueeze(-1)
             x    = torch.where(mask, x_prop,  x)
             lp_x = torch.where(acc,  lp_prop, lp_x)
@@ -177,7 +186,7 @@ class DW4Target:
         if verbose and total > 0:
             print(f"  MALA acceptance (post-burnin): {100.0 * accept_sum / total:.1f}%")
         out = torch.cat(samples, dim=0)
-        return out[torch.randperm(len(out))[:n]]
+        return out[torch.randperm(len(out), device=out.device)[:n]]
 
     @staticmethod
     def particles(x):
@@ -851,9 +860,10 @@ def est_blended(y, t, xr, w, target, s0_ref=None):
 # ==============================================================
 # Heun predictor–corrector reverse SDE
 # ==============================================================
-def heun_sde(score_fn, n, d, n_steps=200, t_max=3.0, t_min=0.015):
-    ts  = torch.linspace(t_max, t_min, n_steps + 1, dtype=torch.get_default_dtype())
-    y   = torch.randn(n, d, dtype=torch.get_default_dtype())
+def heun_sde(score_fn, n, d, n_steps=200, t_max=3.0, t_min=0.015, device=None):
+    device = DEVICE if device is None else torch.device(device)
+    ts  = torch.linspace(t_max, t_min, n_steps + 1, dtype=torch.get_default_dtype(), device=device)
+    y   = torch.randn(n, d, dtype=torch.get_default_dtype(), device=device)
     ms  = 0.0
     fail = False
     for i in range(n_steps):
@@ -874,7 +884,7 @@ def heun_sde(score_fn, n, d, n_steps=200, t_max=3.0, t_min=0.015):
         if not torch.isfinite(y).all():
             fail = True; break
     if not fail:
-        tf = torch.tensor(t_min, dtype=torch.get_default_dtype())
+        tf = torch.tensor(t_min, dtype=torch.get_default_dtype(), device=y.device)
         sf = score_fn(y, tf)
         ms = max(ms, sf.abs().max().item())
         if torch.isfinite(sf).all():
@@ -974,7 +984,7 @@ def w2_distance(X, Y):
 def ess_kde(samples, target, n_max=1000):
     from sklearn.neighbors import KernelDensity
     n    = min(len(samples), n_max)
-    sc   = samples[torch.randperm(len(samples))[:n]]
+    sc   = samples[torch.randperm(len(samples), device=samples.device)[:n]]
     sc_np = sc.cpu().double().numpy()
     d    = sc_np.shape[1]
     bw   = max(n ** (-1.0 / (d + 4)), 0.05)
@@ -1012,9 +1022,9 @@ def copying_score(samples, xr_train, xt_test, n_gen=800, k_pool=None,
         return dict(mean_d_train=float('nan'), mean_d_test=float('nan'),
                     ratio=float('nan'), copying=False,
                     d_train_dist=np.array([]), d_test_dist=np.array([]))
-    gen  = samples[torch.randperm(len(samples))[:n_gen]]
-    ref  = xr_train[torch.randperm(len(xr_train))[:k_pool]]
-    test = xt_test [torch.randperm(len(xt_test)) [:k_pool]]
+    gen  = samples[torch.randperm(len(samples), device=samples.device)[:n_gen]]
+    ref  = xr_train[torch.randperm(len(xr_train), device=xr_train.device)[:k_pool]]
+    test = xt_test [torch.randperm(len(xt_test), device=xt_test.device) [:k_pool]]
     def min_dist(A, B, chunk=200):
         if len(A) == 0 or len(B) == 0:
             return torch.zeros(len(A), device=A.device)
@@ -1041,11 +1051,11 @@ def copying_score(samples, xr_train, xt_test, n_gen=800, k_pool=None,
 def score_rmse_snis_ref(score_hat_fn, target, xr_ref_large, n_eval=2000,
                         t_min=0.015, t_max=3.0, n_time_grid=120):
     with torch.no_grad():
-        x0 = xr_ref_large[torch.randperm(len(xr_ref_large))[:n_eval]]
+        x0 = xr_ref_large[torch.randperm(len(xr_ref_large), device=xr_ref_large.device)[:n_eval]]
         t_grid = torch.exp(torch.linspace(
             math.log(t_min), math.log(t_max), n_time_grid,
-            dtype=torch.get_default_dtype()))
-        idx = torch.randint(0, n_time_grid, (n_eval,))
+            dtype=torch.get_default_dtype(), device=x0.device))
+        idx = torch.randint(0, n_time_grid, (n_eval,), device=x0.device)
         t   = t_grid[idx]
         a   = at(t).unsqueeze(-1)
         v   = vt(t).unsqueeze(-1)
@@ -1553,6 +1563,8 @@ def meta_run(root_dir='outputs_stress_test',
 
         out_dir = os.path.join(root_dir, vname)
         torch.manual_seed(42)  # reset seed per variant for reproducibility
+        if DEVICE.type == 'cuda':
+            torch.cuda.manual_seed_all(42)
 
         res, xt, xr, meths, tgt = run(target, out_dir=out_dir, methods=methods)
         plot(res, xt, xr, meths, tgt, out_dir=out_dir)
