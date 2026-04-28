@@ -86,6 +86,11 @@ EXAMPLE_CONFIG: Dict[str, Any] = {
         "angle_spread_deg": 0.0,
         "weight_skew": 0.0,                 # 0 = uniform, >0 = exponential skew
         "sparse_protective_fraction": 0.10,
+        # Sparse-protective-only controls. The angle is the visible long/sloppy
+        # covariance axis of the central stiff component in the first two coords;
+        # 90 deg reproduces the old vertical stripe, 45 deg removes axis alignment.
+        "sparse_stiff_component_angle_deg": 45.0,
+        "sparse_stiff_mean_scale": 0.0,     # 0 puts stiff component(s) exactly at center
     },
 
     "reference": {
@@ -551,16 +556,44 @@ def build_gmm_from_config(config: Mapping[str, Any], *, device: torch.device, dt
 
     elif family == "sparse_protective":
         # Most components are soft; a small subset has a stiff protective direction.
+        # For d>=2 the stiff subset can be placed at the center with an oblique
+        # long/sloppy covariance axis. This removes the coordinate-axis alignment
+        # that lets diagonal blended score estimation get artificially lucky.
         frac = float(gcfg.get("sparse_protective_fraction", 0.20))
         n_stiff = max(1, int(round(K * frac)))
-        for k in range(K):
-            diag = torch.full((d,), base_var, device=device, dtype=dtype)
-            if k < n_stiff:
+        stiff_long_angle = math.radians(float(gcfg.get("sparse_stiff_component_angle_deg", 90.0)))
+
+        def sparse_stiff_cov() -> torch.Tensor:
+            if d == 1:
+                diag = torch.full((d,), base_var, device=device, dtype=dtype)
                 diag[0] = stiff_var
-            covs.append(torch.diag(diag))
+                return torch.diag(diag)
+            # The visible line/long axis is tangent=(cos phi, sin phi).
+            # The protected/stiff normal is perpendicular to it.
+            tangent = torch.zeros(d, device=device, dtype=dtype)
+            normal = torch.zeros(d, device=device, dtype=dtype)
+            tangent[0] = math.cos(stiff_long_angle)
+            tangent[1] = math.sin(stiff_long_angle)
+            normal[0] = -math.sin(stiff_long_angle)
+            normal[1] = math.cos(stiff_long_angle)
+            cov = base_var * torch.eye(d, device=device, dtype=dtype)
+            cov[:2, :2] = (
+                base_var * torch.outer(tangent[:2], tangent[:2])
+                + stiff_var * torch.outer(normal[:2], normal[:2])
+            )
+            return sym(cov)
+
+        for k in range(K):
+            if k < n_stiff:
+                covs.append(sparse_stiff_cov())
+            else:
+                covs.append(base_var * torch.eye(d, device=device, dtype=dtype))
+
         # Place stiff components near the origin/wall and soft components around them.
+        # sparse_stiff_mean_scale=0.0 puts the stiff component exactly at the center.
         means = _circle_means(K, d, sep, device=device, dtype=dtype)
-        means[:n_stiff] *= 0.15
+        stiff_mean_scale = float(gcfg.get("sparse_stiff_mean_scale", 0.15))
+        means[:n_stiff] *= stiff_mean_scale
         weights = torch.full((K,), 1.0 / K, device=device, dtype=dtype)
 
     else:
