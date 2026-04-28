@@ -9,6 +9,11 @@ testing low-variance score-estimation hypotheses on analytically tractable GMMs.
 Default retained methods:
     Tweedie, TSI, HLSI, CE-HLSI, Blended, OP-Blend
 
+Default example after the first rotating-eigenvector run:
+    sparse_protective_stress -- designed to test whether CE leaks when
+    only a small fraction of the transition cloud carries the stiff
+    protective curvature.
+
 The script:
     1. Builds a configurable Gaussian-mixture family.
     2. Draws a reference bank and ground-truth samples.
@@ -52,7 +57,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 # =============================================================================
 
 EXAMPLE_CONFIG: Dict[str, Any] = {
-    "name": "rotating_eigenvectors_demo",
+    "name": "sparse_protective_stress",
     "seed": 42,
     "device": "auto",                       # "auto", "cpu", "cuda"
     "dtype": "float64",
@@ -65,33 +70,33 @@ EXAMPLE_CONFIG: Dict[str, Any] = {
         #   sparse_protective
         #   double_x
         #   rotated_pair
-        "family": "rotating_eigenvectors",
+        "family": "sparse_protective",
         "dimension": 2,
-        "n_components": 6,
+        "n_components": 10,
 
         # If separation is null, overlap is converted to a separation proxy.
         # overlap ~ exp(-sep^2/(8*var_parallel)) for equal-covariance pairs.
-        "overlap": 0.08,
+        "overlap": 0.15,
         "separation": None,
 
         # Covariance controls.
         "base_variance": 1.0,
-        "stiff_variance": 0.015,
-        "precision_ratio": 80.0,
-        "angle_spread_deg": 135.0,
+        "stiff_variance": 0.005,
+        "precision_ratio": 200.0,
+        "angle_spread_deg": 0.0,
         "weight_skew": 0.0,                 # 0 = uniform, >0 = exponential skew
-        "sparse_protective_fraction": 0.20,
+        "sparse_protective_fraction": 0.10,
     },
 
     "reference": {
-        "n_ref": 3000,
+        "n_ref": 4000,
         "lmin": 1e-4,
         "lmax": 1e6,
     },
 
     "sampler": {
         "methods": ["Tweedie", "TSI", "HLSI", "CE-HLSI", "Blended", "OP-Blend"],
-        "n_samples": 1200,
+        "n_samples": 1500,
         "n_steps": 90,
         "t_max": 3.0,
         "t_min": 0.015,
@@ -100,10 +105,11 @@ EXAMPLE_CONFIG: Dict[str, Any] = {
     },
 
     "diagnostics": {
-        "n_states": 512,
+        "n_states": 768,
         "t_grid": [0.015, 0.03, 0.06, 0.12, 0.25, 0.5, 1.0, 2.0],
         "batch_size": 512,
-        "spectrum_t": 0.12,
+        # first rotating-eigenvector result showed the crucial action near 0.03--0.12
+        "spectrum_t": 0.06,
     },
 
     "metrics": {
@@ -111,9 +117,9 @@ EXAMPLE_CONFIG: Dict[str, Any] = {
         "mmd_max_points": 1000,
         "ksd_max_points": 700,
         "nll_max_points": 3000,
-        "sliced_wasserstein_max_points": 1200,
+        "sliced_wasserstein_max_points": 1500,
         "sliced_wasserstein_projections": 128,
-        "score_rmse_n_eval": 1200,
+        "score_rmse_n_eval": 1500,
         "score_rmse_t_grid": [0.015, 0.03, 0.06, 0.12, 0.25, 0.5, 1.0, 2.0],
         "hist_bins_2d": 150,
     },
@@ -1135,11 +1141,23 @@ def compute_diagnostics(
         accum: Dict[str, List[float]] = {
             "epsilon_cov_exact": [],
             "epsilon_cov_bank": [],
+            "epsilon_cov_bank_to_exact": [],
             "score_cov_exact_norm": [],
             "score_cov_bank_norm": [],
+            # Relative-to-componentwise mismatch is useful but can be misleading
+            # when the componentwise gated signal is tiny; keep absolute and
+            # pre-disagreement-normalized versions too.
             "ce_gate_signal_rel_mismatch": [],
+            "ce_gate_signal_abs_mismatch": [],
+            "ce_gate_signal_pre_rel_mismatch": [],
             "ce_attenuation_ratio": [],
             "op_attenuation_ratio": [],
+            # Direct leakage diagnostic requested after the first run:
+            # how much more post-gated OP disagreement survives than CE.
+            "op_ce_leakage_ratio": [],
+            "op_minus_ce_attenuation": [],
+            "op_minus_ce_local_risk": [],
+            "op_to_ce_local_risk_ratio": [],
             "protective_mass": [],
             "oracle_moment_cond": [],
             "oracle_moment_rank_eff": [],
@@ -1181,6 +1199,9 @@ def compute_diagnostics(
             accum["score_cov_bank_norm"].append(safe_float(norm_bank.mean()))
             accum["epsilon_cov_exact"].append(safe_float(eps_exact.mean()))
             accum["epsilon_cov_bank"].append(safe_float(eps_bank.mean()))
+            accum["epsilon_cov_bank_to_exact"].append(
+                safe_float((eps_bank / eps_exact.clamp(min=1e-12)).median())
+            )
 
             # 2. Gate-signal covariance / CE compression mismatch.
             H_i = precomp["H_ce"]
@@ -1193,18 +1214,37 @@ def compute_diagnostics(
             compwise_gate_signal = weighted_mean(w, Gi_delta)
             ce_gate_signal = bmv(Gce, delta_bar)
             mismatch = compwise_gate_signal - ce_gate_signal
-            rel_mismatch = mismatch.norm(dim=1) / compwise_gate_signal.norm(dim=1).clamp(min=1e-12)
+            mismatch_norm = mismatch.norm(dim=1)
+            rel_mismatch = mismatch_norm / compwise_gate_signal.norm(dim=1).clamp(min=1e-12)
             accum["ce_gate_signal_rel_mismatch"].append(safe_float(rel_mismatch.mean()))
+            accum["ce_gate_signal_abs_mismatch"].append(safe_float(mismatch_norm.mean()))
 
             # 3. Pre/post rectification attenuation.
             pre_norm = delta_bar.norm(dim=1).clamp(min=1e-12)
+            pre_rel_mismatch = mismatch_norm / pre_norm
+            accum["ce_gate_signal_pre_rel_mismatch"].append(safe_float(pre_rel_mismatch.mean()))
+
             ce_att = ce_gate_signal.norm(dim=1) / pre_norm
             accum["ce_attenuation_ratio"].append(safe_float(ce_att.mean()))
 
             Gop, am, bm, C_DD = op_blend_gate(y, t, xr, w, precomp)
-            op_gate_signal = bmv(Gop, bm - am)
-            op_att = op_gate_signal.norm(dim=1) / (bm - am).norm(dim=1).clamp(min=1e-12)
+            op_delta = bm - am
+            op_gate_signal = bmv(Gop, op_delta)
+            op_att = op_gate_signal.norm(dim=1) / op_delta.norm(dim=1).clamp(min=1e-12)
             accum["op_attenuation_ratio"].append(safe_float(op_att.mean()))
+
+            op_ce_leak = op_gate_signal.norm(dim=1) / ce_gate_signal.norm(dim=1).clamp(min=1e-12)
+            accum["op_ce_leakage_ratio"].append(safe_float(op_ce_leak.median()))
+            accum["op_minus_ce_attenuation"].append(safe_float((op_att - ce_att).mean()))
+
+            ce_score_local = obj["stwd"] + ce_gate_signal
+            op_score_local = am + op_gate_signal
+            ce_local_risk = (ce_score_local - true_score).square().sum(dim=1)
+            op_local_risk = (op_score_local - true_score).square().sum(dim=1)
+            accum["op_minus_ce_local_risk"].append(safe_float((op_local_risk - ce_local_risk).mean()))
+            accum["op_to_ce_local_risk_ratio"].append(
+                safe_float((op_local_risk / ce_local_risk.clamp(min=1e-12)).median())
+            )
 
             # 4. Protective mass: Hbar directional mass relative to max component mass.
             eigHbar, Ubar = torch.linalg.eigh(sym(Hbar))
@@ -1395,28 +1435,87 @@ def plot_performance_vs_diagnostics(
 
     diag_keys = [
         ("epsilon_cov_exact", r"$\epsilon_{\rm cov}$ exact"),
-        ("ce_gate_signal_rel_mismatch", r"CE gate-signal mismatch"),
+        ("ce_gate_signal_abs_mismatch", r"$\|\Delta_{\rm CE}\|$"),
+        ("ce_gate_signal_pre_rel_mismatch", r"$\|\Delta_{\rm CE}\|/\|d\|$"),
         ("protective_mass", "protective mass"),
+        ("op_ce_leakage_ratio", r"OP/CE post-gate leakage"),
         ("oracle_moment_cond", r"oracle moment cond."),
         ("ess", "ESS"),
-        ("hlsi_surrogate_target_rmse", "surrogate-target RMSE"),
+        ("epsilon_cov_bank_to_exact", r"bank/exact $\epsilon_{\rm cov}$"),
     ]
 
-    fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.0), squeeze=False)
+    fig, axes = plt.subplots(2, 4, figsize=(17.0, 7.0), squeeze=False)
     axes = axes.ravel()
+    sc = None
     for ax, (key, label) in zip(axes, diag_keys):
-        x = np.array([r[key] for r in by_t], dtype=float)
+        x = np.array([r.get(key, np.nan) for r in by_t], dtype=float)
         sc = ax.scatter(x, yvals, c=np.log10(t), s=58)
         for xi, yi, ti in zip(x, yvals, t):
-            ax.annotate(f"{ti:.2g}", (xi, yi), fontsize=7, alpha=0.75)
+            if np.isfinite(xi) and np.isfinite(yi):
+                ax.annotate(f"{ti:.2g}", (xi, yi), fontsize=7, alpha=0.75)
         ax.set_xlabel(label)
         ax.set_ylabel("CE excess local risk vs best(CE, OP)")
-        if np.nanmax(x) / max(np.nanmin(x[x > 0]) if np.any(x > 0) else 1.0, 1e-12) > 100:
+        finite_pos = x[np.isfinite(x) & (x > 0)]
+        if finite_pos.size and np.nanmax(finite_pos) / max(np.nanmin(finite_pos), 1e-12) > 100:
             ax.set_xscale("log")
         ax.grid(alpha=0.25)
-    cbar = fig.colorbar(sc, ax=axes.tolist(), shrink=0.8)
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=axes.tolist(), shrink=0.8)
+        cbar.set_label(r"$\log_{10} t$")
+    fig.suptitle("CE performance-vs-diagnostics phase plot", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=int(cfg["plot"]["fig_dpi"]))
+    return fig
+
+
+
+def plot_op_leakage_vs_risk(
+    diagnostics: Mapping[str, Any],
+    out_path: str,
+    cfg: Mapping[str, Any],
+) -> plt.Figure:
+    """Dedicated plot for the post-run hypothesis: OP leaks too much exactly
+    when it loses local score risk to CE."""
+    by_t = diagnostics["by_t"]
+    t = np.array([r["t"] for r in by_t], dtype=float)
+    ce_risk = np.array(diagnostics["method_score_mse_by_t"].get("CE-HLSI", [np.nan] * len(t)), dtype=float)
+    op_risk = np.array(diagnostics["method_score_mse_by_t"].get("OP-Blend", [np.nan] * len(t)), dtype=float)
+    op_minus_ce = op_risk - ce_risk
+
+    leak = np.array([r.get("op_ce_leakage_ratio", np.nan) for r in by_t], dtype=float)
+    op_minus_ce_diag = np.array([r.get("op_minus_ce_local_risk", np.nan) for r in by_t], dtype=float)
+    prot = np.array([r.get("protective_mass", np.nan) for r in by_t], dtype=float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), squeeze=False)
+    ax = axes[0, 0]
+    sc = ax.scatter(leak, op_minus_ce, c=np.log10(t), s=68)
+    for xi, yi, ti in zip(leak, op_minus_ce, t):
+        if np.isfinite(xi) and np.isfinite(yi):
+            ax.annotate(f"{ti:.2g}", (xi, yi), fontsize=8, alpha=0.75)
+    ax.axhline(0.0, linewidth=1.0, alpha=0.5)
+    ax.axvline(1.0, linewidth=1.0, alpha=0.5)
+    ax.set_xlabel(r"median $\|G_{\rm OP}d_{\rm OP}\| / \|G_{\rm CE}d_{\rm CE}\|$")
+    ax.set_ylabel(r"OP local score MSE $-$ CE local score MSE")
+    ax.set_title("OP leakage vs OP-minus-CE risk")
+    finite_pos = leak[np.isfinite(leak) & (leak > 0)]
+    if finite_pos.size and np.nanmax(finite_pos) / max(np.nanmin(finite_pos), 1e-12) > 50:
+        ax.set_xscale("log")
+    ax.grid(alpha=0.25)
+
+    ax = axes[0, 1]
+    sc2 = ax.scatter(prot, op_minus_ce_diag, c=np.log10(t), s=68)
+    for xi, yi, ti in zip(prot, op_minus_ce_diag, t):
+        if np.isfinite(xi) and np.isfinite(yi):
+            ax.annotate(f"{ti:.2g}", (xi, yi), fontsize=8, alpha=0.75)
+    ax.axhline(0.0, linewidth=1.0, alpha=0.5)
+    ax.set_xlabel("protective mass")
+    ax.set_ylabel(r"diagnostic OP local risk $-$ CE local risk")
+    ax.set_title("Protective mass vs diagnostic risk gap")
+    ax.grid(alpha=0.25)
+
+    cbar = fig.colorbar(sc, ax=axes.ravel().tolist(), shrink=0.85)
     cbar.set_label(r"$\log_{10} t$")
-    fig.suptitle("Performance-vs-diagnostics phase plot", fontsize=14)
+    fig.suptitle("OP leakage and sparse-protection diagnostics", fontsize=14)
     fig.tight_layout()
     fig.savefig(out_path, dpi=int(cfg["plot"]["fig_dpi"]))
     return fig
@@ -1638,6 +1737,7 @@ def run_experiment(config: Mapping[str, Any], output_dir: str) -> Dict[str, Any]
         "samples": os.path.join(output_dir, "samples_grid.png"),
         "risk": os.path.join(output_dir, "local_score_risk_by_time.png"),
         "diagnostics": os.path.join(output_dir, "performance_vs_diagnostics.png"),
+        "op_leakage": os.path.join(output_dir, "op_leakage_vs_risk.png"),
         "spectrum": os.path.join(output_dir, "attenuation_spectrum.png"),
         "metrics_table": os.path.join(output_dir, "metrics_table.png"),
     }
@@ -1645,6 +1745,7 @@ def run_experiment(config: Mapping[str, Any], output_dir: str) -> Dict[str, Any]
         figs.append(plot_samples_grid(samples, gt, gmm, cfg, plot_paths["samples"]))
     figs.append(plot_method_risk_by_time(diagnostics, methods, plot_paths["risk"], cfg))
     figs.append(plot_performance_vs_diagnostics(diagnostics, plot_paths["diagnostics"], cfg))
+    figs.append(plot_op_leakage_vs_risk(diagnostics, plot_paths["op_leakage"], cfg))
     figs.append(plot_attenuation_spectrum(spectrum, plot_paths["spectrum"], cfg))
     figs.append(plot_metrics_table(metrics, plot_paths["metrics_table"], cfg))
 
