@@ -910,6 +910,7 @@ def precompute_reference_bank(X_ref, prior_model, lik_model, label='base',
             'X_ref': X_ref.detach().cpu(),
             's0_post_ref': s0_post.detach().cpu(),
             'log_lik_ref': log_lik.detach().cpu(),
+            'log_none_ref': torch.zeros_like(log_lik).detach().cpu(),
             'log_mass_ref': log_mass.detach().cpu(),
             'P_ref': P_ref.detach().cpu(),
             'mu_ref': mu_ref.detach().cpu(),
@@ -2719,6 +2720,10 @@ INIT_DISPLAY_NAMES = {
 }
 
 INIT_WEIGHT_ALIASES = {
+    _normalize_sampler_key('none'): 'None',
+    _normalize_sampler_key('no weights'): 'None',
+    _normalize_sampler_key('unweighted'): 'None',
+    _normalize_sampler_key('uniform'): 'None',
     _normalize_sampler_key('l'): 'L',
     _normalize_sampler_key('likelihood'): 'L',
     _normalize_sampler_key('default'): 'L',
@@ -2732,6 +2737,7 @@ INIT_WEIGHT_ALIASES = {
 }
 
 INIT_WEIGHT_BANK_KEYS = {
+    'None': 'log_none_ref',
     'L': 'log_lik_ref',
     'WC': 'log_mass_ref',
     'PoU': 'log_pou_ref',
@@ -2816,7 +2822,7 @@ def canonicalize_init_name(name):
 
 def canonicalize_init_weights(name):
     if name is None:
-        return 'L'
+        return 'None'
     key = _normalize_sampler_key(name)
     if key not in INIT_WEIGHT_ALIASES:
         raise ValueError(f"Unknown init_weights mode: {name}")
@@ -2858,6 +2864,8 @@ def format_sampler_display_name(init_mode, init_weights='L'):
     if init_mode == 'ref_laplace':
         return 'Ref_Laplace'
     base = INIT_DISPLAY_NAMES.get(init_mode, str(init_mode))
+    if init_weights == 'None':
+        return f'{base} [None]'
     if init_weights == 'L':
         return base
     if init_mode == 'hlsi_posterior' and init_weights == 'WC':
@@ -2892,16 +2900,21 @@ def format_sampler_display_name(init_mode, init_weights='L'):
 
 
 
-def get_sampler_bank_key(init_mode):
+def get_sampler_bank_key(init_mode, mala_refs=False):
     init_mode = canonicalize_init_name(init_mode)
+    if bool(mala_refs):
+        return 'mala_refs'
     return 'base'
 
 
 
-def get_sampler_precomp_bank(precomp, init_mode):
-    bank_key = get_sampler_bank_key(init_mode)
+def get_sampler_precomp_bank(precomp, init_mode, mala_refs=False):
+    bank_key = get_sampler_bank_key(init_mode, mala_refs=mala_refs)
     if bank_key not in precomp:
-        raise KeyError(f"Reference bank '{bank_key}' was requested by init='{init_mode}' but was not precomputed.")
+        raise KeyError(
+            f"Reference bank '{bank_key}' was requested by init='{init_mode}' "
+            f"with mala_refs={bool(mala_refs)} but was not precomputed."
+        )
     return precomp[bank_key]
 
 
@@ -3050,6 +3063,8 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('precond_mala', False)
     cfg['precond_mala'] = bool(cfg['precond_mala'])
     cfg.setdefault('is_reference', False)
+    cfg.setdefault('mala_refs', False)
+    cfg['mala_refs'] = bool(cfg['mala_refs'])
     cfg['transition_w'] = canonicalize_transition_w(cfg.get('transition_w', 'ou'))
 
     gate_defaults = {
@@ -3087,7 +3102,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     print(f"\n=== Running {display_name} ===")
     print(
         f"  init={cfg['init']} | init_weights={cfg['init_weights']} | transition_w={cfg['transition_w']} | "
-        f"init_steps={cfg['init_steps']} | mala_steps={cfg['mala_steps']} | "
+        f"mala_refs={cfg['mala_refs']} | init_steps={cfg['init_steps']} | mala_steps={cfg['mala_steps']} | "
         f"mala_burnin={cfg['mala_burnin']} | mala_dt={cfg['mala_dt']}"
     )
 
@@ -3098,7 +3113,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
     init_stage_info = None
 
     if cfg['init'] == 'ref_laplace':
-        bank = get_sampler_precomp_bank(precomp, cfg['init'])
+        bank = get_sampler_precomp_bank(precomp, cfg['init'], mala_refs=cfg.get('mala_refs', False))
         local_bank = select_local_bank(bank, 'hlsi_posterior', 'L')
         init_samples, init_stage_info = sample_ref_laplace(
             cfg['n_samples'],
@@ -3106,7 +3121,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
             log_weight_key='log_mass_ref',
         )
     elif cfg['init'] != 'prior' and cfg['init_steps'] > 0:
-        bank = get_sampler_precomp_bank(precomp, cfg['init'])
+        bank = get_sampler_precomp_bank(precomp, cfg['init'], mala_refs=cfg.get('mala_refs', False))
         local_bank = select_local_bank(bank, cfg['init'], cfg['init_weights'])
         init_log_weights = get_sampler_log_weights(cfg['init'], cfg['init_weights'], bank)
         init_out = run_sampler_heun(
@@ -3152,6 +3167,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp):
         )
 
     run_info = dict(cfg)
+    run_info['init_reference_bank'] = 'mala_refs' if cfg.get('mala_refs', False) else 'base'
     run_info['init_bank'] = local_bank['bank_name'] if cfg['init'] != 'prior' and local_bank is not None else 'base'
     if cfg['init'] == 'ref_laplace':
         run_info['init_log_weights'] = 'log_mass_ref'
@@ -3216,7 +3232,18 @@ def run_sampler_suite(sampler_configs, prior_model, lik_model, precomp):
     return samples, ess_logs, run_info
 
 
-def build_precomp(prior_model, lik_model, n_ref=10000, build_gnl_banks=False, compute_pou=True):
+DEFAULT_MALA_REF_CONFIG = {
+    'init': 'prior',
+    'init_steps': 0,
+    'mala_steps': 1000,
+    'mala_burnin': 200,
+    'mala_dt': 1e-4,
+    'is_reference': True,
+}
+
+
+def build_precomp(prior_model, lik_model, n_ref=10000, build_gnl_banks=False, compute_pou=True,
+                  build_mala_refs=False, mala_ref_config=None, compute_pou_mala_refs=False):
     print(f"Generating {n_ref} reference particles for the base bank...")
     t0 = time.time()
     x_ref_base = prior_model.sample(n_ref)
@@ -3224,6 +3251,33 @@ def build_precomp(prior_model, lik_model, n_ref=10000, build_gnl_banks=False, co
         x_ref_base, prior_model, lik_model, label='base', compute_pou=compute_pou,
     )
     precomp = {'base': base_bank}
+
+    if build_mala_refs:
+        mala_cfg = dict(DEFAULT_MALA_REF_CONFIG)
+        if mala_ref_config is not None:
+            mala_cfg.update(mala_ref_config)
+        print(
+            f"Generating {n_ref} dedicated MALA reference particles for mala_refs bank "
+            f"(steps={mala_cfg['mala_steps']}, burn_in={mala_cfg['mala_burnin']}, dt={mala_cfg['mala_dt']})."
+        )
+        x_ref_mala, mala_ref_info = run_mala_sampler(
+            n_ref, prior_model, lik_model,
+            steps=int(mala_cfg['mala_steps']),
+            dt=float(mala_cfg['mala_dt']),
+            burn_in=int(mala_cfg['mala_burnin']),
+            x_init=None, verbose=True, return_info=True,
+        )
+        mala_bank = precompute_reference_bank(
+            x_ref_mala, prior_model, lik_model, label='mala_refs',
+            compute_pou=bool(compute_pou_mala_refs),
+        )
+        precomp['mala_refs'] = mala_bank
+        precomp['mala_refs_info'] = dict(mala_ref_info)
+        del x_ref_mala, mala_ref_info, mala_bank
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     if build_gnl_banks:
         gnl_info = build_gnl_factorization(
             prior_model, lik_model,
@@ -3256,12 +3310,22 @@ def build_precomp(prior_model, lik_model, n_ref=10000, build_gnl_banks=False, co
 
 
 def run_standard_sampler_pipeline(prior_model, lik_model, sampler_configs, n_ref=10000,
-                                  build_gnl_banks=False, compute_pou=True):
+                                  build_gnl_banks=False, compute_pou=True, mala_ref_config=None):
+    mala_ref_cfgs = [dict(cfg) for cfg in sampler_configs.values() if bool(dict(cfg).get('mala_refs', False))]
+    build_mala_refs = len(mala_ref_cfgs) > 0
+    compute_pou_mala_refs = any(
+        'pou' in str(cfg.get('init_weights', '')).lower()
+        or 'pou' in str(cfg.get('init', '')).lower()
+        for cfg in mala_ref_cfgs
+    )
     precomp = build_precomp(
         prior_model, lik_model,
         n_ref=n_ref,
         build_gnl_banks=build_gnl_banks,
         compute_pou=compute_pou,
+        build_mala_refs=build_mala_refs,
+        mala_ref_config=mala_ref_config,
+        compute_pou_mala_refs=compute_pou_mala_refs,
     )
     samples, ess_logs, sampler_run_info = run_sampler_suite(sampler_configs, prior_model, lik_model, precomp)
     display_names = {label: info.get('display_name', label) for label, info in sampler_run_info.items()}
