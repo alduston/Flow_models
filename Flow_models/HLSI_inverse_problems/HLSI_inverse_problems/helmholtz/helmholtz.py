@@ -7,7 +7,7 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+THIS_DIR = os.getcwd() #os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -20,6 +20,489 @@ import pandas as pd
 import torch
 from scipy.spatial.distance import cdist
 
+# ==========================================
+# Dashboard PDF utilities
+# ==========================================
+# Produces a single multipage PDF containing the scalar metrics tables and every
+# figure produced by this script. Console progress logs are intentionally not
+# captured into the dashboard.
+
+import glob
+import numbers
+import re
+import shutil
+import textwrap
+from datetime import datetime
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.image as mpimg
+
+SAVE_DASHBOARD_PDF = True
+DASHBOARD_SHOW_FIGURES = True
+DASHBOARD_PDF_PATH = None  # Filled after init_run_results(), inside the active run-results directory.
+
+
+def _dashboard_is_scalar_cell(x):
+    if x is None:
+        return True
+    if isinstance(x, (str, bool)):
+        return True
+    if isinstance(x, numbers.Number):
+        return True
+    if isinstance(x, np.generic):
+        return True
+    return False
+
+
+def _dashboard_format_cell(x, max_len=72):
+    if x is None:
+        return ""
+    try:
+        if isinstance(x, np.generic):
+            x = x.item()
+    except Exception:
+        pass
+    if isinstance(x, numbers.Number):
+        try:
+            xf = float(x)
+            if not np.isfinite(xf):
+                return str(x)
+            if abs(xf) >= 1e4 or (0 < abs(xf) < 1e-3):
+                return f"{xf:.4e}"
+            return f"{xf:.6g}"
+        except Exception:
+            return str(x)
+    if isinstance(x, (list, tuple, dict, np.ndarray)):
+        try:
+            if isinstance(x, np.ndarray):
+                return f"array{tuple(x.shape)}"
+            return f"{type(x).__name__}[{len(x)}]"
+        except Exception:
+            return type(x).__name__
+    s = str(x)
+    if len(s) > max_len:
+        return s[: max_len - 3] + "..."
+    return s
+
+
+def _dashboard_sanitize_df(df, include_index=True):
+    df = pd.DataFrame(df).copy()
+    if include_index and not isinstance(df.index, pd.RangeIndex):
+        df = df.reset_index()
+    for col in df.columns:
+        df[col] = df[col].map(_dashboard_format_cell)
+    df.columns = [_dashboard_format_cell(c, max_len=40) for c in df.columns]
+    return df
+
+
+def metrics_dict_to_scalar_df(metrics_dict, display_names=None):
+    """Convert the metrics dictionary into a dashboard-friendly scalar table."""
+    display_names = display_names or {}
+    rows = []
+    for label, data in metrics_dict.items():
+        if not isinstance(data, dict):
+            continue
+        row = OrderedDict()
+        row["Method"] = display_names.get(label, label)
+        for key, val in data.items():
+            if _dashboard_is_scalar_cell(val):
+                row[key] = val
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def nested_dict_to_df(dct, row_name="Method", display_names=None):
+    """Convert nested dict/list records into a table without large arrays."""
+    display_names = display_names or {}
+    if isinstance(dct, pd.DataFrame):
+        return dct.copy()
+    rows = []
+    if isinstance(dct, dict):
+        iterable = dct.items()
+    else:
+        iterable = enumerate(dct)
+    for key, val in iterable:
+        row = OrderedDict()
+        row[row_name] = display_names.get(key, key)
+        if isinstance(val, dict):
+            for k, v in val.items():
+                if _dashboard_is_scalar_cell(v):
+                    row[k] = v
+                elif isinstance(v, (list, tuple, np.ndarray)):
+                    row[k] = _dashboard_format_cell(v)
+                else:
+                    row[k] = _dashboard_format_cell(v)
+        else:
+            row["value"] = _dashboard_format_cell(val)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def sampler_configs_to_df(configs):
+    rows = []
+    for label, cfg in configs.items():
+        row = OrderedDict()
+        row["Method"] = label
+        row.update(cfg)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+class DashboardPDF:
+    def __init__(self, path, title="Dashboard"):
+        self.path = os.path.abspath(path)
+        self.title = title
+        self.enabled = bool(SAVE_DASHBOARD_PDF)
+        self.pdf = PdfPages(self.path) if self.enabled else None
+        self._seen_fig_ids = {id(plt.figure(num)) for num in plt.get_fignums()}
+        self.figure_pages = 0
+        self.table_pages = 0
+        self.text_pages = 0
+
+    def add_text_page(self, title, lines, footer=None, mono=False):
+        if not self.enabled:
+            return
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor("white")
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.axis("off")
+        ax.text(0.055, 0.93, title, fontsize=18, fontweight="bold", va="top")
+        y = 0.86
+        fontsize = 9.2 if mono else 10.5
+        family = "monospace" if mono else "sans-serif"
+        for raw in lines:
+            wrapped = textwrap.wrap(str(raw), width=112 if mono else 105) or [""]
+            for line in wrapped:
+                ax.text(0.06, y, line, fontsize=fontsize, family=family, va="top")
+                y -= 0.033 if mono else 0.038
+                if y < 0.08:
+                    if footer:
+                        ax.text(0.055, 0.035, footer, fontsize=8.5, alpha=0.65)
+                    self.pdf.savefig(fig, bbox_inches="tight")
+                    plt.close(fig)
+                    self.text_pages += 1
+                    fig = plt.figure(figsize=(11, 8.5))
+                    fig.patch.set_facecolor("white")
+                    ax = fig.add_axes([0, 0, 1, 1])
+                    ax.axis("off")
+                    ax.text(0.055, 0.93, title + " (cont.)", fontsize=18, fontweight="bold", va="top")
+                    y = 0.86
+        if footer:
+            ax.text(0.055, 0.035, footer, fontsize=8.5, alpha=0.65)
+        self.pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        self.text_pages += 1
+
+    def add_dataframe(self, title, df, max_rows=28, max_cols=7, include_index=True):
+        if not self.enabled:
+            return
+        df = _dashboard_sanitize_df(df, include_index=include_index)
+        if df.empty:
+            self.add_text_page(title, ["No rows available."])
+            return
+
+        # Keep the first column (usually Method / metric name) pinned on horizontal splits.
+        first_col = [df.columns[0]]
+        other_cols = list(df.columns[1:])
+        cols_per_page = max(1, max_cols - 1)
+        col_chunks = [other_cols[i:i + cols_per_page] for i in range(0, len(other_cols), cols_per_page)] or [[]]
+
+        for ci, col_chunk in enumerate(col_chunks):
+            cols = first_col + col_chunk
+            df_col = df.loc[:, cols]
+            for ri in range(0, len(df_col), max_rows):
+                df_page = df_col.iloc[ri:ri + max_rows]
+                fig, ax = plt.subplots(figsize=(11, 8.5))
+                fig.patch.set_facecolor("white")
+                ax.axis("off")
+                suffix = ""
+                if len(col_chunks) > 1:
+                    suffix += f" - columns {ci + 1}/{len(col_chunks)}"
+                if len(df_col) > max_rows:
+                    suffix += f" - rows {ri + 1}-{min(ri + max_rows, len(df_col))}"
+                ax.set_title(title + suffix, fontsize=15, fontweight="bold", pad=14)
+
+                col_width = 1.0 / max(len(df_page.columns), 1)
+                table = ax.table(
+                    cellText=df_page.values,
+                    colLabels=df_page.columns,
+                    cellLoc="center",
+                    colLoc="center",
+                    loc="center",
+                    colWidths=[col_width] * len(df_page.columns),
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(7.5 if len(df_page.columns) >= 6 else 8.5)
+                table.scale(1.0, 1.25)
+                for (row, col), cell in table.get_celld().items():
+                    if row == 0:
+                        cell.set_text_props(weight="bold")
+                    if col == 0 and row > 0:
+                        cell.set_text_props(ha="left")
+                self.pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+                self.table_pages += 1
+
+    def _style_table_cells(self, table, header_fontsize=None, body_fontsize=None,
+                           header_facecolor="0.92", first_col_left=True):
+        """Apply consistent, readable table styling for dashboard pages."""
+        for (row, col), cell in table.get_celld().items():
+            cell.set_edgecolor("0.72")
+            cell.set_linewidth(0.45)
+            if row == 0:
+                cell.set_facecolor(header_facecolor)
+                cell.set_text_props(weight="bold", fontsize=header_fontsize)
+            else:
+                if row % 2 == 0:
+                    cell.set_facecolor("0.985")
+                if body_fontsize is not None:
+                    cell.set_text_props(fontsize=body_fontsize)
+                if first_col_left and col == 0:
+                    cell.set_text_props(ha="left")
+
+    def _add_table_block(self, ax, title, df, bbox, col_widths=None,
+                         header_fontsize=8.2, body_fontsize=8.0):
+        """Draw one compact table block inside an existing page."""
+        df_fmt = _dashboard_sanitize_df(df, include_index=False)
+        ax.text(bbox[0], bbox[1] + bbox[3] + 0.012, title,
+                fontsize=11.5, fontweight="bold", va="bottom", ha="left")
+        if df_fmt.empty:
+            ax.text(bbox[0], bbox[1] + 0.5 * bbox[3], "No rows available.", fontsize=10)
+            return
+        n_cols = len(df_fmt.columns)
+        if col_widths is None:
+            first_w = 0.24 if n_cols > 1 else 1.0
+            rest_w = (1.0 - first_w) / max(n_cols - 1, 1)
+            col_widths = [first_w] + [rest_w] * (n_cols - 1)
+        table = ax.table(
+            cellText=df_fmt.values,
+            colLabels=df_fmt.columns,
+            cellLoc="center",
+            colLoc="center",
+            loc="center",
+            colWidths=col_widths,
+            bbox=bbox,
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(body_fontsize)
+        self._style_table_cells(table, header_fontsize=header_fontsize, body_fontsize=body_fontsize)
+
+    def _rename_runinfo_columns(self, df):
+        """Shorten run-info headers enough to fit while preserving content."""
+        rename = {
+            "display_name": "method label",
+            "method": "sampler",
+            "weight_mode": "weights",
+            "mala_step_size": "MALA dt",
+            "score_norm_initial": "score norm init",
+            "score_norm_mean": "score norm mean",
+            "score_norm_final": "score norm final",
+            "score_norm_max": "score norm max",
+            "pde_likelihood_evals": "PDE logL evals",
+            "pde_score_evals": "PDE score evals",
+            "pde_gn_hessian_evals": "PDE GN Hess evals",
+            "pde_solve_count": "PDE solves",
+            "runtime_seconds": "runtime (s)",
+            "reference_method": "reference",
+            "N_ref": "N ref",
+            "mala_steps": "MALA steps",
+            "mala_burnin": "MALA burnin",
+        }
+        return df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    def add_results_tables(self, results_df, results_runinfo_df):
+        """Add exactly two table pages: canonical metrics and readable run-info.
+
+        The metrics page keeps the saved *_metrics.csv / tables.tex layout. The
+        run-info page preserves the saved *_runinfo.csv contents, but splits the
+        many accounting columns into three normal table blocks on one page so it
+        remains legible instead of becoming a tiny one-line wide table.
+        """
+        if not self.enabled:
+            return
+
+        # Page 1: metric rows x sampler columns, matching *_metrics.csv / tables.tex.
+        metrics_fmt = _dashboard_sanitize_df(results_df, include_index=True)
+        fig, ax = plt.subplots(figsize=(12.5, 8.5))
+        fig.patch.set_facecolor("white")
+        ax.axis("off")
+        ax.set_title("Metrics table (saved *_metrics.csv / tables.tex layout)",
+                     fontsize=18, fontweight="bold", pad=14)
+        n_rows = max(len(metrics_fmt), 1)
+        n_cols = max(len(metrics_fmt.columns), 1)
+        first_w = 0.34 if n_cols > 1 else 0.95
+        rest_w = (0.94 - first_w) / max(n_cols - 1, 1)
+        col_widths = [first_w] + [rest_w] * (n_cols - 1)
+        table = ax.table(
+            cellText=metrics_fmt.values,
+            colLabels=metrics_fmt.columns,
+            cellLoc="center",
+            colLoc="center",
+            loc="center",
+            colWidths=col_widths,
+            bbox=[0.035, 0.055, 0.93, 0.86],
+        )
+        table.auto_set_font_size(False)
+        # Larger text than the previous version; still adapts if many methods are added.
+        body_fs = min(10.5, max(7.2, 120.0 / (n_rows + 0.75 * n_cols)))
+        header_fs = min(10.5, body_fs + 0.5)
+        table.set_fontsize(body_fs)
+        self._style_table_cells(table, header_fontsize=header_fs, body_fontsize=body_fs)
+        self.pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        self.table_pages += 1
+
+        # Page 2: normal, readable run-info blocks on one page.
+        runinfo = pd.DataFrame(results_runinfo_df).copy()
+        target = ""
+        if "target" in runinfo.columns and len(runinfo) > 0:
+            target = str(runinfo["target"].iloc[0])
+        runinfo = self._rename_runinfo_columns(runinfo)
+        fig, ax = plt.subplots(figsize=(15.5, 10.0))
+        fig.patch.set_facecolor("white")
+        ax.axis("off")
+        title = "Run-info table (saved *_runinfo.csv, split for readability)"
+        if target:
+            title += f" - {target}"
+        ax.set_title(title, fontsize=18, fontweight="bold", pad=14)
+
+        def cols_present(cols):
+            return [c for c in cols if c in runinfo.columns]
+
+        config_cols = cols_present([
+            "method label", "sampler", "weights", "N ref", "steps",
+            "MALA steps", "MALA burnin", "MALA dt", "reference", "runtime (s)",
+        ])
+        score_cols = cols_present([
+            "method label", "score_norm", "score norm init", "score norm mean",
+            "score norm final", "score norm max",
+        ])
+        budget_cols = cols_present([
+            "method label", "PDE logL evals", "PDE score evals", "PDE GN Hess evals", "PDE solves",
+        ])
+
+        # Normalized column widths for each block. First column gets label width;
+        # remaining columns share the rest.
+        def widths(n, first=0.24):
+            if n <= 1:
+                return [1.0]
+            return [first] + [(1.0 - first) / (n - 1)] * (n - 1)
+
+        if config_cols:
+            self._add_table_block(
+                ax, "Sampler configuration and runtime", runinfo[config_cols],
+                bbox=[0.035, 0.635, 0.93, 0.265], col_widths=widths(len(config_cols), first=0.22),
+                header_fontsize=8.8, body_fontsize=8.7,
+            )
+        if score_cols:
+            self._add_table_block(
+                ax, "Score-norm diagnostics", runinfo[score_cols],
+                bbox=[0.035, 0.355, 0.93, 0.185], col_widths=widths(len(score_cols), first=0.30),
+                header_fontsize=9.2, body_fontsize=9.0,
+            )
+        if budget_cols:
+            self._add_table_block(
+                ax, "PDE evaluation budget", runinfo[budget_cols],
+                bbox=[0.035, 0.115, 0.93, 0.165], col_widths=widths(len(budget_cols), first=0.30),
+                header_fontsize=9.2, body_fontsize=9.0,
+            )
+
+        # If future runinfo files add columns not covered above, surface them in a small note
+        # instead of silently dropping them.
+        used = set(config_cols + score_cols + budget_cols + ["target", "label"])
+        extra = [c for c in runinfo.columns if c not in used]
+        if extra:
+            ax.text(0.035, 0.055, "Additional run-info columns: " + ", ".join(extra),
+                    fontsize=8.0, alpha=0.75, ha="left", va="bottom")
+        self.pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        self.table_pages += 1
+
+    def _figure_sort_key(self, path):
+        name = os.path.basename(path)
+        m = re.search(r"_figure_(\d+)_", name)
+        return (int(m.group(1)) if m else 10_000, name)
+
+    def add_image_page(self, image_path):
+        """Embed one saved PNG/JPG as a full dashboard page."""
+        if not self.enabled or not os.path.exists(image_path):
+            return
+        img = mpimg.imread(image_path)
+        h, w = img.shape[:2]
+        aspect = w / max(h, 1)
+        if aspect > 2.2:
+            figsize = (18.0, 7.0)
+        elif aspect > 1.35:
+            figsize = (15.5, 9.0)
+        else:
+            figsize = (11.0, 10.0)
+        fig = plt.figure(figsize=figsize)
+        fig.patch.set_facecolor("white")
+        ax = fig.add_axes([0.015, 0.015, 0.97, 0.97])
+        ax.imshow(img)
+        ax.axis("off")
+        self.pdf.savefig(fig, bbox_inches="tight", pad_inches=0.03)
+        plt.close(fig)
+        self.figure_pages += 1
+
+    def add_run_results_png_figures(self, run_results_dir):
+        """Append all saved run-results PNG figures, sorted by figure number.
+
+        This is intentionally based on the files saved by sampling.py's patched
+        plt.show() hook, so dashboard coverage matches the normal run-results
+        directory exactly: ESS, PCA, field reconstructions, wavefields, boundary
+        traces, curvature spectra, and any future diagnostics.
+        """
+        if not self.enabled or not run_results_dir or not os.path.isdir(run_results_dir):
+            return
+        pngs = sorted(glob.glob(os.path.join(run_results_dir, "*.png")), key=self._figure_sort_key)
+        for path in pngs:
+            self.add_image_page(path)
+
+    def add_figure(self, fig=None, close=False):
+        if not self.enabled:
+            return
+        if fig is None:
+            fig = plt.gcf()
+        try:
+            fig.savefig(self.pdf, format="pdf", bbox_inches="tight")
+            self.figure_pages += 1
+        except Exception as exc:
+            self.add_text_page("Figure capture failed", [repr(exc)])
+        if close:
+            plt.close(fig)
+
+    def capture_new_figures(self, close=False):
+        if not self.enabled:
+            return
+        for num in list(plt.get_fignums()):
+            fig = plt.figure(num)
+            fig_id = id(fig)
+            if fig_id not in self._seen_fig_ids:
+                self.add_figure(fig, close=close)
+                self._seen_fig_ids.add(fig_id)
+
+    def close(self):
+        if self.enabled and self.pdf is not None:
+            self.pdf.close()
+            self.pdf = None
+
+
+def dashboard_copy_into_run_dir(dashboard_path, results_df_path=None):
+    """Copy the dashboard into the run-results directory so it is included in the zip."""
+    if not dashboard_path or not os.path.exists(dashboard_path) or results_df_path is None:
+        return dashboard_path
+    run_dir = os.path.dirname(os.path.abspath(results_df_path))
+    os.makedirs(run_dir, exist_ok=True)
+    dest = os.path.join(run_dir, os.path.basename(dashboard_path))
+    if os.path.abspath(dest) != os.path.abspath(dashboard_path):
+        shutil.copy2(dashboard_path, dest)
+    return dest
+
+
+'''
+import sampling as sampling_utils
 from sampling import (
     GaussianPrior,
     compute_field_summary_metrics,
@@ -40,6 +523,8 @@ from sampling import (
     summarize_sampler_run,
     zip_run_results_dir,
 )
+'''
+
 
 # ==========================================
 # KL basis generation
@@ -254,8 +739,8 @@ HESS_MIN = 1e-6
 HESS_MAX = 1e8
 GNL_PILOT_N = 512
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
-DEFAULT_N_GEN = 500
-N_REF = 10000
+DEFAULT_N_GEN = 1500
+N_REF = 1500
 BUILD_GNL_BANKS = False
 
 configure_sampling(
@@ -270,7 +755,11 @@ configure_sampling(
     gnl_stiff_lambda_cut=GNL_STIFF_LAMBDA_CUT,
     gnl_use_dominant_particle_newton=True,
 )
-init_run_results('helmholtz_scattering_hlsi')
+run_results_info = init_run_results('helmholtz_scattering_hlsi')
+DASHBOARD_PDF_PATH = os.path.join(
+    run_results_info['run_results_dir'],
+    f"{run_results_info['run_results_stem']}_summary_dashboard.pdf",
+)
 
 # ==========================================
 # Execution
@@ -303,55 +792,55 @@ lik_model, lik_aux = make_physics_likelihood(
 )
 posterior_score_fn = make_posterior_score_fn(lik_model)
 
-'''
+
 SAMPLER_CONFIGS = OrderedDict([
-    ('MALA (prior)', {'init': 'prior', 'init_steps': 0, 'mala_steps': 500, 'mala_burnin': 100, 'mala_dt': 1e-4, 'is_reference': True}),
-    ('Tweedie', {'init': 'tweedie', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('Blend', {'init': 'blend', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': False}),
-    ('HLSI', {'init': 'HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('WC-HLSI', {'init': 'HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('PoU-HLSI', {'init': 'HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+   #('MALA', {'init': 'prior', 'init_steps': 0, 'mala_steps': 1, 'mala_burnin': 0, 'mala_dt': 1e-4, 'is_reference': True}),
+
+    #('HLSI', {'init': 'HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('WC-HLSI', {'init': 'HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-HLSI', {'init': 'CE-HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-WC-HLSI', {'init': 'CE-HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-PoU-HLSI', {'init': 'CE-HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+    #('MALA_HLSI', {'ref_source': 'MALA', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('HLSI_HLSI', {'ref_source': 'HLSI', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('WC-HLSI_HLSI', {'ref_source': 'WC-HLSI', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('HLSI_HLSI', {'ref_source': 'HLSI', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+    #('MALA_CE-HLSI', {'ref_source': 'MALA', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('HLSI_CE-HLSI', {'ref_source': 'HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('WC-HLSI_CE-HLSI', {'ref_source': 'WC-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('CE-HLSI_CE-HLSI', {'ref_source': 'CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+    ('CE-HLSI_CE-HLSI_CE-HLSI', {'ref_source': 'CE-HLSI_CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('HLSI_HLSI_HLSI', {'ref_source': 'HLSI_HLSI', 'init': ' HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('CE-HLSI_HLSI_HLSI_HLSI', {'ref_source': 'CE-HLSI_HLSI_HLSI', 'init': ' HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    #('CE-HLSI_HLSI_HLSI_HLSI_HSLI', {'ref_source': 'CE-HLSI_HLSI_HLSI_HLSI', 'init': ' HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+
 ])
-
-
-SAMPLER_CONFIGS = OrderedDict([
-    ('MALA', {'init': 'prior', 'init_steps': 0, 'mala_steps': 500, 'mala_burnin': 100, 'mala_dt': 1e-4, 'precond_mala': False, 'is_reference': True}),
-    ('Precond MALA', { 'init': 'prior', 'init_steps': 0, 'mala_steps': 500, 'mala_burnin': 100, 'mala_dt': 4e-3, 'precond_mala': True, 'is_reference': True,}),
-    ('Ref_Laplace', {'init': 'Ref_Laplace', 'init_weights': 'WC', 'init_steps': 0, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': False}),
-    ('Tweedie', {'init': 'tweedie', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('Blend', {'init': 'blend', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': False}),
-
-    ('HLSI', {'init': 'HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('WC-HLSI', {'init': 'HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('PoU-HLSI', {'init': 'HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': False}),
-    ('CE-HLSI', {'init': 'CE-HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-WC-HLSI', {'init': 'CE-HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-PoU-HLSI', {'init': 'CE-HLSI', 'init_weights': 'PoU', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': False}),
-
-    ('KAPPA05_PoU', {'init': 'GATE-HLSI', 'init_weights': 'PoU', 'gate_rho': 1.0, 'gate_beta': 1.0, 'gate_kappa': 0.5}),
-    ('KAPPA10_PoU', {'init': 'GATE-HLSI', 'init_weights': 'PoU', 'gate_rho': 1.0, 'gate_beta': 1.0, 'gate_kappa': 1.0}),
-
-    ('KAPPA05_WC', {'init': 'GATE-HLSI', 'init_weights': 'WC', 'gate_rho': 1.0, 'gate_beta': 1.0, 'gate_kappa': 0.5, 'log_mean_ess': True}),
-    ('KAPPA10_WC', {'init': 'GATE-HLSI', 'init_weights': 'WC', 'gate_rho': 1.0, 'gate_beta': 1.0, 'gate_kappa': 1.0}),
-])
-'''
-
-SAMPLER_CONFIGS = OrderedDict([
-    ('MALA (prior)', {'init': 'prior', 'init_steps': 0, 'mala_steps': 500, 'mala_burnin': 100, 'mala_dt': 1e-4, 'is_reference': True}),
-    ('HLSI-OU', {'init': 'HLSI', 'init_weights': 'L', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('HLSI-Surr', {'init': 'HLSI', 'init_weights': 'L', 'transition_w': 'surrogate', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI-OU', {'init': 'CE-HLSI', 'init_weights': 'L', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI-Surr', {'init': 'CE-HLSI', 'init_weights': 'L', 'transition_w': 'surrogate', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('WC-HLSI-OU', {'init': 'HLSI', 'init_weights': 'WC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('WC-HLSI-Surr', {'init': 'HLSI', 'init_weights': 'WC', 'transition_w': 'surrogate', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('PoU-HLSI-OU', {'init': 'HLSI', 'init_weights': 'PoU', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('PoU-HLSI-Surr', {'init': 'HLSI', 'init_weights': 'PoU', 'transition_w': 'surrogate', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-])
-
-
+dashboard = DashboardPDF(
+    DASHBOARD_PDF_PATH,
+    title="Helmholtz scattering HLSI dashboard",
+)
+dashboard.add_text_page(
+    "Helmholtz scattering HLSI dashboard",
+    [
+        f"Created: {datetime.now().isoformat(timespec='seconds')}",
+        "This dashboard contains the two canonical saved-results tables plus every PNG diagnostic plot saved in the run directory.",
+        "Tables are intentionally limited to two pages: metrics plus a readable split run-info page.",
+        "Random progress output from precomputation / Hessian batching is intentionally excluded.",
+        f"run_results_dir = {run_results_info['run_results_dir']}",
+        "",
+        f"seed = {seed}",
+        f"ACTIVE_DIM = {ACTIVE_DIM}",
+        f"N_REF = {N_REF}",
+        f"DEFAULT_N_GEN = {DEFAULT_N_GEN}",
+        f"NOISE_STD = {NOISE_STD}",
+        f"HELMHOLTZ_K = {HELMHOLTZ_K}",
+        f"N = {N}, N_SOURCES = {N_SOURCES}, N_RECEIVERS = {N_RECEIVERS}, N_HOLDOUT_RECEIVERS = {N_HOLDOUT_RECEIVERS}",
+        f"HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}",
+        f"PLOT_NORMALIZER = {PLOT_NORMALIZER}",
+    ],
+)
 pipeline = run_standard_sampler_pipeline(prior_model, lik_model, SAMPLER_CONFIGS, n_ref=N_REF, build_gnl_banks=BUILD_GNL_BANKS, compute_pou=True)
 samples = pipeline['samples']
 ess_logs = pipeline['ess_logs']
@@ -455,23 +944,35 @@ def solve_complex_fields(alpha_latent, source_idx=0):
 
 
 
-def trace_style_for_label(label):
-    label_l = label.lower()
-    base = dict(linestyle='--', linewidth=1.55, alpha=0.92, zorder=6, marker='o', markersize=3.2, markerfacecolor='white', markeredgewidth=0.8, markevery=4)
-    if 'prior' in label_l or 'mala' in label_l:
-        return dict(base, color='tab:blue', linewidth=1.25, alpha=0.55, markersize=2.8, zorder=5)
-    if 'tweedie' in label_l:
-        return dict(base, color='tab:orange')
-    if 'blend' in label_l:
-        return dict(base, color='tab:green')
-    if 'wc-hlsi' in label_l:
-        return dict(base, color='tab:brown')
-    if 'ce' in label_l and 'hlsi' in label_l:
-        return dict(base, color='tab:pink')
-    if 'hlsi' in label_l:
-        return dict(base, color='tab:purple', linewidth=1.75, alpha=0.96, zorder=7, marker='D', markersize=3.4)
-    return dict(base)
+BOUNDARY_TRACE_COLORS = [
+    'tab:blue', 'tab:orange', 'tab:green', 'tab:purple', 'tab:brown',
+    'tab:pink', 'tab:olive', 'tab:cyan', 'tab:gray', 'tab:red',
+]
+BOUNDARY_TRACE_MARKERS = ['o', 's', 'D', '^', 'v', 'P', 'X', '<', '>', 'h']
 
+
+def trace_style_for_index(index):
+    """Fixed-order trace style so CE-HLSI bootstrap variants get distinct colors."""
+    color = BOUNDARY_TRACE_COLORS[index % len(BOUNDARY_TRACE_COLORS)]
+    marker = BOUNDARY_TRACE_MARKERS[index % len(BOUNDARY_TRACE_MARKERS)]
+    return dict(
+        color=color,
+        linestyle='--',
+        linewidth=1.55,
+        alpha=0.92,
+        zorder=6 + index,
+        marker=marker,
+        markersize=3.2,
+        markerfacecolor='white',
+        markeredgewidth=0.8,
+        markevery=4,
+    )
+
+
+def trace_style_for_label(label):
+    # Backward-compatible fallback for any old call sites. New boundary-trace
+    # plotting uses trace_style_for_index(...) to guarantee distinct colors.
+    return trace_style_for_index(0)
 
 
 def legend_priority(label):
@@ -523,6 +1024,8 @@ plot_pca_histograms(samples, alpha_true_np, display_names=display_names, normali
 
 results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(metrics, sampler_run_info, n_ref=N_REF, target_name='Helmholtz scattering', display_names=display_names, reference_name=reference_title)
 
+dashboard.add_results_tables(results_df, results_runinfo_df)
+
 save_reproducibility_log(
     title='Helmholtz scattering HLSI run reproducibility log',
     config={
@@ -542,7 +1045,7 @@ save_reproducibility_log(
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
     },
     extra_sections={
-        'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path},
+        'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path, 'dashboard_pdf': DASHBOARD_PDF_PATH},
         'summary_stats': {
             'reference_key': reference_key,
             'reference_title': reference_title,
@@ -580,7 +1083,6 @@ plot_field_reconstruction_grid(
     suptitle=f'Nonlinear Helmholtz inverse scattering (d={ACTIVE_DIM}, k={HELMHOLTZ_K:g})',
     field_name='Contrast $q(x)$',
 )
-
 print('\nVisualizing complex wavefields for source 0...')
 methods_to_plot = [label for label in samples.keys() if label in mean_fields]
 n_cols = len(methods_to_plot) + 1
@@ -622,7 +1124,13 @@ for i, label in enumerate(methods_to_plot):
     axes2[1, col].set_title(f"{display_names.get(label, label)}\narg(u_total)", fontsize=14)
     axes2[1, col].axis('off')
 plt.tight_layout()
-plt.show()
+try:
+    sampling_utils._save_all_open_figures_to_run_results()
+except Exception:
+    pass
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
+plt.close(fig2)
 
 print('\nVisualizing boundary receiver traces for source 0...')
 fig3, axes3 = plt.subplots(2, 2, figsize=(32, 7.8), sharex='col', gridspec_kw={'height_ratios': [1.0, 1.0], 'wspace': 0.14, 'hspace': 0.16})
@@ -634,14 +1142,14 @@ imag_true = np.imag(y_true_s0)
 real_obs = np.real(y_obs_s0)
 imag_obs = np.imag(y_obs_s0)
 model_trace_data = OrderedDict()
-for label in methods_to_plot[:4]:
+for trace_idx, label in enumerate(methods_to_plot[:4]):
     samps_clean = get_valid_samples(samples[label])
     if samps_clean.shape[0] < 10:
         continue
     mean_lat = np.mean(samps_clean, axis=0)[:ACTIVE_DIM]
     y_pred = unpack_measurement_vector(np.array(solve_forward(jnp.array(mean_lat))))[0]
     pretty_label = display_names.get(label, label)
-    model_trace_data[pretty_label] = {'real': np.real(y_pred).copy(), 'imag': np.imag(y_pred).copy(), 'style': trace_style_for_label(pretty_label)}
+    model_trace_data[pretty_label] = {'real': np.real(y_pred).copy(), 'imag': np.imag(y_pred).copy(), 'style': trace_style_for_index(trace_idx)}
 obs_scatter_style = dict(color='tab:red', s=10, alpha=0.42, linewidths=0.0, zorder=1)
 clean_main_style = dict(color='k', linewidth=2.4, alpha=0.92, zorder=4)
 resid_zero_style = dict(color='0.25', linewidth=1.0, linestyle='--', alpha=0.75, zorder=0)
@@ -704,13 +1212,19 @@ for ax in (ax3a, ax3b):
     handles.extend(h)
     labels.extend(l)
 legend_map = OrderedDict()
-for h, l in sorted(zip(handles, labels), key=lambda pair: (legend_priority(pair[1]), pair[1])):
+for h, l in zip(handles, labels):
     if l not in legend_map:
         legend_map[l] = h
 fig3.legend(legend_map.values(), legend_map.keys(), loc='upper center', ncol=min(6, len(legend_map)), frameon=False, fontsize=10, bbox_to_anchor=(0.5, 1.02))
 fig3.suptitle('Source-0 scattered-field boundary traces', fontsize=16, y=1.08)
 plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
-plt.show()
+try:
+    sampling_utils._save_all_open_figures_to_run_results()
+except Exception:
+    pass
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
+plt.close(fig3)
 
 print('\nVisualizing Gauss-Newton curvature spectrum...')
 fig4, ax4 = plt.subplots(1, 1, figsize=(9, 5))
@@ -730,7 +1244,18 @@ ax4.set_title('Gauss-Newton curvature spectrum', fontsize=15)
 ax4.grid(True, which='both', alpha=0.25)
 ax4.legend(fontsize=9)
 plt.tight_layout()
-plt.show()
+try:
+    sampling_utils._save_all_open_figures_to_run_results()
+except Exception:
+    pass
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
+plt.close(fig4)
 
+dashboard.add_run_results_png_figures(run_results_info['run_results_dir'])
+dashboard.close()
+# The dashboard already lives in the active run-results directory, so zip_run_results_dir()
+# includes it alongside the PNGs, CSVs, and reproducibility log.
 run_results_zip_path = zip_run_results_dir()
+print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
