@@ -5,29 +5,28 @@ Robustness of SNIS score estimators to misspecified reference samples on a 2D GM
 Implements SNIS versions of the main estimators:
   - Tweedie
   - TSI
-  - Blend / Blended (scalar variance-optimal blend)
+  - Blended / Blend (coordinatewise variance-optimal blend)
   - OP-Blend (full operator-valued empirical variance-optimal blend)
   - HLSI (componentwise resolvent gate)
   - CE-HLSI (empirical conditional-expectation gate)
-  - Hybrid-CE-HLSI (perturbed score signals with clean-reference CE gate)
+  - Hybrid-CE-HLSI (perturbed-reference score aggregate with clean-reference CE gate)
   - optional ORACLE sampler
 
 Experiment:
   1. Draw clean references X_i ~ p_0 from a known 2D GMM.
-  2. Perturb anchors using a selectable corruption mode:
+  2. Perturb anchors with --corruption_mode:
        heat: X_i^eps = X_i + sigma * N(0,I)
-       ou:   X_i^eps = sqrt(max(1 - sigma^2, 0)) X_i + sigma * N(0,I)
-     so perturb_sigmas remains a noise-standard-deviation sweep in both modes.
+       ou:   X_i^eps = exp(-sigma) X_i + sqrt(1-exp(-2 sigma)) N(0,I)
   3. Query exact score and exact observed information H=-∇²log p at those anchors.
-  4. Build SNIS estimators using the current reference bank. Hybrid-CE-HLSI
-     uses perturbed anchors for Tweedie/TSI score signals but clean anchors for
-     the CE attenuation gate on the first layer.
+  4. Build SNIS estimators using the perturbed anchors.
+     Hybrid-CE-HLSI additionally uses the paired clean anchors to compute only
+     the CE-HLSI gate, while keeping perturbed-anchor score signals.
+     Method names may be bootstrapped chains: Final_Previous means run Previous
+     first, then use its samples as references for Final.
   5. Sample with a stochastic predictor-corrector reverse OU sampler.
-  6. Optionally bootstrap with underscore-separated method names. A_B means
-     run B first, then use B's samples as references for A.
-  7. Measure generated samples using NLL / KSD / MMD / SW2 and the time-integrated
+  6. Measure generated samples using NLL / KSD / MMD / SW2 and the time-integrated
      score RMSE (Fisher-type score divergence) against the exact OU-diffused GMM score.
-  8. Save per-sigma histogram panels, a meta metric array, and a meta histogram
+  7. Save per-sigma histogram panels, a meta metric array, and a meta histogram
      array over all perturbation levels.
 """
 
@@ -38,12 +37,14 @@ import json
 import math
 import os
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, PowerNorm
 import numpy as np
 import pandas as pd
 import torch
@@ -66,22 +67,25 @@ class ExperimentConfig:
     n_samples: int = 1500
     n_truth: int = 4000
     metrics_max_n: int = 1500
+    metrics: Tuple[str, ...] = ("nll", "ksd", "mmd", "sw2", "kl", "kl_rev", "fisher_rmse")
+    n_trials: int = 1
     # If true, all sample-vs-target metrics use one fixed unperturbed target
     # evaluation pool and fixed SW2/Fisher probes for the entire perturbation sweep.
     fixed_metric_pool: bool = True
 
     # Sweep
     perturb_sigmas: Tuple[float, ...] = (0.0, 0.05, 0.10, 0.20, 0.35, 0.50)
-    corruption_mode: str = "heat"  # heat or ou
+    # heat/additive: x + sigma*z.  ou: exp(-sigma)*x + sqrt(1-exp(-2*sigma))*z.
+    corruption_mode: str = "heat"
 
     # Reverse OU PC sampler
-    t_start: float = 3.0
-    t_end: float = 1.0e-3
-    n_steps: int = 160
+    t_start: float = 2.0
+    t_end: float = 0.005
+    n_steps: int = 100
     n_corrector: int = 1
     corrector_snr: float = 0.08
     corrector_step_max: float = 2.0e-3
-    init_mode: str = "exact_pt"  # exact_pt or normal
+    init_mode: str = "normal"  # normal or exact_pt; normal matches gmm_hlsi_sandbox.py
     final_denoise: bool = True
     sample_clip: float = 15.0
     score_clip: float = 200.0
@@ -94,10 +98,11 @@ class ExperimentConfig:
     fisher_time_grid: str = "log"  # log or linear
 
     # Estimators
-    methods: Tuple[str, ...] = ("Tweedie", "TSI", "Blend", "OP-Blend", "HLSI", "CE-HLSI", "Hybrid-CE-HLSI")
+    #methods: Tuple[str, ...] = ("Tweedie", "HLSI", "CE-HLSI", "Blended", "OP-Blend")
+    methods: Tuple[str, ...] = ("Tweedie", "CE-HLSI", "Hybrid-CE-HLSI")
     include_oracle: bool = True
     curvature_mode: str = "raw"  # raw, psd, abs
-    curvature_floor: float = 1.0e-5
+    curvature_floor: float = -1.0e6
     curvature_cap: float = 1.0e6
     resolvent_eps: float = 1.0e-8
     gate_clip: Optional[float] = 50.0
@@ -116,6 +121,11 @@ class ExperimentConfig:
     grid_lim: float = 5.0
     grid_n: int = 180
     hist_bins: int = 90
+    hist_cmap: str = "bright_lava"
+    hist_gamma: float = 0.35
+    hist_vmax_quantile: float = 0.995
+    hist_contour_alpha: float = 0.16
+    hist_contour_lw: float = 0.35
     plot_every_sigma: bool = True
 
 
@@ -174,6 +184,81 @@ def median_bandwidth(x: torch.Tensor, y: Optional[torch.Tensor] = None, max_n: i
         return 1.0
     med = torch.median(vals).item()
     return float(math.sqrt(max(med, 1.0e-12)))
+
+
+def safe_float(x) -> float:
+    try:
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().item()
+        x = float(x)
+        if math.isnan(x) or math.isinf(x):
+            return float("nan")
+        return x
+    except Exception:
+        return float("nan")
+
+
+def sym(A: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (A + A.transpose(-1, -2))
+
+
+def batch_eye(batch: int, d: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.eye(d, device=device, dtype=dtype).expand(batch, d, d)
+
+
+def bmv(A: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    return torch.einsum("...ij,...j->...i", A, x)
+
+
+def project_symmetric_gate(G: torch.Tensor, min_eig: float = 0.0, max_eig: float = 1.0) -> torch.Tensor:
+    Gs = sym(G)
+    eig, U = torch.linalg.eigh(Gs)
+    eig = eig.clamp(min=min_eig, max=max_eig)
+    return U @ torch.diag_embed(eig) @ U.transpose(-1, -2)
+
+
+METRIC_ALIASES: Dict[str, str] = {
+    "sliced_w2": "sw2",
+    "score_rmse": "fisher_rmse",
+    "fisher_mse": "fisher_rmse",
+    "kl_gt_to_model_2d": "kl",
+    "kl_model_to_gt_2d": "kl_rev",
+}
+
+AVAILABLE_METRICS: Tuple[str, ...] = ("nll", "ksd", "mmd", "sw2", "kl", "kl_rev", "fisher_rmse")
+SAMPLE_METRICS: Tuple[str, ...] = ("nll", "ksd", "mmd", "sw2", "kl", "kl_rev")
+FISHER_METRICS: Tuple[str, ...] = ("fisher_rmse",)
+
+
+def canonicalize_metrics(metrics: Tuple[str, ...] | List[str]) -> Tuple[str, ...]:
+    if metrics is None or len(metrics) == 0:
+        metrics = list(AVAILABLE_METRICS)
+    out: List[str] = []
+    for raw in metrics:
+        if raw is None:
+            continue
+        name = str(raw).strip().lower()
+        if not name:
+            continue
+        if name == "all":
+            for m in AVAILABLE_METRICS:
+                if m not in out:
+                    out.append(m)
+            continue
+        name = METRIC_ALIASES.get(name, name)
+        if name not in AVAILABLE_METRICS:
+            raise ValueError(f"Unknown metric '{raw}'. Available metrics: {', '.join(AVAILABLE_METRICS)}")
+        if name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def metric_enabled(cfg: ExperimentConfig, name: str) -> bool:
+    return name in cfg.metrics
+
+
+def any_metric_enabled(cfg: ExperimentConfig, names: Tuple[str, ...] | List[str]) -> bool:
+    return any(name in cfg.metrics for name in names)
 
 
 # -----------------------------------------------------------------------------
@@ -321,16 +406,17 @@ class SNISScoreBank:
         gate_clip: Optional[float],
         weight_temp: float,
         eval_chunk: int,
-        gate_anchors: Optional[torch.Tensor] = None,
         op_blend_reg: float = 1.0e-8,
         op_blend_pinv_rtol: float = 1.0e-6,
         op_blend_project_gate: bool = False,
+        gate_anchors: Optional[torch.Tensor] = None,
     ):
         self.target = target
 
-        # Score bank: always the possibly perturbed anchors. These determine
-        # SNIS weights/signals b,c for Tweedie, TSI, Blend, HLSI, CE-HLSI, and
-        # the signal side of Hybrid-CE-HLSI.
+        # Main bank: perturbed anchors in the misspecification experiment.
+        # These anchors define the SNIS weights/signals used for Tweedie, TSI,
+        # Blend, OP-Blend, HLSI, CE-HLSI, and the score aggregate part of
+        # Hybrid-CE-HLSI.
         self.x = anchors.detach()
         self.N, self.d = self.x.shape
         self.device = self.x.device
@@ -339,17 +425,19 @@ class SNISScoreBank:
         self.H_raw = target.observed_information(self.x, t=0.0).detach()
         self.P = process_curvature(self.H_raw, curvature_mode, curvature_floor, curvature_cap).detach()
 
-        # Gate bank: optional clean/unperturbed anchors used only by
-        # Hybrid-CE-HLSI.  Its OU weights and curvature average define the
-        # attenuation matrix while the score signal remains the perturbed-bank
-        # bbar/cbar above.
-        self.x_gate = None if gate_anchors is None else gate_anchors.detach()
-        if self.x_gate is not None:
-            self.H_gate_raw = target.observed_information(self.x_gate, t=0.0).detach()
-            self.P_gate = process_curvature(self.H_gate_raw, curvature_mode, curvature_floor, curvature_cap).detach()
+        # Gate bank: optional clean anchors paired with the perturbed anchors.
+        # Hybrid-CE-HLSI uses this bank only for the CE gate: it computes
+        # clean-reference OU weights and averages clean-reference curvature, while
+        # still applying that gate to the perturbed-reference score aggregate.
+        self.gate_x = self.x if gate_anchors is None else gate_anchors.detach().to(device=self.device, dtype=self.dtype)
+        if self.gate_x.shape != self.x.shape:
+            raise ValueError(f"gate_anchors must have shape {tuple(self.x.shape)}, got {tuple(self.gate_x.shape)}")
+        if gate_anchors is None:
+            self.H_gate_raw = self.H_raw
+            self.P_gate = self.P
         else:
-            self.H_gate_raw = None
-            self.P_gate = None
+            self.H_gate_raw = target.observed_information(self.gate_x, t=0.0).detach()
+            self.P_gate = process_curvature(self.H_gate_raw, curvature_mode, curvature_floor, curvature_cap).detach()
 
         self.resolvent_eps = resolvent_eps
         self.gate_clip = gate_clip
@@ -359,75 +447,80 @@ class SNISScoreBank:
         self.op_blend_pinv_rtol = op_blend_pinv_rtol
         self.op_blend_project_gate = op_blend_project_gate
 
-    def _weights_from_anchors(self, y: torch.Tensor, alpha: torch.Tensor, gamma: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+    def _weights_for_anchors(self, y: torch.Tensor, t: float, anchors: torch.Tensor):
+        t_tensor = torch.as_tensor(t, device=self.device, dtype=self.dtype)
+        alpha, gamma = alpha_gamma(t_tensor)
         diff = y[:, None, :] - alpha * anchors[None, :, :]
         logw = -0.5 * torch.sum(diff * diff, dim=-1) / gamma
         if self.weight_temp != 1.0:
             logw = logw / self.weight_temp
         logw = logw - torch.max(logw, dim=1, keepdim=True).values
         w = torch.exp(logw)
-        return w / torch.clamp(w.sum(dim=1, keepdim=True), min=1.0e-300)
+        w = w / torch.clamp(w.sum(dim=1, keepdim=True), min=1.0e-300)
+        return w, alpha, gamma
 
     def _weights_and_signals(self, y: torch.Tensor, t: float):
-        t_tensor = torch.as_tensor(t, device=self.device, dtype=self.dtype)
-        alpha, gamma = alpha_gamma(t_tensor)
-        w = self._weights_from_anchors(y, alpha, gamma, self.x)
+        w, alpha, gamma = self._weights_for_anchors(y, t, self.x)
         b = (alpha * self.x[None, :, :] - y[:, None, :]) / gamma
         c = self.score0[None, :, :] / alpha
         return w, b, c, alpha, gamma
 
     def estimate_chunk(self, y: torch.Tensor, t: float, method: str) -> torch.Tensor:
+        method_key = str(method).strip().replace("_", "-").lower()
         w, b, c, alpha, gamma = self._weights_and_signals(y, t)
         bbar = torch.sum(w[:, :, None] * b, dim=1)
         cbar = torch.sum(w[:, :, None] * c, dim=1)
 
-        if method == "Tweedie":
+        if method_key == "tweedie":
             return bbar
-        if method == "TSI":
+        if method_key == "tsi":
             return cbar
-        if method in ("Blend", "Blended"):
-            wb = w * w
-            db = b - bbar[:, None, :]
-            dc = c - cbar[:, None, :]
-            sig_b = torch.sum(wb * torch.sum(db * db, dim=-1), dim=1)
-            sig_c = torch.sum(wb * torch.sum(dc * dc, dim=-1), dim=1)
-            rho = torch.sum(wb * torch.sum(db * dc, dim=-1), dim=1)
-            denom = torch.clamp(sig_b + sig_c - 2.0 * rho, min=1.0e-30)
-            g_tsi = torch.clamp((sig_b - rho) / denom, min=0.0, max=1.0)
-            return bbar + g_tsi[:, None] * (cbar - bbar)
-        if method == "OP-Blend":
-            # Sandbox-style full operator blend: cbar + G(bbar-cbar), where
-            # G minimizes empirical conditional variance of TSI + G(Tweedie-TSI).
-            D = b - c
-            Dbar = bbar - cbar
+        if method_key in {"blend", "blended"}:
+            # Match gmm_hlsi_sandbox.py: coordinatewise variance-optimal blend
+            # between the per-anchor TSI signal c and Tweedie signal b.
             Ac = c - cbar[:, None, :]
-            Dc = D - Dbar[:, None, :]
-            C_AD = torch.einsum("bn,bni,bnj->bij", w, Ac, Dc)
-            C_DD = torch.einsum("bn,bni,bnj->bij", w, Dc, Dc)
-            C_DD = 0.5 * (C_DD + C_DD.transpose(-1, -2))
-            B, d = y.shape
-            I = torch.eye(d, device=y.device, dtype=y.dtype).expand(B, d, d)
+            Bc = b - bbar[:, None, :]
+            va = torch.sum(w[:, :, None] * Ac.square(), dim=1).clamp(min=1.0e-30)
+            vb = torch.sum(w[:, :, None] * Bc.square(), dim=1).clamp(min=1.0e-30)
+            cab = torch.sum(w[:, :, None] * Ac * Bc, dim=1)
+            den = (va + vb - 2.0 * cab).clamp(min=1.0e-20)
+            g = ((va - cab) / den).clamp(0.0, 1.0)
+            return cbar + g * (bbar - cbar)
+        if method_key == "op-blend":
+            # Full matrix empirical variance-optimal gate, exactly mirroring
+            # op_blend_gate / est_op_blended in gmm_hlsi_sandbox.py.
+            tsi = c
+            twd = b
+            am = cbar
+            bm = bbar
+            D = twd - tsi
+            Dm = bm - am
+            Ac = tsi - am[:, None, :]
+            Dc = D - Dm[:, None, :]
+            C_AD = torch.einsum("bm,bmi,bmj->bij", w, Ac, Dc)
+            C_DD = torch.einsum("bm,bmi,bmj->bij", w, Dc, Dc)
+            C_DD = sym(C_DD)
+            Bsz, d = y.shape
+            I = batch_eye(Bsz, d, device=y.device, dtype=y.dtype)
             scale = C_DD.diagonal(dim1=-2, dim2=-1).mean(-1).clamp(min=1.0)
-            C_DD_solve = C_DD + (self.op_blend_reg * scale).view(B, 1, 1) * I
+            C_DD_solve = C_DD + (self.op_blend_reg * scale).view(Bsz, 1, 1) * I
             G = -torch.matmul(C_AD, torch.linalg.pinv(C_DD_solve, rtol=self.op_blend_pinv_rtol))
             if self.op_blend_project_gate:
-                eig, U = torch.linalg.eigh(0.5 * (G + G.transpose(-1, -2)))
-                eig = eig.clamp(min=0.0, max=1.0)
-                G = U @ torch.diag_embed(eig) @ U.transpose(-1, -2)
-            return cbar + torch.einsum("bij,bj->bi", G, Dbar)
-        if method == "HLSI":
+                G = project_symmetric_gate(G, 0.0, 1.0)
+            return am + bmv(G, bm - am)
+        if method_key == "hlsi":
             G_i = resolvent_gate(self.P, alpha, gamma, self.resolvent_eps, self.gate_clip)
             corr = torch.einsum("nij,bnj->bni", G_i, (c - b))
             h_i = b + corr
             return torch.sum(w[:, :, None] * h_i, dim=1)
-        if method == "CE-HLSI":
+        if method_key == "ce-hlsi":
             Pbar = torch.sum(w[:, :, None, None] * self.P[None, :, :, :], dim=1)
             Gbar = resolvent_gate(Pbar, alpha, gamma, self.resolvent_eps, self.gate_clip)
             return bbar + torch.einsum("bij,bj->bi", Gbar, (cbar - bbar))
-        if method == "Hybrid-CE-HLSI":
-            if self.x_gate is None or self.P_gate is None:
-                raise ValueError("Hybrid-CE-HLSI requires gate_anchors=clean_refs when constructing SNISScoreBank.")
-            w_gate = self._weights_from_anchors(y, alpha, gamma, self.x_gate)
+        if method_key in {"hybrid-ce-hlsi", "ce-hlsi-hybrid", "hybrid-ce"}:
+            # Score aggregate uses perturbed-reference signals (bbar, cbar).
+            # The CE gate itself is computed from the paired clean gate bank.
+            w_gate, _, _ = self._weights_for_anchors(y, t, self.gate_x)
             Pbar_gate = torch.sum(w_gate[:, :, None, None] * self.P_gate[None, :, :, :], dim=1)
             Gbar_gate = resolvent_gate(Pbar_gate, alpha, gamma, self.resolvent_eps, self.gate_clip)
             return bbar + torch.einsum("bij,bj->bi", Gbar_gate, (cbar - bbar))
@@ -455,48 +548,84 @@ class SNISScoreBank:
 
 
 @torch.no_grad()
-def pc_reverse_sampler(target: GMM2D, score_fn: Callable[[torch.Tensor, float], torch.Tensor], cfg: ExperimentConfig, generator: torch.Generator) -> torch.Tensor:
+def reverse_ou_heun_sde(
+    target: GMM2D,
+    score_fn: Callable[[torch.Tensor, float], torch.Tensor],
+    cfg: ExperimentConfig,
+    generator: torch.Generator,
+) -> Tuple[torch.Tensor, Dict[str, float | str | bool]]:
+    """Reverse OU Heun SDE sampler matched to gmm_hlsi_sandbox.py.
+
+    Forward OU is dx=-x dt+sqrt(2)dW.  In decreasing diffusion time,
+    reverse drift is y + 2 score_t(y).  We use the same predictor/corrector
+    noise as the sandbox Heun implementation and finish with a Tweedie
+    denoising map at t_min.
+    """
     device = target.device
     dtype = target.dtype
-    if cfg.init_mode == "exact_pt":
-        x = target.sample_pt(cfg.n_samples, cfg.t_start, generator=generator)
-    elif cfg.init_mode == "normal":
-        x = torch.randn((cfg.n_samples, 2), device=device, dtype=dtype, generator=generator)
+    d = target.d
+
+    if cfg.init_mode == "normal":
+        y = torch.randn((cfg.n_samples, d), device=device, dtype=dtype, generator=generator)
+    elif cfg.init_mode == "exact_pt":
+        y = target.sample_pt(cfg.n_samples, cfg.t_start, generator=generator)
     else:
-        raise ValueError("init_mode must be exact_pt or normal")
+        raise ValueError("init_mode must be normal or exact_pt")
 
-    times = torch.linspace(cfg.t_start, cfg.t_end, cfg.n_steps + 1, device=device, dtype=dtype)
-    for k in range(cfg.n_steps):
-        t_cur = float(times[k].item())
-        h = float((times[k] - times[k + 1]).item())
+    ts = torch.linspace(cfg.t_start, cfg.t_end, cfg.n_steps + 1, device=device, dtype=dtype)
+    max_abs_score = 0.0
+    fail = False
+    fail_reason = ""
 
-        # Corrector steps: ULA targeting p_t.
-        for _ in range(cfg.n_corrector):
-            score = clamp_norm(score_fn(x, t_cur), cfg.score_clip)
-            noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
-            grad_norm = torch.mean(torch.linalg.norm(score, dim=1))
-            noise_norm = torch.mean(torch.linalg.norm(noise, dim=1))
-            step = 2.0 * (cfg.corrector_snr * noise_norm / (grad_norm + 1.0e-12)) ** 2
-            step = torch.clamp(step, min=1.0e-7, max=cfg.corrector_step_max)
-            x = x + step * score + torch.sqrt(2.0 * step) * noise
+    for i in range(cfg.n_steps):
+        tc = ts[i]
+        tn = ts[i + 1]
+        h = tc - tn
+
+        s1 = clamp_norm(score_fn(y, float(tc.item())), cfg.score_clip)
+        max_abs_score = max(max_abs_score, safe_float(s1.abs().max()))
+        if not torch.isfinite(s1).all():
+            fail, fail_reason = True, "nonfinite score at predictor"
+            break
+
+        drift1 = y + 2.0 * s1
+        noise = torch.sqrt(2.0 * h) * torch.randn(y.shape, device=device, dtype=dtype, generator=generator)
+        yh = y + h * drift1 + noise
+
+        s2 = clamp_norm(score_fn(yh, float(tn.item())), cfg.score_clip)
+        max_abs_score = max(max_abs_score, safe_float(s2.abs().max()))
+        if not torch.isfinite(s2).all():
+            fail, fail_reason = True, "nonfinite score at corrector"
+            break
+
+        drift2 = yh + 2.0 * s2
+        y = y + 0.5 * h * (drift1 + drift2) + noise
+
+        if cfg.sample_clip and cfg.sample_clip > 0:
+            y = torch.clamp(y, min=-cfg.sample_clip, max=cfg.sample_clip)
+        if not torch.isfinite(y).all():
+            fail, fail_reason = True, "nonfinite state"
+            break
+
+    if not fail and cfg.final_denoise:
+        tf = torch.tensor(cfg.t_end, device=device, dtype=dtype)
+        sf = clamp_norm(score_fn(y, cfg.t_end), cfg.score_clip)
+        max_abs_score = max(max_abs_score, safe_float(sf.abs().max()))
+        if not torch.isfinite(sf).all():
+            fail, fail_reason = True, "nonfinite final score"
+        else:
+            y = (y + (1.0 - torch.exp(-2.0 * tf)) * sf) / torch.exp(-tf)
             if cfg.sample_clip and cfg.sample_clip > 0:
-                x = torch.clamp(x, min=-cfg.sample_clip, max=cfg.sample_clip)
+                y = torch.clamp(y, min=-cfg.sample_clip, max=cfg.sample_clip)
 
-        # Predictor for reverse OU SDE.
-        score = clamp_norm(score_fn(x, t_cur), cfg.score_clip)
-        noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
-        x = x + h * (x + 2.0 * score) + math.sqrt(2.0 * h) * noise
-        if cfg.sample_clip and cfg.sample_clip > 0:
-            x = torch.clamp(x, min=-cfg.sample_clip, max=cfg.sample_clip)
+    info = {"failed": bool(fail), "fail_reason": fail_reason, "max_abs_score": float(max_abs_score)}
+    return y.detach(), info
 
-    if cfg.final_denoise:
-        alpha, gamma = alpha_gamma(torch.tensor(cfg.t_end, device=device, dtype=dtype))
-        score = clamp_norm(score_fn(x, cfg.t_end), cfg.score_clip)
-        x = (x + gamma * score) / alpha
-        if cfg.sample_clip and cfg.sample_clip > 0:
-            x = torch.clamp(x, min=-cfg.sample_clip, max=cfg.sample_clip)
 
-    return x.detach()
+# Backward-compatible name; now uses the sandbox-matched Heun sampler.
+def pc_reverse_sampler(target: GMM2D, score_fn: Callable[[torch.Tensor, float], torch.Tensor], cfg: ExperimentConfig, generator: torch.Generator) -> torch.Tensor:
+    y, _ = reverse_ou_heun_sde(target, score_fn, cfg, generator)
+    return y
 
 
 # -----------------------------------------------------------------------------
@@ -506,37 +635,42 @@ def pc_reverse_sampler(target: GMM2D, score_fn: Callable[[torch.Tensor, float], 
 
 @torch.no_grad()
 def nll_metric(target: GMM2D, x: torch.Tensor) -> float:
-    return float((-target.log_prob(x, t=0.0)).mean().item())
+    return safe_float((-target.log_prob(x, t=0.0)).mean())
 
 
 @torch.no_grad()
 def mmd_rbf(x: torch.Tensor, y: torch.Tensor, bandwidth: Optional[float] = None) -> float:
-    """Biased multiscale RBF MMD diagnostic.
+    """Sandbox-matched biased multiscale RBF MMD^2 diagnostic.
 
-    The earlier unbiased single-band estimator can become negative at finite n and
-    then clamp to zero, which is visually misleading in robustness sweeps.  This
-    biased multiscale version is more stable for comparing sampler degradation.
+    This intentionally matches gmm_hlsi_sandbox.py more closely than the older
+    square-root MMD used by early versions of this robustness script.
     """
     if bandwidth is None:
         bandwidth = median_bandwidth(x, y)
-    base = float(bandwidth)
-    scales = [0.25, 0.5, 1.0, 2.0, 4.0]
+    base_h2 = float(bandwidth) ** 2
+    scales = torch.tensor([0.25, 0.5, 1.0, 2.0, 4.0], device=x.device, dtype=x.dtype)
     dxx = pairwise_sq_dists(x, x)
     dyy = pairwise_sq_dists(y, y)
     dxy = pairwise_sq_dists(x, y)
-    mmd2 = torch.zeros((), device=x.device, dtype=x.dtype)
+    vals = []
     for scale in scales:
-        h2 = (base * scale) ** 2
+        h2 = torch.clamp(base_h2 * scale, min=torch.as_tensor(1.0e-12, device=x.device, dtype=x.dtype))
         Kxx = torch.exp(-dxx / (2.0 * h2))
         Kyy = torch.exp(-dyy / (2.0 * h2))
         Kxy = torch.exp(-dxy / (2.0 * h2))
-        mmd2 = mmd2 + Kxx.mean() + Kyy.mean() - 2.0 * Kxy.mean()
-    mmd2 = mmd2 / len(scales)
-    return float(torch.sqrt(torch.clamp(mmd2, min=0.0)).item())
+        vals.append(Kxx.mean() + Kyy.mean() - 2.0 * Kxy.mean())
+    return safe_float(torch.stack(vals).mean().clamp(min=0.0))
 
 
 @torch.no_grad()
-def sliced_w2(x: torch.Tensor, y: torch.Tensor, n_proj: int = 256, generator: Optional[torch.Generator] = None, dirs: Optional[torch.Tensor] = None) -> float:
+def sliced_w2(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    n_proj: int = 256,
+    generator: Optional[torch.Generator] = None,
+    dirs: Optional[torch.Tensor] = None,
+) -> float:
+    """Sandbox-matched sliced Wasserstein-2: mean squared 1D W2, not sqrt."""
     d = x.shape[1]
     if dirs is None:
         dirs = torch.randn((n_proj, d), device=x.device, dtype=x.dtype, generator=generator)
@@ -546,35 +680,53 @@ def sliced_w2(x: torch.Tensor, y: torch.Tensor, n_proj: int = 256, generator: Op
     px = x @ dirs.T
     py = y @ dirs.T
     n = min(px.shape[0], py.shape[0])
-    # Deterministic truncation. The truth pool itself is randomly drawn once upstream
-    # and then held fixed across the entire perturbation sweep.
     px = px[:n]
     py = py[:n]
     sx = torch.sort(px, dim=0).values
     sy = torch.sort(py, dim=0).values
-    return float(torch.sqrt(torch.clamp(torch.mean((sx - sy) ** 2), min=0.0)).item())
+    return safe_float(((sx - sy) ** 2).mean())
 
 
 @torch.no_grad()
 def ksd_rbf(target: GMM2D, x: torch.Tensor, bandwidth: Optional[float] = None) -> float:
+    """Sandbox-matched biased RBF KSD with diagonal included."""
     n, d = x.shape
     if bandwidth is None:
         bandwidth = median_bandwidth(x)
-    h2 = bandwidth * bandwidth
-    h4 = h2 * h2
+    h2 = float(bandwidth) ** 2
     s = target.score(x, t=0.0)
-    dxy = x[:, None, :] - x[None, :, :]
-    r2 = torch.sum(dxy * dxy, dim=-1)
-    K = torch.exp(-r2 / (2.0 * h2))
+    diffs = x[:, None, :] - x[None, :, :]
+    d2 = torch.sum(diffs * diffs, dim=-1)
+    K = torch.exp(-d2 / (2.0 * h2))
     ss = s @ s.T
-    sd = torch.einsum("id,ijd->ij", s, dxy)
-    ds = torch.einsum("jd,ijd->ij", s, dxy)
-    stein = K * (ss + (sd - ds) / h2 + d / h2 - r2 / h4)
-    if n > 1:
-        val = (stein.sum() - stein.diag().sum()) / (n * (n - 1))
-    else:
-        val = stein.mean()
-    return float(torch.sqrt(torch.clamp(val, min=0.0)).item())
+    sx_grad_y = torch.einsum("id,ijd->ij", s, diffs) / h2 * K
+    sy_grad_x = -torch.einsum("jd,ijd->ij", s, diffs) / h2 * K
+    trace = (d / h2 - d2 / (h2 * h2)) * K
+    kstein = ss * K + sx_grad_y + sy_grad_x + trace
+    return safe_float(kstein.mean().clamp(min=0.0).sqrt())
+
+
+def hist_kl_2d(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    *,
+    bins: int = 150,
+    smoothing: float = 1.0e-12,
+) -> Tuple[float, float]:
+    """Sandbox-matched approximate KL(P_X||P_Y), KL(P_Y||P_X)."""
+    Xn = as_numpy(X[:, :2])
+    Yn = as_numpy(Y[:, :2])
+    lo = np.minimum(np.percentile(Xn, 0.5, axis=0), np.percentile(Yn, 0.5, axis=0))
+    hi = np.maximum(np.percentile(Xn, 99.5, axis=0), np.percentile(Yn, 99.5, axis=0))
+    pad = 0.05 * (hi - lo + 1.0e-8)
+    rng = [[lo[0] - pad[0], hi[0] + pad[0]], [lo[1] - pad[1], hi[1] + pad[1]]]
+    Hx, _, _ = np.histogram2d(Xn[:, 0], Xn[:, 1], bins=bins, range=rng, density=False)
+    Hy, _, _ = np.histogram2d(Yn[:, 0], Yn[:, 1], bins=bins, range=rng, density=False)
+    px = Hx.astype(np.float64) + smoothing
+    py = Hy.astype(np.float64) + smoothing
+    px = px / px.sum()
+    py = py / py.sum()
+    return float(np.sum(px * (np.log(px) - np.log(py)))), float(np.sum(py * (np.log(py) - np.log(px))))
 
 
 @dataclass
@@ -583,12 +735,13 @@ class MetricContext:
 
     This prevents accidental comparisons against perturbed references and removes
     metric noise from changing target pools, changing SW2 projections, or changing
-    Fisher probe samples across methods.
+    Fisher probe samples across methods. Expensive metric-specific state is only
+    built when that metric is requested through --metrics.
     """
     truth_eval: torch.Tensor
-    sw2_dirs: torch.Tensor
-    ksd_bandwidth: float
-    mmd_bandwidth: float
+    sw2_dirs: Optional[torch.Tensor]
+    ksd_bandwidth: Optional[float]
+    mmd_bandwidth: Optional[float]
     fisher_times: torch.Tensor
     fisher_y: List[torch.Tensor]
     fisher_score: List[torch.Tensor]
@@ -600,20 +753,29 @@ def build_metric_context(target: GMM2D, truth_pool: torch.Tensor, cfg: Experimen
     # Fixed unperturbed target pool, held constant across every perturbation sigma.
     truth_eval = truth_pool[:n_eval].detach()
 
-    dirs = torch.randn((cfg.sw2_projections, truth_eval.shape[1]), device=truth_eval.device, dtype=truth_eval.dtype, generator=generator)
-    dirs = dirs / torch.clamp(torch.linalg.norm(dirs, dim=1, keepdim=True), min=1.0e-12)
+    dirs: Optional[torch.Tensor] = None
+    if metric_enabled(cfg, "sw2"):
+        dirs = torch.randn((cfg.sw2_projections, truth_eval.shape[1]), device=truth_eval.device, dtype=truth_eval.dtype, generator=generator)
+        dirs = dirs / torch.clamp(torch.linalg.norm(dirs, dim=1, keepdim=True), min=1.0e-12)
 
-    ksd_bw = float(cfg.ksd_bandwidth) if cfg.ksd_bandwidth is not None else median_bandwidth(truth_eval)
-    mmd_bw = float(cfg.mmd_bandwidth) if cfg.mmd_bandwidth is not None else median_bandwidth(truth_eval)
+    ksd_bw: Optional[float] = None
+    if metric_enabled(cfg, "ksd"):
+        ksd_bw = float(cfg.ksd_bandwidth) if cfg.ksd_bandwidth is not None else median_bandwidth(truth_eval)
 
-    fisher_times = make_fisher_time_grid(cfg, target.device, target.dtype)
+    mmd_bw: Optional[float] = None
+    if metric_enabled(cfg, "mmd"):
+        mmd_bw = float(cfg.mmd_bandwidth) if cfg.mmd_bandwidth is not None else median_bandwidth(truth_eval)
+
+    fisher_times = torch.empty((0,), device=target.device, dtype=target.dtype)
     fisher_y: List[torch.Tensor] = []
     fisher_score: List[torch.Tensor] = []
-    for t_tensor in fisher_times:
-        t = float(t_tensor.item())
-        y = target.sample_pt(cfg.fisher_n_per_t, t, generator=generator).detach()
-        fisher_y.append(y)
-        fisher_score.append(target.score(y, t=t).detach())
+    if metric_enabled(cfg, "fisher_rmse"):
+        fisher_times = make_fisher_time_grid(cfg, target.device, target.dtype)
+        for t_tensor in fisher_times:
+            t = float(t_tensor.item())
+            y = target.sample_pt(cfg.fisher_n_per_t, t, generator=generator).detach()
+            fisher_y.append(y)
+            fisher_score.append(target.score(y, t=t).detach())
 
     return MetricContext(
         truth_eval=truth_eval,
@@ -631,13 +793,31 @@ def compute_all_metrics(target: GMM2D, samples: torch.Tensor, metric_ctx: Metric
     n = min(cfg.metrics_max_n, samples.shape[0], metric_ctx.truth_eval.shape[0])
     x = samples[:n]
     y = metric_ctx.truth_eval[:n]
-    return {
-        "nll": nll_metric(target, x),
-        "ksd": ksd_rbf(target, x, bandwidth=metric_ctx.ksd_bandwidth),
-        "mmd": mmd_rbf(x, y, bandwidth=metric_ctx.mmd_bandwidth),
-        "sw2": sliced_w2(x, y, n_proj=cfg.sw2_projections, dirs=metric_ctx.sw2_dirs),
-        "metric_target_n": float(n),
-    }
+    out: Dict[str, float] = {"metric_target_n": float(n)}
+
+    if not torch.isfinite(x).all():
+        for metric in SAMPLE_METRICS:
+            if metric_enabled(cfg, metric):
+                out[metric] = float("nan")
+        return out
+
+    if metric_enabled(cfg, "nll"):
+        out["nll"] = nll_metric(target, x)
+    if metric_enabled(cfg, "ksd"):
+        out["ksd"] = ksd_rbf(target, x, bandwidth=metric_ctx.ksd_bandwidth)
+    if metric_enabled(cfg, "mmd"):
+        out["mmd"] = mmd_rbf(x, y, bandwidth=metric_ctx.mmd_bandwidth)
+    if metric_enabled(cfg, "sw2"):
+        if metric_ctx.sw2_dirs is None:
+            raise RuntimeError("SW2 was requested but fixed projection directions were not initialized.")
+        out["sw2"] = sliced_w2(x, y, n_proj=cfg.sw2_projections, dirs=metric_ctx.sw2_dirs)
+    if metric_enabled(cfg, "kl") or metric_enabled(cfg, "kl_rev"):
+        kl_gt_model, kl_model_gt = hist_kl_2d(y, x, bins=cfg.hist_bins)
+        if metric_enabled(cfg, "kl"):
+            out["kl"] = kl_gt_model
+        if metric_enabled(cfg, "kl_rev"):
+            out["kl_rev"] = kl_model_gt
+    return out
 
 
 @torch.no_grad()
@@ -657,8 +837,10 @@ def make_fisher_time_grid(cfg: ExperimentConfig, device: torch.device, dtype: to
 
 @torch.no_grad()
 def integrated_score_fisher_metric(score_fn: Callable[[torch.Tensor, float], torch.Tensor], metric_ctx: MetricContext, cfg: ExperimentConfig) -> Dict[str, float]:
-    if cfg.fisher_n_t <= 0 or cfg.fisher_n_per_t <= 0:
-        return {"fisher_mse": float("nan"), "fisher_rmse": float("nan")}
+    if not metric_enabled(cfg, "fisher_rmse"):
+        return {}
+    if cfg.fisher_n_t <= 0 or cfg.fisher_n_per_t <= 0 or len(metric_ctx.fisher_y) == 0:
+        return {"fisher_rmse": float("nan")}
     mse_vals = []
     for t_tensor, y, s_true in zip(metric_ctx.fisher_times, metric_ctx.fisher_y, metric_ctx.fisher_score):
         t = float(t_tensor.item())
@@ -666,7 +848,8 @@ def integrated_score_fisher_metric(score_fn: Callable[[torch.Tensor, float], tor
         err2 = torch.sum((s_hat - s_true) ** 2, dim=1)
         mse_vals.append(torch.mean(err2))
     mse = float(torch.mean(torch.stack(mse_vals)).item())
-    return {"fisher_mse": mse, "fisher_rmse": float(math.sqrt(max(mse, 0.0)))}
+    rmse = float(math.sqrt(max(mse, 0.0)))
+    return {"fisher_rmse": rmse}
 
 
 # -----------------------------------------------------------------------------
@@ -685,14 +868,78 @@ def density_grid(target: GMM2D, lim: float, n: int) -> Tuple[np.ndarray, np.ndar
     return as_numpy(X), as_numpy(Y), as_numpy(p)
 
 
-def _draw_hist_panel(ax, arr: np.ndarray, Xg: np.ndarray, Yg: np.ndarray, Pg: np.ndarray, cfg: ExperimentConfig) -> None:
-    ax.contour(Xg, Yg, Pg, levels=8, linewidths=0.6, alpha=0.55)
-    ax.hist2d(
+def get_hist_cmap(name: str):
+    if name == "bright_lava":
+        # Brighter low-count response than standard inferno/magma.  Combined with
+        # PowerNorm below, singleton / low-count pixels remain visible while the
+        # shared count-to-brightness normalization is preserved across panels.
+        return LinearSegmentedColormap.from_list(
+            "bright_lava",
+            ["#000000", "#3b0000", "#9a0000", "#ff1f00", "#ff9500", "#ffe066", "#ffffff"],
+        )
+    return plt.get_cmap(name)
+
+
+def hist_count_image(arr: np.ndarray, cfg: ExperimentConfig) -> np.ndarray:
+    H, _, _ = np.histogram2d(
         arr[:, 0],
         arr[:, 1],
         bins=cfg.hist_bins,
         range=[[-cfg.grid_lim, cfg.grid_lim], [-cfg.grid_lim, cfg.grid_lim]],
-        density=True,
+        density=False,
+    )
+    return H
+
+
+def hist_global_vmax(arrays: List[np.ndarray], cfg: ExperimentConfig) -> float:
+    counts: List[np.ndarray] = []
+    for arr in arrays:
+        if arr is None or len(arr) == 0:
+            continue
+        H = hist_count_image(arr, cfg).reshape(-1)
+        H = H[H > 0]
+        if H.size:
+            counts.append(H.astype(np.float64))
+    if not counts:
+        return 1.0
+    vals = np.concatenate(counts)
+    q = float(np.clip(cfg.hist_vmax_quantile, 0.50, 1.0))
+    # Use a high quantile rather than a single global max so one hot bin does not
+    # make all ordinary mass nearly invisible.  This is still a shared, fixed
+    # count-to-brightness map for every panel in the figure.
+    return max(float(np.quantile(vals, q)), 1.0)
+
+
+def _draw_hist_panel(
+    ax,
+    arr: np.ndarray,
+    Xg: np.ndarray,
+    Yg: np.ndarray,
+    Pg: np.ndarray,
+    cfg: ExperimentConfig,
+    hist_vmax: Optional[float] = None,
+) -> None:
+    H = hist_count_image(arr, cfg)
+    cmap = get_hist_cmap(cfg.hist_cmap)
+    vmax = max(float(hist_vmax if hist_vmax is not None else H.max()), 1.0)
+    ax.imshow(
+        H.T,
+        origin="lower",
+        extent=[-cfg.grid_lim, cfg.grid_lim, -cfg.grid_lim, cfg.grid_lim],
+        aspect="equal",
+        interpolation="nearest",
+        cmap=cmap,
+        norm=PowerNorm(gamma=float(cfg.hist_gamma), vmin=0.0, vmax=vmax),
+        alpha=1.0,
+    )
+    ax.contour(
+        Xg,
+        Yg,
+        Pg,
+        levels=8,
+        linewidths=float(cfg.hist_contour_lw),
+        alpha=float(cfg.hist_contour_alpha),
+        colors="white",
     )
     ax.set_xlim(-cfg.grid_lim, cfg.grid_lim)
     ax.set_ylim(-cfg.grid_lim, cfg.grid_lim)
@@ -700,18 +947,26 @@ def _draw_hist_panel(ax, arr: np.ndarray, Xg: np.ndarray, Yg: np.ndarray, Pg: np
 
 
 
+
+def cfg_n_trials_from_df(df: pd.DataFrame) -> int:
+    if "n_trials_observed" not in df.columns or df.empty:
+        return 1
+    vals = pd.to_numeric(df["n_trials_observed"], errors="coerce")
+    if vals.notna().sum() == 0:
+        return 1
+    return int(max(1, vals.max()))
+
+
 def plot_metric_array(metrics_df: pd.DataFrame, metric_names: List[str], outpath: str) -> None:
     metric_names = [m for m in metric_names if m in metrics_df.columns]
     if not metric_names:
         return
-    corruption_label = "REFERENCE"
-    if "corruption_mode" in metrics_df.columns and not metrics_df["corruption_mode"].dropna().empty:
-        corruption_label = str(metrics_df["corruption_mode"].dropna().iloc[0]).upper()
     ncols = min(3, len(metric_names))
     nrows = int(math.ceil(len(metric_names) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.1 * nrows), constrained_layout=True)
     axes = np.array(axes).reshape(-1)
     methods = list(metrics_df["method"].unique())
+    show_err = cfg_n_trials_from_df(metrics_df) > 1
     for ax, metric in zip(axes, metric_names):
         for method in methods:
             sub = metrics_df[metrics_df["method"] == method].sort_values("perturb_sigma")
@@ -720,8 +975,13 @@ def plot_metric_array(metrics_df: pd.DataFrame, metric_names: List[str], outpath
             y = pd.to_numeric(sub[metric], errors="coerce")
             if y.notna().sum() == 0:
                 continue
-            ax.plot(sub["perturb_sigma"], y, marker="o", linewidth=1.8, label=method)
-        ax.set_xlabel(f"{corruption_label} reference perturbation sigma")
+            yerr_col = f"{metric}_sem"
+            if show_err and yerr_col in sub.columns:
+                yerr = pd.to_numeric(sub[yerr_col], errors="coerce")
+                ax.errorbar(sub["perturb_sigma"], y, yerr=yerr, marker="o", linewidth=1.8, capsize=2, label=method)
+            else:
+                ax.plot(sub["perturb_sigma"], y, marker="o", linewidth=1.8, label=method)
+        ax.set_xlabel("reference perturbation sigma")
         label = "time-integrated score RMSE" if metric == "fisher_rmse" else metric.upper()
         ax.set_ylabel(label)
         ax.set_title(label + " vs reference perturbation")
@@ -733,31 +993,39 @@ def plot_metric_array(metrics_df: pd.DataFrame, metric_names: List[str], outpath
     plt.close(fig)
 
 
-
 def plot_contrast_sweeps(metrics_df: pd.DataFrame, outpath: str) -> None:
-    metric_names = ["ksd", "nll", "mmd", "sw2"]
-    corruption_label = "REFERENCE"
-    if "corruption_mode" in metrics_df.columns and not metrics_df["corruption_mode"].dropna().empty:
-        corruption_label = str(metrics_df["corruption_mode"].dropna().iloc[0]).upper()
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    metric_names = [m for m in SAMPLE_METRICS if f"delta_vs_ref_{m}" in metrics_df.columns]
+    if not metric_names:
+        return
+    ncols = min(3, len(metric_names))
+    nrows = int(math.ceil(len(metric_names) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.1 * nrows), constrained_layout=True)
     axes = np.array(axes).reshape(-1)
     sample_df = metrics_df[metrics_df["method"] != "PERTURBED_REF"].copy()
+    show_err = cfg_n_trials_from_df(metrics_df) > 1
     for ax, metric in zip(axes, metric_names):
         col = f"delta_vs_ref_{metric}"
-        if col not in sample_df.columns:
-            continue
         ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
         for method in sample_df["method"].unique():
             sub = sample_df[sample_df["method"] == method].sort_values("perturb_sigma")
-            ax.plot(sub["perturb_sigma"], sub[col], marker="o", linewidth=1.8, label=method)
-        ax.set_xlabel(f"{corruption_label} reference perturbation sigma")
+            y = pd.to_numeric(sub[col], errors="coerce")
+            if y.notna().sum() == 0:
+                continue
+            yerr_col = f"{col}_sem"
+            if show_err and yerr_col in sub.columns:
+                yerr = pd.to_numeric(sub[yerr_col], errors="coerce")
+                ax.errorbar(sub["perturb_sigma"], y, yerr=yerr, marker="o", linewidth=1.8, capsize=2, label=method)
+            else:
+                ax.plot(sub["perturb_sigma"], y, marker="o", linewidth=1.8, label=method)
+        ax.set_xlabel("reference perturbation sigma")
         ax.set_ylabel(f"{metric.upper()} - reference {metric.upper()}")
         ax.set_title("contrastive improvement (<0 is better)")
         ax.grid(True, alpha=0.25)
+    for ax in axes[len(metric_names):]:
+        ax.axis("off")
     axes[0].legend(fontsize=8, ncol=2)
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
-
 
 
 def plot_samples_for_sigma(target: GMM2D, ref: torch.Tensor, sample_by_method: Dict[str, torch.Tensor], sigma: float, cfg: ExperimentConfig, outpath: str) -> None:
@@ -765,24 +1033,43 @@ def plot_samples_for_sigma(target: GMM2D, ref: torch.Tensor, sample_by_method: D
     panels: List[Tuple[str, Optional[torch.Tensor], str]] = [("target density", None, "density"), ("perturbed refs", ref, "hist")]
     for method, samples in sample_by_method.items():
         panels.append((method, samples, "hist"))
+    hist_arrays = [as_numpy(pts) for _, pts, kind in panels if kind == "hist" and pts is not None]
+    hist_vmax = hist_global_vmax(hist_arrays, cfg)
+
     ncols = 4
     nrows = int(math.ceil(len(panels) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.0 * nrows), constrained_layout=True)
     axes = np.array(axes).reshape(-1)
+    cmap = get_hist_cmap(cfg.hist_cmap)
     for ax, (title, pts, kind) in zip(axes, panels):
-        ax.contour(Xg, Yg, Pg, levels=8, linewidths=0.7, alpha=0.65)
         if kind == "density":
-            ax.imshow(Pg, origin="lower", extent=[-cfg.grid_lim, cfg.grid_lim, -cfg.grid_lim, cfg.grid_lim], aspect="equal", alpha=0.85)
+            ax.imshow(
+                Pg,
+                origin="lower",
+                extent=[-cfg.grid_lim, cfg.grid_lim, -cfg.grid_lim, cfg.grid_lim],
+                aspect="equal",
+                cmap=cmap,
+                alpha=0.90,
+            )
+            ax.contour(
+                Xg,
+                Yg,
+                Pg,
+                levels=8,
+                linewidths=float(cfg.hist_contour_lw),
+                alpha=float(cfg.hist_contour_alpha),
+                colors="white",
+            )
         else:
             arr = as_numpy(pts)
-            _draw_hist_panel(ax, arr, Xg, Yg, Pg, cfg)
+            _draw_hist_panel(ax, arr, Xg, Yg, Pg, cfg, hist_vmax=hist_vmax)
         ax.set_xlim(-cfg.grid_lim, cfg.grid_lim)
         ax.set_ylim(-cfg.grid_lim, cfg.grid_lim)
         ax.set_aspect("equal")
         ax.set_title(title)
     for ax in axes[len(panels):]:
         ax.axis("off")
-    fig.suptitle(f"{cfg.corruption_mode.upper()} reference perturbation sigma = {sigma:g}", fontsize=14)
+    fig.suptitle(f"Reference perturbation sigma = {sigma:g} | shared histogram vmax count = {hist_vmax:.0f}", fontsize=14)
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
 
@@ -801,6 +1088,13 @@ def plot_histogram_array_over_sigmas(
     row_names = ["PERTURBED_REF"] + method_order
     Xg, Yg, Pg = density_grid(target, cfg.grid_lim, cfg.grid_n)
 
+    hist_arrays: List[np.ndarray] = []
+    for sigma in sigmas:
+        hist_arrays.append(as_numpy(refs_by_sigma[sigma]))
+        for row_name in method_order:
+            hist_arrays.append(as_numpy(samples_by_sigma[sigma][row_name]))
+    hist_vmax = hist_global_vmax(hist_arrays, cfg)
+
     nrows = len(row_names)
     ncols = len(sigmas)
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.2 * nrows), constrained_layout=True)
@@ -813,92 +1107,167 @@ def plot_histogram_array_over_sigmas(
                 arr = as_numpy(refs_by_sigma[sigma])
             else:
                 arr = as_numpy(samples_by_sigma[sigma][row_name])
-            _draw_hist_panel(ax, arr, Xg, Yg, Pg, cfg)
+            _draw_hist_panel(ax, arr, Xg, Yg, Pg, cfg, hist_vmax=hist_vmax)
             if i == 0:
                 ax.set_title(f"sigma={sigma:g}")
             if j == 0:
                 ax.set_ylabel(row_name)
-    fig.suptitle(f"Histogram array over {cfg.corruption_mode.upper()} reference perturbation levels", fontsize=14)
+    fig.suptitle(f"Histogram array over reference perturbation levels | shared histogram vmax count = {hist_vmax:.0f}", fontsize=14)
     fig.savefig(outpath, dpi=200)
     plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
-# Corruption and bootstrap helpers
+# Main experiment
 # -----------------------------------------------------------------------------
 
 
-def canonicalize_method_name(method: str) -> str:
-    """Normalize a sampler-token spelling without changing displayed labels."""
+def aggregate_trials(df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+    """Average numeric trial-level diagnostics over repeated random trials."""
+    if df.empty:
+        return df.copy()
+    numeric_cols = [
+        c for c in df.columns
+        if c not in set(group_cols + ["trial", "trial_seed"])
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    grouped = df.groupby(group_cols, dropna=False)
+    mean_df = grouped[numeric_cols].mean().reset_index() if numeric_cols else grouped.size().reset_index(name="n_rows")
+    if numeric_cols:
+        std_df = grouped[numeric_cols].std(ddof=1).add_suffix("_std").reset_index()
+        sem_df = grouped[numeric_cols].sem(ddof=1).add_suffix("_sem").reset_index()
+        mean_df = mean_df.merge(std_df, on=group_cols, how="left").merge(sem_df, on=group_cols, how="left")
+    mean_df["n_trials_observed"] = grouped.size().to_numpy()
+    return mean_df
+
+
+def add_reference_contrasts(metrics_df: pd.DataFrame, cfg: ExperimentConfig) -> pd.DataFrame:
+    """Add per-trial sample-vs-perturbed-reference contrasts before averaging."""
+    metrics_df = metrics_df.copy()
+    contrast_metrics = [m for m in SAMPLE_METRICS if metric_enabled(cfg, m) and m in metrics_df.columns]
+    for metric in contrast_metrics:
+        ref_col = f"_ref_{metric}"
+        ref_df = (
+            metrics_df[metrics_df["method"] == "PERTURBED_REF"][["perturb_sigma", "trial", metric]]
+            .rename(columns={metric: ref_col})
+        )
+        metrics_df = metrics_df.merge(ref_df, on=["perturb_sigma", "trial"], how="left")
+        metrics_df[f"delta_vs_ref_{metric}"] = metrics_df[metric] - metrics_df[ref_col]
+        denom = metrics_df[ref_col].abs().clip(lower=1.0e-12)
+        metrics_df[f"ratio_vs_ref_{metric}"] = metrics_df[metric] / denom
+        metrics_df = metrics_df.drop(columns=[ref_col])
+    return metrics_df
+
+
+def format_mean_sem(row: pd.Series, metric: str, n_trials: int) -> str:
+    val = row.get(metric, np.nan)
+    try:
+        val_f = float(val)
+    except Exception:
+        return "nan"
+    if not math.isfinite(val_f):
+        return "nan"
+    sem_col = f"{metric}_sem"
+    sem = row.get(sem_col, np.nan)
+    try:
+        sem_f = float(sem)
+    except Exception:
+        sem_f = float("nan")
+    if n_trials > 1 and math.isfinite(sem_f):
+        return f"{val_f:.5g}±{sem_f:.2g}"
+    return f"{val_f:.5g}"
+
+
+
+
+def normalize_corruption_mode(mode: str) -> str:
+    mode_key = str(mode).strip().lower().replace("_", "-")
     aliases = {
-        "tweedie": "Tweedie",
-        "tsi": "TSI",
-        "blend": "Blend",
-        "blended": "Blend",
-        "op-blend": "OP-Blend",
-        "op_blend": "OP-Blend",
-        "operator-blend": "OP-Blend",
-        "operator_blend": "OP-Blend",
-        "hlsi": "HLSI",
-        "ce-hlsi": "CE-HLSI",
-        "ce_hlsi": "CE-HLSI",
-        "hybrid-ce-hlsi": "Hybrid-CE-HLSI",
-        "hybrid_ce_hlsi": "Hybrid-CE-HLSI",
-        "oracle": "ORACLE",
+        "add": "heat",
+        "additive": "heat",
+        "additive-noise": "heat",
+        "noise": "heat",
+        "gaussian": "heat",
+        "heat": "heat",
+        "ou": "ou",
+        "ornstein-uhlenbeck": "ou",
+        "ornstein": "ou",
     }
-    key = str(method).strip().lower()
-    if key in aliases:
-        return aliases[key]
-    return str(method).strip()
-
-
-def parse_method_chain(method_label: str) -> List[str]:
-    """Return execution order for a possibly bootstrapped method label.
-
-    Single-token labels are unchanged. For underscore chains, the rightmost token
-    is run first and the leftmost token is the final reported sampler. Thus
-    ``Tweedie_HLSI`` executes ``HLSI -> Tweedie`` and reports samples under the
-    label ``Tweedie_HLSI``.
-
-    Whole-label aliases such as ``op_blend`` or ``ce_hlsi`` are treated as single
-    methods, not bootstrap chains.
-    """
-    raw = str(method_label).strip()
-    whole = canonicalize_method_name(raw)
-    if whole != raw or "_" not in raw:
-        if not whole:
-            raise ValueError(f"Invalid empty method label: {method_label!r}")
-        return [whole]
-
-    parts = [p.strip() for p in raw.split("_") if p.strip()]
-    if not parts:
-        raise ValueError(f"Invalid empty method label: {method_label!r}")
-    return [canonicalize_method_name(p) for p in reversed(parts)]
+    if mode_key not in aliases:
+        raise ValueError("Unknown corruption_mode={!r}. Use 'heat' or 'ou'.".format(mode))
+    return aliases[mode_key]
 
 
 @torch.no_grad()
-def corrupt_references(clean_refs: torch.Tensor, sigma: float, mode: str, generator: torch.Generator) -> torch.Tensor:
-    """Perturb references while keeping perturb_sigmas as the noise std parameter.
+def perturb_reference_bank(
+    clean_refs: torch.Tensor,
+    sigma: float,
+    corruption_mode: str,
+    generator: torch.Generator,
+) -> Tuple[torch.Tensor, Dict[str, float | str]]:
+    """Perturb a clean reference bank in either heat or OU mode.
 
-    heat mode is the old behavior: x + sigma z.
-    ou mode applies an OU-style contraction and noise injection with
-        noise_std = sigma, signal_decay = sqrt(1 - sigma^2).
-    For sigma >= 1, the decay is clipped to zero, giving pure noise references.
+    heat interprets perturb_sigma as an additive Gaussian standard deviation:
+        x_eps = x + sigma z.
+
+    ou interprets perturb_sigma as an OU diffusion time:
+        x_eps = exp(-sigma) x + sqrt(1 - exp(-2 sigma)) z.
+
+    This lets values such as sigma=1.2 remain meaningful in OU mode: they
+    represent stronger mean reversion rather than an invalid noise standard
+    deviation larger than one.
     """
-    sigma = float(sigma)
-    mode = str(mode).strip().lower()
+    mode = normalize_corruption_mode(corruption_mode)
+    sigma_f = float(sigma)
     noise = torch.randn(clean_refs.shape, device=clean_refs.device, dtype=clean_refs.dtype, generator=generator)
     if mode == "heat":
-        return (clean_refs + sigma * noise).detach()
-    if mode == "ou":
-        if sigma < 0.0:
-            raise ValueError("OU corruption requires nonnegative perturb sigmas.")
-        alpha = math.sqrt(max(1.0 - sigma * sigma, 0.0))
-        return (alpha * clean_refs + sigma * noise).detach()
-    raise ValueError(f"Unknown corruption_mode={mode!r}; expected 'heat' or 'ou'.")
+        signal_scale = 1.0
+        noise_scale = sigma_f
+    elif mode == "ou":
+        if sigma_f < 0.0:
+            raise ValueError("OU corruption requires perturb_sigma >= 0, got {}".format(sigma_f))
+        signal_scale = math.exp(-sigma_f)
+        noise_scale = math.sqrt(max(0.0, 1.0 - math.exp(-2.0 * sigma_f)))
+    else:  # normalize_corruption_mode makes this unreachable.
+        raise ValueError("Unknown corruption mode: {}".format(corruption_mode))
+    refs = (signal_scale * clean_refs + noise_scale * noise).detach()
+    return refs, {
+        "corruption_mode": mode,
+        "corruption_signal_scale": float(signal_scale),
+        "corruption_noise_scale": float(noise_scale),
+    }
 
 
-def build_snis_bank(target: GMM2D, anchors: torch.Tensor, cfg: ExperimentConfig, gate_anchors: Optional[torch.Tensor] = None) -> SNISScoreBank:
+def split_bootstrap_method(method: str) -> List[str]:
+    """Return the actual execution order for an underscore bootstrap chain.
+
+    Naming convention follows the inverse-problem sampler convention: A_B means
+    run B first, then use B's samples as the reference bank for A. Therefore the
+    execution order is the underscore-separated tokens read right-to-left.
+    Single-token methods are returned unchanged and preserve legacy behavior.
+    """
+    parts = [part.strip() for part in str(method).split("_") if part.strip()]
+    if not parts:
+        raise ValueError("Empty method name in --methods")
+    return list(reversed(parts)) if len(parts) > 1 else parts
+
+
+def method_bootstrap_depth(method: str) -> int:
+    if str(method).upper() == "ORACLE":
+        return 1
+    return len(split_bootstrap_method(method))
+
+
+def has_bootstrap_chains(methods: Tuple[str, ...] | List[str]) -> bool:
+    return any(method_bootstrap_depth(method) > 1 for method in methods)
+
+
+def build_snis_bank(
+    target: GMM2D,
+    anchors: torch.Tensor,
+    gate_anchors: Optional[torch.Tensor],
+    cfg: ExperimentConfig,
+) -> SNISScoreBank:
     return SNISScoreBank(
         target=target,
         anchors=anchors,
@@ -909,122 +1278,181 @@ def build_snis_bank(target: GMM2D, anchors: torch.Tensor, cfg: ExperimentConfig,
         gate_clip=cfg.gate_clip,
         weight_temp=cfg.weight_temp,
         eval_chunk=cfg.eval_chunk,
-        gate_anchors=gate_anchors,
         op_blend_reg=cfg.op_blend_reg,
         op_blend_pinv_rtol=cfg.op_blend_pinv_rtol,
         op_blend_project_gate=cfg.op_blend_project_gate,
+        gate_anchors=gate_anchors,
     )
 
 
 @torch.no_grad()
-def run_bootstrap_method_chain(
+def run_method_or_bootstrap_chain(
     target: GMM2D,
-    cfg: ExperimentConfig,
-    method_label: str,
+    method: str,
     initial_refs: torch.Tensor,
     initial_gate_refs: torch.Tensor,
+    cfg: ExperimentConfig,
+    trial_seed: int,
     sigma_idx: int,
     method_idx: int,
-) -> Tuple[torch.Tensor, Callable[[torch.Tensor, float], torch.Tensor], Optional[SNISScoreBank], List[Dict[str, float | str]], float, torch.Tensor, List[str]]:
-    """Run a single method or an underscore-defined bootstrap chain.
+) -> Tuple[torch.Tensor, Callable[[torch.Tensor, float], torch.Tensor], Dict[str, float | str | bool | int], List[Dict[str, float | str | bool | int]]]:
+    """Run either one legacy method or an underscore-defined bootstrap chain.
 
-    The returned samples are always the samples from the final stage.  Intermediate
-    stages are used only to create the next stage's reference bank.
+    For method='Final_Previous', this executes Previous first on the corrupted
+    reference bank, then rebuilds a fresh SNIS bank using the first cfg.n_ref
+    generated samples as references and runs Final. Longer chains repeat this
+    rule. This keeps cfg.n_ref decoupled from cfg.n_samples: samplers may
+    generate more samples than are used as the next reference bank.
     """
-    execution_order = parse_method_chain(method_label)
+    method_name = str(method)
+    if method_name.upper() == "ORACLE":
+        sample_seed = int(trial_seed + 10000 + 101 * sigma_idx + method_idx)
+        sample_gen = make_generator(sample_seed, target.device)
+        score_fn = lambda x, t: target.score(x, t=t)
+        t0 = time.time()
+        samples, sampler_info = reverse_ou_heun_sde(target, score_fn, cfg, generator=sample_gen)
+        elapsed = time.time() - t0
+        summary = {
+            "bootstrap_depth": 1,
+            "execution_order": "ORACLE",
+            "final_stage_method": "ORACLE",
+            "final_ref_n": 0,
+            "elapsed_sec": elapsed,
+            "sampler_failed": bool(sampler_info.get("failed", False)),
+            "sampler_fail_reason": str(sampler_info.get("fail_reason", "")),
+            "sampler_max_abs_score": safe_float(sampler_info.get("max_abs_score", float("nan"))),
+        }
+        stage_rows = [{
+            "method": method_name,
+            "bootstrap_depth": 1,
+            "stage_index": 0,
+            "stage_method": "ORACLE",
+            "stage_ref_source": "none",
+            "stage_ref_n": 0,
+            "stage_seed": sample_seed,
+            "stage_elapsed_sec": elapsed,
+            "stage_sampler_failed": bool(sampler_info.get("failed", False)),
+            "stage_sampler_fail_reason": str(sampler_info.get("fail_reason", "")),
+            "stage_sampler_max_abs_score": safe_float(sampler_info.get("max_abs_score", float("nan"))),
+        }]
+        return samples, score_fn, summary, stage_rows
+
+    execution_order = split_bootstrap_method(method_name)
     current_refs = initial_refs.detach()
     current_gate_refs = initial_gate_refs.detach()
     final_score_fn: Optional[Callable[[torch.Tensor, float], torch.Tensor]] = None
-    final_bank: Optional[SNISScoreBank] = None
-    final_input_refs = current_refs
+    final_samples: Optional[torch.Tensor] = None
+    final_sampler_info: Dict[str, float | str | bool] = {}
     total_elapsed = 0.0
-    stage_records: List[Dict[str, float | str]] = []
-    samples: Optional[torch.Tensor] = None
+    stage_rows: List[Dict[str, float | str | bool | int]] = []
+    last_stage_ref_n = int(current_refs.shape[0])
 
+    seed_base = int(trial_seed + 10000 + 101 * sigma_idx + method_idx)
     for stage_idx, stage_method in enumerate(execution_order):
-        ref_source = "initial_corrupted_refs" if stage_idx == 0 else f"stage_{stage_idx - 1}_{execution_order[stage_idx - 1]}_samples"
-        print(
-            f"    stage {stage_idx + 1}/{len(execution_order)}: {stage_method} "
-            f"using {current_refs.shape[0]} refs from {ref_source}",
-            flush=True,
-        )
-
-        if stage_method == "ORACLE":
-            bank = None
-            score_fn = lambda x, t: target.score(x, t=t)
-        else:
-            bank = build_snis_bank(target, current_refs, cfg, gate_anchors=current_gate_refs)
-            score_fn = lambda x, t, b=bank, m=stage_method: b.estimate(x, t=t, method=m)
-
-        sample_seed = cfg.seed + 10000 + 1000003 * sigma_idx + 10007 * method_idx + 211 * stage_idx
-        sample_gen = make_generator(sample_seed, target.device)
+        last_stage_ref_n = int(current_refs.shape[0])
+        stage_bank = build_snis_bank(target, current_refs, current_gate_refs, cfg)
+        score_fn = lambda x, t, bank=stage_bank, m=stage_method: bank.estimate(x, t=t, method=m)
+        stage_seed = seed_base if stage_idx == 0 else int(seed_base + 1_000_003 * stage_idx)
+        stage_gen = make_generator(stage_seed, target.device)
         t0 = time.time()
-        samples = pc_reverse_sampler(target, score_fn, cfg, generator=sample_gen)
+        samples, sampler_info = reverse_ou_heun_sde(target, score_fn, cfg, generator=stage_gen)
         elapsed = time.time() - t0
         total_elapsed += elapsed
 
+        stage_rows.append({
+            "method": method_name,
+            "bootstrap_depth": len(execution_order),
+            "execution_order": " -> ".join(execution_order),
+            "stage_index": int(stage_idx),
+            "stage_method": str(stage_method),
+            "stage_ref_source": "initial_corrupted_refs" if stage_idx == 0 else "previous_stage_samples_first_n_ref",
+            "stage_ref_n": int(current_refs.shape[0]),
+            "stage_generated_n": int(samples.shape[0]),
+            "stage_next_ref_n": int(min(cfg.n_ref, samples.shape[0])) if stage_idx < len(execution_order) - 1 else 0,
+            "stage_seed": int(stage_seed),
+            "stage_elapsed_sec": float(elapsed),
+            "stage_sampler_failed": bool(sampler_info.get("failed", False)),
+            "stage_sampler_fail_reason": str(sampler_info.get("fail_reason", "")),
+            "stage_sampler_max_abs_score": safe_float(sampler_info.get("max_abs_score", float("nan"))),
+        })
+
+        final_samples = samples
         final_score_fn = score_fn
-        final_bank = bank
-        final_input_refs = current_refs
-        stage_records.append(
-            {
-                "stage": float(stage_idx + 1),
-                "stage_method": stage_method,
-                "ref_source": ref_source,
-                "input_ref_n": float(current_refs.shape[0]),
-                "gate_ref_n": float(0 if stage_method == "ORACLE" else current_gate_refs.shape[0]),
-                "elapsed_sec": float(elapsed),
-            }
-        )
+        final_sampler_info = sampler_info
 
-        # Descendants use the previous generated sample cloud as the complete
-        # reference bank. There is no paired clean bank after layer one, so the
-        # Hybrid-CE-HLSI gate bank defaults to the same descendant references.
-        current_refs = samples.detach()
-        current_gate_refs = current_refs
+        # Bootstrap update: only the first n_ref generated samples become the
+        # next reference bank. This keeps n_samples and n_ref decoupled, e.g.
+        # n_ref=500, n_samples=2000 generates 2000 final samples but passes
+        # only samples[:500] into the next bootstrap layer.
+        #
+        # There is no separate paired clean bank after the first layer, so the
+        # gate bank is set to the same generated references. Thus a later
+        # Hybrid-CE-HLSI stage is well-defined but no longer uses the original
+        # clean/perturbed pairing.
+        if stage_idx < len(execution_order) - 1:
+            next_ref_n = min(int(cfg.n_ref), int(samples.shape[0]))
+            current_refs = samples[:next_ref_n].detach()
+            current_gate_refs = current_refs
 
-    if samples is None or final_score_fn is None:
-        raise RuntimeError(f"No samples were produced for method_label={method_label!r}.")
-    return samples, final_score_fn, final_bank, stage_records, total_elapsed, final_input_refs, execution_order
+    if final_samples is None or final_score_fn is None:
+        raise RuntimeError("Bootstrap chain produced no samples for method {}".format(method_name))
 
+    summary = {
+        "bootstrap_depth": int(len(execution_order)),
+        "execution_order": " -> ".join(execution_order),
+        "final_stage_method": str(execution_order[-1]),
+        "final_ref_n": int(last_stage_ref_n),
+        "elapsed_sec": float(total_elapsed),
+        "sampler_failed": bool(final_sampler_info.get("failed", False)),
+        "sampler_fail_reason": str(final_sampler_info.get("fail_reason", "")),
+        "sampler_max_abs_score": safe_float(final_sampler_info.get("max_abs_score", float("nan"))),
+    }
+    return final_samples, final_score_fn, summary, stage_rows
 
-def append_ess_diagnostics(
-    ess_rows: List[Dict[str, float | str]],
-    target: GMM2D,
-    cfg: ExperimentConfig,
-    bank: Optional[SNISScoreBank],
-    sigma: float,
-    label: str,
-    generator: torch.Generator,
-) -> None:
-    if bank is None:
+def print_sigma_metric_summary(sigma: float, sigma_metrics_df: pd.DataFrame, cfg: ExperimentConfig) -> None:
+    """Print one compact trial-averaged metric summary for a perturbation level."""
+    if sigma_metrics_df.empty:
         return
-    for t_probe in [cfg.t_start, 1.5, 0.7, 0.25, 0.08, cfg.t_end]:
-        y_probe = target.sample_pt(min(1024, cfg.n_samples), t_probe, generator=generator)
-        ess = bank.ess(y_probe, t_probe)
-        ess_rows.append(
-            {
-                "perturb_sigma": float(sigma),
-                "corruption_mode": cfg.corruption_mode,
-                "method": label,
-                "t": float(t_probe),
-                "ess_mean": float(ess.mean().item()),
-                "ess_median": float(ess.median().item()),
-                "ess_min": float(ess.min().item()),
-                "ess_max": float(ess.max().item()),
-            }
-        )
-
-# -----------------------------------------------------------------------------
-# Main experiment
-# -----------------------------------------------------------------------------
+    metrics_to_print = [m for m in cfg.metrics if m in sigma_metrics_df.columns]
+    if not metrics_to_print:
+        return
+    if "n_trials_observed" in sigma_metrics_df.columns:
+        observed = pd.to_numeric(sigma_metrics_df["n_trials_observed"], errors="coerce")
+    else:
+        observed = pd.Series(1, index=sigma_metrics_df.index, dtype=float)
+    n_trials = int(max(1, observed.max()))
+    print(f"\n=== perturb_sigma={sigma:g} averaged over {n_trials} trial(s) ===", flush=True)
+    preferred_order = ["PERTURBED_REF", *list(cfg.methods), "ORACLE"]
+    order_rank = {name: i for i, name in enumerate(preferred_order)}
+    printable_df = sigma_metrics_df.copy()
+    printable_df["_order"] = printable_df["method"].map(lambda name: order_rank.get(str(name), len(order_rank)))
+    printable_df = printable_df.sort_values(["_order", "method"])
+    for _, row in printable_df.iterrows():
+        method = str(row.get("method", ""))
+        parts = []
+        for m in metrics_to_print:
+            formatted = format_mean_sem(row, m, n_trials)
+            # PERTURBED_REF has no score estimator, so Fisher score error is not applicable.
+            if method == "PERTURBED_REF" and formatted == "nan":
+                continue
+            parts.append(f"{m}={formatted}")
+        print(f"  {method}: " + ", ".join(parts), flush=True)
 
 
 def run_experiment(cfg: ExperimentConfig) -> None:
-    cfg.corruption_mode = str(cfg.corruption_mode).strip().lower()
-    if cfg.corruption_mode not in {"heat", "ou"}:
-        raise ValueError("corruption_mode must be 'heat' or 'ou'.")
-
+    cfg.metrics = canonicalize_metrics(cfg.metrics)
+    cfg.n_trials = max(int(cfg.n_trials), 1)
+    cfg.corruption_mode = normalize_corruption_mode(cfg.corruption_mode)
+    cfg.n_ref = int(cfg.n_ref)
+    cfg.n_samples = int(cfg.n_samples)
+    if has_bootstrap_chains(list(cfg.methods)) and cfg.n_samples < cfg.n_ref:
+        warnings.warn(
+            "Bootstrap chains require n_samples >= n_ref so that each stage can pass "
+            "a full reference bank to the next stage. Resetting n_samples from "
+            f"{cfg.n_samples} to n_ref={cfg.n_ref}.",
+            RuntimeWarning,
+        )
+        cfg.n_samples = cfg.n_ref
     ensure_dir(cfg.outdir)
     dtype = get_dtype(cfg.dtype)
     device = torch.device(cfg.device)
@@ -1033,13 +1461,6 @@ def run_experiment(cfg: ExperimentConfig) -> None:
     torch.manual_seed(cfg.seed)
 
     target = GMM2D.default(device=device, dtype=dtype)
-    gen = make_generator(cfg.seed, device)
-    # This is the large, separate, unperturbed target pool. It is generated once
-    # and then held fixed for MMD/SW2 and all sample-vs-target metrics.
-    truth = target.sample(cfg.n_truth, generator=gen).detach()
-    metric_gen = make_generator(cfg.seed + 424242, device)
-    metric_ctx = build_metric_context(target, truth, cfg, generator=metric_gen)
-    clean_refs = target.sample(cfg.n_ref, generator=gen).detach()
 
     methods = list(cfg.methods)
     if cfg.include_oracle and "ORACLE" not in methods:
@@ -1048,145 +1469,188 @@ def run_experiment(cfg: ExperimentConfig) -> None:
     with open(os.path.join(cfg.outdir, "config.json"), "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    all_rows: List[Dict[str, float | str]] = []
-    ess_rows: List[Dict[str, float | str]] = []
-    stage_rows: List[Dict[str, float | str]] = []
+    all_rows: List[Dict[str, float | str | int | bool]] = []
+    ess_rows: List[Dict[str, float | str | int]] = []
+    bootstrap_rows: List[Dict[str, float | str | int | bool]] = []
     refs_by_sigma: Dict[float, torch.Tensor] = {}
     samples_by_sigma: Dict[float, Dict[str, torch.Tensor]] = {}
 
     for sigma_idx, sigma in enumerate(cfg.perturb_sigmas):
-        print(f"\n=== corruption_mode={cfg.corruption_mode} | perturb_sigma={sigma:g} ===", flush=True)
-        pert_gen = make_generator(cfg.seed + 1000 + sigma_idx, device)
-        refs = corrupt_references(clean_refs, float(sigma), cfg.corruption_mode, generator=pert_gen)
-        refs_by_sigma[float(sigma)] = refs
-
-        base_bank = build_snis_bank(target, refs, cfg, gate_anchors=clean_refs)
-
-        ref_metrics = compute_all_metrics(target, refs, metric_ctx, cfg)
-        ref_rms_shift = float(torch.sqrt(torch.mean(torch.sum((refs - clean_refs) ** 2, dim=1))).item())
-        ref_mean_shift = float(torch.mean(torch.linalg.norm(refs - clean_refs, dim=1)).item())
-        ref_row = {
-            "perturb_sigma": float(sigma),
-            "corruption_mode": cfg.corruption_mode,
-            "method": "PERTURBED_REF",
-            "bootstrap_depth": float(0),
-            "execution_order": "",
-            "final_stage_method": "",
-            "final_ref_n": float(refs.shape[0]),
-            "elapsed_sec": float("nan"),
-            "rms_anchor_shift": ref_rms_shift,
-            "mean_anchor_shift": ref_mean_shift,
-            "metric_target": "fixed_unperturbed_target_pool",
-            "fisher_mse": float("nan"),
-            "fisher_rmse": float("nan"),
-            **ref_metrics,
-        }
-        all_rows.append(ref_row)
-        print("reference metrics:", {k: round(v, 5) for k, v in ref_metrics.items()}, flush=True)
-
-        # Base-bank ESS preserves the old diagnostic.  Method-specific bootstrap
-        # ESS is also recorded below for multi-layer chains.
-        append_ess_diagnostics(
-            ess_rows, target, cfg, base_bank, float(sigma), "PERTURBED_REF_BANK", generator=pert_gen
+        print(
+            f"\nRunning perturb_sigma={sigma:g} with corruption_mode={cfg.corruption_mode} "
+            f"across {cfg.n_trials} trial(s)...",
+            flush=True,
         )
+        ref_plot_parts: List[torch.Tensor] = []
+        sample_plot_parts: Dict[str, List[torch.Tensor]] = {method: [] for method in methods}
+        sigma_rows: List[Dict[str, float | str | int | bool]] = []
 
-        sample_by_method: Dict[str, torch.Tensor] = {}
-        for method_idx, method in enumerate(methods):
-            execution_order = parse_method_chain(method)
-            order_text = " -> ".join(execution_order)
-            print(f"  sampling {method} ({order_text})...", flush=True)
-            samples, score_fn, final_bank, records, elapsed, final_input_refs, execution_order = run_bootstrap_method_chain(
-                target=target,
-                cfg=cfg,
-                method_label=method,
-                initial_refs=refs,
-                initial_gate_refs=clean_refs,
-                sigma_idx=sigma_idx,
-                method_idx=method_idx,
+        for trial_idx in range(cfg.n_trials):
+            trial_seed = int(cfg.seed + 1_000_003 * trial_idx)
+
+            # Fresh target/reference/metric randomness per trial.  This averages out
+            # stochasticity from finite reference banks, sampling, histogram KL bins,
+            # SW2 directions, and Fisher probe draws.
+            trial_gen = make_generator(trial_seed + 17, device)
+            truth = target.sample(cfg.n_truth, generator=trial_gen).detach()
+            metric_gen = make_generator(trial_seed + 424242, device)
+            metric_ctx = build_metric_context(target, truth, cfg, generator=metric_gen)
+            clean_refs = target.sample(cfg.n_ref, generator=trial_gen).detach()
+
+            pert_gen = make_generator(trial_seed + 1000 + sigma_idx, device)
+            refs, corruption_info = perturb_reference_bank(
+                clean_refs=clean_refs,
+                sigma=float(sigma),
+                corruption_mode=cfg.corruption_mode,
+                generator=pert_gen,
             )
-            sample_by_method[method] = samples
+            ref_plot_parts.append(refs.detach().cpu())
 
-            for rec in records:
-                stage_rows.append(
+            initial_bank = build_snis_bank(target, refs, clean_refs, cfg)
+
+            ref_metrics = compute_all_metrics(target, refs, metric_ctx, cfg)
+            ref_rms_shift = float(torch.sqrt(torch.mean(torch.sum((refs - clean_refs) ** 2, dim=1))).item())
+            ref_mean_shift = float(torch.mean(torch.linalg.norm(refs - clean_refs, dim=1)).item())
+            ref_row = {
+                "perturb_sigma": float(sigma),
+                "trial": int(trial_idx),
+                "trial_seed": int(trial_seed),
+                "method": "PERTURBED_REF",
+                "n_ref": int(cfg.n_ref),
+                "bootstrap_depth": 0,
+                "execution_order": "reference_only",
+                "final_stage_method": "reference_only",
+                "final_ref_n": int(cfg.n_ref),
+                "rms_anchor_shift": ref_rms_shift,
+                "mean_anchor_shift": ref_mean_shift,
+                "metric_target": "fresh_unperturbed_target_pool_per_trial",
+                **corruption_info,
+                **({"fisher_rmse": float("nan")} if metric_enabled(cfg, "fisher_rmse") else {}),
+                **ref_metrics,
+            }
+            all_rows.append(ref_row)
+            sigma_rows.append(ref_row)
+
+            sample_by_method: Dict[str, torch.Tensor] = {}
+            for method_idx, method in enumerate(methods):
+                samples, score_fn, run_info, stage_rows = run_method_or_bootstrap_chain(
+                    target=target,
+                    method=method,
+                    initial_refs=refs,
+                    initial_gate_refs=clean_refs,
+                    cfg=cfg,
+                    trial_seed=trial_seed,
+                    sigma_idx=sigma_idx,
+                    method_idx=method_idx,
+                )
+                sample_by_method[method] = samples
+                sample_plot_parts[method].append(samples.detach().cpu())
+                metrics = compute_all_metrics(target, samples, metric_ctx, cfg)
+                fisher_metrics = integrated_score_fisher_metric(score_fn, metric_ctx, cfg)
+                row = {
+                    "perturb_sigma": float(sigma),
+                    "trial": int(trial_idx),
+                    "trial_seed": int(trial_seed),
+                    "method": method,
+                    "n_ref": int(cfg.n_ref),
+                    "rms_anchor_shift": ref_rms_shift,
+                    "mean_anchor_shift": ref_mean_shift,
+                    "metric_target": "fresh_unperturbed_target_pool_per_trial",
+                    **corruption_info,
+                    **run_info,
+                    **metrics,
+                    **fisher_metrics,
+                }
+                all_rows.append(row)
+                sigma_rows.append(row)
+
+                for stage_row in stage_rows:
+                    bootstrap_rows.append({
+                        "perturb_sigma": float(sigma),
+                        "trial": int(trial_idx),
+                        "trial_seed": int(trial_seed),
+                        "corruption_mode": cfg.corruption_mode,
+                        "corruption_signal_scale": float(corruption_info["corruption_signal_scale"]),
+                        "corruption_noise_scale": float(corruption_info["corruption_noise_scale"]),
+                        **stage_row,
+                    })
+
+            for t_probe in [cfg.t_start, 1.5, 0.7, 0.25, 0.08, cfg.t_end]:
+                y_probe = target.sample_pt(min(1024, cfg.n_samples), t_probe, generator=pert_gen)
+                ess = initial_bank.ess(y_probe, t_probe)
+                ess_rows.append(
                     {
                         "perturb_sigma": float(sigma),
+                        "trial": int(trial_idx),
+                        "trial_seed": int(trial_seed),
                         "corruption_mode": cfg.corruption_mode,
-                        "method": method,
-                        "bootstrap_depth": float(len(execution_order)),
-                        "execution_order": " -> ".join(execution_order),
-                        **rec,
+                        "bank": "initial_corrupted_reference_bank",
+                        "t": float(t_probe),
+                        "ess_mean": float(ess.mean().item()),
+                        "ess_median": float(ess.median().item()),
+                        "ess_min": float(ess.min().item()),
+                        "ess_max": float(ess.max().item()),
                     }
                 )
 
-            metrics = compute_all_metrics(target, samples, metric_ctx, cfg)
-            fisher_metrics = integrated_score_fisher_metric(score_fn, metric_ctx, cfg)
-            row = {
-                "perturb_sigma": float(sigma),
-                "corruption_mode": cfg.corruption_mode,
-                "method": method,
-                "bootstrap_depth": float(len(execution_order)),
-                "execution_order": " -> ".join(execution_order),
-                "final_stage_method": execution_order[-1],
-                "final_ref_n": float(final_input_refs.shape[0]),
-                "elapsed_sec": elapsed,
-                "rms_anchor_shift": ref_rms_shift,
-                "mean_anchor_shift": ref_mean_shift,
-                "metric_target": "fixed_unperturbed_target_pool",
-                **metrics,
-                **fisher_metrics,
+            npz_payload = {
+                "truth": as_numpy(truth),
+                "truth_eval_fixed": as_numpy(metric_ctx.truth_eval),
+                "clean_refs": as_numpy(clean_refs),
+                "perturbed_refs": as_numpy(refs),
             }
-            all_rows.append(row)
-            printable = {**metrics, **fisher_metrics}
-            print(f"    {method} metrics:", {k: round(v, 5) for k, v in printable.items()}, f"elapsed={elapsed:.1f}s", flush=True)
+            for method, samples in sample_by_method.items():
+                npz_payload[method.replace("-", "_")] = as_numpy(samples)
+            if cfg.n_trials == 1:
+                npz_name = f"samples_sigma_{sigma:g}.npz"
+            else:
+                npz_name = f"samples_sigma_{sigma:g}_trial_{trial_idx:03d}.npz"
+            np.savez_compressed(os.path.join(cfg.outdir, npz_name), **npz_payload)
 
-            if len(execution_order) > 1 and final_bank is not None:
-                ess_gen = make_generator(cfg.seed + 300000 + 1009 * sigma_idx + method_idx, device)
-                append_ess_diagnostics(
-                    ess_rows, target, cfg, final_bank, float(sigma), f"{method}_FINAL_BANK", generator=ess_gen
-                )
-
-        samples_by_sigma[float(sigma)] = sample_by_method
+        refs_by_sigma[float(sigma)] = torch.cat(ref_plot_parts, dim=0)
+        samples_by_sigma[float(sigma)] = {
+            method: torch.cat(parts, dim=0) for method, parts in sample_plot_parts.items() if parts
+        }
 
         if cfg.plot_every_sigma:
             plot_samples_for_sigma(
                 target=target,
-                ref=refs,
-                sample_by_method=sample_by_method,
+                ref=refs_by_sigma[float(sigma)],
+                sample_by_method=samples_by_sigma[float(sigma)],
                 sigma=float(sigma),
                 cfg=cfg,
-                outpath=os.path.join(cfg.outdir, f"sample_heatmaps_{cfg.corruption_mode}_sigma_{sigma:g}.png"),
+                outpath=os.path.join(cfg.outdir, f"sample_heatmaps_sigma_{sigma:g}.png"),
             )
 
-        npz_payload = {
-            "truth": as_numpy(truth),
-            "truth_eval_fixed": as_numpy(metric_ctx.truth_eval),
-            "perturbed_refs": as_numpy(refs),
-            "clean_refs": as_numpy(clean_refs),
-        }
-        for method, samples in sample_by_method.items():
-            npz_payload[method.replace("-", "_")] = as_numpy(samples)
-        np.savez_compressed(os.path.join(cfg.outdir, f"samples_{cfg.corruption_mode}_sigma_{sigma:g}.npz"), **npz_payload)
+        sigma_trials_df = pd.DataFrame(sigma_rows)
+        sigma_trials_df = add_reference_contrasts(sigma_trials_df, cfg)
+        sigma_metrics_df = aggregate_trials(sigma_trials_df, ["perturb_sigma", "method"])
+        print_sigma_metric_summary(float(sigma), sigma_metrics_df, cfg)
 
-    metrics_df = pd.DataFrame(all_rows)
-    for metric in ["ksd", "nll", "mmd", "sw2"]:
-        ref_map = metrics_df[metrics_df["method"] == "PERTURBED_REF"].set_index("perturb_sigma")[metric].to_dict()
-        metrics_df[f"delta_vs_ref_{metric}"] = metrics_df.apply(
-            lambda r, m=metric: float(r[m] - ref_map.get(r["perturb_sigma"], np.nan)), axis=1
-        )
-        metrics_df[f"ratio_vs_ref_{metric}"] = metrics_df.apply(
-            lambda r, m=metric: float(r[m] / max(ref_map.get(r["perturb_sigma"], np.nan), 1.0e-12)), axis=1
-        )
+    metrics_trials_df = pd.DataFrame(all_rows)
+    metrics_trials_df = add_reference_contrasts(metrics_trials_df, cfg)
+    metrics_df = aggregate_trials(metrics_trials_df, ["perturb_sigma", "method"])
 
-    ess_df = pd.DataFrame(ess_rows)
-    stages_df = pd.DataFrame(stage_rows)
+    ess_trials_df = pd.DataFrame(ess_rows)
+    ess_df = aggregate_trials(ess_trials_df, ["perturb_sigma", "t"]) if not ess_trials_df.empty else ess_trials_df
+    bootstrap_df = pd.DataFrame(bootstrap_rows)
+
+    metrics_trials_csv = os.path.join(cfg.outdir, "metrics_trials.csv")
     metrics_csv = os.path.join(cfg.outdir, "metrics.csv")
+    ess_trials_csv = os.path.join(cfg.outdir, "ess_diagnostics_trials.csv")
     ess_csv = os.path.join(cfg.outdir, "ess_diagnostics.csv")
-    stages_csv = os.path.join(cfg.outdir, "bootstrap_stages.csv")
+    bootstrap_csv = os.path.join(cfg.outdir, "bootstrap_stages.csv")
+    metrics_trials_df.to_csv(metrics_trials_csv, index=False)
     metrics_df.to_csv(metrics_csv, index=False)
+    ess_trials_df.to_csv(ess_trials_csv, index=False)
     ess_df.to_csv(ess_csv, index=False)
-    stages_df.to_csv(stages_csv, index=False)
+    bootstrap_df.to_csv(bootstrap_csv, index=False)
 
-    plot_metric_array(metrics_df, ["ksd", "nll", "mmd", "sw2", "fisher_rmse"], os.path.join(cfg.outdir, "meta_metric_array.png"))
+    plot_metric_array(
+        metrics_df,
+        [m for m in cfg.metrics if m in metrics_df.columns],
+        os.path.join(cfg.outdir, "meta_metric_array.png"),
+    )
     plot_contrast_sweeps(metrics_df, os.path.join(cfg.outdir, "contrast_vs_reference.png"))
     plot_histogram_array_over_sigmas(
         target=target,
@@ -1199,20 +1663,32 @@ def run_experiment(cfg: ExperimentConfig) -> None:
 
     if not ess_df.empty:
         fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
-        plot_ess = ess_df[ess_df["method"] == "PERTURBED_REF_BANK"].copy()
-        for sigma in sorted(plot_ess["perturb_sigma"].unique()):
-            sub = plot_ess[plot_ess["perturb_sigma"] == sigma].sort_values("t")
-            ax.plot(sub["t"], sub["ess_median"], marker="o", label=f"sigma={sigma:g}")
+        for sigma in sorted(ess_df["perturb_sigma"].unique()):
+            sub = ess_df[ess_df["perturb_sigma"] == sigma].sort_values("t")
+            y = pd.to_numeric(sub["ess_median"], errors="coerce")
+            yerr = pd.to_numeric(sub.get("ess_median_sem", pd.Series(index=sub.index, dtype=float)), errors="coerce")
+            if yerr.notna().sum() > 0 and cfg.n_trials > 1:
+                ax.errorbar(sub["t"], y, yerr=yerr, marker="o", linewidth=1.8, capsize=2, label=f"sigma={sigma:g}")
+            else:
+                ax.plot(sub["t"], y, marker="o", label=f"sigma={sigma:g}")
         ax.set_xscale("log")
         ax.set_xlabel("t")
         ax.set_ylabel("median ESS")
-        ax.set_title(f"OU SNIS ESS for base {cfg.corruption_mode.upper()}-corrupted reference banks")
+        ax.set_title(f"OU SNIS ESS under {cfg.corruption_mode} reference corruption")
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=8, ncol=2)
         fig.savefig(os.path.join(cfg.outdir, "ess_vs_t.png"), dpi=180)
         plt.close(fig)
 
-    print(f"\nDone. Wrote:\n  {metrics_csv}\n  {ess_csv}\n  {stages_csv}\n  {cfg.outdir}")
+    print(
+        f"\nDone. Wrote:\n"
+        f"  {metrics_csv}              # trial-averaged metrics\n"
+        f"  {metrics_trials_csv}       # raw per-trial metrics\n"
+        f"  {ess_csv}                  # trial-averaged ESS diagnostics\n"
+        f"  {ess_trials_csv}           # raw per-trial ESS diagnostics\n"
+        f"  {bootstrap_csv}            # per-stage bootstrap diagnostics\n"
+        f"  {cfg.outdir}"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1227,11 +1703,19 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--device", type=str, default=ExperimentConfig.device)
     p.add_argument("--dtype", type=str, default=ExperimentConfig.dtype)
     p.add_argument("--n_ref", type=int, default=ExperimentConfig.n_ref)
-    p.add_argument("--n_samples", type=int, default=ExperimentConfig.n_samples)
+    p.add_argument("--n_samples", type=int, default=ExperimentConfig.n_samples, help="Number of generated samples per sampler stage. For bootstrap chains, if n_samples > n_ref only the first n_ref generated samples feed the next stage; if n_samples < n_ref, n_samples is reset to n_ref with a warning.")
     p.add_argument("--n_truth", type=int, default=ExperimentConfig.n_truth)
     p.add_argument("--metrics_max_n", type=int, default=ExperimentConfig.metrics_max_n)
+    p.add_argument("--n_trials", type=int, default=ExperimentConfig.n_trials, help="Number of independent trials per perturbation sigma. Each trial redraws reference banks, metric probes, and sampler seeds; metrics.csv reports trial means and SEM columns.")
+    p.add_argument(
+        "--metrics",
+        type=str,
+        nargs="+",
+        default=list(ExperimentConfig.metrics),
+        help=f"Metrics to compute. Use any of: {', '.join(AVAILABLE_METRICS)}. Aliases accepted: sliced_w2->sw2, score_rmse->fisher_rmse, old KL names->kl/kl_rev.",
+    )
     p.add_argument("--perturb_sigmas", type=float, nargs="+", default=list(ExperimentConfig.perturb_sigmas))
-    p.add_argument("--corruption_mode", type=str.lower, choices=["heat", "ou"], default=ExperimentConfig.corruption_mode)
+    p.add_argument("--corruption_mode", type=str, choices=["heat", "ou"], default=ExperimentConfig.corruption_mode, help="Reference corruption mode. heat: x+sigma*z. ou: exp(-sigma)*x+sqrt(1-exp(-2*sigma))*z, interpreting perturb_sigma as OU time.")
     p.add_argument("--t_start", type=float, default=ExperimentConfig.t_start)
     p.add_argument("--t_end", type=float, default=ExperimentConfig.t_end)
     p.add_argument("--n_steps", type=int, default=ExperimentConfig.n_steps)
@@ -1267,6 +1751,11 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--grid_lim", type=float, default=ExperimentConfig.grid_lim)
     p.add_argument("--grid_n", type=int, default=ExperimentConfig.grid_n)
     p.add_argument("--hist_bins", type=int, default=ExperimentConfig.hist_bins)
+    p.add_argument("--hist_cmap", type=str, default=ExperimentConfig.hist_cmap)
+    p.add_argument("--hist_gamma", type=float, default=ExperimentConfig.hist_gamma, help="PowerNorm gamma for histogram brightness; smaller values brighten low-count pixels.")
+    p.add_argument("--hist_vmax_quantile", type=float, default=ExperimentConfig.hist_vmax_quantile, help="Shared high-count quantile used as histogram vmax; avoids one hot bin making all panels faint.")
+    p.add_argument("--hist_contour_alpha", type=float, default=ExperimentConfig.hist_contour_alpha)
+    p.add_argument("--hist_contour_lw", type=float, default=ExperimentConfig.hist_contour_lw)
     p.add_argument("--no_plots_per_sigma", action="store_true")
     args = p.parse_args()
 
@@ -1287,6 +1776,8 @@ def parse_args() -> ExperimentConfig:
         n_samples=args.n_samples,
         n_truth=args.n_truth,
         metrics_max_n=args.metrics_max_n,
+        metrics=canonicalize_metrics(args.metrics),
+        n_trials=max(int(args.n_trials), 1),
         perturb_sigmas=tuple(args.perturb_sigmas),
         corruption_mode=args.corruption_mode,
         t_start=args.t_start,
@@ -1322,6 +1813,11 @@ def parse_args() -> ExperimentConfig:
         grid_lim=args.grid_lim,
         grid_n=args.grid_n,
         hist_bins=args.hist_bins,
+        hist_cmap=args.hist_cmap,
+        hist_gamma=args.hist_gamma,
+        hist_vmax_quantile=args.hist_vmax_quantile,
+        hist_contour_alpha=args.hist_contour_alpha,
+        hist_contour_lw=args.hist_contour_lw,
         plot_every_sigma=not args.no_plots_per_sigma,
     )
 
