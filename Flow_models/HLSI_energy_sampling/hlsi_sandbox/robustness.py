@@ -5,17 +5,20 @@ Robustness of SNIS score estimators to misspecified reference samples on a 2D GM
 Implements SNIS versions of the main estimators:
   - Tweedie
   - TSI
-  - Blended / Blend (coordinatewise variance-optimal blend)
+  - Blend / Blended (scalar variance-optimal blend)
   - OP-Blend (full operator-valued empirical variance-optimal blend)
   - HLSI (componentwise resolvent gate)
   - CE-HLSI (empirical conditional-expectation gate)
+  - Hybrid-CE-HLSI (perturbed score signals with clean-reference CE gate)
   - optional ORACLE sampler
 
 Experiment:
   1. Draw clean references X_i ~ p_0 from a known 2D GMM.
   2. Perturb anchors: X_i^eps = X_i + sigma * N(0,I).
   3. Query exact score and exact observed information H=-∇²log p at those anchors.
-  4. Build SNIS estimators using the perturbed anchors.
+  4. Build SNIS estimators using the perturbed anchors. Hybrid-CE-HLSI
+     uses perturbed anchors for Tweedie/TSI score signals but clean anchors for
+     the CE attenuation gate.
   5. Sample with a stochastic predictor-corrector reverse OU sampler.
   6. Measure generated samples using NLL / KSD / MMD / SW2 and the time-integrated
      score RMSE (Fisher-type score divergence) against the exact OU-diffused GMM score.
@@ -67,12 +70,12 @@ class ExperimentConfig:
 
     # Reverse OU PC sampler
     t_start: float = 3.0
-    t_end: float = 0.015
-    n_steps: int = 90
+    t_end: float = 1.0e-3
+    n_steps: int = 160
     n_corrector: int = 1
     corrector_snr: float = 0.08
     corrector_step_max: float = 2.0e-3
-    init_mode: str = "normal"  # normal or exact_pt; normal matches gmm_hlsi_sandbox.py
+    init_mode: str = "exact_pt"  # exact_pt or normal
     final_denoise: bool = True
     sample_clip: float = 15.0
     score_clip: float = 200.0
@@ -85,7 +88,7 @@ class ExperimentConfig:
     fisher_time_grid: str = "log"  # log or linear
 
     # Estimators
-    methods: Tuple[str, ...] = ("Tweedie", "TSI", "HLSI", "CE-HLSI", "Blended", "OP-Blend")
+    methods: Tuple[str, ...] = ("Tweedie", "TSI", "Blend", "OP-Blend", "HLSI", "CE-HLSI", "Hybrid-CE-HLSI")
     include_oracle: bool = True
     curvature_mode: str = "raw"  # raw, psd, abs
     curvature_floor: float = 1.0e-5
@@ -165,37 +168,6 @@ def median_bandwidth(x: torch.Tensor, y: Optional[torch.Tensor] = None, max_n: i
         return 1.0
     med = torch.median(vals).item()
     return float(math.sqrt(max(med, 1.0e-12)))
-
-
-def safe_float(x) -> float:
-    try:
-        if isinstance(x, torch.Tensor):
-            x = x.detach().cpu().item()
-        x = float(x)
-        if math.isnan(x) or math.isinf(x):
-            return float("nan")
-        return x
-    except Exception:
-        return float("nan")
-
-
-def sym(A: torch.Tensor) -> torch.Tensor:
-    return 0.5 * (A + A.transpose(-1, -2))
-
-
-def batch_eye(batch: int, d: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return torch.eye(d, device=device, dtype=dtype).expand(batch, d, d)
-
-
-def bmv(A: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("...ij,...j->...i", A, x)
-
-
-def project_symmetric_gate(G: torch.Tensor, min_eig: float = 0.0, max_eig: float = 1.0) -> torch.Tensor:
-    Gs = sym(G)
-    eig, U = torch.linalg.eigh(Gs)
-    eig = eig.clamp(min=min_eig, max=max_eig)
-    return U @ torch.diag_embed(eig) @ U.transpose(-1, -2)
 
 
 # -----------------------------------------------------------------------------
@@ -343,11 +315,16 @@ class SNISScoreBank:
         gate_clip: Optional[float],
         weight_temp: float,
         eval_chunk: int,
+        gate_anchors: Optional[torch.Tensor] = None,
         op_blend_reg: float = 1.0e-8,
         op_blend_pinv_rtol: float = 1.0e-6,
         op_blend_project_gate: bool = False,
     ):
         self.target = target
+
+        # Score bank: always the possibly perturbed anchors. These determine
+        # SNIS weights/signals b,c for Tweedie, TSI, Blend, HLSI, CE-HLSI, and
+        # the signal side of Hybrid-CE-HLSI.
         self.x = anchors.detach()
         self.N, self.d = self.x.shape
         self.device = self.x.device
@@ -355,6 +332,19 @@ class SNISScoreBank:
         self.score0 = target.score(self.x, t=0.0).detach()
         self.H_raw = target.observed_information(self.x, t=0.0).detach()
         self.P = process_curvature(self.H_raw, curvature_mode, curvature_floor, curvature_cap).detach()
+
+        # Gate bank: optional clean/unperturbed anchors used only by
+        # Hybrid-CE-HLSI.  Its OU weights and curvature average define the
+        # attenuation matrix while the score signal remains the perturbed-bank
+        # bbar/cbar above.
+        self.x_gate = None if gate_anchors is None else gate_anchors.detach()
+        if self.x_gate is not None:
+            self.H_gate_raw = target.observed_information(self.x_gate, t=0.0).detach()
+            self.P_gate = process_curvature(self.H_gate_raw, curvature_mode, curvature_floor, curvature_cap).detach()
+        else:
+            self.H_gate_raw = None
+            self.P_gate = None
+
         self.resolvent_eps = resolvent_eps
         self.gate_clip = gate_clip
         self.weight_temp = weight_temp
@@ -363,16 +353,19 @@ class SNISScoreBank:
         self.op_blend_pinv_rtol = op_blend_pinv_rtol
         self.op_blend_project_gate = op_blend_project_gate
 
-    def _weights_and_signals(self, y: torch.Tensor, t: float):
-        t_tensor = torch.as_tensor(t, device=self.device, dtype=self.dtype)
-        alpha, gamma = alpha_gamma(t_tensor)
-        diff = y[:, None, :] - alpha * self.x[None, :, :]
+    def _weights_from_anchors(self, y: torch.Tensor, alpha: torch.Tensor, gamma: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+        diff = y[:, None, :] - alpha * anchors[None, :, :]
         logw = -0.5 * torch.sum(diff * diff, dim=-1) / gamma
         if self.weight_temp != 1.0:
             logw = logw / self.weight_temp
         logw = logw - torch.max(logw, dim=1, keepdim=True).values
         w = torch.exp(logw)
-        w = w / torch.clamp(w.sum(dim=1, keepdim=True), min=1.0e-300)
+        return w / torch.clamp(w.sum(dim=1, keepdim=True), min=1.0e-300)
+
+    def _weights_and_signals(self, y: torch.Tensor, t: float):
+        t_tensor = torch.as_tensor(t, device=self.device, dtype=self.dtype)
+        alpha, gamma = alpha_gamma(t_tensor)
+        w = self._weights_from_anchors(y, alpha, gamma, self.x)
         b = (alpha * self.x[None, :, :] - y[:, None, :]) / gamma
         c = self.score0[None, :, :] / alpha
         return w, b, c, alpha, gamma
@@ -386,39 +379,36 @@ class SNISScoreBank:
             return bbar
         if method == "TSI":
             return cbar
-        if method in {"Blend", "Blended"}:
-            # Match gmm_hlsi_sandbox.py: coordinatewise variance-optimal blend
-            # between the per-anchor TSI signal c and Tweedie signal b.
-            Ac = c - cbar[:, None, :]
-            Bc = b - bbar[:, None, :]
-            va = torch.sum(w[:, :, None] * Ac.square(), dim=1).clamp(min=1.0e-30)
-            vb = torch.sum(w[:, :, None] * Bc.square(), dim=1).clamp(min=1.0e-30)
-            cab = torch.sum(w[:, :, None] * Ac * Bc, dim=1)
-            den = (va + vb - 2.0 * cab).clamp(min=1.0e-20)
-            g = ((va - cab) / den).clamp(0.0, 1.0)
-            return cbar + g * (bbar - cbar)
+        if method in ("Blend", "Blended"):
+            wb = w * w
+            db = b - bbar[:, None, :]
+            dc = c - cbar[:, None, :]
+            sig_b = torch.sum(wb * torch.sum(db * db, dim=-1), dim=1)
+            sig_c = torch.sum(wb * torch.sum(dc * dc, dim=-1), dim=1)
+            rho = torch.sum(wb * torch.sum(db * dc, dim=-1), dim=1)
+            denom = torch.clamp(sig_b + sig_c - 2.0 * rho, min=1.0e-30)
+            g_tsi = torch.clamp((sig_b - rho) / denom, min=0.0, max=1.0)
+            return bbar + g_tsi[:, None] * (cbar - bbar)
         if method == "OP-Blend":
-            # Full matrix empirical variance-optimal gate, exactly mirroring
-            # op_blend_gate / est_op_blended in gmm_hlsi_sandbox.py.
-            tsi = c
-            twd = b
-            am = cbar
-            bm = bbar
-            D = twd - tsi
-            Dm = bm - am
-            Ac = tsi - am[:, None, :]
-            Dc = D - Dm[:, None, :]
-            C_AD = torch.einsum("bm,bmi,bmj->bij", w, Ac, Dc)
-            C_DD = torch.einsum("bm,bmi,bmj->bij", w, Dc, Dc)
-            C_DD = sym(C_DD)
-            Bsz, d = y.shape
-            I = batch_eye(Bsz, d, device=y.device, dtype=y.dtype)
+            # Sandbox-style full operator blend: cbar + G(bbar-cbar), where
+            # G minimizes empirical conditional variance of TSI + G(Tweedie-TSI).
+            D = b - c
+            Dbar = bbar - cbar
+            Ac = c - cbar[:, None, :]
+            Dc = D - Dbar[:, None, :]
+            C_AD = torch.einsum("bn,bni,bnj->bij", w, Ac, Dc)
+            C_DD = torch.einsum("bn,bni,bnj->bij", w, Dc, Dc)
+            C_DD = 0.5 * (C_DD + C_DD.transpose(-1, -2))
+            B, d = y.shape
+            I = torch.eye(d, device=y.device, dtype=y.dtype).expand(B, d, d)
             scale = C_DD.diagonal(dim1=-2, dim2=-1).mean(-1).clamp(min=1.0)
-            C_DD_solve = C_DD + (self.op_blend_reg * scale).view(Bsz, 1, 1) * I
+            C_DD_solve = C_DD + (self.op_blend_reg * scale).view(B, 1, 1) * I
             G = -torch.matmul(C_AD, torch.linalg.pinv(C_DD_solve, rtol=self.op_blend_pinv_rtol))
             if self.op_blend_project_gate:
-                G = project_symmetric_gate(G, 0.0, 1.0)
-            return am + bmv(G, bm - am)
+                eig, U = torch.linalg.eigh(0.5 * (G + G.transpose(-1, -2)))
+                eig = eig.clamp(min=0.0, max=1.0)
+                G = U @ torch.diag_embed(eig) @ U.transpose(-1, -2)
+            return cbar + torch.einsum("bij,bj->bi", G, Dbar)
         if method == "HLSI":
             G_i = resolvent_gate(self.P, alpha, gamma, self.resolvent_eps, self.gate_clip)
             corr = torch.einsum("nij,bnj->bni", G_i, (c - b))
@@ -428,6 +418,13 @@ class SNISScoreBank:
             Pbar = torch.sum(w[:, :, None, None] * self.P[None, :, :, :], dim=1)
             Gbar = resolvent_gate(Pbar, alpha, gamma, self.resolvent_eps, self.gate_clip)
             return bbar + torch.einsum("bij,bj->bi", Gbar, (cbar - bbar))
+        if method == "Hybrid-CE-HLSI":
+            if self.x_gate is None or self.P_gate is None:
+                raise ValueError("Hybrid-CE-HLSI requires gate_anchors=clean_refs when constructing SNISScoreBank.")
+            w_gate = self._weights_from_anchors(y, alpha, gamma, self.x_gate)
+            Pbar_gate = torch.sum(w_gate[:, :, None, None] * self.P_gate[None, :, :, :], dim=1)
+            Gbar_gate = resolvent_gate(Pbar_gate, alpha, gamma, self.resolvent_eps, self.gate_clip)
+            return bbar + torch.einsum("bij,bj->bi", Gbar_gate, (cbar - bbar))
         raise ValueError(f"Unknown method={method}")
 
     @torch.no_grad()
@@ -452,84 +449,48 @@ class SNISScoreBank:
 
 
 @torch.no_grad()
-def reverse_ou_heun_sde(
-    target: GMM2D,
-    score_fn: Callable[[torch.Tensor, float], torch.Tensor],
-    cfg: ExperimentConfig,
-    generator: torch.Generator,
-) -> Tuple[torch.Tensor, Dict[str, float | str | bool]]:
-    """Reverse OU Heun SDE sampler matched to gmm_hlsi_sandbox.py.
-
-    Forward OU is dx=-x dt+sqrt(2)dW.  In decreasing diffusion time,
-    reverse drift is y + 2 score_t(y).  We use the same predictor/corrector
-    noise as the sandbox Heun implementation and finish with a Tweedie
-    denoising map at t_min.
-    """
+def pc_reverse_sampler(target: GMM2D, score_fn: Callable[[torch.Tensor, float], torch.Tensor], cfg: ExperimentConfig, generator: torch.Generator) -> torch.Tensor:
     device = target.device
     dtype = target.dtype
-    d = target.d
-
-    if cfg.init_mode == "normal":
-        y = torch.randn((cfg.n_samples, d), device=device, dtype=dtype, generator=generator)
-    elif cfg.init_mode == "exact_pt":
-        y = target.sample_pt(cfg.n_samples, cfg.t_start, generator=generator)
+    if cfg.init_mode == "exact_pt":
+        x = target.sample_pt(cfg.n_samples, cfg.t_start, generator=generator)
+    elif cfg.init_mode == "normal":
+        x = torch.randn((cfg.n_samples, 2), device=device, dtype=dtype, generator=generator)
     else:
-        raise ValueError("init_mode must be normal or exact_pt")
+        raise ValueError("init_mode must be exact_pt or normal")
 
-    ts = torch.linspace(cfg.t_start, cfg.t_end, cfg.n_steps + 1, device=device, dtype=dtype)
-    max_abs_score = 0.0
-    fail = False
-    fail_reason = ""
+    times = torch.linspace(cfg.t_start, cfg.t_end, cfg.n_steps + 1, device=device, dtype=dtype)
+    for k in range(cfg.n_steps):
+        t_cur = float(times[k].item())
+        h = float((times[k] - times[k + 1]).item())
 
-    for i in range(cfg.n_steps):
-        tc = ts[i]
-        tn = ts[i + 1]
-        h = tc - tn
-
-        s1 = clamp_norm(score_fn(y, float(tc.item())), cfg.score_clip)
-        max_abs_score = max(max_abs_score, safe_float(s1.abs().max()))
-        if not torch.isfinite(s1).all():
-            fail, fail_reason = True, "nonfinite score at predictor"
-            break
-
-        drift1 = y + 2.0 * s1
-        noise = torch.sqrt(2.0 * h) * torch.randn(y.shape, device=device, dtype=dtype, generator=generator)
-        yh = y + h * drift1 + noise
-
-        s2 = clamp_norm(score_fn(yh, float(tn.item())), cfg.score_clip)
-        max_abs_score = max(max_abs_score, safe_float(s2.abs().max()))
-        if not torch.isfinite(s2).all():
-            fail, fail_reason = True, "nonfinite score at corrector"
-            break
-
-        drift2 = yh + 2.0 * s2
-        y = y + 0.5 * h * (drift1 + drift2) + noise
-
-        if cfg.sample_clip and cfg.sample_clip > 0:
-            y = torch.clamp(y, min=-cfg.sample_clip, max=cfg.sample_clip)
-        if not torch.isfinite(y).all():
-            fail, fail_reason = True, "nonfinite state"
-            break
-
-    if not fail and cfg.final_denoise:
-        tf = torch.tensor(cfg.t_end, device=device, dtype=dtype)
-        sf = clamp_norm(score_fn(y, cfg.t_end), cfg.score_clip)
-        max_abs_score = max(max_abs_score, safe_float(sf.abs().max()))
-        if not torch.isfinite(sf).all():
-            fail, fail_reason = True, "nonfinite final score"
-        else:
-            y = (y + (1.0 - torch.exp(-2.0 * tf)) * sf) / torch.exp(-tf)
+        # Corrector steps: ULA targeting p_t.
+        for _ in range(cfg.n_corrector):
+            score = clamp_norm(score_fn(x, t_cur), cfg.score_clip)
+            noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+            grad_norm = torch.mean(torch.linalg.norm(score, dim=1))
+            noise_norm = torch.mean(torch.linalg.norm(noise, dim=1))
+            step = 2.0 * (cfg.corrector_snr * noise_norm / (grad_norm + 1.0e-12)) ** 2
+            step = torch.clamp(step, min=1.0e-7, max=cfg.corrector_step_max)
+            x = x + step * score + torch.sqrt(2.0 * step) * noise
             if cfg.sample_clip and cfg.sample_clip > 0:
-                y = torch.clamp(y, min=-cfg.sample_clip, max=cfg.sample_clip)
+                x = torch.clamp(x, min=-cfg.sample_clip, max=cfg.sample_clip)
 
-    info = {"failed": bool(fail), "fail_reason": fail_reason, "max_abs_score": float(max_abs_score)}
-    return y.detach(), info
+        # Predictor for reverse OU SDE.
+        score = clamp_norm(score_fn(x, t_cur), cfg.score_clip)
+        noise = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+        x = x + h * (x + 2.0 * score) + math.sqrt(2.0 * h) * noise
+        if cfg.sample_clip and cfg.sample_clip > 0:
+            x = torch.clamp(x, min=-cfg.sample_clip, max=cfg.sample_clip)
 
+    if cfg.final_denoise:
+        alpha, gamma = alpha_gamma(torch.tensor(cfg.t_end, device=device, dtype=dtype))
+        score = clamp_norm(score_fn(x, cfg.t_end), cfg.score_clip)
+        x = (x + gamma * score) / alpha
+        if cfg.sample_clip and cfg.sample_clip > 0:
+            x = torch.clamp(x, min=-cfg.sample_clip, max=cfg.sample_clip)
 
-# Backward-compatible name; now uses the sandbox-matched Heun sampler.
-def pc_reverse_sampler(target: GMM2D, score_fn: Callable[[torch.Tensor, float], torch.Tensor], cfg: ExperimentConfig, generator: torch.Generator) -> torch.Tensor:
-    y, _ = reverse_ou_heun_sde(target, score_fn, cfg, generator)
-    return y
+    return x.detach()
 
 
 # -----------------------------------------------------------------------------
@@ -539,42 +500,37 @@ def pc_reverse_sampler(target: GMM2D, score_fn: Callable[[torch.Tensor, float], 
 
 @torch.no_grad()
 def nll_metric(target: GMM2D, x: torch.Tensor) -> float:
-    return safe_float((-target.log_prob(x, t=0.0)).mean())
+    return float((-target.log_prob(x, t=0.0)).mean().item())
 
 
 @torch.no_grad()
 def mmd_rbf(x: torch.Tensor, y: torch.Tensor, bandwidth: Optional[float] = None) -> float:
-    """Sandbox-matched biased multiscale RBF MMD^2 diagnostic.
+    """Biased multiscale RBF MMD diagnostic.
 
-    This intentionally matches gmm_hlsi_sandbox.py more closely than the older
-    square-root MMD used by early versions of this robustness script.
+    The earlier unbiased single-band estimator can become negative at finite n and
+    then clamp to zero, which is visually misleading in robustness sweeps.  This
+    biased multiscale version is more stable for comparing sampler degradation.
     """
     if bandwidth is None:
         bandwidth = median_bandwidth(x, y)
-    base_h2 = float(bandwidth) ** 2
-    scales = torch.tensor([0.25, 0.5, 1.0, 2.0, 4.0], device=x.device, dtype=x.dtype)
+    base = float(bandwidth)
+    scales = [0.25, 0.5, 1.0, 2.0, 4.0]
     dxx = pairwise_sq_dists(x, x)
     dyy = pairwise_sq_dists(y, y)
     dxy = pairwise_sq_dists(x, y)
-    vals = []
+    mmd2 = torch.zeros((), device=x.device, dtype=x.dtype)
     for scale in scales:
-        h2 = torch.clamp(base_h2 * scale, min=torch.as_tensor(1.0e-12, device=x.device, dtype=x.dtype))
+        h2 = (base * scale) ** 2
         Kxx = torch.exp(-dxx / (2.0 * h2))
         Kyy = torch.exp(-dyy / (2.0 * h2))
         Kxy = torch.exp(-dxy / (2.0 * h2))
-        vals.append(Kxx.mean() + Kyy.mean() - 2.0 * Kxy.mean())
-    return safe_float(torch.stack(vals).mean().clamp(min=0.0))
+        mmd2 = mmd2 + Kxx.mean() + Kyy.mean() - 2.0 * Kxy.mean()
+    mmd2 = mmd2 / len(scales)
+    return float(torch.sqrt(torch.clamp(mmd2, min=0.0)).item())
 
 
 @torch.no_grad()
-def sliced_w2(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    n_proj: int = 256,
-    generator: Optional[torch.Generator] = None,
-    dirs: Optional[torch.Tensor] = None,
-) -> float:
-    """Sandbox-matched sliced Wasserstein-2: mean squared 1D W2, not sqrt."""
+def sliced_w2(x: torch.Tensor, y: torch.Tensor, n_proj: int = 256, generator: Optional[torch.Generator] = None, dirs: Optional[torch.Tensor] = None) -> float:
     d = x.shape[1]
     if dirs is None:
         dirs = torch.randn((n_proj, d), device=x.device, dtype=x.dtype, generator=generator)
@@ -584,53 +540,35 @@ def sliced_w2(
     px = x @ dirs.T
     py = y @ dirs.T
     n = min(px.shape[0], py.shape[0])
+    # Deterministic truncation. The truth pool itself is randomly drawn once upstream
+    # and then held fixed across the entire perturbation sweep.
     px = px[:n]
     py = py[:n]
     sx = torch.sort(px, dim=0).values
     sy = torch.sort(py, dim=0).values
-    return safe_float(((sx - sy) ** 2).mean())
+    return float(torch.sqrt(torch.clamp(torch.mean((sx - sy) ** 2), min=0.0)).item())
 
 
 @torch.no_grad()
 def ksd_rbf(target: GMM2D, x: torch.Tensor, bandwidth: Optional[float] = None) -> float:
-    """Sandbox-matched biased RBF KSD with diagonal included."""
     n, d = x.shape
     if bandwidth is None:
         bandwidth = median_bandwidth(x)
-    h2 = float(bandwidth) ** 2
+    h2 = bandwidth * bandwidth
+    h4 = h2 * h2
     s = target.score(x, t=0.0)
-    diffs = x[:, None, :] - x[None, :, :]
-    d2 = torch.sum(diffs * diffs, dim=-1)
-    K = torch.exp(-d2 / (2.0 * h2))
+    dxy = x[:, None, :] - x[None, :, :]
+    r2 = torch.sum(dxy * dxy, dim=-1)
+    K = torch.exp(-r2 / (2.0 * h2))
     ss = s @ s.T
-    sx_grad_y = torch.einsum("id,ijd->ij", s, diffs) / h2 * K
-    sy_grad_x = -torch.einsum("jd,ijd->ij", s, diffs) / h2 * K
-    trace = (d / h2 - d2 / (h2 * h2)) * K
-    kstein = ss * K + sx_grad_y + sy_grad_x + trace
-    return safe_float(kstein.mean().clamp(min=0.0).sqrt())
-
-
-def hist_kl_2d(
-    X: torch.Tensor,
-    Y: torch.Tensor,
-    *,
-    bins: int = 150,
-    smoothing: float = 1.0e-12,
-) -> Tuple[float, float]:
-    """Sandbox-matched approximate KL(P_X||P_Y), KL(P_Y||P_X)."""
-    Xn = as_numpy(X[:, :2])
-    Yn = as_numpy(Y[:, :2])
-    lo = np.minimum(np.percentile(Xn, 0.5, axis=0), np.percentile(Yn, 0.5, axis=0))
-    hi = np.maximum(np.percentile(Xn, 99.5, axis=0), np.percentile(Yn, 99.5, axis=0))
-    pad = 0.05 * (hi - lo + 1.0e-8)
-    rng = [[lo[0] - pad[0], hi[0] + pad[0]], [lo[1] - pad[1], hi[1] + pad[1]]]
-    Hx, _, _ = np.histogram2d(Xn[:, 0], Xn[:, 1], bins=bins, range=rng, density=False)
-    Hy, _, _ = np.histogram2d(Yn[:, 0], Yn[:, 1], bins=bins, range=rng, density=False)
-    px = Hx.astype(np.float64) + smoothing
-    py = Hy.astype(np.float64) + smoothing
-    px = px / px.sum()
-    py = py / py.sum()
-    return float(np.sum(px * (np.log(px) - np.log(py)))), float(np.sum(py * (np.log(py) - np.log(px))))
+    sd = torch.einsum("id,ijd->ij", s, dxy)
+    ds = torch.einsum("jd,ijd->ij", s, dxy)
+    stein = K * (ss + (sd - ds) / h2 + d / h2 - r2 / h4)
+    if n > 1:
+        val = (stein.sum() - stein.diag().sum()) / (n * (n - 1))
+    else:
+        val = stein.mean()
+    return float(torch.sqrt(torch.clamp(val, min=0.0)).item())
 
 
 @dataclass
@@ -687,27 +625,11 @@ def compute_all_metrics(target: GMM2D, samples: torch.Tensor, metric_ctx: Metric
     n = min(cfg.metrics_max_n, samples.shape[0], metric_ctx.truth_eval.shape[0])
     x = samples[:n]
     y = metric_ctx.truth_eval[:n]
-    if not torch.isfinite(x).all():
-        return {
-            "nll": float("nan"),
-            "ksd": float("nan"),
-            "mmd": float("nan"),
-            "sliced_w2": float("nan"),
-            "sw2": float("nan"),
-            "kl_gt_to_model_2d": float("nan"),
-            "kl_model_to_gt_2d": float("nan"),
-            "metric_target_n": float(n),
-        }
-    sw2_val = sliced_w2(x, y, n_proj=cfg.sw2_projections, dirs=metric_ctx.sw2_dirs)
-    kl_gt_model, kl_model_gt = hist_kl_2d(y, x, bins=cfg.hist_bins)
     return {
         "nll": nll_metric(target, x),
         "ksd": ksd_rbf(target, x, bandwidth=metric_ctx.ksd_bandwidth),
         "mmd": mmd_rbf(x, y, bandwidth=metric_ctx.mmd_bandwidth),
-        "sliced_w2": sw2_val,
-        "sw2": sw2_val,
-        "kl_gt_to_model_2d": kl_gt_model,
-        "kl_model_to_gt_2d": kl_model_gt,
+        "sw2": sliced_w2(x, y, n_proj=cfg.sw2_projections, dirs=metric_ctx.sw2_dirs),
         "metric_target_n": float(n),
     }
 
@@ -738,8 +660,7 @@ def integrated_score_fisher_metric(score_fn: Callable[[torch.Tensor, float], tor
         err2 = torch.sum((s_hat - s_true) ** 2, dim=1)
         mse_vals.append(torch.mean(err2))
     mse = float(torch.mean(torch.stack(mse_vals)).item())
-    rmse = float(math.sqrt(max(mse, 0.0)))
-    return {"fisher_mse": mse, "fisher_rmse": rmse, "score_rmse": rmse}
+    return {"fisher_mse": mse, "fisher_rmse": float(math.sqrt(max(mse, 0.0)))}
 
 
 # -----------------------------------------------------------------------------
@@ -941,6 +862,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
             gate_clip=cfg.gate_clip,
             weight_temp=cfg.weight_temp,
             eval_chunk=cfg.eval_chunk,
+            gate_anchors=clean_refs,
             op_blend_reg=cfg.op_blend_reg,
             op_blend_pinv_rtol=cfg.op_blend_pinv_rtol,
             op_blend_project_gate=cfg.op_blend_project_gate,
@@ -971,7 +893,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
             else:
                 score_fn = lambda x, t, m=method: bank.estimate(x, t=t, method=m)
             t0 = time.time()
-            samples, sampler_info = reverse_ou_heun_sde(target, score_fn, cfg, generator=sample_gen)
+            samples = pc_reverse_sampler(target, score_fn, cfg, generator=sample_gen)
             elapsed = time.time() - t0
             sample_by_method[method] = samples
             metrics = compute_all_metrics(target, samples, metric_ctx, cfg)
@@ -983,9 +905,6 @@ def run_experiment(cfg: ExperimentConfig) -> None:
                 "rms_anchor_shift": ref_rms_shift,
                 "mean_anchor_shift": ref_mean_shift,
                 "metric_target": "fixed_unperturbed_target_pool",
-                "sampler_failed": bool(sampler_info.get("failed", False)),
-                "sampler_fail_reason": str(sampler_info.get("fail_reason", "")),
-                "sampler_max_abs_score": safe_float(sampler_info.get("max_abs_score", float("nan"))),
                 **metrics,
                 **fisher_metrics,
             }
@@ -1025,7 +944,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
         np.savez_compressed(os.path.join(cfg.outdir, f"samples_sigma_{sigma:g}.npz"), **npz_payload)
 
     metrics_df = pd.DataFrame(all_rows)
-    for metric in ["ksd", "nll", "mmd", "sw2", "sliced_w2", "kl_gt_to_model_2d", "kl_model_to_gt_2d"]:
+    for metric in ["ksd", "nll", "mmd", "sw2"]:
         ref_map = metrics_df[metrics_df["method"] == "PERTURBED_REF"].set_index("perturb_sigma")[metric].to_dict()
         metrics_df[f"delta_vs_ref_{metric}"] = metrics_df.apply(
             lambda r, m=metric: float(r[m] - ref_map.get(r["perturb_sigma"], np.nan)), axis=1
@@ -1040,11 +959,7 @@ def run_experiment(cfg: ExperimentConfig) -> None:
     metrics_df.to_csv(metrics_csv, index=False)
     ess_df.to_csv(ess_csv, index=False)
 
-    plot_metric_array(
-        metrics_df,
-        ["ksd", "nll", "mmd", "sliced_w2", "kl_gt_to_model_2d", "kl_model_to_gt_2d", "score_rmse"],
-        os.path.join(cfg.outdir, "meta_metric_array.png"),
-    )
+    plot_metric_array(metrics_df, ["ksd", "nll", "mmd", "sw2", "fisher_rmse"], os.path.join(cfg.outdir, "meta_metric_array.png"))
     plot_contrast_sweeps(metrics_df, os.path.join(cfg.outdir, "contrast_vs_reference.png"))
     plot_histogram_array_over_sigmas(
         target=target,
