@@ -10,6 +10,7 @@ Implements SNIS versions of the main estimators:
   - HLSI (componentwise resolvent gate)
   - CE-HLSI (empirical conditional-expectation gate)
   - Hybrid-CE-HLSI (perturbed-reference score aggregate with clean-reference CE gate)
+  - DRC-CE-HLSI (density-ratio-corrected CE-HLSI with probability-flow logq updates)
   - optional ORACLE sampler
 
 Experiment:
@@ -21,8 +22,10 @@ Experiment:
   4. Build SNIS estimators using the perturbed anchors.
      Hybrid-CE-HLSI additionally uses the paired clean anchors to compute only
      the CE-HLSI gate, while keeping perturbed-anchor score signals.
-     Method names may be bootstrapped chains: Final_Previous means run Previous
-     first, then use its samples as references for Final.
+     DRC-CE-HLSI uses global log reference weights rho_i updated by analytic
+     CE-HLSI probability-flow likelihoods. Method names may be bootstrapped
+     chains: Final_Previous means run Previous first, then use its samples as
+     references for Final.
   5. Sample with a stochastic predictor-corrector reverse OU sampler.
   6. Measure generated samples using NLL / KSD / MMD / SW2 and the time-integrated
      score RMSE (Fisher-type score divergence) against the exact OU-diffused GMM score.
@@ -38,7 +41,7 @@ import math
 import os
 import time
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 import matplotlib
@@ -99,7 +102,7 @@ class ExperimentConfig:
 
     # Estimators
     #methods: Tuple[str, ...] = ("Tweedie", "HLSI", "CE-HLSI", "Blended", "OP-Blend")
-    methods: Tuple[str, ...] = ("Tweedie", "CE-HLSI", "Hybrid-CE-HLSI")
+    methods: Tuple[str, ...] = ("CE-HLSI", "CE-HLSI_CE-HLSI", "DRC-CE-HLSI", "DRC-CE-HLSI_DRC-CE-HLSI")
     include_oracle: bool = True
     curvature_mode: str = "raw"  # raw, psd, abs
     curvature_floor: float = -1.0e6
@@ -111,6 +114,17 @@ class ExperimentConfig:
     op_blend_reg: float = 1.0e-8
     op_blend_pinv_rtol: float = 1.0e-6
     op_blend_project_gate: bool = False
+
+    # Density-ratio-corrected CE-HLSI / probability-flow likelihoods
+    pf_steps: int = 64
+    pf_t_start: Optional[float] = None  # default: t_end
+    pf_t_end: Optional[float] = None    # default: t_start
+    rho_beta: float = 1.0
+    rho_clip: Optional[float] = 20.0
+    rho_ess_floor: float = 0.02
+    rho_batch: int = 512
+    drc_disable_final_denoise: bool = True
+    pf_div_clip: Optional[float] = 1.0e4
 
     # Metrics
     mmd_bandwidth: Optional[float] = None
@@ -410,6 +424,7 @@ class SNISScoreBank:
         op_blend_pinv_rtol: float = 1.0e-6,
         op_blend_project_gate: bool = False,
         gate_anchors: Optional[torch.Tensor] = None,
+        log_ref_weights: Optional[torch.Tensor] = None,
     ):
         self.target = target
 
@@ -424,6 +439,13 @@ class SNISScoreBank:
         self.score0 = target.score(self.x, t=0.0).detach()
         self.H_raw = target.observed_information(self.x, t=0.0).detach()
         self.P = process_curvature(self.H_raw, curvature_mode, curvature_floor, curvature_cap).detach()
+        if log_ref_weights is None:
+            self.log_ref_weights = torch.zeros((self.N,), device=self.device, dtype=self.dtype)
+        else:
+            self.log_ref_weights = log_ref_weights.detach().to(device=self.device, dtype=self.dtype).reshape(-1)
+            if self.log_ref_weights.shape[0] != self.N:
+                raise ValueError(f"log_ref_weights must have length {self.N}, got {self.log_ref_weights.shape[0]}")
+            self.log_ref_weights = torch.nan_to_num(self.log_ref_weights, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Gate bank: optional clean anchors paired with the perturbed anchors.
         # Hybrid-CE-HLSI uses this bank only for the CE gate: it computes
@@ -447,20 +469,29 @@ class SNISScoreBank:
         self.op_blend_pinv_rtol = op_blend_pinv_rtol
         self.op_blend_project_gate = op_blend_project_gate
 
-    def _weights_for_anchors(self, y: torch.Tensor, t: float, anchors: torch.Tensor):
+    def _weights_for_anchors(
+        self,
+        y: torch.Tensor,
+        t: float,
+        anchors: torch.Tensor,
+        log_ref_weights: Optional[torch.Tensor] = None,
+    ):
         t_tensor = torch.as_tensor(t, device=self.device, dtype=self.dtype)
         alpha, gamma = alpha_gamma(t_tensor)
+        gamma = torch.clamp(gamma, min=torch.as_tensor(1.0e-12, device=self.device, dtype=self.dtype))
         diff = y[:, None, :] - alpha * anchors[None, :, :]
         logw = -0.5 * torch.sum(diff * diff, dim=-1) / gamma
         if self.weight_temp != 1.0:
             logw = logw / self.weight_temp
+        if log_ref_weights is not None:
+            logw = logw + log_ref_weights[None, :]
         logw = logw - torch.max(logw, dim=1, keepdim=True).values
         w = torch.exp(logw)
         w = w / torch.clamp(w.sum(dim=1, keepdim=True), min=1.0e-300)
         return w, alpha, gamma
 
     def _weights_and_signals(self, y: torch.Tensor, t: float):
-        w, alpha, gamma = self._weights_for_anchors(y, t, self.x)
+        w, alpha, gamma = self._weights_for_anchors(y, t, self.x, self.log_ref_weights)
         b = (alpha * self.x[None, :, :] - y[:, None, :]) / gamma
         c = self.score0[None, :, :] / alpha
         return w, b, c, alpha, gamma
@@ -513,18 +544,67 @@ class SNISScoreBank:
             corr = torch.einsum("nij,bnj->bni", G_i, (c - b))
             h_i = b + corr
             return torch.sum(w[:, :, None] * h_i, dim=1)
-        if method_key == "ce-hlsi":
+        if method_key in {"ce-hlsi", "drc-ce-hlsi"}:
             Pbar = torch.sum(w[:, :, None, None] * self.P[None, :, :, :], dim=1)
             Gbar = resolvent_gate(Pbar, alpha, gamma, self.resolvent_eps, self.gate_clip)
             return bbar + torch.einsum("bij,bj->bi", Gbar, (cbar - bbar))
         if method_key in {"hybrid-ce-hlsi", "ce-hlsi-hybrid", "hybrid-ce"}:
             # Score aggregate uses perturbed-reference signals (bbar, cbar).
             # The CE gate itself is computed from the paired clean gate bank.
-            w_gate, _, _ = self._weights_for_anchors(y, t, self.gate_x)
+            w_gate, _, _ = self._weights_for_anchors(y, t, self.gate_x, None)
             Pbar_gate = torch.sum(w_gate[:, :, None, None] * self.P_gate[None, :, :, :], dim=1)
             Gbar_gate = resolvent_gate(Pbar_gate, alpha, gamma, self.resolvent_eps, self.gate_clip)
             return bbar + torch.einsum("bij,bj->bi", Gbar_gate, (cbar - bbar))
         raise ValueError(f"Unknown method={method}")
+
+    def ce_hlsi_score_and_divergence_chunk(self, y: torch.Tensor, t: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return corrected CE-HLSI score and analytic divergence for one chunk.
+
+        This implements
+            div s = tr(J_b) + tr(G J_r)
+                    - (gamma / alpha^2) sum_a e_a^T G (partial_a Pbar) G r,
+        where all averages use the bank's global log_ref_weights. The same
+        corrected weights are therefore used for bbar, cbar, and Pbar.
+        """
+        w, b, c, alpha, gamma = self._weights_and_signals(y, t)
+        B, N, d = b.shape
+        bbar = torch.sum(w[:, :, None] * b, dim=1)
+        cbar = torch.sum(w[:, :, None] * c, dim=1)
+        Pbar = torch.sum(w[:, :, None, None] * self.P[None, :, :, :], dim=1)
+        G = resolvent_gate(Pbar, alpha, gamma, self.resolvent_eps, self.gate_clip)
+
+        r = cbar - bbar
+        score = bbar + torch.einsum("bij,bj->bi", G, r)
+
+        db = b - bbar[:, None, :]
+        dc = c - cbar[:, None, :]
+        dP = self.P[None, :, :, :] - Pbar[:, None, :, :]
+        Cbb = torch.einsum("bn,bni,bnj->bij", w, db, db)
+        Ccb = torch.einsum("bn,bni,bnj->bij", w, dc, db)
+        I = torch.eye(d, device=y.device, dtype=y.dtype).expand(B, d, d)
+        Jb = Cbb - I / gamma
+        Jc = Ccb
+        Jr = Jc - Jb
+
+        dPdy = torch.einsum("bn,bna,bnuv->bauv", w, db, dP)
+        Gr = torch.einsum("bij,bj->bi", G, r)
+        gate_trace_term = torch.einsum("bau,bauv,bv->b", G, dPdy, Gr)
+        tr_Jb = torch.diagonal(Jb, dim1=-2, dim2=-1).sum(dim=-1)
+        tr_GJr = torch.einsum("bij,bji->b", G, Jr)
+        div = tr_Jb + tr_GJr - (gamma / torch.clamp(alpha * alpha, min=1.0e-12)) * gate_trace_term
+        div = torch.nan_to_num(div, nan=0.0, posinf=1.0e12, neginf=-1.0e12)
+        score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+        return score, div
+
+    @torch.no_grad()
+    def ce_hlsi_score_and_divergence(self, y: torch.Tensor, t: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores: List[torch.Tensor] = []
+        divs: List[torch.Tensor] = []
+        for start in range(0, y.shape[0], self.eval_chunk):
+            s, div = self.ce_hlsi_score_and_divergence_chunk(y[start:start + self.eval_chunk], t)
+            scores.append(s)
+            divs.append(div)
+        return torch.cat(scores, dim=0), torch.cat(divs, dim=0)
 
     @torch.no_grad()
     def estimate(self, y: torch.Tensor, t: float, method: str) -> torch.Tensor:
@@ -1267,6 +1347,7 @@ def build_snis_bank(
     anchors: torch.Tensor,
     gate_anchors: Optional[torch.Tensor],
     cfg: ExperimentConfig,
+    log_ref_weights: Optional[torch.Tensor] = None,
 ) -> SNISScoreBank:
     return SNISScoreBank(
         target=target,
@@ -1282,8 +1363,201 @@ def build_snis_bank(
         op_blend_pinv_rtol=cfg.op_blend_pinv_rtol,
         op_blend_project_gate=cfg.op_blend_project_gate,
         gate_anchors=gate_anchors,
+        log_ref_weights=log_ref_weights,
     )
 
+
+
+def normalize_method_key(method: str) -> str:
+    return str(method).strip().replace("_", "-").lower()
+
+
+def is_drc_method_token(method: str) -> bool:
+    key = normalize_method_key(method)
+    return key in {"drc-ce-hlsi", "drc-ce", "density-ratio-ce-hlsi", "density-ratio-corrected-ce-hlsi"}
+
+
+def score_method_for_stage(method: str) -> str:
+    return "CE-HLSI" if is_drc_method_token(method) else method
+
+
+def standard_normal_logprob(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1]
+    return -0.5 * (d * math.log(2.0 * math.pi) + torch.sum(x * x, dim=-1))
+
+
+def centered_log_weights(logw: torch.Tensor) -> torch.Tensor:
+    logw = torch.nan_to_num(logw, nan=0.0, posinf=0.0, neginf=0.0)
+    return logw - (torch.logsumexp(logw, dim=0) - math.log(max(int(logw.numel()), 1)))
+
+
+def log_weight_ess(logw: torch.Tensor) -> Tuple[float, float]:
+    if logw.numel() == 0:
+        return float("nan"), float("nan")
+    lw = logw - torch.max(logw)
+    w = torch.exp(lw)
+    ess = (w.sum() ** 2) / torch.clamp(torch.sum(w * w), min=1.0e-30)
+    ess_f = safe_float(ess)
+    return ess_f, ess_f / float(logw.numel())
+
+
+def finalize_density_ratio_weights(raw_rho: torch.Tensor, cfg: ExperimentConfig) -> Tuple[torch.Tensor, Dict[str, float | bool]]:
+    """Center, temper, clip, and optionally shrink beta to satisfy ESS floor."""
+    raw_centered = centered_log_weights(raw_rho)
+    beta_target = max(float(cfg.rho_beta), 0.0)
+    clip = cfg.rho_clip
+
+    def apply(beta: float) -> torch.Tensor:
+        out = beta * raw_centered
+        if clip is not None and clip > 0:
+            out = torch.clamp(out, min=-float(clip), max=float(clip))
+        return centered_log_weights(out)
+
+    rho = apply(beta_target)
+    ess, ess_frac = log_weight_ess(rho)
+    beta_eff = beta_target
+    floor = max(float(cfg.rho_ess_floor), 0.0)
+    adapted = False
+    if floor > 0.0 and math.isfinite(ess_frac) and ess_frac < floor and beta_target > 0.0:
+        lo, hi = 0.0, beta_target
+        for _ in range(30):
+            mid = 0.5 * (lo + hi)
+            cand = apply(mid)
+            _, cand_frac = log_weight_ess(cand)
+            if math.isfinite(cand_frac) and cand_frac >= floor:
+                lo = mid
+            else:
+                hi = mid
+        beta_eff = lo
+        rho = apply(beta_eff)
+        ess, ess_frac = log_weight_ess(rho)
+        adapted = True
+
+    return rho.detach(), {
+        "rho_beta_target": float(beta_target),
+        "rho_beta_eff": float(beta_eff),
+        "rho_adapted_for_ess": bool(adapted),
+        "rho_ess": float(ess),
+        "rho_ess_frac": float(ess_frac),
+        "rho_mean": safe_float(rho.mean()),
+        "rho_std": safe_float(rho.std(unbiased=False)),
+        "rho_min": safe_float(rho.min()),
+        "rho_max": safe_float(rho.max()),
+        "rho_raw_mean": safe_float(raw_centered.mean()),
+        "rho_raw_std": safe_float(raw_centered.std(unbiased=False)),
+        "rho_raw_min": safe_float(raw_centered.min()),
+        "rho_raw_max": safe_float(raw_centered.max()),
+    }
+
+
+@torch.no_grad()
+def pf_logprob_ce_hlsi(bank: SNISScoreBank, x0: torch.Tensor, cfg: ExperimentConfig) -> Tuple[torch.Tensor, Dict[str, float | bool]]:
+    """Estimate log q_k(x0) by the forward OU probability-flow ODE.
+
+    The frozen bank's corrected CE-HLSI field supplies both score and analytic
+    divergence. This intentionally integrates from max(t_end, pf_t_start) to
+    pf_t_end, so DRC methods default to using non-denoised sampler endpoints.
+    """
+    if x0.numel() == 0:
+        return torch.empty((0,), device=bank.device, dtype=bank.dtype), {"pf_failed_frac": 0.0}
+    t0 = float(cfg.t_end if cfg.pf_t_start is None else cfg.pf_t_start)
+    t1 = float(cfg.t_start if cfg.pf_t_end is None else cfg.pf_t_end)
+    t0 = max(t0, 1.0e-6)
+    t1 = max(t1, t0 + 1.0e-6)
+    n_steps = max(int(cfg.pf_steps), 1)
+    batch = max(int(cfg.rho_batch), 1)
+    out: List[torch.Tensor] = []
+    failed_total = 0
+    max_abs_div = 0.0
+    max_abs_state = 0.0
+    ts = torch.linspace(t0, t1, n_steps + 1, device=bank.device, dtype=bank.dtype)
+    d = x0.shape[1]
+
+    for start in range(0, x0.shape[0], batch):
+        x = x0[start:start + batch].detach().clone()
+        A = torch.zeros((x.shape[0],), device=x.device, dtype=x.dtype)
+        alive = torch.ones((x.shape[0],), device=x.device, dtype=torch.bool)
+        for j in range(n_steps):
+            t = float(ts[j].item())
+            tn = float(ts[j + 1].item())
+            h = tn - t
+            s, div = bank.ce_hlsi_score_and_divergence(x, t)
+            s = clamp_norm(s, cfg.score_clip)
+            if cfg.pf_div_clip is not None and cfg.pf_div_clip > 0:
+                div = torch.clamp(div, min=-float(cfg.pf_div_clip), max=float(cfg.pf_div_clip))
+            v = -x - s
+            a = float(d) + div
+
+            x_e = x + h * v
+            s_e, div_e = bank.ce_hlsi_score_and_divergence(x_e, tn)
+            s_e = clamp_norm(s_e, cfg.score_clip)
+            if cfg.pf_div_clip is not None and cfg.pf_div_clip > 0:
+                div_e = torch.clamp(div_e, min=-float(cfg.pf_div_clip), max=float(cfg.pf_div_clip))
+            v_e = -x_e - s_e
+            a_e = float(d) + div_e
+
+            finite = torch.isfinite(x_e).all(dim=1) & torch.isfinite(v_e).all(dim=1) & torch.isfinite(a) & torch.isfinite(a_e)
+            alive = alive & finite
+            x = x + 0.5 * h * (v + v_e)
+            A = A + 0.5 * h * (a + a_e)
+            if cfg.sample_clip and cfg.sample_clip > 0:
+                x = torch.clamp(x, min=-cfg.sample_clip, max=cfg.sample_clip)
+            max_abs_div = max(max_abs_div, safe_float(torch.max(torch.abs(torch.cat([div.reshape(-1), div_e.reshape(-1)])))))
+            max_abs_state = max(max_abs_state, safe_float(x.abs().max()))
+        logq = standard_normal_logprob(x) - A
+        good = alive & torch.isfinite(logq)
+        failed_total += int((~good).sum().item())
+        if (~good).any():
+            replacement = torch.nanmedian(logq[good]) if good.any() else torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            logq = torch.where(good, logq, replacement)
+        out.append(logq.detach())
+
+    logq_all = torch.cat(out, dim=0)
+    return logq_all, {
+        "pf_failed_frac": float(failed_total) / float(max(1, x0.shape[0])),
+        "pf_t_start": float(t0),
+        "pf_t_end": float(t1),
+        "pf_steps": int(n_steps),
+        "pf_max_abs_div": float(max_abs_div),
+        "pf_max_abs_state": float(max_abs_state),
+        "pf_logq_mean": safe_float(logq_all.mean()),
+        "pf_logq_std": safe_float(logq_all.std(unbiased=False)),
+        "pf_logq_min": safe_float(logq_all.min()),
+        "pf_logq_max": safe_float(logq_all.max()),
+    }
+
+
+@torch.no_grad()
+def compute_drc_next_weights(
+    target: GMM2D,
+    frozen_bank: SNISScoreBank,
+    next_refs: torch.Tensor,
+    cfg: ExperimentConfig,
+) -> Tuple[torch.Tensor, Dict[str, float | bool]]:
+    logq, pf_info = pf_logprob_ce_hlsi(frozen_bank, next_refs, cfg)
+    logpi = target.log_prob(next_refs, t=0.0)
+    raw_rho = logpi - logq
+    rho, rho_info = finalize_density_ratio_weights(raw_rho, cfg)
+
+    # Mode-mass diagnostic under exact GMM responsibilities. This is not used by
+    # the algorithm; it is useful for checking whether DRC is correcting mode mass.
+    resp = target.responsibilities(next_refs, t=0.0)
+    assign = torch.argmax(resp, dim=1)
+    target_w = target.weights.detach()
+    mode_fracs = torch.stack([(assign == k).to(target.dtype).mean() for k in range(target.K)])
+    mode_l1 = torch.sum(torch.abs(mode_fracs - target_w))
+
+    info: Dict[str, float | bool] = {
+        **pf_info,
+        **rho_info,
+        "rho_logpi_mean": safe_float(logpi.mean()),
+        "rho_logpi_std": safe_float(logpi.std(unbiased=False)),
+        "mode_mass_l1": safe_float(mode_l1),
+    }
+    for k in range(target.K):
+        info[f"mode_mass_{k}"] = safe_float(mode_fracs[k])
+        info[f"target_mode_weight_{k}"] = safe_float(target_w[k])
+    return rho.detach(), info
 
 @torch.no_grad()
 def run_method_or_bootstrap_chain(
@@ -1340,6 +1614,7 @@ def run_method_or_bootstrap_chain(
     execution_order = split_bootstrap_method(method_name)
     current_refs = initial_refs.detach()
     current_gate_refs = initial_gate_refs.detach()
+    current_log_ref_weights = torch.zeros((current_refs.shape[0],), device=current_refs.device, dtype=current_refs.dtype)
     final_score_fn: Optional[Callable[[torch.Tensor, float], torch.Tensor]] = None
     final_samples: Optional[torch.Tensor] = None
     final_sampler_info: Dict[str, float | str | bool] = {}
@@ -1350,14 +1625,40 @@ def run_method_or_bootstrap_chain(
     seed_base = int(trial_seed + 10000 + 101 * sigma_idx + method_idx)
     for stage_idx, stage_method in enumerate(execution_order):
         last_stage_ref_n = int(current_refs.shape[0])
-        stage_bank = build_snis_bank(target, current_refs, current_gate_refs, cfg)
-        score_fn = lambda x, t, bank=stage_bank, m=stage_method: bank.estimate(x, t=t, method=m)
+        stage_is_drc = is_drc_method_token(stage_method)
+        stage_bank = build_snis_bank(
+            target,
+            current_refs,
+            current_gate_refs,
+            cfg,
+            log_ref_weights=current_log_ref_weights,
+        )
+        stage_score_method = score_method_for_stage(stage_method)
+        score_fn = lambda x, t, bank=stage_bank, m=stage_score_method: bank.estimate(x, t=t, method=m)
         stage_seed = seed_base if stage_idx == 0 else int(seed_base + 1_000_003 * stage_idx)
         stage_gen = make_generator(stage_seed, target.device)
+        stage_cfg = cfg
+        if stage_is_drc and cfg.drc_disable_final_denoise and cfg.final_denoise:
+            stage_cfg = replace(cfg, final_denoise=False)
         t0 = time.time()
-        samples, sampler_info = reverse_ou_heun_sde(target, score_fn, cfg, generator=stage_gen)
+        samples, sampler_info = reverse_ou_heun_sde(target, score_fn, stage_cfg, generator=stage_gen)
         elapsed = time.time() - t0
         total_elapsed += elapsed
+
+        next_ref_n = min(int(cfg.n_ref), int(samples.shape[0]))
+        drc_info: Dict[str, float | bool] = {
+            "stage_is_drc": bool(stage_is_drc),
+            "stage_score_method": str(stage_score_method),
+            "stage_final_denoise_used": bool(stage_cfg.final_denoise),
+            "stage_input_rho_ess": log_weight_ess(current_log_ref_weights)[0],
+            "stage_input_rho_ess_frac": log_weight_ess(current_log_ref_weights)[1],
+        }
+        next_log_ref_weights = torch.zeros((next_ref_n,), device=current_refs.device, dtype=current_refs.dtype)
+        if stage_is_drc and next_ref_n > 0:
+            ratio_t0 = time.time()
+            next_log_ref_weights, ratio_info = compute_drc_next_weights(target, stage_bank, samples[:next_ref_n].detach(), cfg)
+            drc_info.update(ratio_info)
+            drc_info["rho_update_elapsed_sec"] = float(time.time() - ratio_t0)
 
         stage_rows.append({
             "method": method_name,
@@ -1368,12 +1669,13 @@ def run_method_or_bootstrap_chain(
             "stage_ref_source": "initial_corrupted_refs" if stage_idx == 0 else "previous_stage_samples_first_n_ref",
             "stage_ref_n": int(current_refs.shape[0]),
             "stage_generated_n": int(samples.shape[0]),
-            "stage_next_ref_n": int(min(cfg.n_ref, samples.shape[0])) if stage_idx < len(execution_order) - 1 else 0,
+            "stage_next_ref_n": int(next_ref_n) if stage_idx < len(execution_order) - 1 else 0,
             "stage_seed": int(stage_seed),
             "stage_elapsed_sec": float(elapsed),
             "stage_sampler_failed": bool(sampler_info.get("failed", False)),
             "stage_sampler_fail_reason": str(sampler_info.get("fail_reason", "")),
             "stage_sampler_max_abs_score": safe_float(sampler_info.get("max_abs_score", float("nan"))),
+            **drc_info,
         })
 
         final_samples = samples
@@ -1390,9 +1692,9 @@ def run_method_or_bootstrap_chain(
         # Hybrid-CE-HLSI stage is well-defined but no longer uses the original
         # clean/perturbed pairing.
         if stage_idx < len(execution_order) - 1:
-            next_ref_n = min(int(cfg.n_ref), int(samples.shape[0]))
             current_refs = samples[:next_ref_n].detach()
             current_gate_refs = current_refs
+            current_log_ref_weights = next_log_ref_weights.detach() if stage_is_drc else torch.zeros((next_ref_n,), device=current_refs.device, dtype=current_refs.dtype)
 
     if final_samples is None or final_score_fn is None:
         raise RuntimeError("Bootstrap chain produced no samples for method {}".format(method_name))
@@ -1745,6 +2047,17 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--op_blend_reg", type=float, default=ExperimentConfig.op_blend_reg)
     p.add_argument("--op_blend_pinv_rtol", type=float, default=ExperimentConfig.op_blend_pinv_rtol)
     p.add_argument("--op_blend_project_gate", action="store_true")
+    p.add_argument("--pf_steps", type=int, default=ExperimentConfig.pf_steps, help="Probability-flow Heun steps for DRC log q estimates.")
+    p.add_argument("--pf_t_start", type=float, default=None, help="Start time for DRC probability-flow logq; defaults to t_end.")
+    p.add_argument("--pf_t_end", type=float, default=None, help="Terminal time for DRC probability-flow logq; defaults to t_start.")
+    p.add_argument("--rho_beta", type=float, default=ExperimentConfig.rho_beta, help="Tempering exponent for DRC log density-ratio weights.")
+    p.add_argument("--rho_clip", type=float, default=ExperimentConfig.rho_clip if ExperimentConfig.rho_clip is not None else 0.0, help="Absolute clip for centered DRC log density-ratio weights; use --no_rho_clip to disable.")
+    p.add_argument("--no_rho_clip", action="store_true")
+    p.add_argument("--rho_ess_floor", type=float, default=ExperimentConfig.rho_ess_floor, help="Minimum ESS/N for DRC weights; beta is shrunk if needed.")
+    p.add_argument("--rho_batch", type=int, default=ExperimentConfig.rho_batch, help="Batch size for DRC probability-flow logq estimates.")
+    p.add_argument("--drc_final_denoise", action="store_true", help="Use final Tweedie denoising inside DRC sampler stages. Default disables it so path-integral ratios match sampler endpoints.")
+    p.add_argument("--pf_div_clip", type=float, default=ExperimentConfig.pf_div_clip if ExperimentConfig.pf_div_clip is not None else 0.0, help="Absolute clip for analytic divergence during DRC probability-flow integration; use --no_pf_div_clip to disable.")
+    p.add_argument("--no_pf_div_clip", action="store_true")
     p.add_argument("--mmd_bandwidth", type=float, default=None)
     p.add_argument("--ksd_bandwidth", type=float, default=None)
     p.add_argument("--sw2_projections", type=int, default=ExperimentConfig.sw2_projections)
@@ -1766,6 +2079,8 @@ def parse_args() -> ExperimentConfig:
         include_oracle = False
 
     gate_clip = None if args.no_gate_clip else args.gate_clip
+    rho_clip = None if args.no_rho_clip else args.rho_clip
+    pf_div_clip = None if args.no_pf_div_clip else args.pf_div_clip
 
     return ExperimentConfig(
         outdir=args.outdir,
@@ -1807,6 +2122,15 @@ def parse_args() -> ExperimentConfig:
         op_blend_reg=args.op_blend_reg,
         op_blend_pinv_rtol=args.op_blend_pinv_rtol,
         op_blend_project_gate=args.op_blend_project_gate,
+        pf_steps=args.pf_steps,
+        pf_t_start=args.pf_t_start,
+        pf_t_end=args.pf_t_end,
+        rho_beta=args.rho_beta,
+        rho_clip=rho_clip,
+        rho_ess_floor=args.rho_ess_floor,
+        rho_batch=args.rho_batch,
+        drc_disable_final_denoise=not args.drc_final_denoise,
+        pf_div_clip=pf_div_clip,
         mmd_bandwidth=args.mmd_bandwidth,
         ksd_bandwidth=args.ksd_bandwidth,
         sw2_projections=args.sw2_projections,
