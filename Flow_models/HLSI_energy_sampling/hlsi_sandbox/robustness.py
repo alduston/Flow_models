@@ -138,6 +138,11 @@ class ExperimentConfig:
     hist_cmap: str = "bright_lava"
     hist_gamma: float = 0.35
     hist_vmax_quantile: float = 0.995
+    # Residual panels use histogram_probability(method) - histogram_probability(ORACLE).
+    # The vmax quantile avoids a single outlier bin washing out the plot, and
+    # residual_intensity > 1 lowers the displayed vmax to brighten residual pixels.
+    residual_vmax_quantile: float = 0.995
+    residual_intensity: float = 1.8
     hist_contour_alpha: float = 0.16
     hist_contour_lw: float = 0.35
     plot_every_sigma: bool = True
@@ -1108,51 +1113,78 @@ def plot_contrast_sweeps(metrics_df: pd.DataFrame, outpath: str) -> None:
     plt.close(fig)
 
 
-def plot_samples_for_sigma(target: GMM2D, ref: torch.Tensor, sample_by_method: Dict[str, torch.Tensor], sigma: float, cfg: ExperimentConfig, outpath: str) -> None:
-    Xg, Yg, Pg = density_grid(target, cfg.grid_lim, cfg.grid_n)
-    panels: List[Tuple[str, Optional[torch.Tensor], str]] = [("target density", None, "density"), ("perturbed refs", ref, "hist")]
-    for method, samples in sample_by_method.items():
-        panels.append((method, samples, "hist"))
-    hist_arrays = [as_numpy(pts) for _, pts, kind in panels if kind == "hist" and pts is not None]
-    hist_vmax = hist_global_vmax(hist_arrays, cfg)
 
-    ncols = 4
-    nrows = int(math.ceil(len(panels) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.0 * nrows), constrained_layout=True)
-    axes = np.array(axes).reshape(-1)
-    cmap = get_hist_cmap(cfg.hist_cmap)
-    for ax, (title, pts, kind) in zip(axes, panels):
-        if kind == "density":
-            ax.imshow(
-                Pg,
-                origin="lower",
-                extent=[-cfg.grid_lim, cfg.grid_lim, -cfg.grid_lim, cfg.grid_lim],
-                aspect="equal",
-                cmap=cmap,
-                alpha=0.90,
-            )
-            ax.contour(
-                Xg,
-                Yg,
-                Pg,
-                levels=8,
-                linewidths=float(cfg.hist_contour_lw),
-                alpha=float(cfg.hist_contour_alpha),
-                colors="white",
-            )
-        else:
-            arr = as_numpy(pts)
-            _draw_hist_panel(ax, arr, Xg, Yg, Pg, cfg, hist_vmax=hist_vmax)
-        ax.set_xlim(-cfg.grid_lim, cfg.grid_lim)
-        ax.set_ylim(-cfg.grid_lim, cfg.grid_lim)
-        ax.set_aspect("equal")
-        ax.set_title(title)
-    for ax in axes[len(panels):]:
-        ax.axis("off")
-    fig.suptitle(f"Reference perturbation sigma = {sigma:g} | shared histogram vmax count = {hist_vmax:.0f}", fontsize=14)
-    fig.savefig(outpath, dpi=180)
-    plt.close(fig)
+def _hist_prob_image(arr: np.ndarray, cfg: ExperimentConfig) -> np.ndarray:
+    """Histogram as a probability image on the plotting grid."""
+    H = hist_count_image(arr, cfg).astype(np.float64)
+    total = float(H.sum())
+    if total > 0.0:
+        H = H / total
+    return H
 
+
+def _draw_hist_prob_panel(
+    ax,
+    arr: np.ndarray,
+    Xg: np.ndarray,
+    Yg: np.ndarray,
+    Pg: np.ndarray,
+    cfg: ExperimentConfig,
+    hist_vmax: Optional[float] = None,
+) -> None:
+    """Draw the usual lava count histogram panel with target contours."""
+    _draw_hist_panel(ax, arr, Xg, Yg, Pg, cfg, hist_vmax=hist_vmax)
+    ax.set_xticks([-4, -2, 0, 2, 4])
+    ax.set_yticks([-4, -2, 0, 2, 4])
+
+
+def _draw_residual_panel(
+    ax,
+    residual: np.ndarray,
+    Xg: np.ndarray,
+    Yg: np.ndarray,
+    Pg: np.ndarray,
+    cfg: ExperimentConfig,
+    resid_vmax: float,
+) -> None:
+    """Draw empirical histogram probability residuals against the oracle histogram."""
+    vmax = max(float(resid_vmax), 1.0e-12)
+    ax.imshow(
+        residual.T,
+        origin="lower",
+        extent=[-cfg.grid_lim, cfg.grid_lim, -cfg.grid_lim, cfg.grid_lim],
+        aspect="equal",
+        interpolation="nearest",
+        cmap="RdBu_r",
+        vmin=-vmax,
+        vmax=vmax,
+        alpha=1.0,
+    )
+    ax.contour(
+        Xg,
+        Yg,
+        Pg,
+        levels=8,
+        linewidths=float(cfg.hist_contour_lw),
+        alpha=float(cfg.hist_contour_alpha),
+        colors="black",
+    )
+    ax.set_xlim(-cfg.grid_lim, cfg.grid_lim)
+    ax.set_ylim(-cfg.grid_lim, cfg.grid_lim)
+    ax.set_aspect("equal")
+    ax.set_xticks([-4, -2, 0, 2, 4])
+    ax.set_yticks([-4, -2, 0, 2, 4])
+
+
+def plot_samples_for_sigma(*args, **kwargs) -> None:
+    """Deprecated: per-sigma heatmaps are intentionally disabled.
+
+    The experiment now emits one histogram diagnostic only:
+    histogram_array_over_sigmas.png.  That plot has two rows per perturbation
+    level: a histogram row followed by a residual-to-ORACLE row.  This no-op is
+    kept only so stale calls from older branches do not create extra figures.
+    """
+    return None
 
 
 def plot_histogram_array_over_sigmas(
@@ -1163,36 +1195,112 @@ def plot_histogram_array_over_sigmas(
     cfg: ExperimentConfig,
     outpath: str,
 ) -> None:
-    """Grid with rows = methods (plus perturbed refs), cols = perturbation sigmas."""
+    """One horizontal sampler array per sigma, with residuals to ORACLE below.
+
+    Layout is exactly:
+        row 2*k     : histograms for perturb_sigma[k]
+        row 2*k + 1 : histogram_probability(method) - histogram_probability(ORACLE)
+
+    Columns are sampler methods only, including ORACLE when present.  The
+    perturbed reference cloud is intentionally not plotted here because it is not
+    a sampler and the requested diagnostic is sampler-vs-oracle residuals.
+    """
     sigmas = sorted(refs_by_sigma.keys())
-    row_names = ["PERTURBED_REF"] + method_order
+    if not sigmas:
+        return
+
+    # Use sampler columns only. Preserve caller order and force ORACLE at the end
+    # if present in the data but absent from method_order.
+    sampler_names: List[str] = []
+    for name in method_order:
+        if name in samples_by_sigma.get(sigmas[0], {}) and name not in sampler_names:
+            sampler_names.append(name)
+    if "ORACLE" not in sampler_names and "ORACLE" in samples_by_sigma.get(sigmas[0], {}):
+        sampler_names.append("ORACLE")
+    if not sampler_names:
+        raise RuntimeError("No sampler samples available for histogram array plot.")
+    if any("ORACLE" not in samples_by_sigma.get(sigma, {}) for sigma in sigmas):
+        raise RuntimeError(
+            "histogram_array_over_sigmas requires ORACLE samples so residuals can be computed "
+            "as method histogram minus ORACLE histogram. Re-run with --include_oracle."
+        )
+
     Xg, Yg, Pg = density_grid(target, cfg.grid_lim, cfg.grid_n)
 
+    # Shared histogram count brightness across all sampler panels.
     hist_arrays: List[np.ndarray] = []
     for sigma in sigmas:
-        hist_arrays.append(as_numpy(refs_by_sigma[sigma]))
-        for row_name in method_order:
-            hist_arrays.append(as_numpy(samples_by_sigma[sigma][row_name]))
+        for name in sampler_names:
+            hist_arrays.append(as_numpy(samples_by_sigma[sigma][name]))
     hist_vmax = hist_global_vmax(hist_arrays, cfg)
 
-    nrows = len(row_names)
-    ncols = len(sigmas)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.2 * nrows), constrained_layout=True)
-    axes = np.array(axes).reshape(nrows, ncols)
+    # Precompute probability histograms and residuals to ORACLE.  Residuals use
+    # normalized histogram images, not raw counts, so unequal sample counts do not
+    # show up as spurious global offsets.
+    residual_by_sigma: Dict[float, Dict[str, np.ndarray]] = {}
+    abs_residual_values: List[np.ndarray] = []
+    for sigma in sigmas:
+        residual_by_sigma[sigma] = {}
+        oracle_prob = _hist_prob_image(as_numpy(samples_by_sigma[sigma]["ORACLE"]), cfg)
+        for name in sampler_names:
+            prob = _hist_prob_image(as_numpy(samples_by_sigma[sigma][name]), cfg)
+            resid = prob - oracle_prob
+            residual_by_sigma[sigma][name] = resid
+            vals = np.abs(resid).reshape(-1)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                abs_residual_values.append(vals)
 
-    for j, sigma in enumerate(sigmas):
-        for i, row_name in enumerate(row_names):
-            ax = axes[i, j]
-            if row_name == "PERTURBED_REF":
-                arr = as_numpy(refs_by_sigma[sigma])
-            else:
-                arr = as_numpy(samples_by_sigma[sigma][row_name])
-            _draw_hist_panel(ax, arr, Xg, Yg, Pg, cfg, hist_vmax=hist_vmax)
-            if i == 0:
-                ax.set_title(f"sigma={sigma:g}")
-            if j == 0:
-                ax.set_ylabel(row_name)
-    fig.suptitle(f"Histogram array over reference perturbation levels | shared histogram vmax count = {hist_vmax:.0f}", fontsize=14)
+    if abs_residual_values:
+        all_abs = np.concatenate(abs_residual_values)
+        positive_abs = all_abs[all_abs > 0.0]
+        scale_vals = positive_abs if positive_abs.size else all_abs
+        q = float(np.clip(getattr(cfg, "residual_vmax_quantile", 0.995), 0.50, 1.0))
+        resid_ref = float(np.quantile(scale_vals, q)) if scale_vals.size else 1.0e-12
+    else:
+        resid_ref = 1.0e-12
+    intensity = max(float(getattr(cfg, "residual_intensity", 1.8)), 1.0e-6)
+    resid_vmax = max(resid_ref / intensity, 1.0e-12)
+
+    nrows = 2 * len(sigmas)
+    ncols = len(sampler_names)
+    fig_w = max(3.2 * ncols, 6.0)
+    fig_h = max(3.1 * nrows, 4.0)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), constrained_layout=True)
+    axes = np.asarray(axes)
+    if axes.ndim == 1:
+        axes = axes.reshape(nrows, ncols)
+
+    for s_idx, sigma in enumerate(sigmas):
+        hist_row = 2 * s_idx
+        resid_row = hist_row + 1
+        for col_idx, name in enumerate(sampler_names):
+            arr = as_numpy(samples_by_sigma[sigma][name])
+            ax_hist = axes[hist_row, col_idx]
+            _draw_hist_prob_panel(ax_hist, arr, Xg, Yg, Pg, cfg, hist_vmax=hist_vmax)
+            if s_idx == 0:
+                ax_hist.set_title(name)
+            if col_idx == 0:
+                ax_hist.set_ylabel(f"sigma={sigma:g}\nhist")
+
+            ax_resid = axes[resid_row, col_idx]
+            _draw_residual_panel(
+                ax_resid,
+                residual_by_sigma[sigma][name],
+                Xg,
+                Yg,
+                Pg,
+                cfg,
+                resid_vmax=resid_vmax,
+            )
+            if col_idx == 0:
+                ax_resid.set_ylabel(f"sigma={sigma:g}\nresid")
+
+    fig.suptitle(
+        "Histogram rows and residual-to-ORACLE rows over reference perturbation levels | "
+        f"shared histogram vmax count = {hist_vmax:.0f} | residual scale = ±{resid_vmax:.3g}",
+        fontsize=14,
+    )
     fig.savefig(outpath, dpi=200)
     plt.close(fig)
 
@@ -1318,17 +1426,50 @@ def perturb_reference_bank(
     }
 
 
+def expand_bootstrap_token(token: str) -> List[str]:
+    """Expand shorthand like HLSI2 into [HLSI, HLSI].
+
+    Method names in this script do not end in digits, so trailing digits are
+    unambiguously interpreted as a repetition count.  Examples:
+        HLSI2              -> HLSI_HLSI
+        CE-HLSI3           -> CE-HLSI_CE-HLSI_CE-HLSI
+        DRC-CE-HLSI2_HLSI  -> DRC-CE-HLSI_DRC-CE-HLSI_HLSI
+    """
+    token = str(token).strip()
+    if not token:
+        raise ValueError("Empty method token in --methods")
+    split = len(token)
+    while split > 0 and token[split - 1].isdigit():
+        split -= 1
+    if split == len(token):
+        return [token]
+    base = token[:split]
+    count_str = token[split:]
+    if not base:
+        raise ValueError(f"Invalid bootstrap shorthand '{token}': missing method name before count.")
+    count = int(count_str)
+    if count <= 0:
+        raise ValueError(f"Invalid bootstrap shorthand '{token}': repetition count must be positive.")
+    return [base] * count
+
+
 def split_bootstrap_method(method: str) -> List[str]:
-    """Return the actual execution order for an underscore bootstrap chain.
+    """Return the actual execution order for a bootstrap chain.
 
     Naming convention follows the inverse-problem sampler convention: A_B means
     run B first, then use B's samples as the reference bank for A. Therefore the
     execution order is the underscore-separated tokens read right-to-left.
-    Single-token methods are returned unchanged and preserve legacy behavior.
+
+    Numeric shorthand is also accepted: HLSI2 is interpreted as HLSI_HLSI,
+    CE-HLSI3 as CE-HLSI_CE-HLSI_CE-HLSI, etc.  Shorthand expansion is applied
+    before the right-to-left execution-order reversal.
     """
-    parts = [part.strip() for part in str(method).split("_") if part.strip()]
-    if not parts:
+    raw_parts = [part.strip() for part in str(method).split("_") if part.strip()]
+    if not raw_parts:
         raise ValueError("Empty method name in --methods")
+    parts: List[str] = []
+    for part in raw_parts:
+        parts.extend(expand_bootstrap_token(part))
     return list(reversed(parts)) if len(parts) > 1 else parts
 
 
@@ -1756,6 +1897,15 @@ def run_experiment(cfg: ExperimentConfig) -> None:
         )
         cfg.n_samples = cfg.n_ref
     ensure_dir(cfg.outdir)
+    # This script now emits exactly one histogram diagnostic.  Remove stale
+    # per-sigma heatmaps from older runs in the same output directory so they
+    # cannot be mistaken for current outputs.
+    for _fname in list(os.listdir(cfg.outdir)):
+        if _fname.startswith("sample_heatmaps_sigma_") and _fname.endswith(".png"):
+            try:
+                os.remove(os.path.join(cfg.outdir, _fname))
+            except OSError:
+                pass
     dtype = get_dtype(cfg.dtype)
     device = torch.device(cfg.device)
     torch.set_default_dtype(dtype)
@@ -1914,15 +2064,8 @@ def run_experiment(cfg: ExperimentConfig) -> None:
             method: torch.cat(parts, dim=0) for method, parts in sample_plot_parts.items() if parts
         }
 
-        if cfg.plot_every_sigma:
-            plot_samples_for_sigma(
-                target=target,
-                ref=refs_by_sigma[float(sigma)],
-                sample_by_method=samples_by_sigma[float(sigma)],
-                sigma=float(sigma),
-                cfg=cfg,
-                outpath=os.path.join(cfg.outdir, f"sample_heatmaps_sigma_{sigma:g}.png"),
-            )
+        # Per-sigma sample_heatmaps plots are intentionally disabled; the single
+        # histogram diagnostic is emitted after all sigmas are complete.
 
         sigma_trials_df = pd.DataFrame(sigma_rows)
         sigma_trials_df = add_reference_contrasts(sigma_trials_df, cfg)
@@ -2067,6 +2210,8 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--hist_cmap", type=str, default=ExperimentConfig.hist_cmap)
     p.add_argument("--hist_gamma", type=float, default=ExperimentConfig.hist_gamma, help="PowerNorm gamma for histogram brightness; smaller values brighten low-count pixels.")
     p.add_argument("--hist_vmax_quantile", type=float, default=ExperimentConfig.hist_vmax_quantile, help="Shared high-count quantile used as histogram vmax; avoids one hot bin making all panels faint.")
+    p.add_argument("--residual_vmax_quantile", type=float, default=ExperimentConfig.residual_vmax_quantile, help="Quantile of absolute residual values used for the shared red/blue residual scale.")
+    p.add_argument("--residual_intensity", type=float, default=ExperimentConfig.residual_intensity, help="Multiplier that brightens residual panels by dividing the residual vmax. Values >1 increase residual pixel intensity.")
     p.add_argument("--hist_contour_alpha", type=float, default=ExperimentConfig.hist_contour_alpha)
     p.add_argument("--hist_contour_lw", type=float, default=ExperimentConfig.hist_contour_lw)
     p.add_argument("--no_plots_per_sigma", action="store_true")
@@ -2140,6 +2285,8 @@ def parse_args() -> ExperimentConfig:
         hist_cmap=args.hist_cmap,
         hist_gamma=args.hist_gamma,
         hist_vmax_quantile=args.hist_vmax_quantile,
+        residual_vmax_quantile=args.residual_vmax_quantile,
+        residual_intensity=args.residual_intensity,
         hist_contour_alpha=args.hist_contour_alpha,
         hist_contour_lw=args.hist_contour_lw,
         plot_every_sigma=not args.no_plots_per_sigma,
