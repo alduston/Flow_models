@@ -14,15 +14,20 @@ Implements SNIS versions of the main estimators:
 
 Experiment:
   1. Draw clean references X_i ~ p_0 from a known 2D GMM.
-  2. Perturb anchors: X_i^eps = X_i + sigma * N(0,I).
+  2. Perturb anchors using a selectable corruption mode:
+       heat: X_i^eps = X_i + sigma * N(0,I)
+       ou:   X_i^eps = sqrt(max(1 - sigma^2, 0)) X_i + sigma * N(0,I)
+     so perturb_sigmas remains a noise-standard-deviation sweep in both modes.
   3. Query exact score and exact observed information H=-∇²log p at those anchors.
-  4. Build SNIS estimators using the perturbed anchors. Hybrid-CE-HLSI
+  4. Build SNIS estimators using the current reference bank. Hybrid-CE-HLSI
      uses perturbed anchors for Tweedie/TSI score signals but clean anchors for
-     the CE attenuation gate.
+     the CE attenuation gate on the first layer.
   5. Sample with a stochastic predictor-corrector reverse OU sampler.
-  6. Measure generated samples using NLL / KSD / MMD / SW2 and the time-integrated
+  6. Optionally bootstrap with underscore-separated method names. A_B means
+     run B first, then use B's samples as references for A.
+  7. Measure generated samples using NLL / KSD / MMD / SW2 and the time-integrated
      score RMSE (Fisher-type score divergence) against the exact OU-diffused GMM score.
-  7. Save per-sigma histogram panels, a meta metric array, and a meta histogram
+  8. Save per-sigma histogram panels, a meta metric array, and a meta histogram
      array over all perturbation levels.
 """
 
@@ -67,6 +72,7 @@ class ExperimentConfig:
 
     # Sweep
     perturb_sigmas: Tuple[float, ...] = (0.0, 0.05, 0.10, 0.20, 0.35, 0.50)
+    corruption_mode: str = "heat"  # heat or ou
 
     # Reverse OU PC sampler
     t_start: float = 3.0
@@ -698,6 +704,9 @@ def plot_metric_array(metrics_df: pd.DataFrame, metric_names: List[str], outpath
     metric_names = [m for m in metric_names if m in metrics_df.columns]
     if not metric_names:
         return
+    corruption_label = "REFERENCE"
+    if "corruption_mode" in metrics_df.columns and not metrics_df["corruption_mode"].dropna().empty:
+        corruption_label = str(metrics_df["corruption_mode"].dropna().iloc[0]).upper()
     ncols = min(3, len(metric_names))
     nrows = int(math.ceil(len(metric_names) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.1 * nrows), constrained_layout=True)
@@ -712,7 +721,7 @@ def plot_metric_array(metrics_df: pd.DataFrame, metric_names: List[str], outpath
             if y.notna().sum() == 0:
                 continue
             ax.plot(sub["perturb_sigma"], y, marker="o", linewidth=1.8, label=method)
-        ax.set_xlabel("reference perturbation sigma")
+        ax.set_xlabel(f"{corruption_label} reference perturbation sigma")
         label = "time-integrated score RMSE" if metric == "fisher_rmse" else metric.upper()
         ax.set_ylabel(label)
         ax.set_title(label + " vs reference perturbation")
@@ -727,6 +736,9 @@ def plot_metric_array(metrics_df: pd.DataFrame, metric_names: List[str], outpath
 
 def plot_contrast_sweeps(metrics_df: pd.DataFrame, outpath: str) -> None:
     metric_names = ["ksd", "nll", "mmd", "sw2"]
+    corruption_label = "REFERENCE"
+    if "corruption_mode" in metrics_df.columns and not metrics_df["corruption_mode"].dropna().empty:
+        corruption_label = str(metrics_df["corruption_mode"].dropna().iloc[0]).upper()
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
     axes = np.array(axes).reshape(-1)
     sample_df = metrics_df[metrics_df["method"] != "PERTURBED_REF"].copy()
@@ -738,7 +750,7 @@ def plot_contrast_sweeps(metrics_df: pd.DataFrame, outpath: str) -> None:
         for method in sample_df["method"].unique():
             sub = sample_df[sample_df["method"] == method].sort_values("perturb_sigma")
             ax.plot(sub["perturb_sigma"], sub[col], marker="o", linewidth=1.8, label=method)
-        ax.set_xlabel("reference perturbation sigma")
+        ax.set_xlabel(f"{corruption_label} reference perturbation sigma")
         ax.set_ylabel(f"{metric.upper()} - reference {metric.upper()}")
         ax.set_title("contrastive improvement (<0 is better)")
         ax.grid(True, alpha=0.25)
@@ -770,7 +782,7 @@ def plot_samples_for_sigma(target: GMM2D, ref: torch.Tensor, sample_by_method: D
         ax.set_title(title)
     for ax in axes[len(panels):]:
         ax.axis("off")
-    fig.suptitle(f"Reference perturbation sigma = {sigma:g}", fontsize=14)
+    fig.suptitle(f"{cfg.corruption_mode.upper()} reference perturbation sigma = {sigma:g}", fontsize=14)
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
 
@@ -806,10 +818,202 @@ def plot_histogram_array_over_sigmas(
                 ax.set_title(f"sigma={sigma:g}")
             if j == 0:
                 ax.set_ylabel(row_name)
-    fig.suptitle("Histogram array over reference perturbation levels", fontsize=14)
+    fig.suptitle(f"Histogram array over {cfg.corruption_mode.upper()} reference perturbation levels", fontsize=14)
     fig.savefig(outpath, dpi=200)
     plt.close(fig)
 
+
+# -----------------------------------------------------------------------------
+# Corruption and bootstrap helpers
+# -----------------------------------------------------------------------------
+
+
+def canonicalize_method_name(method: str) -> str:
+    """Normalize a sampler-token spelling without changing displayed labels."""
+    aliases = {
+        "tweedie": "Tweedie",
+        "tsi": "TSI",
+        "blend": "Blend",
+        "blended": "Blend",
+        "op-blend": "OP-Blend",
+        "op_blend": "OP-Blend",
+        "operator-blend": "OP-Blend",
+        "operator_blend": "OP-Blend",
+        "hlsi": "HLSI",
+        "ce-hlsi": "CE-HLSI",
+        "ce_hlsi": "CE-HLSI",
+        "hybrid-ce-hlsi": "Hybrid-CE-HLSI",
+        "hybrid_ce_hlsi": "Hybrid-CE-HLSI",
+        "oracle": "ORACLE",
+    }
+    key = str(method).strip().lower()
+    if key in aliases:
+        return aliases[key]
+    return str(method).strip()
+
+
+def parse_method_chain(method_label: str) -> List[str]:
+    """Return execution order for a possibly bootstrapped method label.
+
+    Single-token labels are unchanged. For underscore chains, the rightmost token
+    is run first and the leftmost token is the final reported sampler. Thus
+    ``Tweedie_HLSI`` executes ``HLSI -> Tweedie`` and reports samples under the
+    label ``Tweedie_HLSI``.
+
+    Whole-label aliases such as ``op_blend`` or ``ce_hlsi`` are treated as single
+    methods, not bootstrap chains.
+    """
+    raw = str(method_label).strip()
+    whole = canonicalize_method_name(raw)
+    if whole != raw or "_" not in raw:
+        if not whole:
+            raise ValueError(f"Invalid empty method label: {method_label!r}")
+        return [whole]
+
+    parts = [p.strip() for p in raw.split("_") if p.strip()]
+    if not parts:
+        raise ValueError(f"Invalid empty method label: {method_label!r}")
+    return [canonicalize_method_name(p) for p in reversed(parts)]
+
+
+@torch.no_grad()
+def corrupt_references(clean_refs: torch.Tensor, sigma: float, mode: str, generator: torch.Generator) -> torch.Tensor:
+    """Perturb references while keeping perturb_sigmas as the noise std parameter.
+
+    heat mode is the old behavior: x + sigma z.
+    ou mode applies an OU-style contraction and noise injection with
+        noise_std = sigma, signal_decay = sqrt(1 - sigma^2).
+    For sigma >= 1, the decay is clipped to zero, giving pure noise references.
+    """
+    sigma = float(sigma)
+    mode = str(mode).strip().lower()
+    noise = torch.randn(clean_refs.shape, device=clean_refs.device, dtype=clean_refs.dtype, generator=generator)
+    if mode == "heat":
+        return (clean_refs + sigma * noise).detach()
+    if mode == "ou":
+        if sigma < 0.0:
+            raise ValueError("OU corruption requires nonnegative perturb sigmas.")
+        alpha = math.sqrt(max(1.0 - sigma * sigma, 0.0))
+        return (alpha * clean_refs + sigma * noise).detach()
+    raise ValueError(f"Unknown corruption_mode={mode!r}; expected 'heat' or 'ou'.")
+
+
+def build_snis_bank(target: GMM2D, anchors: torch.Tensor, cfg: ExperimentConfig, gate_anchors: Optional[torch.Tensor] = None) -> SNISScoreBank:
+    return SNISScoreBank(
+        target=target,
+        anchors=anchors,
+        curvature_mode=cfg.curvature_mode,
+        curvature_floor=cfg.curvature_floor,
+        curvature_cap=cfg.curvature_cap,
+        resolvent_eps=cfg.resolvent_eps,
+        gate_clip=cfg.gate_clip,
+        weight_temp=cfg.weight_temp,
+        eval_chunk=cfg.eval_chunk,
+        gate_anchors=gate_anchors,
+        op_blend_reg=cfg.op_blend_reg,
+        op_blend_pinv_rtol=cfg.op_blend_pinv_rtol,
+        op_blend_project_gate=cfg.op_blend_project_gate,
+    )
+
+
+@torch.no_grad()
+def run_bootstrap_method_chain(
+    target: GMM2D,
+    cfg: ExperimentConfig,
+    method_label: str,
+    initial_refs: torch.Tensor,
+    initial_gate_refs: torch.Tensor,
+    sigma_idx: int,
+    method_idx: int,
+) -> Tuple[torch.Tensor, Callable[[torch.Tensor, float], torch.Tensor], Optional[SNISScoreBank], List[Dict[str, float | str]], float, torch.Tensor, List[str]]:
+    """Run a single method or an underscore-defined bootstrap chain.
+
+    The returned samples are always the samples from the final stage.  Intermediate
+    stages are used only to create the next stage's reference bank.
+    """
+    execution_order = parse_method_chain(method_label)
+    current_refs = initial_refs.detach()
+    current_gate_refs = initial_gate_refs.detach()
+    final_score_fn: Optional[Callable[[torch.Tensor, float], torch.Tensor]] = None
+    final_bank: Optional[SNISScoreBank] = None
+    final_input_refs = current_refs
+    total_elapsed = 0.0
+    stage_records: List[Dict[str, float | str]] = []
+    samples: Optional[torch.Tensor] = None
+
+    for stage_idx, stage_method in enumerate(execution_order):
+        ref_source = "initial_corrupted_refs" if stage_idx == 0 else f"stage_{stage_idx - 1}_{execution_order[stage_idx - 1]}_samples"
+        print(
+            f"    stage {stage_idx + 1}/{len(execution_order)}: {stage_method} "
+            f"using {current_refs.shape[0]} refs from {ref_source}",
+            flush=True,
+        )
+
+        if stage_method == "ORACLE":
+            bank = None
+            score_fn = lambda x, t: target.score(x, t=t)
+        else:
+            bank = build_snis_bank(target, current_refs, cfg, gate_anchors=current_gate_refs)
+            score_fn = lambda x, t, b=bank, m=stage_method: b.estimate(x, t=t, method=m)
+
+        sample_seed = cfg.seed + 10000 + 1000003 * sigma_idx + 10007 * method_idx + 211 * stage_idx
+        sample_gen = make_generator(sample_seed, target.device)
+        t0 = time.time()
+        samples = pc_reverse_sampler(target, score_fn, cfg, generator=sample_gen)
+        elapsed = time.time() - t0
+        total_elapsed += elapsed
+
+        final_score_fn = score_fn
+        final_bank = bank
+        final_input_refs = current_refs
+        stage_records.append(
+            {
+                "stage": float(stage_idx + 1),
+                "stage_method": stage_method,
+                "ref_source": ref_source,
+                "input_ref_n": float(current_refs.shape[0]),
+                "gate_ref_n": float(0 if stage_method == "ORACLE" else current_gate_refs.shape[0]),
+                "elapsed_sec": float(elapsed),
+            }
+        )
+
+        # Descendants use the previous generated sample cloud as the complete
+        # reference bank. There is no paired clean bank after layer one, so the
+        # Hybrid-CE-HLSI gate bank defaults to the same descendant references.
+        current_refs = samples.detach()
+        current_gate_refs = current_refs
+
+    if samples is None or final_score_fn is None:
+        raise RuntimeError(f"No samples were produced for method_label={method_label!r}.")
+    return samples, final_score_fn, final_bank, stage_records, total_elapsed, final_input_refs, execution_order
+
+
+def append_ess_diagnostics(
+    ess_rows: List[Dict[str, float | str]],
+    target: GMM2D,
+    cfg: ExperimentConfig,
+    bank: Optional[SNISScoreBank],
+    sigma: float,
+    label: str,
+    generator: torch.Generator,
+) -> None:
+    if bank is None:
+        return
+    for t_probe in [cfg.t_start, 1.5, 0.7, 0.25, 0.08, cfg.t_end]:
+        y_probe = target.sample_pt(min(1024, cfg.n_samples), t_probe, generator=generator)
+        ess = bank.ess(y_probe, t_probe)
+        ess_rows.append(
+            {
+                "perturb_sigma": float(sigma),
+                "corruption_mode": cfg.corruption_mode,
+                "method": label,
+                "t": float(t_probe),
+                "ess_mean": float(ess.mean().item()),
+                "ess_median": float(ess.median().item()),
+                "ess_min": float(ess.min().item()),
+                "ess_max": float(ess.max().item()),
+            }
+        )
 
 # -----------------------------------------------------------------------------
 # Main experiment
@@ -817,6 +1021,10 @@ def plot_histogram_array_over_sigmas(
 
 
 def run_experiment(cfg: ExperimentConfig) -> None:
+    cfg.corruption_mode = str(cfg.corruption_mode).strip().lower()
+    if cfg.corruption_mode not in {"heat", "ou"}:
+        raise ValueError("corruption_mode must be 'heat' or 'ou'.")
+
     ensure_dir(cfg.outdir)
     dtype = get_dtype(cfg.dtype)
     device = torch.device(cfg.device)
@@ -842,38 +1050,30 @@ def run_experiment(cfg: ExperimentConfig) -> None:
 
     all_rows: List[Dict[str, float | str]] = []
     ess_rows: List[Dict[str, float | str]] = []
+    stage_rows: List[Dict[str, float | str]] = []
     refs_by_sigma: Dict[float, torch.Tensor] = {}
     samples_by_sigma: Dict[float, Dict[str, torch.Tensor]] = {}
 
     for sigma_idx, sigma in enumerate(cfg.perturb_sigmas):
-        print(f"\n=== perturb_sigma={sigma:g} ===", flush=True)
+        print(f"\n=== corruption_mode={cfg.corruption_mode} | perturb_sigma={sigma:g} ===", flush=True)
         pert_gen = make_generator(cfg.seed + 1000 + sigma_idx, device)
-        noise = torch.randn(clean_refs.shape, device=device, dtype=dtype, generator=pert_gen)
-        refs = (clean_refs + float(sigma) * noise).detach()
+        refs = corrupt_references(clean_refs, float(sigma), cfg.corruption_mode, generator=pert_gen)
         refs_by_sigma[float(sigma)] = refs
 
-        bank = SNISScoreBank(
-            target=target,
-            anchors=refs,
-            curvature_mode=cfg.curvature_mode,
-            curvature_floor=cfg.curvature_floor,
-            curvature_cap=cfg.curvature_cap,
-            resolvent_eps=cfg.resolvent_eps,
-            gate_clip=cfg.gate_clip,
-            weight_temp=cfg.weight_temp,
-            eval_chunk=cfg.eval_chunk,
-            gate_anchors=clean_refs,
-            op_blend_reg=cfg.op_blend_reg,
-            op_blend_pinv_rtol=cfg.op_blend_pinv_rtol,
-            op_blend_project_gate=cfg.op_blend_project_gate,
-        )
+        base_bank = build_snis_bank(target, refs, cfg, gate_anchors=clean_refs)
 
         ref_metrics = compute_all_metrics(target, refs, metric_ctx, cfg)
         ref_rms_shift = float(torch.sqrt(torch.mean(torch.sum((refs - clean_refs) ** 2, dim=1))).item())
         ref_mean_shift = float(torch.mean(torch.linalg.norm(refs - clean_refs, dim=1)).item())
         ref_row = {
             "perturb_sigma": float(sigma),
+            "corruption_mode": cfg.corruption_mode,
             "method": "PERTURBED_REF",
+            "bootstrap_depth": float(0),
+            "execution_order": "",
+            "final_stage_method": "",
+            "final_ref_n": float(refs.shape[0]),
+            "elapsed_sec": float("nan"),
             "rms_anchor_shift": ref_rms_shift,
             "mean_anchor_shift": ref_mean_shift,
             "metric_target": "fixed_unperturbed_target_pool",
@@ -884,23 +1084,50 @@ def run_experiment(cfg: ExperimentConfig) -> None:
         all_rows.append(ref_row)
         print("reference metrics:", {k: round(v, 5) for k, v in ref_metrics.items()}, flush=True)
 
+        # Base-bank ESS preserves the old diagnostic.  Method-specific bootstrap
+        # ESS is also recorded below for multi-layer chains.
+        append_ess_diagnostics(
+            ess_rows, target, cfg, base_bank, float(sigma), "PERTURBED_REF_BANK", generator=pert_gen
+        )
+
         sample_by_method: Dict[str, torch.Tensor] = {}
         for method_idx, method in enumerate(methods):
-            print(f"  sampling {method}...", flush=True)
-            sample_gen = make_generator(cfg.seed + 10000 + 101 * sigma_idx + method_idx, device)
-            if method == "ORACLE":
-                score_fn = lambda x, t: target.score(x, t=t)
-            else:
-                score_fn = lambda x, t, m=method: bank.estimate(x, t=t, method=m)
-            t0 = time.time()
-            samples = pc_reverse_sampler(target, score_fn, cfg, generator=sample_gen)
-            elapsed = time.time() - t0
+            execution_order = parse_method_chain(method)
+            order_text = " -> ".join(execution_order)
+            print(f"  sampling {method} ({order_text})...", flush=True)
+            samples, score_fn, final_bank, records, elapsed, final_input_refs, execution_order = run_bootstrap_method_chain(
+                target=target,
+                cfg=cfg,
+                method_label=method,
+                initial_refs=refs,
+                initial_gate_refs=clean_refs,
+                sigma_idx=sigma_idx,
+                method_idx=method_idx,
+            )
             sample_by_method[method] = samples
+
+            for rec in records:
+                stage_rows.append(
+                    {
+                        "perturb_sigma": float(sigma),
+                        "corruption_mode": cfg.corruption_mode,
+                        "method": method,
+                        "bootstrap_depth": float(len(execution_order)),
+                        "execution_order": " -> ".join(execution_order),
+                        **rec,
+                    }
+                )
+
             metrics = compute_all_metrics(target, samples, metric_ctx, cfg)
             fisher_metrics = integrated_score_fisher_metric(score_fn, metric_ctx, cfg)
             row = {
                 "perturb_sigma": float(sigma),
+                "corruption_mode": cfg.corruption_mode,
                 "method": method,
+                "bootstrap_depth": float(len(execution_order)),
+                "execution_order": " -> ".join(execution_order),
+                "final_stage_method": execution_order[-1],
+                "final_ref_n": float(final_input_refs.shape[0]),
                 "elapsed_sec": elapsed,
                 "rms_anchor_shift": ref_rms_shift,
                 "mean_anchor_shift": ref_mean_shift,
@@ -912,21 +1139,13 @@ def run_experiment(cfg: ExperimentConfig) -> None:
             printable = {**metrics, **fisher_metrics}
             print(f"    {method} metrics:", {k: round(v, 5) for k, v in printable.items()}, f"elapsed={elapsed:.1f}s", flush=True)
 
-        samples_by_sigma[float(sigma)] = sample_by_method
+            if len(execution_order) > 1 and final_bank is not None:
+                ess_gen = make_generator(cfg.seed + 300000 + 1009 * sigma_idx + method_idx, device)
+                append_ess_diagnostics(
+                    ess_rows, target, cfg, final_bank, float(sigma), f"{method}_FINAL_BANK", generator=ess_gen
+                )
 
-        for t_probe in [cfg.t_start, 1.5, 0.7, 0.25, 0.08, cfg.t_end]:
-            y_probe = target.sample_pt(min(1024, cfg.n_samples), t_probe, generator=pert_gen)
-            ess = bank.ess(y_probe, t_probe)
-            ess_rows.append(
-                {
-                    "perturb_sigma": float(sigma),
-                    "t": float(t_probe),
-                    "ess_mean": float(ess.mean().item()),
-                    "ess_median": float(ess.median().item()),
-                    "ess_min": float(ess.min().item()),
-                    "ess_max": float(ess.max().item()),
-                }
-            )
+        samples_by_sigma[float(sigma)] = sample_by_method
 
         if cfg.plot_every_sigma:
             plot_samples_for_sigma(
@@ -935,13 +1154,18 @@ def run_experiment(cfg: ExperimentConfig) -> None:
                 sample_by_method=sample_by_method,
                 sigma=float(sigma),
                 cfg=cfg,
-                outpath=os.path.join(cfg.outdir, f"sample_heatmaps_sigma_{sigma:g}.png"),
+                outpath=os.path.join(cfg.outdir, f"sample_heatmaps_{cfg.corruption_mode}_sigma_{sigma:g}.png"),
             )
 
-        npz_payload = {"truth": as_numpy(truth), "truth_eval_fixed": as_numpy(metric_ctx.truth_eval), "perturbed_refs": as_numpy(refs)}
+        npz_payload = {
+            "truth": as_numpy(truth),
+            "truth_eval_fixed": as_numpy(metric_ctx.truth_eval),
+            "perturbed_refs": as_numpy(refs),
+            "clean_refs": as_numpy(clean_refs),
+        }
         for method, samples in sample_by_method.items():
             npz_payload[method.replace("-", "_")] = as_numpy(samples)
-        np.savez_compressed(os.path.join(cfg.outdir, f"samples_sigma_{sigma:g}.npz"), **npz_payload)
+        np.savez_compressed(os.path.join(cfg.outdir, f"samples_{cfg.corruption_mode}_sigma_{sigma:g}.npz"), **npz_payload)
 
     metrics_df = pd.DataFrame(all_rows)
     for metric in ["ksd", "nll", "mmd", "sw2"]:
@@ -954,10 +1178,13 @@ def run_experiment(cfg: ExperimentConfig) -> None:
         )
 
     ess_df = pd.DataFrame(ess_rows)
+    stages_df = pd.DataFrame(stage_rows)
     metrics_csv = os.path.join(cfg.outdir, "metrics.csv")
     ess_csv = os.path.join(cfg.outdir, "ess_diagnostics.csv")
+    stages_csv = os.path.join(cfg.outdir, "bootstrap_stages.csv")
     metrics_df.to_csv(metrics_csv, index=False)
     ess_df.to_csv(ess_csv, index=False)
+    stages_df.to_csv(stages_csv, index=False)
 
     plot_metric_array(metrics_df, ["ksd", "nll", "mmd", "sw2", "fisher_rmse"], os.path.join(cfg.outdir, "meta_metric_array.png"))
     plot_contrast_sweeps(metrics_df, os.path.join(cfg.outdir, "contrast_vs_reference.png"))
@@ -972,19 +1199,20 @@ def run_experiment(cfg: ExperimentConfig) -> None:
 
     if not ess_df.empty:
         fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
-        for sigma in sorted(ess_df["perturb_sigma"].unique()):
-            sub = ess_df[ess_df["perturb_sigma"] == sigma].sort_values("t")
+        plot_ess = ess_df[ess_df["method"] == "PERTURBED_REF_BANK"].copy()
+        for sigma in sorted(plot_ess["perturb_sigma"].unique()):
+            sub = plot_ess[plot_ess["perturb_sigma"] == sigma].sort_values("t")
             ax.plot(sub["t"], sub["ess_median"], marker="o", label=f"sigma={sigma:g}")
         ax.set_xscale("log")
         ax.set_xlabel("t")
         ax.set_ylabel("median ESS")
-        ax.set_title("OU SNIS effective sample size under perturbed reference banks")
+        ax.set_title(f"OU SNIS ESS for base {cfg.corruption_mode.upper()}-corrupted reference banks")
         ax.grid(True, alpha=0.25)
         ax.legend(fontsize=8, ncol=2)
         fig.savefig(os.path.join(cfg.outdir, "ess_vs_t.png"), dpi=180)
         plt.close(fig)
 
-    print(f"\nDone. Wrote:\n  {metrics_csv}\n  {ess_csv}\n  {cfg.outdir}")
+    print(f"\nDone. Wrote:\n  {metrics_csv}\n  {ess_csv}\n  {stages_csv}\n  {cfg.outdir}")
 
 
 # -----------------------------------------------------------------------------
@@ -1003,6 +1231,7 @@ def parse_args() -> ExperimentConfig:
     p.add_argument("--n_truth", type=int, default=ExperimentConfig.n_truth)
     p.add_argument("--metrics_max_n", type=int, default=ExperimentConfig.metrics_max_n)
     p.add_argument("--perturb_sigmas", type=float, nargs="+", default=list(ExperimentConfig.perturb_sigmas))
+    p.add_argument("--corruption_mode", type=str.lower, choices=["heat", "ou"], default=ExperimentConfig.corruption_mode)
     p.add_argument("--t_start", type=float, default=ExperimentConfig.t_start)
     p.add_argument("--t_end", type=float, default=ExperimentConfig.t_end)
     p.add_argument("--n_steps", type=int, default=ExperimentConfig.n_steps)
@@ -1059,6 +1288,7 @@ def parse_args() -> ExperimentConfig:
         n_truth=args.n_truth,
         metrics_max_n=args.metrics_max_n,
         perturb_sigmas=tuple(args.perturb_sigmas),
+        corruption_mode=args.corruption_mode,
         t_start=args.t_start,
         t_end=args.t_end,
         n_steps=args.n_steps,
