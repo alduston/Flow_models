@@ -5,7 +5,7 @@ This module centralizes the common logic duplicated across the inverse-problem
 experiment scripts so sampler changes can be made once and reused everywhere.
 """
 
-import os 
+import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
@@ -2029,7 +2029,7 @@ def run_mala_sampler(n_samples, prior_model, lik_model, steps=1000, dt=5e-4,
         if i >= burn_in:
             accept_count += accept.float().mean().item()
 
-        if verbose and (i % 100 == 0):
+        if verbose and (i % 10 == 0):
             mode_name = 'Precond-MALA' if use_precond else 'MALA'
             print(f"{mode_name} Iteration {i}/{steps}")
 
