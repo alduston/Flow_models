@@ -8,7 +8,7 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-THIS_DIR = os.getcwd()                                    #if on colab 
+#THIS_DIR = os.getcwd()                                    #if on colab 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))     #if not on colab
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
