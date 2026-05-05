@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+
+
 jax.config.update("jax_enable_x64", True)
 torch.set_default_dtype(torch.float64)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1656,6 +1658,278 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
     return score
 
 
+
+def _global_log_weight_ess(logw_cpu):
+    logw = logw_cpu.detach().double().cpu()
+    if logw.numel() == 0:
+        return 0.0
+    m = torch.max(logw)
+    w = torch.exp(logw - m)
+    z1 = torch.sum(w)
+    z2 = torch.sum(w * w)
+    if z2.item() <= 0.0:
+        return 0.0
+    return float((z1 * z1 / z2).item())
+
+
+def _make_frozen_hlsi_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None):
+    """Snapshot exactly the score field used by a pure HLSI-family init stage."""
+    if local_bank is None or init_log_weights is None:
+        return None
+    if cfg.get('init') not in {
+        'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
+    }:
+        return None
+    return {
+        'label': str(label),
+        'mode': cfg['init'],
+        'init_weights': cfg['init_weights'],
+        'transition_w': cfg.get('transition_w', 'ou'),
+        'X_ref': local_bank['X_ref'].detach().cpu(),
+        's0_post_ref': local_bank['s0_post_ref'].detach().cpu(),
+        'log_weights': init_log_weights.detach().cpu(),
+        'P_ref': local_bank['P_ref'].detach().cpu(),
+        'mu_ref': local_bank['mu_ref'].detach().cpu(),
+        'gated_info': {
+            k: v.detach().cpu() for k, v in local_bank['gated_info'].items()
+        } if local_bank.get('gated_info') is not None else None,
+        'gate_rho': cfg.get('gate_rho'),
+        'gate_beta': cfg.get('gate_beta'),
+        'gate_kappa': cfg.get('gate_kappa'),
+        'gate_topk': cfg.get('gate_topk', 64),
+        'gate_metric_source': cfg.get('gate_metric_source', 'mu'),
+        't_min': float(cfg.get('init_tmin', 10 ** (-2.5))),
+        't_max': float(cfg.get('init_tmax', 10.0)),
+        'mala_steps': int(cfg.get('mala_steps', 0)),
+        'law_matches_final_samples': int(cfg.get('mala_steps', 0)) <= 0,
+        'n_ref_score': int(local_bank['X_ref'].shape[0]),
+        'n_samples_final': int(final_samples.shape[0]) if torch.is_tensor(final_samples) else None,
+    }
+
+
+def _eval_score_from_frozen_spec(y, t, spec):
+    return get_score_wrapper(
+        y, t,
+        spec['mode'],
+        spec['X_ref'], spec['s0_post_ref'], spec['log_weights'],
+        P_ref=spec['P_ref'], mu_ref=spec['mu_ref'], gated_info=spec.get('gated_info'),
+        init_weights=spec.get('init_weights', 'L'),
+        transition_w=spec.get('transition_w', 'ou'),
+        gate_rho=spec.get('gate_rho'), gate_beta=spec.get('gate_beta'),
+        gate_kappa=spec.get('gate_kappa'), gate_topk=spec.get('gate_topk', 64),
+        gate_metric_source=spec.get('gate_metric_source', 'mu'),
+    )
+
+
+def _hutchinson_divergence_score(y, t, spec, n_probe=1, fd_eps=1e-3):
+    """Estimate div_x s(x,t) for a frozen HLSI-family score field.
+
+    We deliberately use a symmetric finite-difference Hutchinson estimator rather
+    than PyTorch autograd through the CE eigensolve. Autograd can return NaNs
+    when the CE-averaged Hessian has repeated or nearly repeated eigenvalues,
+    which is common for isotropic/regularized inverse-problem banks. The finite
+    difference estimator is slower but much more robust and requires no changes
+    to the HLSI score evaluator.
+    """
+    if int(n_probe) <= 0:
+        # Cheap but biased fallback: useful only for smoke tests / ablations.
+        return torch.zeros(y.shape[0], device=y.device, dtype=y.dtype)
+
+    y_base = y.detach()
+    div = torch.zeros(y_base.shape[0], device=y_base.device, dtype=y_base.dtype)
+    d = max(1, int(y_base.shape[1]))
+    # Scale the finite-difference radius mildly with the per-particle state size.
+    state_scale = torch.clamp(torch.linalg.norm(y_base, dim=1, keepdim=True) / math.sqrt(float(d)), min=1.0)
+    radius = float(fd_eps) * state_scale
+
+    with torch.no_grad():
+        for _ in range(int(n_probe)):
+            eps = torch.empty_like(y_base).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+            s_plus = _eval_score_from_frozen_spec(y_base + radius * eps, t, spec)
+            s_minus = _eval_score_from_frozen_spec(y_base - radius * eps, t, spec)
+            jvp = (s_plus - s_minus) / (2.0 * radius)
+            div = div + torch.sum(jvp * eps, dim=1)
+            del eps, s_plus, s_minus, jvp
+    return div / float(n_probe)
+
+
+def estimate_logq_probability_flow(X0, source_score_spec, t_min=None, t_max=None,
+                                   n_steps=32, n_div_probes=1, fd_eps=1e-3):
+    """Estimate log q_source(x0) by OU probability-flow continuation to noise.
+
+    The reverse sampler in this module uses the OU reverse-SDE score convention
+        dy = (y + 2 s(y,t)) d tau + sqrt(2) dW_tau
+    while integrating from large t to small t. The associated deterministic
+    probability-flow drift, run forward from data time to noise time, is
+        f_fwd(x,t) = -(x + s(x,t)).
+    We integrate x_t from t_min to t_max and accumulate div f_fwd.
+    """
+    if not source_score_spec.get('law_matches_final_samples', True):
+        raise ValueError(
+            f"Cannot compute DRC weights from source '{source_score_spec.get('label')}' because "
+            "that source appends MALA steps. The frozen HLSI probability-flow density would "
+            "not describe the final reference samples. Use a pure init sampler as ref_source."
+        )
+
+    y = X0.detach().clone().to(device=device, dtype=torch.float64)
+    d = int(y.shape[1])
+    t0 = float(source_score_spec.get('t_min', 10 ** (-2.5)) if t_min is None else t_min)
+    t1 = float(source_score_spec.get('t_max', 10.0) if t_max is None else t_max)
+    t0 = max(t0, 1e-4)
+    if t1 <= t0:
+        raise ValueError(f"DRC probability-flow interval must satisfy t_max > t_min, got {t1} <= {t0}.")
+
+    ts = torch.logspace(math.log10(t0), math.log10(t1), int(n_steps) + 1,
+                        device=device, dtype=torch.float64)
+    div_accum = torch.zeros(y.shape[0], device=device, dtype=torch.float64)
+
+    for i in range(int(n_steps)):
+        t_cur = ts[i]
+        t_next = ts[i + 1]
+        dt = t_next - t_cur
+
+        s_cur = _eval_score_from_frozen_spec(y, t_cur, source_score_spec)
+        div_s_cur = _hutchinson_divergence_score(
+            y, t_cur, source_score_spec, n_probe=n_div_probes, fd_eps=fd_eps)
+        f_cur = -(y + s_cur)
+        div_f_cur = -float(d) - div_s_cur
+
+        y_hat = y + dt * f_cur
+        s_next = _eval_score_from_frozen_spec(y_hat, t_next, source_score_spec)
+        div_s_next = _hutchinson_divergence_score(
+            y_hat, t_next, source_score_spec, n_probe=n_div_probes, fd_eps=fd_eps)
+        f_next = -(y_hat + s_next)
+        div_f_next = -float(d) - div_s_next
+
+        y = y + 0.5 * dt * (f_cur + f_next)
+        div_accum = div_accum + 0.5 * dt * (div_f_cur + div_f_next)
+
+        del s_cur, div_s_cur, f_cur, div_f_cur, y_hat, s_next, div_s_next, f_next, div_f_next
+        if torch.cuda.is_available() and (i + 1) % 8 == 0:
+            torch.cuda.empty_cache()
+
+    log_q_terminal = -0.5 * torch.sum(y * y, dim=1) - 0.5 * float(d) * math.log(2.0 * math.pi)
+    return log_q_terminal + div_accum
+
+
+def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_spec,
+                                     cfg, label='DRC'):
+    """Attach the DRC mass law log pi_tilde(x_i) - log q_source(x_i) to a bank."""
+    if source_score_spec is None:
+        raise ValueError("DRC weights require a frozen source_score_spec. Did the ref_source run first?")
+
+    X_cpu = bank['X_ref'].detach().cpu()
+    n = int(X_cpu.shape[0])
+    batch_size = int(cfg.get('drc_eval_batch_size', 64))
+    logw_chunks = []
+    logq_chunks = []
+
+    print(
+        f"  [{label}] Computing DRC log weights from source={source_score_spec.get('label')!r} "
+        f"with n={n}, batch_size={batch_size}, pf_steps={cfg.get('drc_pf_steps')}, "
+        f"div_probes={cfg.get('drc_div_probes')}"
+    )
+    t0_wall = time.time()
+
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        X = X_cpu[start:stop].to(device=device, dtype=torch.float64)
+        with torch.no_grad():
+            log_prior = prior_model.log_prob(X)
+            log_lik = bank['log_lik_ref'][start:stop].to(device=device, dtype=torch.float64)
+            log_target = log_prior + log_lik
+        log_q = estimate_logq_probability_flow(
+            X,
+            source_score_spec,
+            t_min=cfg.get('drc_tmin', source_score_spec.get('t_min')),
+            t_max=cfg.get('drc_tmax', source_score_spec.get('t_max')),
+            n_steps=cfg.get('drc_pf_steps', 32),
+            n_div_probes=cfg.get('drc_div_probes', 1),
+            fd_eps=cfg.get('drc_fd_eps', 1e-3),
+        )
+        logw = log_target - log_q
+        logw_chunks.append(logw.detach().cpu())
+        logq_chunks.append(log_q.detach().cpu())
+        del X, log_prior, log_lik, log_target, log_q, logw
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if stop == n or (start // batch_size + 1) % max(1, (n + batch_size - 1) // (10 * batch_size)) == 0:
+            print(f"    [{label}] DRC PF batch {stop}/{n} complete")
+
+    logw = torch.cat(logw_chunks, dim=0).double()
+    raw_logw = logw.clone()
+    logq = torch.cat(logq_chunks, dim=0).double()
+
+    logw = logw - torch.mean(logw)
+    temp = float(cfg.get('drc_temperature', 1.0))
+    logw = temp * logw
+    clip = cfg.get('drc_clip', None)
+    if clip is not None:
+        clip = float(clip)
+        med = torch.median(logw)
+        logw = torch.clamp(logw, med - clip, med + clip)
+    logw = logw - torch.mean(logw)
+
+    diag = {
+        'drc_source': str(source_score_spec.get('label')),
+        'drc_logq_mean': float(torch.mean(logq).item()),
+        'drc_logq_std': float(torch.std(logq, unbiased=False).item()),
+        'drc_raw_logw_mean': float(torch.mean(raw_logw).item()),
+        'drc_raw_logw_std': float(torch.std(raw_logw, unbiased=False).item()),
+        'drc_logw_mean': float(torch.mean(logw).item()),
+        'drc_logw_std': float(torch.std(logw, unbiased=False).item()),
+        'drc_logw_min': float(torch.min(logw).item()),
+        'drc_logw_max': float(torch.max(logw).item()),
+        'drc_global_ess': _global_log_weight_ess(logw),
+        'drc_pf_steps': int(cfg.get('drc_pf_steps', 32)),
+        'drc_div_probes': int(cfg.get('drc_div_probes', 1)),
+        'drc_fd_eps': float(cfg.get('drc_fd_eps', 1e-3)),
+        'drc_eval_batch_size': int(batch_size),
+        'drc_runtime_seconds': float(time.time() - t0_wall),
+    }
+    print(
+        f"  [{label}] DRC stats: std={diag['drc_logw_std']:.4g}, "
+        f"range=[{diag['drc_logw_min']:.4g}, {diag['drc_logw_max']:.4g}], "
+        f"ESS={diag['drc_global_ess']:.1f}/{n}, time={diag['drc_runtime_seconds']:.2f}s"
+    )
+    return logw.detach().cpu(), diag
+
+
+def _attach_drc_weights_if_requested(bank, cfg, precomp, prior_model, lik_model,
+                                     ref_source=None, label='DRC'):
+    if not _config_uses_reference_bank(cfg):
+        return bank, {}
+    if canonicalize_init_weights(cfg.get('init_weights', 'L')) != 'DRC':
+        return bank, {}
+
+    # Shallow-copy the bank so different DRC hyperparameters/consumers cannot
+    # silently mutate a cached source bank shared by another sampler.
+    out_bank = dict(bank)
+    if ref_source is None or str(ref_source) == 'None':
+        # Base-prior DRC collapses to ordinary likelihood weighting up to a
+        # constant because q_source is the Gaussian prior.
+        out_bank['log_drc_ref'] = bank['log_lik_ref'].detach().cpu()
+        diag = {
+            'drc_source': 'prior',
+            'drc_fallback': 'prior_drc_equals_likelihood',
+            'drc_global_ess': _global_log_weight_ess(out_bank['log_drc_ref']),
+        }
+        return out_bank, diag
+
+    specs = precomp.get('score_specs', {})
+    if ref_source not in specs:
+        raise ValueError(
+            f"Sampler '{label}' requested init_weights='DRC' with ref_source={ref_source!r}, "
+            f"but no frozen score spec is available for that source. Available specs: {sorted(specs.keys())}."
+        )
+    log_drc, diag = compute_drc_log_weights_for_bank(
+        out_bank, prior_model, lik_model, specs[ref_source], cfg, label=label,
+    )
+    out_bank['log_drc_ref'] = log_drc
+    return out_bank, diag
+
+
 def compute_mean_ess(y, t, X_ref_cpu, log_lik_ref_cpu, eps=1e-30,
                      batch_size=REF_STREAM_BATCH, transition_w='ou',
                      P_ref_cpu=None, mu_ref_cpu=None, gated_info=None):
@@ -2734,6 +3008,13 @@ INIT_WEIGHT_ALIASES = {
     _normalize_sampler_key('po u'): 'PoU',
     _normalize_sampler_key('p ou'): 'PoU',
     _normalize_sampler_key('partition of unity'): 'PoU',
+    _normalize_sampler_key('drc'): 'DRC',
+    _normalize_sampler_key('density ratio correction'): 'DRC',
+    _normalize_sampler_key('density-ratio correction'): 'DRC',
+    _normalize_sampler_key('density ratio corrected'): 'DRC',
+    _normalize_sampler_key('density-ratio corrected'): 'DRC',
+    _normalize_sampler_key('drc ce hlsi'): 'DRC',
+    _normalize_sampler_key('drc-ce-hlsi'): 'DRC',
 }
 
 INIT_WEIGHT_BANK_KEYS = {
@@ -2741,6 +3022,7 @@ INIT_WEIGHT_BANK_KEYS = {
     'L': 'log_lik_ref',
     'WC': 'log_mass_ref',
     'PoU': 'log_pou_ref',
+    'DRC': 'log_drc_ref',
 }
 
 
@@ -2808,6 +3090,11 @@ LEGACY_INIT_SPECS = {
     _normalize_sampler_key('leaf-tl-pou-hlsi'): ('leaf_tl_hlsi', 'PoU'),
     _normalize_sampler_key('leaf_tl_pou_hlsi'): ('leaf_tl_hlsi', 'PoU'),
     _normalize_sampler_key('leaf tl pou hlsi'): ('leaf_tl_hlsi', 'PoU'),
+    _normalize_sampler_key('drc-ce-hlsi'): ('ce_hlsi', 'DRC'),
+    _normalize_sampler_key('drc_ce_hlsi'): ('ce_hlsi', 'DRC'),
+    _normalize_sampler_key('drc ce hlsi'): ('ce_hlsi', 'DRC'),
+    _normalize_sampler_key('density-ratio-corrected-ce-hlsi'): ('ce_hlsi', 'DRC'),
+    _normalize_sampler_key('density ratio corrected ce hlsi'): ('ce_hlsi', 'DRC'),
 }
 
 
@@ -2876,6 +3163,8 @@ def format_sampler_display_name(init_mode, init_weights='L'):
         return 'CE-WC-HLSI'
     if init_mode == 'ce_hlsi' and init_weights == 'PoU':
         return 'CE-PoU-HLSI'
+    if init_mode == 'ce_hlsi' and init_weights == 'DRC':
+        return 'DRC-CE-HLSI'
     if init_mode == 'leaf_hlsi' and init_weights == 'WC':
         return 'Leaf-WC-HLSI'
     if init_mode == 'leaf_hlsi' and init_weights == 'PoU':
@@ -2884,6 +3173,8 @@ def format_sampler_display_name(init_mode, init_weights='L'):
         return 'Leaf-CE-WC-HLSI'
     if init_mode == 'leaf_ce_hlsi' and init_weights == 'PoU':
         return 'Leaf-CE-PoU-HLSI'
+    if init_mode == 'leaf_ce_hlsi' and init_weights == 'DRC':
+        return 'Leaf-DRC-CE-HLSI'
     if init_mode == 'tl_hlsi' and init_weights == 'L':
         return 'TL-HLSI'
     if init_mode == 'tl_hlsi' and init_weights == 'WC':
@@ -2956,7 +3247,9 @@ def get_sampler_log_weights(init_mode, init_weights, bank):
     init_mode = canonicalize_init_name(init_mode)
     init_weights = canonicalize_init_weights(init_weights)
     use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi', 'leaf_tl_hlsi'}
-    if use_leaf and init_weights == 'WC':
+    if init_weights == 'DRC':
+        bank_key = 'log_drc_ref'
+    elif use_leaf and init_weights == 'WC':
         bank_key = 'log_mass_leaf_ref'
     elif use_leaf and init_weights == 'PoU':
         bank_key = 'log_pou_leaf_ref'
@@ -2974,6 +3267,8 @@ def get_sampler_log_weight_name(init_mode, init_weights):
     init_mode = canonicalize_init_name(init_mode)
     init_weights = canonicalize_init_weights(init_weights)
     use_leaf = init_mode in {'leaf_hlsi', 'leaf_ce_hlsi', 'leaf_tl_hlsi'}
+    if init_weights == 'DRC':
+        return 'log_drc_ref'
     if use_leaf and init_weights == 'WC':
         return 'log_mass_leaf_ref'
     if use_leaf and init_weights == 'PoU':
@@ -3111,6 +3406,28 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg['ref_source'] = canonicalize_ref_source(cfg.get('ref_source', None))
 
     cfg['transition_w'] = canonicalize_transition_w(cfg.get('transition_w', 'ou'))
+
+    # DRC uses the existing init_weights channel as a dynamic component-mass law.
+    # The defaults below are intentionally conservative and can be overridden per
+    # sampler config. The actual log_drc_ref vector is attached lazily when the
+    # reference bank for a DRC-consuming sampler is selected.
+    cfg.setdefault('drc_pf_steps', 32)
+    cfg['drc_pf_steps'] = int(max(1, cfg['drc_pf_steps']))
+    cfg.setdefault('drc_div_probes', 1)
+    cfg['drc_div_probes'] = int(max(0, cfg['drc_div_probes']))
+    cfg.setdefault('drc_fd_eps', 1e-3)
+    cfg['drc_fd_eps'] = float(cfg['drc_fd_eps'])
+    cfg.setdefault('drc_tmin', cfg.get('init_tmin', 10 ** (-2.5)))
+    cfg.setdefault('drc_tmax', cfg.get('init_tmax', 10.0))
+    cfg['drc_tmin'] = float(cfg['drc_tmin'])
+    cfg['drc_tmax'] = float(cfg['drc_tmax'])
+    cfg.setdefault('drc_eval_batch_size', 64)
+    cfg['drc_eval_batch_size'] = int(max(1, cfg['drc_eval_batch_size']))
+    cfg.setdefault('drc_temperature', 1.0)
+    cfg['drc_temperature'] = float(cfg['drc_temperature'])
+    cfg.setdefault('drc_clip', 20.0)
+    if cfg['drc_clip'] is not None:
+        cfg['drc_clip'] = float(cfg['drc_clip'])
 
     gate_defaults = {
         'hlsi_posterior': dict(gate_rho=0.0, gate_beta=1.0, gate_kappa=0.0),
@@ -3309,6 +3626,7 @@ def _select_reference_bank_for_config(label, cfg, samples, precomp, prior_model,
 
     ref_source = cfg.get('ref_source')
     needs_pou = _config_requires_pou_bank(cfg)
+    precomp.setdefault('drc_diagnostics', {})
     # For ordinary prior banks, preserve the historical compute_pou flag. For
     # named source banks, only build PoU objects when the consumer actually needs
     # them; descendants build their own banks from the resulting samples later.
@@ -3318,12 +3636,22 @@ def _select_reference_bank_for_config(label, cfg, samples, precomp, prior_model,
             precomp, prior_model, lik_model, n_ref=n_ref_used,
             compute_pou=bool(compute_pou_default or needs_pou),
         )
+        bank, drc_diag = _attach_drc_weights_if_requested(
+            bank, cfg, precomp, prior_model, lik_model, ref_source=None, label=label,
+        )
+        if drc_diag:
+            precomp['drc_diagnostics'][label] = drc_diag
         return bank, 'None', n_ref_used
 
     bank, n_ref_used = _get_or_build_source_bank(
         precomp, samples, ref_source, label, prior_model, lik_model,
         n_ref=cfg.get('n_ref'), compute_pou=needs_pou,
     )
+    bank, drc_diag = _attach_drc_weights_if_requested(
+        bank, cfg, precomp, prior_model, lik_model, ref_source=ref_source, label=label,
+    )
+    if drc_diag:
+        precomp['drc_diagnostics'][label] = drc_diag
     return bank, ref_source, n_ref_used
 
 
@@ -3348,6 +3676,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
     bank = None
     local_bank = None
     init_stage_info = None
+    init_log_weights = None
 
     if cfg['init'] == 'ref_laplace':
         bank = ref_bank if ref_bank is not None else get_sampler_precomp_bank(
@@ -3410,6 +3739,8 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
         )
 
     run_info = dict(cfg)
+    for key, value in precomp.get('drc_diagnostics', {}).get(label, {}).items():
+        run_info[key] = value
     run_info['ref_source'] = ref_bank_source
     run_info['init_reference_bank'] = ref_bank_source
     run_info['n_ref'] = int(n_ref_used) if n_ref_used else 0
@@ -3451,6 +3782,17 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
         run_info['score_norm_max'] = float('nan')
 
     n_ref_local = int(local_bank['X_ref'].shape[0]) if local_bank is not None else 0
+
+    score_spec = _make_frozen_hlsi_score_spec(
+        label, cfg, local_bank, init_log_weights, final_samples=final_samples,
+    )
+    if score_spec is not None:
+        precomp.setdefault('score_specs', {})[label] = score_spec
+        run_info['score_spec_available'] = True
+        run_info['score_spec_law_matches_final_samples'] = bool(score_spec['law_matches_final_samples'])
+    else:
+        run_info['score_spec_available'] = False
+
     run_info.update(_estimate_sampler_pde_eval_counts(cfg, n_ref=n_ref_local, n_samples=cfg['n_samples']))
 
     return final_samples.detach().cpu(), ess_trace, run_info
