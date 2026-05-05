@@ -16,6 +16,7 @@ PROBLEMS=(
   "poisson"
   "afwi"
   "modulus"
+  "helmholtz_alt"
 )
 
 SUB_PROBLEMS=(
