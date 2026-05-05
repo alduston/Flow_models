@@ -1618,7 +1618,7 @@ ax4.grid(True, which='both', alpha=0.25)
 ax4.legend(fontsize=9)
 plt.tight_layout()
 try:
-    sampling_utils._save_all_open_figures_to_run_results()
+    sampling._save_all_open_figures_to_run_results()
 except Exception:
     pass
 if DASHBOARD_SHOW_FIGURES:
