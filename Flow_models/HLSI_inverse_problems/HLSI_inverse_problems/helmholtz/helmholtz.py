@@ -794,28 +794,12 @@ posterior_score_fn = make_posterior_score_fn(lik_model)
 
 
 SAMPLER_CONFIGS = OrderedDict([
-   #('MALA', {'init': 'prior', 'init_steps': 0, 'mala_steps': 1, 'mala_burnin': 0, 'mala_dt': 1e-4, 'is_reference': True}),
-
-    #('HLSI', {'init': 'HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('WC-HLSI', {'init': 'HLSI', 'init_weights': 'WC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-HLSI', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-
-    #('MALA_HLSI', {'ref_source': 'MALA', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('HLSI_HLSI', {'ref_source': 'HLSI', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('WC-HLSI_HLSI', {'ref_source': 'WC-HLSI', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('HLSI_HLSI', {'ref_source': 'HLSI', 'init': 'HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-
-    #('MALA_CE-HLSI', {'ref_source': 'MALA', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('HLSI_CE-HLSI', {'ref_source': 'HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('WC-HLSI_CE-HLSI', {'ref_source': 'WC-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-HLSI_CE-HLSI', {'ref_source': 'CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-
     ('CE-HLSI_CE-HLSI_CE-HLSI', {'ref_source': 'CE-HLSI_CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('HLSI_HLSI_HLSI', {'ref_source': 'HLSI_HLSI', 'init': ' HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('CE-HLSI_HLSI_HLSI_HLSI', {'ref_source': 'CE-HLSI_HLSI_HLSI', 'init': ' HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    #('CE-HLSI_HLSI_HLSI_HLSI_HSLI', {'ref_source': 'CE-HLSI_HLSI_HLSI_HLSI', 'init': ' HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-
-
+    ('DRC-CE-HLSI', {'ref_source': 'CE-HLSI_CE-HLSI_CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('DRC-CE-HLSI_DRC-CE-HLSI', {'ref_source': 'DRC-CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('DRC-CE-HLSI_DRC-CE-HLSI_DRC-CE-HLSI', {'ref_source': 'DRC-CE-HLSI_DRC-CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
 ])
 dashboard = DashboardPDF(
     DASHBOARD_PDF_PATH,
