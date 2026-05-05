@@ -7,7 +7,9 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-THIS_DIR = os.getcwd() #os.path.dirname(os.path.abspath(__file__))
+THIS_DIR = os.getcwd() # if on collab
+#THIS_DIR = os.path.dirname(os.path.abspath(__file__)) # if not on collab
+
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -35,6 +37,51 @@ import textwrap
 from datetime import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.image as mpimg
+
+
+
+#########################################################################
+
+import sys, importlib, linecache, os
+
+# Make sure /content itself is before parent dirs.
+if os.getcwd() not in sys.path:
+    sys.path.insert(0, os.getcwd())
+
+# Clear stale source-line cache and stale imported module.
+linecache.clearcache()
+if "sampling" in sys.modules:
+    del sys.modules["sampling"]
+
+import sampling
+importlib.reload(sampling)
+
+print("Using:", sampling.__file__)
+print("DRC test:", sampling.canonicalize_init_weights("DRC"))
+
+from sampling import (
+    GaussianPrior,
+    compute_field_summary_metrics,
+    compute_heldout_predictive_metrics,
+    compute_latent_metrics,
+    configure_sampling,
+    get_valid_samples,
+    init_run_results,
+    make_physics_likelihood,
+    make_posterior_score_fn,
+    plot_field_reconstruction_grid,
+    plot_mean_ess_logs,
+    plot_pca_histograms,
+    resolve_plot_normalizer,
+    run_standard_sampler_pipeline,
+    save_reproducibility_log,
+    save_results_tables,
+    summarize_sampler_run,
+    zip_run_results_dir,
+)
+
+
+#########################################################################
 
 SAVE_DASHBOARD_PDF = True
 DASHBOARD_SHOW_FIGURES = True
@@ -792,14 +839,16 @@ lik_model, lik_aux = make_physics_likelihood(
 )
 posterior_score_fn = make_posterior_score_fn(lik_model)
 
-
 SAMPLER_CONFIGS = OrderedDict([
-    ('CE-HLSI', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI_CE-HLSI', {'ref_source': 'CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI_CE-HLSI_CE-HLSI', {'ref_source': 'CE-HLSI_CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('DRC-CE-HLSI', {'ref_source': 'CE-HLSI_CE-HLSI_CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('DRC-CE-HLSI_DRC-CE-HLSI', {'ref_source': 'DRC-CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('DRC-CE-HLSI_DRC-CE-HLSI_DRC-CE-HLSI', {'ref_source': 'DRC-CE-HLSI_DRC-CE-HLSI', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('CE-HLSI2', {'ref_source': 'CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('CE-HLSI3', {'ref_source': 'CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('CE-HLSI4', {'ref_source': 'CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+    ('DRC-CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('DRC-CE-HLSI2', {'ref_source': 'DRC-CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('DRC-CE-HLSI3', {'ref_source': 'DRC-CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('DRC-CE-HLSI4', {'ref_source': 'DRC-CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
 ])
 dashboard = DashboardPDF(
     DASHBOARD_PDF_PATH,
