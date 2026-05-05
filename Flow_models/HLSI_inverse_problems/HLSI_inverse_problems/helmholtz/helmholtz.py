@@ -548,29 +548,6 @@ def dashboard_copy_into_run_dir(dashboard_path, results_df_path=None):
     return dest
 
 
-'''
-import sampling as sampling_utils
-from sampling import (
-    GaussianPrior,
-    compute_field_summary_metrics,
-    compute_heldout_predictive_metrics,
-    compute_latent_metrics,
-    configure_sampling,
-    get_valid_samples,
-    init_run_results,
-    make_physics_likelihood,
-    make_posterior_score_fn,
-    plot_field_reconstruction_grid,
-    plot_mean_ess_logs,
-    plot_pca_histograms,
-    resolve_plot_normalizer,
-    run_standard_sampler_pipeline,
-    save_reproducibility_log,
-    save_results_tables,
-    summarize_sampler_run,
-    zip_run_results_dir,
-)
-'''
 
 
 # ==========================================
@@ -1158,7 +1135,7 @@ for i, label in enumerate(methods_to_plot):
     axes2[1, col].axis('off')
 plt.tight_layout()
 try:
-    sampling_utils._save_all_open_figures_to_run_results()
+    sampling._save_all_open_figures_to_run_results()
 except Exception:
     pass
 if DASHBOARD_SHOW_FIGURES:
@@ -1252,7 +1229,7 @@ fig3.legend(legend_map.values(), legend_map.keys(), loc='upper center', ncol=min
 fig3.suptitle('Source-0 scattered-field boundary traces', fontsize=16, y=1.08)
 plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
 try:
-    sampling_utils._save_all_open_figures_to_run_results()
+    sampling._save_all_open_figures_to_run_results()
 except Exception:
     pass
 if DASHBOARD_SHOW_FIGURES:
@@ -1278,7 +1255,7 @@ ax4.grid(True, which='both', alpha=0.25)
 ax4.legend(fontsize=9)
 plt.tight_layout()
 try:
-    sampling_utils._save_all_open_figures_to_run_results()
+    sampling._save_all_open_figures_to_run_results()
 except Exception:
     pass
 if DASHBOARD_SHOW_FIGURES:
