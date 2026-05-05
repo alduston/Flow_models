@@ -3349,6 +3349,34 @@ def choose_reference_key(samples_dict, sampler_run_info=None, preferred=None):
 
 
 
+def _coerce_config_bool(value, default=True):
+    """Parse a permissive boolean config value for sampler dictionaries."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return bool(int(value))
+    if isinstance(value, str):
+        val = value.strip().lower()
+        if val in {'1', 'true', 't', 'yes', 'y', 'on', 'include', 'included'}:
+            return True
+        if val in {'0', 'false', 'f', 'no', 'n', 'off', 'exclude', 'excluded'}:
+            return False
+    return bool(value)
+
+
+def sampler_config_includes_results(config):
+    """Return whether a normalized or raw sampler config should enter reported results.
+
+    ``include_results=False`` keeps the sampler in the execution DAG so later
+    samplers may still use it via ``ref_source``, but omits its samples, ESS
+    trace, and run-info record from the public pipeline outputs used by metrics,
+    plots, dashboards, and saved tables.
+    """
+    return _coerce_config_bool(dict(config).get('include_results', True), default=True)
+
+
 def normalize_sampler_config(label, config, default_n_samples, default_dim):
     if isinstance(config, dict) and config.get('_normalized', False):
         return dict(config)
@@ -3398,6 +3426,8 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('precond_mala', False)
     cfg['precond_mala'] = bool(cfg['precond_mala'])
     cfg.setdefault('is_reference', False)
+    cfg.setdefault('include_results', True)
+    cfg['include_results'] = sampler_config_includes_results(cfg)
 
     # Legacy flag retained for old configs. New configs should prefer
     # ref_source='<sampler-name>' or ref_source='None'.
@@ -3810,15 +3840,20 @@ def run_sampler_suite(sampler_configs, prior_model, lik_model, precomp):
     run_info = OrderedDict()
 
     for label, cfg in sampler_configs.items():
+        cfg_norm = normalize_sampler_config(label, cfg, DEFAULT_N_GEN, ACTIVE_DIM)
+        include_results = sampler_config_includes_results(cfg_norm)
         t_start = time.time()
-        samps, ess_trace, info = run_single_sampler_config(label, cfg, prior_model, lik_model, precomp)
+        samps, ess_trace, info = run_single_sampler_config(label, cfg_norm, prior_model, lik_model, precomp)
         elapsed = time.time() - t_start
-        samples[label] = samps
-        if ess_trace is not None and len(ess_trace.get('t', [])) > 0:
-            ess_logs[label] = ess_trace
         info = dict(info)
         info['runtime_seconds'] = elapsed
-        run_info[label] = info
+        if include_results:
+            samples[label] = samps
+            if ess_trace is not None and len(ess_trace.get('t', [])) > 0:
+                ess_logs[label] = ess_trace
+            run_info[label] = info
+        else:
+            print(f"  [{label}] include_results=False: omitting from samples, ESS logs, metrics tables, and plots.")
         print(f"{label}: {elapsed:.2f}s")
 
     return samples, ess_logs, run_info
@@ -3945,6 +3980,7 @@ def run_tree_sampler_suite(sampler_configs, prior_model, lik_model, n_ref=10000,
             int(cfg.get('n_ref') or n_ref) for _, cfg in legacy_mala_consumers
         )
         hidden_cfg_raw['display_name'] = hidden_label
+        hidden_cfg_raw['include_results'] = False
         hidden_cfg = normalize_sampler_config(hidden_label, hidden_cfg_raw, DEFAULT_N_GEN, ACTIVE_DIM)
         hidden_cfg['_hidden'] = True
         hidden_labels.add(hidden_label)
@@ -3977,6 +4013,8 @@ def run_tree_sampler_suite(sampler_configs, prior_model, lik_model, n_ref=10000,
     samples = OrderedDict()
     ess_logs = OrderedDict()
     run_info = OrderedDict()
+    included_result_labels = []
+    excluded_result_labels = []
 
     for label in execution_order:
         cfg = normalized[label]
@@ -3991,15 +4029,22 @@ def run_tree_sampler_suite(sampler_configs, prior_model, lik_model, n_ref=10000,
         )
         elapsed = time.time() - t_start
         all_samples[label] = samps
-        if label not in hidden_labels:
+        info = dict(info)
+        info['runtime_seconds'] = elapsed
+        include_results = bool(label not in hidden_labels and sampler_config_includes_results(cfg))
+        if include_results:
             samples[label] = samps
             if ess_trace is not None and len(ess_trace.get('t', [])) > 0:
                 ess_logs[label] = ess_trace
-            info = dict(info)
-            info['runtime_seconds'] = elapsed
             run_info[label] = info
+            included_result_labels.append(label)
+        else:
+            excluded_result_labels.append(label)
+            print(f"  [{label}] include_results=False: retaining samples only for downstream ref_source use.")
         print(f"{label}: {elapsed:.2f}s")
 
+    precomp['included_result_labels'] = included_result_labels
+    precomp['excluded_result_labels'] = excluded_result_labels
     return samples, ess_logs, run_info, precomp
 
 
@@ -4013,6 +4058,10 @@ def run_standard_sampler_pipeline(prior_model, lik_model, sampler_configs, n_ref
         sampler_configs, prior_model, lik_model,
         n_ref=n_ref, build_gnl_banks=build_gnl_banks, compute_pou=compute_pou,
     )
+    if len(samples) == 0:
+        raise ValueError(
+            'No sampler outputs are marked for results. Set include_results=True for at least one sampler config.'
+        )
     display_names = {label: info.get('display_name', label) for label, info in sampler_run_info.items()}
     reference_key = choose_reference_key(samples, sampler_run_info)
     reference_title = display_names.get(reference_key, reference_key)
@@ -4026,6 +4075,8 @@ def run_standard_sampler_pipeline(prior_model, lik_model, sampler_configs, n_ref
         'reference_title': reference_title,
         'n_ref': n_ref,
         'n_ref_by_sampler': {label: int(info.get('n_ref', 0)) for label, info in sampler_run_info.items()},
+        'included_result_labels': list(precomp.get('included_result_labels', list(samples.keys()))),
+        'excluded_result_labels': list(precomp.get('excluded_result_labels', [])),
     }
 
 def summarize_sampler_run(sampler_run_info):
