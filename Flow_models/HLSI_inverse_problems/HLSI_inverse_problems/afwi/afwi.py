@@ -8,8 +8,8 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-#THIS_DIR = os.getcwd()                                    #if on colab 
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))     #if not on colab
+THIS_DIR = os.getcwd()                                    #if on colab 
+#THIS_DIR = os.path.dirname(os.path.abspath(__file__))     #if not on colab
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -59,6 +59,489 @@ from sampling import (
     summarize_sampler_run,
     zip_run_results_dir,
 )
+
+# ==========================================
+# Dashboard PDF utilities
+# ==========================================
+# Produces a single multipage PDF containing the scalar metrics tables and every
+# figure produced by this script. Console progress logs are intentionally not
+# captured into the dashboard.
+
+import glob
+import numbers
+import re
+import shutil
+import textwrap
+from datetime import datetime
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.image as mpimg
+
+SAVE_DASHBOARD_PDF = True
+DASHBOARD_SHOW_FIGURES = True
+DASHBOARD_PDF_PATH = None  # Filled after init_run_results(), inside the active run-results directory.
+
+
+def _dashboard_is_scalar_cell(x):
+    if x is None:
+        return True
+    if isinstance(x, (str, bool)):
+        return True
+    if isinstance(x, numbers.Number):
+        return True
+    if isinstance(x, np.generic):
+        return True
+    return False
+
+
+def _dashboard_format_cell(x, max_len=72):
+    if x is None:
+        return ""
+    try:
+        if isinstance(x, np.generic):
+            x = x.item()
+    except Exception:
+        pass
+    if isinstance(x, numbers.Number):
+        try:
+            xf = float(x)
+            if not np.isfinite(xf):
+                return str(x)
+            if abs(xf) >= 1e4 or (0 < abs(xf) < 1e-3):
+                return f"{xf:.4e}"
+            return f"{xf:.6g}"
+        except Exception:
+            return str(x)
+    if isinstance(x, (list, tuple, dict, np.ndarray)):
+        try:
+            if isinstance(x, np.ndarray):
+                return f"array{tuple(x.shape)}"
+            return f"{type(x).__name__}[{len(x)}]"
+        except Exception:
+            return type(x).__name__
+    s = str(x)
+    if len(s) > max_len:
+        return s[: max_len - 3] + "..."
+    return s
+
+
+def _dashboard_sanitize_df(df, include_index=True):
+    df = pd.DataFrame(df).copy()
+    if include_index and not isinstance(df.index, pd.RangeIndex):
+        df = df.reset_index()
+    for col in df.columns:
+        df[col] = df[col].map(_dashboard_format_cell)
+    df.columns = [_dashboard_format_cell(c, max_len=40) for c in df.columns]
+    return df
+
+
+def metrics_dict_to_scalar_df(metrics_dict, display_names=None):
+    """Convert the metrics dictionary into a dashboard-friendly scalar table."""
+    display_names = display_names or {}
+    rows = []
+    for label, data in metrics_dict.items():
+        if not isinstance(data, dict):
+            continue
+        row = OrderedDict()
+        row["Method"] = display_names.get(label, label)
+        for key, val in data.items():
+            if _dashboard_is_scalar_cell(val):
+                row[key] = val
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def nested_dict_to_df(dct, row_name="Method", display_names=None):
+    """Convert nested dict/list records into a table without large arrays."""
+    display_names = display_names or {}
+    if isinstance(dct, pd.DataFrame):
+        return dct.copy()
+    rows = []
+    if isinstance(dct, dict):
+        iterable = dct.items()
+    else:
+        iterable = enumerate(dct)
+    for key, val in iterable:
+        row = OrderedDict()
+        row[row_name] = display_names.get(key, key)
+        if isinstance(val, dict):
+            for k, v in val.items():
+                if _dashboard_is_scalar_cell(v):
+                    row[k] = v
+                elif isinstance(v, (list, tuple, np.ndarray)):
+                    row[k] = _dashboard_format_cell(v)
+                else:
+                    row[k] = _dashboard_format_cell(v)
+        else:
+            row["value"] = _dashboard_format_cell(val)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def sampler_configs_to_df(configs):
+    rows = []
+    for label, cfg in configs.items():
+        row = OrderedDict()
+        row["Method"] = label
+        row.update(cfg)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+class DashboardPDF:
+    def __init__(self, path, title="Dashboard"):
+        self.path = os.path.abspath(path)
+        self.title = title
+        self.enabled = bool(SAVE_DASHBOARD_PDF)
+        self.pdf = PdfPages(self.path) if self.enabled else None
+        self._seen_fig_ids = {id(plt.figure(num)) for num in plt.get_fignums()}
+        self.figure_pages = 0
+        self.table_pages = 0
+        self.text_pages = 0
+
+    def add_text_page(self, title, lines, footer=None, mono=False):
+        if not self.enabled:
+            return
+        if isinstance(lines, str):
+            lines = lines.splitlines()
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.patch.set_facecolor("white")
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.axis("off")
+        ax.text(0.055, 0.93, title, fontsize=18, fontweight="bold", va="top")
+        y = 0.86
+        fontsize = 9.2 if mono else 10.5
+        family = "monospace" if mono else "sans-serif"
+        for raw in lines:
+            wrapped = textwrap.wrap(str(raw), width=112 if mono else 105) or [""]
+            for line in wrapped:
+                ax.text(0.06, y, line, fontsize=fontsize, family=family, va="top")
+                y -= 0.033 if mono else 0.038
+                if y < 0.08:
+                    if footer:
+                        ax.text(0.055, 0.035, footer, fontsize=8.5, alpha=0.65)
+                    self.pdf.savefig(fig, bbox_inches="tight")
+                    plt.close(fig)
+                    self.text_pages += 1
+                    fig = plt.figure(figsize=(11, 8.5))
+                    fig.patch.set_facecolor("white")
+                    ax = fig.add_axes([0, 0, 1, 1])
+                    ax.axis("off")
+                    ax.text(0.055, 0.93, title + " (cont.)", fontsize=18, fontweight="bold", va="top")
+                    y = 0.86
+        if footer:
+            ax.text(0.055, 0.035, footer, fontsize=8.5, alpha=0.65)
+        self.pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        self.text_pages += 1
+
+    def add_dataframe(self, title, df, max_rows=28, max_cols=7, include_index=True):
+        if not self.enabled:
+            return
+        df = _dashboard_sanitize_df(df, include_index=include_index)
+        if df.empty:
+            self.add_text_page(title, ["No rows available."])
+            return
+
+        # Keep the first column (usually Method / metric name) pinned on horizontal splits.
+        first_col = [df.columns[0]]
+        other_cols = list(df.columns[1:])
+        cols_per_page = max(1, max_cols - 1)
+        col_chunks = [other_cols[i:i + cols_per_page] for i in range(0, len(other_cols), cols_per_page)] or [[]]
+
+        for ci, col_chunk in enumerate(col_chunks):
+            cols = first_col + col_chunk
+            df_col = df.loc[:, cols]
+            for ri in range(0, len(df_col), max_rows):
+                df_page = df_col.iloc[ri:ri + max_rows]
+                fig, ax = plt.subplots(figsize=(11, 8.5))
+                fig.patch.set_facecolor("white")
+                ax.axis("off")
+                suffix = ""
+                if len(col_chunks) > 1:
+                    suffix += f" - columns {ci + 1}/{len(col_chunks)}"
+                if len(df_col) > max_rows:
+                    suffix += f" - rows {ri + 1}-{min(ri + max_rows, len(df_col))}"
+                ax.set_title(title + suffix, fontsize=15, fontweight="bold", pad=14)
+
+                col_width = 1.0 / max(len(df_page.columns), 1)
+                table = ax.table(
+                    cellText=df_page.values,
+                    colLabels=df_page.columns,
+                    cellLoc="center",
+                    colLoc="center",
+                    loc="center",
+                    colWidths=[col_width] * len(df_page.columns),
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(7.5 if len(df_page.columns) >= 6 else 8.5)
+                table.scale(1.0, 1.25)
+                for (row, col), cell in table.get_celld().items():
+                    if row == 0:
+                        cell.set_text_props(weight="bold")
+                    if col == 0 and row > 0:
+                        cell.set_text_props(ha="left")
+                self.pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+                self.table_pages += 1
+
+    def _style_table_cells(self, table, header_fontsize=None, body_fontsize=None,
+                           header_facecolor="0.92", first_col_left=True):
+        """Apply consistent, readable table styling for dashboard pages."""
+        for (row, col), cell in table.get_celld().items():
+            cell.set_edgecolor("0.72")
+            cell.set_linewidth(0.45)
+            if row == 0:
+                cell.set_facecolor(header_facecolor)
+                cell.set_text_props(weight="bold", fontsize=header_fontsize)
+            else:
+                if row % 2 == 0:
+                    cell.set_facecolor("0.985")
+                if body_fontsize is not None:
+                    cell.set_text_props(fontsize=body_fontsize)
+                if first_col_left and col == 0:
+                    cell.set_text_props(ha="left")
+
+    def _add_table_block(self, ax, title, df, bbox, col_widths=None,
+                         header_fontsize=8.2, body_fontsize=8.0):
+        """Draw one compact table block inside an existing page."""
+        df_fmt = _dashboard_sanitize_df(df, include_index=False)
+        ax.text(bbox[0], bbox[1] + bbox[3] + 0.012, title,
+                fontsize=11.5, fontweight="bold", va="bottom", ha="left")
+        if df_fmt.empty:
+            ax.text(bbox[0], bbox[1] + 0.5 * bbox[3], "No rows available.", fontsize=10)
+            return
+        n_cols = len(df_fmt.columns)
+        if col_widths is None:
+            first_w = 0.24 if n_cols > 1 else 1.0
+            rest_w = (1.0 - first_w) / max(n_cols - 1, 1)
+            col_widths = [first_w] + [rest_w] * (n_cols - 1)
+        table = ax.table(
+            cellText=df_fmt.values,
+            colLabels=df_fmt.columns,
+            cellLoc="center",
+            colLoc="center",
+            loc="center",
+            colWidths=col_widths,
+            bbox=bbox,
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(body_fontsize)
+        self._style_table_cells(table, header_fontsize=header_fontsize, body_fontsize=body_fontsize)
+
+    def _rename_runinfo_columns(self, df):
+        """Shorten run-info headers enough to fit while preserving content."""
+        rename = {
+            "display_name": "method label",
+            "method": "sampler",
+            "weight_mode": "weights",
+            "mala_step_size": "MALA dt",
+            "score_norm_initial": "score norm init",
+            "score_norm_mean": "score norm mean",
+            "score_norm_final": "score norm final",
+            "score_norm_max": "score norm max",
+            "pde_likelihood_evals": "PDE logL evals",
+            "pde_score_evals": "PDE score evals",
+            "pde_gn_hessian_evals": "PDE GN Hess evals",
+            "pde_solve_count": "PDE solves",
+            "runtime_seconds": "runtime (s)",
+            "reference_method": "reference",
+            "N_ref": "N ref",
+            "mala_steps": "MALA steps",
+            "mala_burnin": "MALA burnin",
+        }
+        return df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    def add_results_tables(self, results_df, results_runinfo_df):
+        """Add exactly two table pages: canonical metrics and readable run-info.
+
+        The metrics page keeps the saved *_metrics.csv / tables.tex layout. The
+        run-info page preserves the saved *_runinfo.csv contents, but splits the
+        many accounting columns into three normal table blocks on one page so it
+        remains legible instead of becoming a tiny one-line wide table.
+        """
+        if not self.enabled:
+            return
+
+        # Page 1: metric rows x sampler columns, matching *_metrics.csv / tables.tex.
+        metrics_fmt = _dashboard_sanitize_df(results_df, include_index=True)
+        fig, ax = plt.subplots(figsize=(12.5, 8.5))
+        fig.patch.set_facecolor("white")
+        ax.axis("off")
+        ax.set_title("Metrics table (saved *_metrics.csv / tables.tex layout)",
+                     fontsize=18, fontweight="bold", pad=14)
+        n_rows = max(len(metrics_fmt), 1)
+        n_cols = max(len(metrics_fmt.columns), 1)
+        first_w = 0.34 if n_cols > 1 else 0.95
+        rest_w = (0.94 - first_w) / max(n_cols - 1, 1)
+        col_widths = [first_w] + [rest_w] * (n_cols - 1)
+        table = ax.table(
+            cellText=metrics_fmt.values,
+            colLabels=metrics_fmt.columns,
+            cellLoc="center",
+            colLoc="center",
+            loc="center",
+            colWidths=col_widths,
+            bbox=[0.035, 0.055, 0.93, 0.86],
+        )
+        table.auto_set_font_size(False)
+        # Larger text than the previous version; still adapts if many methods are added.
+        body_fs = min(10.5, max(7.2, 120.0 / (n_rows + 0.75 * n_cols)))
+        header_fs = min(10.5, body_fs + 0.5)
+        table.set_fontsize(body_fs)
+        self._style_table_cells(table, header_fontsize=header_fs, body_fontsize=body_fs)
+        self.pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        self.table_pages += 1
+
+        # Page 2: normal, readable run-info blocks on one page.
+        runinfo = pd.DataFrame(results_runinfo_df).copy()
+        target = ""
+        if "target" in runinfo.columns and len(runinfo) > 0:
+            target = str(runinfo["target"].iloc[0])
+        runinfo = self._rename_runinfo_columns(runinfo)
+        fig, ax = plt.subplots(figsize=(15.5, 10.0))
+        fig.patch.set_facecolor("white")
+        ax.axis("off")
+        title = "Run-info table (saved *_runinfo.csv, split for readability)"
+        if target:
+            title += f" - {target}"
+        ax.set_title(title, fontsize=18, fontweight="bold", pad=14)
+
+        def cols_present(cols):
+            return [c for c in cols if c in runinfo.columns]
+
+        config_cols = cols_present([
+            "method label", "sampler", "weights", "N ref", "steps",
+            "MALA steps", "MALA burnin", "MALA dt", "reference", "runtime (s)",
+        ])
+        score_cols = cols_present([
+            "method label", "score_norm", "score norm init", "score norm mean",
+            "score norm final", "score norm max",
+        ])
+        budget_cols = cols_present([
+            "method label", "PDE logL evals", "PDE score evals", "PDE GN Hess evals", "PDE solves",
+        ])
+
+        # Normalized column widths for each block. First column gets label width;
+        # remaining columns share the rest.
+        def widths(n, first=0.24):
+            if n <= 1:
+                return [1.0]
+            return [first] + [(1.0 - first) / (n - 1)] * (n - 1)
+
+        if config_cols:
+            self._add_table_block(
+                ax, "Sampler configuration and runtime", runinfo[config_cols],
+                bbox=[0.035, 0.635, 0.93, 0.265], col_widths=widths(len(config_cols), first=0.22),
+                header_fontsize=8.8, body_fontsize=8.7,
+            )
+        if score_cols:
+            self._add_table_block(
+                ax, "Score-norm diagnostics", runinfo[score_cols],
+                bbox=[0.035, 0.355, 0.93, 0.185], col_widths=widths(len(score_cols), first=0.30),
+                header_fontsize=9.2, body_fontsize=9.0,
+            )
+        if budget_cols:
+            self._add_table_block(
+                ax, "PDE evaluation budget", runinfo[budget_cols],
+                bbox=[0.035, 0.115, 0.93, 0.165], col_widths=widths(len(budget_cols), first=0.30),
+                header_fontsize=9.2, body_fontsize=9.0,
+            )
+
+        # If future runinfo files add columns not covered above, surface them in a small note
+        # instead of silently dropping them.
+        used = set(config_cols + score_cols + budget_cols + ["target", "label"])
+        extra = [c for c in runinfo.columns if c not in used]
+        if extra:
+            ax.text(0.035, 0.055, "Additional run-info columns: " + ", ".join(extra),
+                    fontsize=8.0, alpha=0.75, ha="left", va="bottom")
+        self.pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+        self.table_pages += 1
+
+    def _figure_sort_key(self, path):
+        name = os.path.basename(path)
+        m = re.search(r"_figure_(\d+)_", name)
+        return (int(m.group(1)) if m else 10_000, name)
+
+    def add_image_page(self, image_path):
+        """Embed one saved PNG/JPG as a full dashboard page."""
+        if not self.enabled or not os.path.exists(image_path):
+            return
+        img = mpimg.imread(image_path)
+        h, w = img.shape[:2]
+        aspect = w / max(h, 1)
+        if aspect > 2.2:
+            figsize = (18.0, 7.0)
+        elif aspect > 1.35:
+            figsize = (15.5, 9.0)
+        else:
+            figsize = (11.0, 10.0)
+        fig = plt.figure(figsize=figsize)
+        fig.patch.set_facecolor("white")
+        ax = fig.add_axes([0.015, 0.015, 0.97, 0.97])
+        ax.imshow(img)
+        ax.axis("off")
+        self.pdf.savefig(fig, bbox_inches="tight", pad_inches=0.03)
+        plt.close(fig)
+        self.figure_pages += 1
+
+    def add_run_results_png_figures(self, run_results_dir):
+        """Append all saved run-results PNG figures, sorted by figure number.
+
+        This is intentionally based on the files saved by sampling.py's patched
+        plt.show() hook, so dashboard coverage matches the normal run-results
+        directory exactly: ESS, PCA, field reconstructions, wavefields, boundary
+        traces, curvature spectra, and any future diagnostics.
+        """
+        if not self.enabled or not run_results_dir or not os.path.isdir(run_results_dir):
+            return
+        pngs = sorted(glob.glob(os.path.join(run_results_dir, "*.png")), key=self._figure_sort_key)
+        for path in pngs:
+            self.add_image_page(path)
+
+    def add_figure(self, fig=None, close=False):
+        if not self.enabled:
+            return
+        if fig is None:
+            fig = plt.gcf()
+        try:
+            fig.savefig(self.pdf, format="pdf", bbox_inches="tight")
+            self.figure_pages += 1
+        except Exception as exc:
+            self.add_text_page("Figure capture failed", [repr(exc)])
+        if close:
+            plt.close(fig)
+
+    def capture_new_figures(self, close=False):
+        if not self.enabled:
+            return
+        for num in list(plt.get_fignums()):
+            fig = plt.figure(num)
+            fig_id = id(fig)
+            if fig_id not in self._seen_fig_ids:
+                self.add_figure(fig, close=close)
+                self._seen_fig_ids.add(fig_id)
+
+    def close(self):
+        if self.enabled and self.pdf is not None:
+            self.pdf.close()
+            self.pdf = None
+
+
+def dashboard_copy_into_run_dir(dashboard_path, results_df_path=None):
+    """Copy the dashboard into the run-results directory so it is included in the zip."""
+    if not dashboard_path or not os.path.exists(dashboard_path) or results_df_path is None:
+        return dashboard_path
+    run_dir = os.path.dirname(os.path.abspath(results_df_path))
+    os.makedirs(run_dir, exist_ok=True)
+    dest = os.path.join(run_dir, os.path.basename(dashboard_path))
+    if os.path.abspath(dest) != os.path.abspath(dashboard_path):
+        shutil.copy2(dashboard_path, dest)
+    return dest
+
+
+
 ################################################################################
 # ==========================================
 # 0. KL BASIS GENERATION
@@ -310,9 +793,10 @@ HESS_MAX = 1e8
 GNL_PILOT_N = 512
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
 GNL_USE_DOMINANT_PARTICLE_NEWTON = True
-DEFAULT_N_GEN = 10000
-N_REF = 10000
+DEFAULT_N_GEN = 4000
+N_REF = 4000
 BUILD_GNL_BANKS = False
+N_SHOT_GATHER_PLOT_SOURCES = 3
 
 configure_sampling(
     active_dim=ACTIVE_DIM,
@@ -326,7 +810,11 @@ configure_sampling(
     gnl_stiff_lambda_cut=GNL_STIFF_LAMBDA_CUT,
     gnl_use_dominant_particle_newton=GNL_USE_DOMINANT_PARTICLE_NEWTON,
 )
-init_run_results('acoustic_fwi_hlsi')
+run_results_info = init_run_results('acoustic_fwi_hlsi')
+DASHBOARD_PDF_PATH = os.path.join(
+    run_results_info['run_results_dir'],
+    f"{run_results_info['run_results_stem']}_summary_dashboard.pdf",
+)
 
 # ==========================================
 # Experiment execution
@@ -366,6 +854,31 @@ NOISE_STD = 0.05 * np.std(y_clean_np)
 y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
 y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
 y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
+
+dashboard = DashboardPDF(
+    DASHBOARD_PDF_PATH,
+    title='Acoustic FWI HLSI dashboard',
+)
+dashboard.add_text_page(
+    'Acoustic FWI HLSI dashboard',
+    [
+        f"Created: {datetime.now().isoformat(timespec='seconds')}",
+        'This dashboard contains the two canonical saved-results tables plus every PNG diagnostic plot saved in the run directory.',
+        'Tables are intentionally limited to two pages: metrics plus a readable split run-info page.',
+        'Random progress output from precomputation / Hessian batching is intentionally excluded.',
+        f"run_results_dir = {run_results_info['run_results_dir']}",
+        '',
+        f'seed = {seed}',
+        f'ACTIVE_DIM = {ACTIVE_DIM}',
+        f'N_REF = {N_REF}',
+        f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
+        f'NOISE_STD = {NOISE_STD}',
+        f'N = {N}, N_SOURCES = {N_SOURCES}, N_RECEIVERS = {N_RECEIVERS}, N_RECORD_STEPS = {N_RECORD_STEPS}',
+        f'N_SHOT_GATHER_PLOT_SOURCES = {N_SHOT_GATHER_PLOT_SOURCES}',
+        f'HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}',
+        f'PLOT_NORMALIZER = {PLOT_NORMALIZER}',
+    ],
+)
 
 def batched_solve_forward_holdout_np(a_batch, chunk_size=8):
     a_batch = np.asarray(a_batch, dtype=np.float64)
@@ -636,11 +1149,14 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
     reference_name=reference_title,
 )
 
+dashboard.add_results_tables(results_df, results_runinfo_df)
+
 config_dict = {
     'seed': seed,
     'ACTIVE_DIM': ACTIVE_DIM,
     'N_REF': N_REF,
     'BUILD_GNL_BANKS': BUILD_GNL_BANKS,
+    'N_SHOT_GATHER_PLOT_SOURCES': N_SHOT_GATHER_PLOT_SOURCES,
     'PLOT_NORMALIZER': PLOT_NORMALIZER,
     'HESS_MIN': HESS_MIN,
     'HESS_MAX': HESS_MAX,
@@ -656,7 +1172,7 @@ save_reproducibility_log(
     title='Acoustic FWI HLSI run reproducibility log',
     config=config_dict,
     extra_sections={
-        'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path},
+        'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path, 'dashboard_pdf': DASHBOARD_PDF_PATH},
         'summary_stats': {
             'reference_key': reference_key,
             'reference_title': reference_title,
@@ -695,12 +1211,13 @@ fig_field, axes_field = plot_field_reconstruction_grid(
     field_name='Velocity $c(x)$',
 )
 axes_field[0, 0].legend(['Receivers', 'Sources'], fontsize=8, loc='upper right')
-plt.show()
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
 
 # ==========================================
-# Figure 2: all-source shot gathers + aggregate RMS residuals
+# Figure 2: selected-source shot gathers + residuals
 # ==========================================
-print('\nVisualizing shot gathers for all sources plus all-shot RMS summaries...')
+print('\nVisualizing selected acoustic shot gathers and residuals...')
 
 true_meas = np.asarray(true_meas)
 obs_meas = np.asarray(obs_meas)
@@ -719,13 +1236,30 @@ for label in methods_to_plot:
     gather_pred_all = unpack_measurement_vector(np.array(solve_forward(jnp.array(mean_lat))))
     predicted_meas_by_label[label] = gather_pred_all
 
-# Use a single symmetric scale for all per-source signed gather panels and a
-# separate symmetric scale for signed residual panels.
-all_signed_gathers = [true_meas, obs_meas - true_meas]
+# Select a representative subset of source gathers for the signed gather/residual grid.
+# N_SHOT_GATHER_PLOT_SOURCES controls the number of individual source gathers shown;
+# with the default value 3, the figure has 6 rows: 3 gather rows and 3 residual rows.
+n_shot_gather_plot_sources = int(np.clip(int(N_SHOT_GATHER_PLOT_SOURCES), 1, N_SOURCES))
+shot_plot_indices = np.unique(
+    np.round(np.linspace(0, N_SOURCES - 1, n_shot_gather_plot_sources)).astype(int)
+)
+# np.unique can only reduce the count when a pathological value slips through; fill
+# from the left if needed so the requested row count remains stable.
+if shot_plot_indices.size < n_shot_gather_plot_sources:
+    for candidate in range(N_SOURCES):
+        if candidate not in set(shot_plot_indices.tolist()):
+            shot_plot_indices = np.append(shot_plot_indices, candidate)
+        if shot_plot_indices.size >= n_shot_gather_plot_sources:
+            break
+shot_plot_indices = np.sort(shot_plot_indices[:n_shot_gather_plot_sources])
+
+# Use a single symmetric scale for all displayed signed gather panels and a
+# separate symmetric scale for displayed signed residual panels.
+all_signed_gathers = [true_meas[shot_plot_indices], (obs_meas - true_meas)[shot_plot_indices]]
 for pred_all in predicted_meas_by_label.values():
     if pred_all is not None:
-        all_signed_gathers.append(pred_all)
-        all_signed_gathers.append(pred_all - true_meas)
+        all_signed_gathers.append(pred_all[shot_plot_indices])
+        all_signed_gathers.append((pred_all - true_meas)[shot_plot_indices])
 
 gather_vlim = max(
     1e-12,
@@ -738,45 +1272,15 @@ resid_vlim = max(
     1e-12,
     float(np.percentile(
         np.abs(np.concatenate(
-            [(obs_meas - true_meas).ravel()] +
-            [(pred_all - true_meas).ravel() for pred_all in predicted_meas_by_label.values() if pred_all is not None]
+            [(obs_meas - true_meas)[shot_plot_indices].ravel()] +
+            [((pred_all - true_meas)[shot_plot_indices]).ravel() for pred_all in predicted_meas_by_label.values() if pred_all is not None]
         )),
         99.2,
     ))
 )
 
-# Aggregate all-shot RMS summaries collapse the source dimension using RMS, so
-# they are nonnegative and highlight where residual energy persists over the
-# acquisition rather than allowing signed cancellations across shots.
-clean_rms = np.sqrt(np.mean(true_meas ** 2, axis=0))
-obs_clean_rms_resid = np.sqrt(np.mean((obs_meas - true_meas) ** 2, axis=0))
-pred_rms_by_label = OrderedDict()
-rms_resid_by_label = OrderedDict()
-for label, pred_all in predicted_meas_by_label.items():
-    if pred_all is None:
-        pred_rms_by_label[label] = None
-        rms_resid_by_label[label] = None
-    else:
-        pred_rms_by_label[label] = np.sqrt(np.mean(pred_all ** 2, axis=0))
-        rms_resid_by_label[label] = np.sqrt(np.mean((pred_all - true_meas) ** 2, axis=0))
-
-agg_gather_vmax = max(
-    1e-12,
-    float(np.percentile(
-        np.abs(np.concatenate([clean_rms.ravel()] + [x.ravel() for x in pred_rms_by_label.values() if x is not None])),
-        99.2,
-    ))
-)
-agg_resid_vmax = max(
-    1e-12,
-    float(np.percentile(
-        np.abs(np.concatenate([obs_clean_rms_resid.ravel()] + [x.ravel() for x in rms_resid_by_label.values() if x is not None])),
-        99.2,
-    ))
-)
-
 n_cols = len(methods_to_plot) + 1
-n_panel_rows = 2 * (N_SOURCES + 1)
+n_panel_rows = 2 * len(shot_plot_indices)
 fig2, axes2 = plt.subplots(
     n_panel_rows,
     n_cols,
@@ -784,21 +1288,20 @@ fig2, axes2 = plt.subplots(
     sharex='col',
     sharey='row',
 )
+axes2 = np.atleast_2d(axes2)
 
 panel_row_titles = []
-for src_idx in range(N_SOURCES):
+for src_idx in shot_plot_indices:
     panel_row_titles.extend([
         f'Source-{src_idx} shot gather',
         f'Source-{src_idx} residual',
     ])
-panel_row_titles.extend([
-    'All-shot RMS gather',
-    'All-shot RMS residual',
-])
 
-for src_idx in range(N_SOURCES):
-    row_g = 2 * src_idx
+last_src_idx = int(shot_plot_indices[-1])
+for plot_pos, src_idx in enumerate(shot_plot_indices):
+    row_g = 2 * plot_pos
     row_r = row_g + 1
+    src_idx = int(src_idx)
     clean_gather = true_meas[src_idx]
     obs_gather = obs_meas[src_idx]
 
@@ -813,7 +1316,7 @@ for src_idx in range(N_SOURCES):
     )
     axes2[row_g, 0].set_title(f'Ground Truth\nShot gather (src {src_idx})', fontsize=12)
     axes2[row_g, 0].set_ylabel('Time', fontsize=11)
-    if src_idx == N_SOURCES - 1:
+    if src_idx == last_src_idx:
         axes2[row_g, 0].set_xlabel('Receiver x', fontsize=11)
     plt.colorbar(im_g0, ax=axes2[row_g, 0], fraction=0.046, pad=0.04)
 
@@ -828,7 +1331,7 @@ for src_idx in range(N_SOURCES):
     )
     axes2[row_r, 0].set_title('Noisy - clean\n(data residual)', fontsize=12)
     axes2[row_r, 0].set_ylabel('Time', fontsize=11)
-    if src_idx == N_SOURCES - 1:
+    if src_idx == last_src_idx:
         axes2[row_r, 0].set_xlabel('Receiver x', fontsize=11)
     plt.colorbar(im_r0, ax=axes2[row_r, 0], fraction=0.046, pad=0.04)
 
@@ -853,7 +1356,7 @@ for src_idx in range(N_SOURCES):
             extent=extent,
         )
         axes2[row_g, col].set_title(f"{display_names.get(label, label)}\nShot gather", fontsize=12)
-        if src_idx == N_SOURCES - 1:
+        if src_idx == last_src_idx:
             axes2[row_g, col].set_xlabel('Receiver x', fontsize=11)
 
         axes2[row_r, col].imshow(
@@ -866,75 +1369,10 @@ for src_idx in range(N_SOURCES):
             extent=extent,
         )
         axes2[row_r, col].set_title('Pred - clean residual', fontsize=12)
-        if src_idx == N_SOURCES - 1:
+        if src_idx == last_src_idx:
             axes2[row_r, col].set_xlabel('Receiver x', fontsize=11)
 
-# Aggregate all-shot RMS block at the bottom.
-agg_row_g = 2 * N_SOURCES
-agg_row_r = agg_row_g + 1
-
-im_ag0 = axes2[agg_row_g, 0].imshow(
-    clean_rms.T,
-    cmap='magma',
-    origin='lower',
-    aspect='auto',
-    vmin=0.0,
-    vmax=agg_gather_vmax,
-    extent=extent,
-)
-axes2[agg_row_g, 0].set_title('Ground Truth\nAll-shot RMS gather', fontsize=12)
-axes2[agg_row_g, 0].set_ylabel('Time', fontsize=11)
-axes2[agg_row_g, 0].set_xlabel('Receiver x', fontsize=11)
-plt.colorbar(im_ag0, ax=axes2[agg_row_g, 0], fraction=0.046, pad=0.04)
-
-im_ar0 = axes2[agg_row_r, 0].imshow(
-    obs_clean_rms_resid.T,
-    cmap='magma',
-    origin='lower',
-    aspect='auto',
-    vmin=0.0,
-    vmax=agg_resid_vmax,
-    extent=extent,
-)
-axes2[agg_row_r, 0].set_title('Noisy - clean\nAll-shot RMS residual', fontsize=12)
-axes2[agg_row_r, 0].set_ylabel('Time', fontsize=11)
-axes2[agg_row_r, 0].set_xlabel('Receiver x', fontsize=11)
-plt.colorbar(im_ar0, ax=axes2[agg_row_r, 0], fraction=0.046, pad=0.04)
-
-for i, label in enumerate(methods_to_plot):
-    col = i + 1
-    pred_rms = pred_rms_by_label[label]
-    resid_rms = rms_resid_by_label[label]
-    if pred_rms is None:
-        axes2[agg_row_g, col].axis('off')
-        axes2[agg_row_r, col].axis('off')
-        continue
-
-    axes2[agg_row_g, col].imshow(
-        pred_rms.T,
-        cmap='magma',
-        origin='lower',
-        aspect='auto',
-        vmin=0.0,
-        vmax=agg_gather_vmax,
-        extent=extent,
-    )
-    axes2[agg_row_g, col].set_title(f"{display_names.get(label, label)}\nAll-shot RMS gather", fontsize=12)
-    axes2[agg_row_g, col].set_xlabel('Receiver x', fontsize=11)
-
-    axes2[agg_row_r, col].imshow(
-        resid_rms.T,
-        cmap='magma',
-        origin='lower',
-        aspect='auto',
-        vmin=0.0,
-        vmax=agg_resid_vmax,
-        extent=extent,
-    )
-    axes2[agg_row_r, col].set_title('Pred - clean\nAll-shot RMS residual', fontsize=12)
-    axes2[agg_row_r, col].set_xlabel('Receiver x', fontsize=11)
-
-# Put row labels on the left margin for readability in the large grid.
+# Put row labels on the left margin for readability in the grid.
 for r, row_name in enumerate(panel_row_titles):
     axes2[r, 0].annotate(
         row_name,
@@ -950,12 +1388,13 @@ for ax in axes2.ravel():
     ax.set_aspect('auto')
 
 plt.suptitle(
-    f'All-source acoustic shot gathers and residual images ({N_SOURCES} sources + all-shot RMS aggregate)',
+    f'Acoustic shot gathers and residual images ({len(shot_plot_indices)} of {N_SOURCES} sources shown: {shot_plot_indices.tolist()})',
     fontsize=16,
     y=1.002,
 )
 plt.tight_layout()
-plt.show()
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
 
 # ==========================================
 # Figure 3: amplitude / phase receiver diagnostics
@@ -1098,7 +1537,8 @@ fig3.suptitle(
     y=1.10,
 )
 plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
-plt.show()
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
 
 # ==========================================
 # Figure 4: GN curvature spectrum
@@ -1121,7 +1561,19 @@ ax4.set_title('Acoustic FWI Gauss-Newton curvature spectrum', fontsize=15)
 ax4.grid(True, which='both', alpha=0.25)
 ax4.legend(fontsize=9)
 plt.tight_layout()
-plt.show()
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
 
+try:
+    sampling._save_all_open_figures_to_run_results()
+except Exception:
+    pass
+
+dashboard.add_run_results_png_figures(run_results_info['run_results_dir'])
+dashboard.close()
+plt.close('all')
+# The dashboard already lives in the active run-results directory, so zip_run_results_dir()
+# includes it alongside the PNGs, CSVs, and reproducibility log.
 run_results_zip_path = zip_run_results_dir()
+print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
