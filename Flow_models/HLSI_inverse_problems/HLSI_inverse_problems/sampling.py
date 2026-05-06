@@ -15,6 +15,7 @@ import platform
 import random
 import shutil
 import time
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -1906,6 +1907,31 @@ def _attach_drc_weights_if_requested(bank, cfg, precomp, prior_model, lik_model,
     # Shallow-copy the bank so different DRC hyperparameters/consumers cannot
     # silently mutate a cached source bank shared by another sampler.
     out_bank = dict(bank)
+
+    # Alternating DRC-R support: a ratio-only node stores endpoint log-ratio
+    # weights under its sampler label.  A downstream CE-HLSI node can consume
+    # those weights simply by setting init_weights='DRC' and ref_source='<DRC-R node>'.
+    carried = precomp.get('carried_log_ref_weights', {})
+    if ref_source in carried:
+        n = int(bank['X_ref'].shape[0])
+        logw = carried[ref_source].detach().cpu().double().reshape(-1)
+        if logw.numel() < n:
+            raise ValueError(
+                f"Sampler '{label}' requested {n} DRC-R carried weights from ref_source={ref_source!r}, "
+                f"but only {logw.numel()} are available."
+            )
+        out_bank['log_drc_ref'] = logw[:n].contiguous()
+        diag = {
+            'drc_source': str(ref_source),
+            'drc_source_kind': 'alternating_ratio_update_carried_weights',
+            'drc_global_ess': _global_log_weight_ess(out_bank['log_drc_ref']),
+            'drc_logw_mean': float(torch.mean(out_bank['log_drc_ref']).item()),
+            'drc_logw_std': float(torch.std(out_bank['log_drc_ref'], unbiased=False).item()),
+            'drc_logw_min': float(torch.min(out_bank['log_drc_ref']).item()),
+            'drc_logw_max': float(torch.max(out_bank['log_drc_ref']).item()),
+        }
+        return out_bank, diag
+
     if ref_source is None or str(ref_source) == 'None':
         # Base-prior DRC collapses to ordinary likelihood weighting up to a
         # constant because q_source is the Gaussian prior.
@@ -2026,7 +2052,7 @@ def _estimate_sampler_pde_eval_counts(cfg, n_ref=0, n_samples=None):
     elif init_mode == 'blend_posterior':
         counts['pde_likelihood_evals'] += n_ref
         counts['pde_score_evals'] += n_ref
-    elif init_mode in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi', 'ref_laplace'}:
+    elif init_mode in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi', 'ref_laplace', 'drc_ratio_update'}:
         counts['pde_likelihood_evals'] += n_ref
         counts['pde_score_evals'] += n_ref
         counts['pde_gn_hessian_evals'] += n_ref
@@ -2954,6 +2980,21 @@ INIT_ALIASES = {
     _normalize_sampler_key('ce-hlsi'): 'ce_hlsi',
     _normalize_sampler_key('ce_hlsi'): 'ce_hlsi',
     _normalize_sampler_key('ce hlsi'): 'ce_hlsi',
+    _normalize_sampler_key('drc-r'): 'drc_ratio_update',
+    _normalize_sampler_key('drc_r'): 'drc_ratio_update',
+    _normalize_sampler_key('drc r'): 'drc_ratio_update',
+    _normalize_sampler_key('drc-w'): 'drc_ratio_update',
+    _normalize_sampler_key('drc_w'): 'drc_ratio_update',
+    _normalize_sampler_key('drc w'): 'drc_ratio_update',
+    _normalize_sampler_key('drc-weight'): 'drc_ratio_update',
+    _normalize_sampler_key('drc-ratio'): 'drc_ratio_update',
+    _normalize_sampler_key('drc_ratio_update'): 'drc_ratio_update',
+    _normalize_sampler_key('drc ratio update'): 'drc_ratio_update',
+    _normalize_sampler_key('drc-update'): 'drc_ratio_update',
+    _normalize_sampler_key('density-ratio-update'): 'drc_ratio_update',
+    _normalize_sampler_key('density ratio update'): 'drc_ratio_update',
+    _normalize_sampler_key('density-ratio-weight'): 'drc_ratio_update',
+    _normalize_sampler_key('alternating-drc-r'): 'drc_ratio_update',
     _normalize_sampler_key('leaf-hlsi'): 'leaf_hlsi',
     _normalize_sampler_key('leaf_hlsi'): 'leaf_hlsi',
     _normalize_sampler_key('leaf hlsi'): 'leaf_hlsi',
@@ -2986,6 +3027,7 @@ INIT_DISPLAY_NAMES = {
     'ref_laplace': 'Ref_Laplace',
     'hlsi_posterior': 'HLSI',
     'ce_hlsi': 'CE-HLSI',
+    'drc_ratio_update': 'DRC-R',
     'leaf_hlsi': 'Leaf-HLSI',
     'leaf_ce_hlsi': 'Leaf-CE-HLSI',
     'tl_hlsi': 'TL-HLSI',
@@ -3117,6 +3159,18 @@ def canonicalize_init_weights(name):
 
 
 
+def is_drc_ratio_update_init(init_mode):
+    """Return True for the alternating DRC ratio-only R-step node.
+
+    A DRC-R node does not run the reverse sampler. It computes endpoint
+    log-density-ratio weights for its current reference bank, keeps the same
+    reference coordinates, and stores the weights for downstream CE-HLSI nodes
+    that use ``init_weights='DRC'`` with ``ref_source`` pointing to this node.
+    """
+    return canonicalize_init_name(init_mode) == 'drc_ratio_update'
+
+
+
 def canonicalize_gate_metric_source(name):
     if name is None:
         return 'mu'
@@ -3148,6 +3202,8 @@ def parse_init_spec(name):
 def format_sampler_display_name(init_mode, init_weights='L'):
     if init_mode == 'prior':
         return 'Prior'
+    if init_mode == 'drc_ratio_update':
+        return 'DRC-R'
     if init_mode == 'ref_laplace':
         return 'Ref_Laplace'
     base = INIT_DISPLAY_NAMES.get(init_mode, str(init_mode))
@@ -3397,6 +3453,13 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
         cfg['init_weights'] = canonicalize_init_weights(
             cfg.get('init_weights', implied_weights if implied_weights is not None else 'WC')
         )
+    elif cfg['init'] == 'drc_ratio_update':
+        # DRC-R is a ratio-only R-step.  By default it estimates q from an
+        # unweighted CE-HLSI proposal on the current references; advanced
+        # schedules may set init_weights='DRC' to estimate a weighted proposal.
+        cfg['init_weights'] = canonicalize_init_weights(
+            cfg.get('init_weights', implied_weights if implied_weights is not None else 'None')
+        )
     else:
         cfg['init_weights'] = canonicalize_init_weights(
             cfg.get('init_weights', implied_weights if implied_weights is not None else 'L')
@@ -3410,10 +3473,10 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('display_name', str(label))
     cfg.setdefault('canonical_display_name', format_sampler_display_name(
         cfg['init'], 'L' if cfg['init'] == 'prior' else cfg['init_weights']))
-    cfg.setdefault('init_steps', 0 if cfg['init'] in {'prior', 'ref_laplace'} else 200)
+    cfg.setdefault('init_steps', 0 if cfg['init'] in {'prior', 'ref_laplace', 'drc_ratio_update'} else 200)
     cfg.setdefault('init_tmax', 10.0)
     cfg.setdefault('init_tmin', 10 ** (-2.5))
-    cfg.setdefault('log_mean_ess', cfg['init'] not in {'prior', 'ref_laplace'})
+    cfg.setdefault('log_mean_ess', cfg['init'] not in {'prior', 'ref_laplace', 'drc_ratio_update'})
     cfg.setdefault('n_samples', default_n_samples)
     cfg['n_samples'] = int(cfg['n_samples'])
     cfg.setdefault('n_ref', None)
@@ -3474,7 +3537,7 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('gate_metric_source', 'mu')
     cfg['gate_metric_source'] = canonicalize_gate_metric_source(cfg['gate_metric_source'])
 
-    if cfg['init'] in {'prior', 'ref_laplace'} and cfg['init_steps'] != 0:
+    if cfg['init'] in {'prior', 'ref_laplace', 'drc_ratio_update'} and cfg['init_steps'] != 0:
         print(f"[normalize_sampler_config] '{label}': init='{cfg['init']}' ignores "
               f"init_steps={cfg['init_steps']}; setting to 0.")
         cfg['init_steps'] = 0
@@ -3497,7 +3560,11 @@ def _normalize_sampler_configs(sampler_configs, default_n_samples=DEFAULT_N_GEN,
 
 
 def _config_uses_reference_bank(cfg):
-    return cfg['init'] == 'ref_laplace' or (cfg['init'] != 'prior' and cfg['init_steps'] > 0)
+    return (
+        cfg['init'] == 'ref_laplace'
+        or cfg['init'] == 'drc_ratio_update'
+        or (cfg['init'] != 'prior' and cfg['init_steps'] > 0)
+    )
 
 
 
@@ -3686,6 +3753,93 @@ def _select_reference_bank_for_config(label, cfg, samples, precomp, prior_model,
 
 
 
+
+
+def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
+                                 ref_bank=None, ref_bank_source='None', n_ref_used=0):
+    """Run the alternating DRC-R ratio-only node.
+
+    DRC-R is the projected-IPF R-step: build a frozen CE-HLSI proposal on the
+    current references, estimate log q on the same endpoint coordinates using
+    probability-flow integration, store rho = log pi - log q as carried
+    reference weights, and return the unchanged reference coordinates as this
+    node's samples.  No reverse sampler or MALA step is run here.
+    """
+    if ref_bank is None:
+        ref_bank = get_sampler_precomp_bank(
+            precomp, cfg['init'], mala_refs=cfg.get('mala_refs', False),
+            ref_source=cfg.get('ref_source'), n_ref=cfg.get('n_ref'),
+        )
+    if ref_bank is None:
+        raise ValueError(f"DRC-R sampler '{label}' requires a reference bank.")
+
+    if cfg.get('ref_source') is None and not bool(cfg.get('initial_refs_self_consistent', False)):
+        warnings.warn(
+            f"DRC-R sampler '{label}' has no ref_source. Alternating DRC usually requires "
+            "one or more CE-HLSI self-consistency stages before the ratio update.",
+            RuntimeWarning,
+        )
+
+    # The proposal whose density is estimated is always a CE-HLSI-family field
+    # over the current reference bank.  cfg['init_weights'] controls whether this
+    # proposal is unweighted ('None', standard alternating invariant) or weighted
+    # ('DRC', advanced schedules with carried weights).
+    local_bank = select_local_bank(ref_bank, 'ce_hlsi', cfg['init_weights'])
+    init_log_weights = get_sampler_log_weights('ce_hlsi', cfg['init_weights'], ref_bank)
+    score_cfg = dict(cfg)
+    score_cfg['init'] = 'ce_hlsi'
+    score_cfg['mala_steps'] = 0
+    score_cfg['mala_burnin'] = 0
+    source_score_spec = _make_frozen_hlsi_score_spec(
+        label, score_cfg, local_bank, init_log_weights, final_samples=local_bank['X_ref'],
+    )
+    if source_score_spec is None:
+        raise RuntimeError(f"Could not build frozen CE-HLSI proposal spec for DRC-R sampler '{label}'.")
+
+    t0 = time.time()
+    log_drc, drc_diag = compute_drc_log_weights_for_bank(
+        ref_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
+    )
+    drc_diag = dict(drc_diag)
+    drc_diag['drc_ratio_update_elapsed_seconds'] = float(time.time() - t0)
+    drc_diag['drc_ratio_update_only'] = True
+    drc_diag['drc_proposal_weight_tensor'] = get_sampler_log_weight_name('ce_hlsi', cfg['init_weights'])
+
+    # Option B: keep reference coordinates fixed and pass rho forward as global
+    # reference weights for the next CE-HLSI stage.
+    precomp.setdefault('carried_log_ref_weights', {})[label] = log_drc.detach().cpu()
+    precomp.setdefault('drc_diagnostics', {})[label] = drc_diag
+    precomp.setdefault('score_specs', {})[label] = source_score_spec
+
+    final_samples = local_bank['X_ref'].detach().cpu()
+    run_info = dict(cfg)
+    run_info.update(drc_diag)
+    run_info['ref_source'] = ref_bank_source
+    run_info['init_reference_bank'] = ref_bank_source
+    run_info['n_ref'] = int(n_ref_used) if n_ref_used else int(final_samples.shape[0])
+    run_info['init_bank'] = local_bank['bank_name']
+    run_info['init_log_weights'] = get_sampler_log_weight_name('ce_hlsi', cfg['init_weights'])
+    run_info['output_log_weights'] = 'carried_log_ref_weights/log_drc_ref'
+    run_info['transition_w'] = cfg.get('transition_w', 'ou')
+    run_info['gate_family'] = resolve_hlsi_gate_law(
+        'ce_hlsi',
+        gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'), gate_kappa=cfg.get('gate_kappa'),
+        gate_topk=cfg.get('gate_topk', 64), gate_metric_source=cfg.get('gate_metric_source', 'mu'),
+    ).family
+    run_info['score_spec_available'] = True
+    run_info['score_spec_law_matches_final_samples'] = True
+    run_info['ratio_update_only'] = True
+    run_info['mala_steps'] = 0
+    run_info['mala_burnin'] = 0
+    run_info['score_norm'] = float('nan')
+    run_info['score_norm_initial'] = float('nan')
+    run_info['score_norm_mean'] = float('nan')
+    run_info['score_norm_final'] = float('nan')
+    run_info['score_norm_max'] = float('nan')
+    run_info.update(_estimate_sampler_pde_eval_counts(cfg, n_ref=int(final_samples.shape[0]), n_samples=0))
+    return final_samples, None, run_info
+
+
 def run_single_sampler_config(label, config, prior_model, lik_model, precomp=None,
                               ref_bank=None, ref_bank_source='None', n_ref_used=0):
     if precomp is None:
@@ -3700,6 +3854,12 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
         f"init_steps={cfg['init_steps']} | mala_steps={cfg['mala_steps']} | "
         f"mala_burnin={cfg['mala_burnin']} | mala_dt={cfg['mala_dt']}"
     )
+
+    if cfg['init'] == 'drc_ratio_update':
+        return _run_drc_ratio_update_config(
+            label, cfg, prior_model, lik_model, precomp,
+            ref_bank=ref_bank, ref_bank_source=ref_bank_source, n_ref_used=n_ref_used,
+        )
 
     init_samples = None
     ess_trace = None
@@ -4040,6 +4200,7 @@ def run_tree_sampler_suite(sampler_configs, prior_model, lik_model, n_ref=10000,
             included_result_labels.append(label)
         else:
             excluded_result_labels.append(label)
+            precomp.setdefault('excluded_run_info', OrderedDict())[label] = info
             print(f"  [{label}] include_results=False: retaining samples only for downstream ref_source use.")
         print(f"{label}: {elapsed:.2f}s")
 
