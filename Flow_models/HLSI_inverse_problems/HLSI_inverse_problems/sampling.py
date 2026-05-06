@@ -3605,18 +3605,28 @@ def _resolve_sampler_execution_order(normalized_configs):
 
 
 
-def _validate_sampler_ref_counts(normalized_configs):
+def _validate_sampler_ref_counts(normalized_configs, default_n_ref=None):
+    """Validate source-bank sizes for tree bootstrapping.
+
+    For a sampler with ``ref_source='A'``, an omitted per-sampler ``n_ref`` now
+    means "use the pipeline/default n_ref" rather than "use every sample A
+    generated."  This keeps estimator-bank size decoupled from ``n_samples`` /
+    ``DEFAULT_N_GEN``, which are allowed to be larger for metrics and plots.
+    """
+    default_n_ref = None if default_n_ref is None else int(default_n_ref)
     for label, cfg in normalized_configs.items():
         src = cfg.get('ref_source')
         if src is None:
             continue
         requested = cfg.get('n_ref')
+        requested_effective = default_n_ref if requested is None else int(requested)
         available = normalized_configs[src].get('n_samples')
-        if requested is not None and available is not None and int(requested) > int(available):
+        if requested_effective is not None and available is not None and int(requested_effective) > int(available):
             raise ValueError(
-                f"Sampler '{label}' requests n_ref={requested} from ref_source='{src}', "
+                f"Sampler '{label}' requests n_ref={requested_effective} from ref_source='{src}' "
+                f"({'default n_ref' if requested is None else 'per-sampler n_ref'}), "
                 f"but '{src}' is configured to generate only n_samples={available}. "
-                f"Increase '{src}' n_samples or lower '{label}' n_ref."
+                f"Increase '{src}' n_samples/DEFAULT_N_GEN or lower '{label}' n_ref/the pipeline n_ref."
             )
 
 
@@ -3740,9 +3750,10 @@ def _select_reference_bank_for_config(label, cfg, samples, precomp, prior_model,
             precomp['drc_diagnostics'][label] = drc_diag
         return bank, 'None', n_ref_used
 
+    source_n_ref = int(default_n_ref if cfg.get('n_ref') is None else cfg['n_ref'])
     bank, n_ref_used = _get_or_build_source_bank(
         precomp, samples, ref_source, label, prior_model, lik_model,
-        n_ref=cfg.get('n_ref'), compute_pou=needs_pou,
+        n_ref=source_n_ref, compute_pou=needs_pou,
     )
     bank, drc_diag = _attach_drc_weights_if_requested(
         bank, cfg, precomp, prior_model, lik_model, ref_source=ref_source, label=label,
@@ -4114,9 +4125,11 @@ def run_tree_sampler_suite(sampler_configs, prior_model, lik_model, n_ref=10000,
 
     Each sampler is run exactly once. If sampler B has ``ref_source='A'``, then
     B's reference bank is precomputed from the already-generated samples of A.
-    ``n_ref`` may be specified per child; if omitted for a named source, all
-    finite samples from the source are used. For ``ref_source='None'``/missing,
-    a prior bank of size ``n_ref`` (global or per-config) is used.
+    ``n_ref`` may be specified per child; if omitted for a named source, the
+    pipeline/default ``n_ref`` is used, so source samplers may generate more
+    samples for metrics/visualization without enlarging the next estimator bank.
+    For ``ref_source='None'``/missing, a prior bank of size ``n_ref`` (global or
+    per-config) is used.
     """
     normalized = _normalize_sampler_configs(sampler_configs, DEFAULT_N_GEN, ACTIVE_DIM)
 
@@ -4152,7 +4165,7 @@ def run_tree_sampler_suite(sampler_configs, prior_model, lik_model, n_ref=10000,
             new_normalized[label] = cfg
         normalized = new_normalized
 
-    _validate_sampler_ref_counts(normalized)
+    _validate_sampler_ref_counts(normalized, default_n_ref=n_ref)
     execution_order = _resolve_sampler_execution_order(normalized)
     print("\n=== Sampler execution order ===")
     print(" -> ".join(execution_order))
