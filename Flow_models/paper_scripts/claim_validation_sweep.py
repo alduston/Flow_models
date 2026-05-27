@@ -11,8 +11,9 @@ What it produces
      - misaligned_subspace_gmm_d8
    For each target and each N_ref, it compares:
      - tweedie
-     - blend       (coordinatewise plug-in scalar variance-minimizing blend)
-     - lfgi        (operator-valued LFGI gate)
+     - blend        (coordinatewise plug-in scalar variance-minimizing blend)
+     - matrix-blend (primal/moment-normal-equation matrix-valued gate blend)
+     - lfgi         (operator-valued LFGI Hessian-resolvent gate)
    Metrics saved and plotted:
      - MMD to exact target samples
      - sliced W2 (SW2) to exact target samples
@@ -40,7 +41,7 @@ Publication plotting defaults
 -----------------------------
 The generated figures use paper-facing method names, large typography,
 print-safe line styles, and the color convention
-TWEEDIE=red, BLEND=blue, LFGI=green.
+TWEEDIE=red, SCALAR BLEND=blue, MATRIX BLEND=purple, LFGI=green.
 
 The script intentionally avoids the full dashboard machinery: no histograms, no
 PCA panels, no curl diagnostics, no auxiliary metrics. It is meant to populate the
@@ -89,19 +90,23 @@ PUB_FIGSIZE = (5.6, 3.75)
 PUB_FIGSIZE_WIDE = (6.0, 3.8)
 
 # Fixed method color convention requested for the paper:
-# TWEEDIE = red, BLEND = blue, LFGI = green.  Markers and line styles are also
-# distinct so the curves remain interpretable in grayscale printouts.
+# TWEEDIE = red, SCALAR BLEND = blue, MATRIX BLEND = purple, LFGI = green.
+# Markers and line styles are also distinct so the curves remain interpretable
+# in grayscale printouts.
 METHOD_STYLES = {
     "tweedie": {"label": "TWEEDIE", "color": "#D62728", "marker": "o", "linestyle": "--"},
-    "blend": {"label": "BLEND", "color": "#1F77B4", "marker": "s", "linestyle": "-."},
+    "blend": {"label": "SCALAR BLEND", "color": "#1F77B4", "marker": "s", "linestyle": "-."},
+    "matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
     "lfgi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
-    # Backward-compatible alias for old raw logs.
+    # Backward-compatible aliases for old raw logs / method names.
     "ce-hlsi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
+    "primal-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "moment-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
 }
 
 GATE_STYLES = {
     "lfgi-hessian": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
-    "primal-moment": {"label": "PRIMAL MOMENT", "color": "#7F7F7F", "marker": "X", "linestyle": "--"},
+    "primal-moment": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
 }
 
 TARGET_TITLES = {
@@ -126,11 +131,11 @@ METRIC_LABELS = {
     "score_rmse": "Score RMSE (lower is better)",
 }
 
-# For NLL, BLEND can catastrophically blow up at small N_ref.  If the
-# y-axis is scaled from all methods, the scientifically relevant separation
-# between TWEEDIE and LFGI is visually compressed.  We therefore keep BLEND
-# plotted, but set the NLL axis limits from the comparison methods that remain
-# in the credible regime.
+# For NLL, SCALAR BLEND and MATRIX BLEND can catastrophically blow up at small
+# N_ref.  If the y-axis is scaled from all methods, the scientifically relevant
+# separation between TWEEDIE and LFGI is visually compressed.  We therefore keep
+# all methods plotted, but set the NLL axis limits from the comparison methods
+# that remain in the credible regime.
 NLL_YLIM_METHODS = ("tweedie", "lfgi", "ce-hlsi")
 
 GATE_METRIC_TITLES = {
@@ -217,11 +222,12 @@ def save_publication_figure(fig: plt.Figure, out_dir: Path, stem: str) -> None:
 
 
 def set_nll_focus_ylim(ax: plt.Axes, agg: List[Dict[str, object]]) -> None:
-    """Set NLL y-limits from TWEEDIE/LFGI, not catastrophic BLEND outliers.
+    """Set NLL y-limits from TWEEDIE/LFGI, not catastrophic blend outliers.
 
-    BLEND is still drawn, but values outside the focused range are clipped by
-    the axis.  This makes the LFGI-vs-TWEEDIE separation readable while still
-    showing when BLEND re-enters the credible NLL range at large N_ref.
+    SCALAR BLEND and MATRIX BLEND are still drawn, but values outside the
+    focused range are clipped by the axis.  This makes the LFGI-vs-TWEEDIE
+    separation readable while still showing when the moment-based comparators
+    re-enter the credible NLL range at large N_ref.
     """
     vals: List[float] = []
     for r in agg:
@@ -251,7 +257,7 @@ def set_nll_focus_ylim(ax: plt.Axes, agg: List[Dict[str, object]]) -> None:
     ax.set_ylim(lo - pad, hi + pad)
 
     # Small, unobtrusive note so the focused axis is not mistaken for missing
-    # BLEND data.
+    # outlier data.
     ax.text(
         0.02,
         0.03,
@@ -665,6 +671,65 @@ def ce_gate_matrix(Pbar: torch.Tensor, t: float | torch.Tensor, gate_clip: float
     return sym(torch.einsum("bij,bj,bkj->bik", evecs, vals, evecs))
 
 
+
+def primal_matrix_blend_from_weights(
+    y: torch.Tensor,
+    t: float | torch.Tensor,
+    ref: ReferenceBank,
+    w: torch.Tensor,
+    *,
+    ridge: float = 1e-10,
+    gate_clip: float = 0.0,
+) -> torch.Tensor:
+    """Primal moment-normal-equation matrix blend score estimator.
+
+    This is the direct finite-reference implementation of the local operator
+    control-variate optimum.  It estimates
+        G = -Cov(b,d) Cov(d,d)^{-1},    d = c - b,
+    using the same OU/SNIS posterior weights as the scalar blend, then returns
+        E[b|y] + G (E[c|y] - E[b|y]).
+
+    LFGI uses the Hessian-resolvent identity to estimate the same population
+    gate more stably; this method is the moment-based comparator.
+    """
+    a = at(t).to(y).clamp_min(1e-30)
+    g = vt(t).to(y).clamp_min(1e-30)
+    d_dim = int(ref.x.shape[1])
+    eye = torch.eye(d_dim, dtype=y.dtype, device=y.device)
+
+    b_atom = -(y.unsqueeze(1) - a * ref.x.unsqueeze(0)) / g
+    c_atom = (ref.s0.unsqueeze(0) / a).expand(y.shape[0], -1, -1)
+    d_atom = c_atom - b_atom
+
+    b_bar = torch.einsum("bn,bnd->bd", w, b_atom)
+    c_bar = torch.einsum("bn,bnd->bd", w, c_atom)
+    d_bar = c_bar - b_bar
+
+    bc = b_atom - b_bar.unsqueeze(1)
+    dc = d_atom - d_bar.unsqueeze(1)
+    C = torch.einsum("bn,bni,bnj->bij", w, bc, dc)
+    D = sym(torch.einsum("bn,bni,bnj->bij", w, dc, dc))
+
+    # Add an absolute ridge to the disagreement covariance.  The primal normal
+    # equation is intentionally left as the statistically difficult baseline;
+    # the ridge only prevents numerical singularities from terminating a sweep.
+    A = D + float(ridge) * eye.unsqueeze(0)
+    try:
+        G = -torch.linalg.solve(A, C.transpose(-1, -2)).transpose(-1, -2)
+    except RuntimeError:
+        G = -C @ torch.linalg.pinv(A)
+    G = torch.nan_to_num(G, nan=0.0, posinf=1e12, neginf=-1e12)
+
+    if gate_clip and gate_clip > 0:
+        # Clip by singular values without assuming the noisy moment estimate is
+        # symmetric.  This is off by default, matching the unclipped primal gate.
+        U, S, Vh = torch.linalg.svd(G, full_matrices=False)
+        S = S.clamp(max=float(gate_clip))
+        G = torch.einsum("bij,bj,bjk->bik", U, S, Vh)
+
+    return b_bar + torch.einsum("bij,bj->bi", G, d_bar)
+
+
 def estimate_score_chunk(
     y: torch.Tensor,
     t: float | torch.Tensor,
@@ -673,6 +738,7 @@ def estimate_score_chunk(
     chunk: int = 256,
     gate_ref: Optional[ReferenceBank] = None,
     gate_clip: float = 0.0,
+    primal_ridge: float = 1e-10,
 ) -> torch.Tensor:
     method = method.lower().replace("_", "-")
     outs: List[torch.Tensor] = []
@@ -704,6 +770,18 @@ def estimate_score_chunk(
             den = (va + vb - 2.0 * cab).clamp_min(1e-20)
             lam_twd = ((va - cab) / den).clamp(0.0, 1.0)
             outs.append((1.0 - lam_twd) * am + lam_twd * bm)
+            continue
+        if method in {"matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"}:
+            outs.append(
+                primal_matrix_blend_from_weights(
+                    yb,
+                    t,
+                    ref,
+                    w,
+                    ridge=primal_ridge,
+                    gate_clip=gate_clip,
+                )
+            )
             continue
         if method in {"lfgi", "ce-hlsi"}:
             if gate_ref is ref:
@@ -887,11 +965,20 @@ def time_avg_score_rmse(
     method: str,
     chunk: int,
     gate_clip: float,
+    primal_ridge: float = 1e-10,
 ) -> float:
     sse = 0.0
     count = 0
     for t, y, s_true in zip(bench.t_grid, bench.ys, bench.true_scores):
-        s_hat = estimate_score_chunk(y, t, ref, method, chunk=chunk, gate_clip=gate_clip)
+        s_hat = estimate_score_chunk(
+            y,
+            t,
+            ref,
+            method,
+            chunk=chunk,
+            gate_clip=gate_clip,
+            primal_ridge=primal_ridge,
+        )
         err2 = (s_hat - s_true).square()
         if not torch.isfinite(err2).all():
             return float("nan")
@@ -905,8 +992,18 @@ def time_avg_score_rmse(
 # -----------------------------------------------------------------------------
 
 
-METHODS = ["tweedie", "blend", "lfgi"]
+METHODS = ["tweedie", "blend", "matrix-blend", "lfgi"]
 DISPLAY = {m: METHOD_STYLES[m]["label"] for m in METHODS}
+
+
+def method_aliases(method: str) -> List[str]:
+    """Canonical method key plus backward-compatible raw-log aliases."""
+    key = method.lower().replace("_", "-")
+    if key == "lfgi":
+        return ["lfgi", "ce-hlsi"]
+    if key == "matrix-blend":
+        return ["matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"]
+    return [key]
 
 
 def run_metric_sweeps(args) -> List[Dict[str, object]]:
@@ -931,7 +1028,15 @@ def run_metric_sweeps(args) -> List[Dict[str, object]]:
                     print(f"  N_ref={nref:5d} rep={rep:02d} method={method}")
                     t0 = time.time()
                     def score_fn(y, t, method=method, ref=ref):
-                        return estimate_score_chunk(y, t, ref, method, chunk=args.score_chunk, gate_clip=args.gate_clip)
+                        return estimate_score_chunk(
+                            y,
+                            t,
+                            ref,
+                            method,
+                            chunk=args.score_chunk,
+                            gate_clip=args.gate_clip,
+                            primal_ridge=args.primal_ridge,
+                        )
 
                     samples, failed, max_score = heun_reverse_sde(
                         score_fn=score_fn,
@@ -960,7 +1065,14 @@ def run_metric_sweeps(args) -> List[Dict[str, object]]:
                         )
                         nll_val = target_nll(sample_eval, target, max_n=args.n_metric)
                         ksd_val = ksd_rbf(sample_eval, target.score, max_n=args.n_metric)
-                    score_rmse = time_avg_score_rmse(score_bench, ref, method, chunk=args.score_chunk, gate_clip=args.gate_clip)
+                    score_rmse = time_avg_score_rmse(
+                        score_bench,
+                        ref,
+                        method,
+                        chunk=args.score_chunk,
+                        gate_clip=args.gate_clip,
+                        primal_ridge=args.primal_ridge,
+                    )
                     rows.append({
                         "experiment": "metric_sweep",
                         "target": target.name,
@@ -1002,7 +1114,8 @@ def aggregate_metric_rows(rows: List[Dict[str, object]], target_name: str) -> Li
     metrics = ["mmd", "sw2", "nll", "ksd", "score_rmse"]
     for nref in sorted({int(r["n_ref"]) for r in rows if r.get("target") == target_name}):
         for method in METHODS:
-            sub = [r for r in rows if r.get("target") == target_name and int(r["n_ref"]) == nref and r.get("method") == method]
+            aliases = set(method_aliases(method))
+            sub = [r for r in rows if r.get("target") == target_name and int(r["n_ref"]) == nref and str(r.get("method", "")).lower().replace("_", "-") in aliases]
             if not sub:
                 continue
             row = {"target": target_name, "n_ref": nref, "method": method}
@@ -1026,11 +1139,9 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
         positive: List[float] = []
 
         for method in METHODS:
-            # Accept either the new row key (lfgi) or old raw logs (lfgi).
-            method_keys = [method]
-            if method == "lfgi":
-                method_keys.append("ce-hlsi")
-            sub = [r for r in agg if r["method"] in method_keys]
+            # Accept backward-compatible raw-log aliases.
+            method_keys = set(method_aliases(method))
+            sub = [r for r in agg if str(r["method"]).lower().replace("_", "-") in method_keys]
             if not sub:
                 continue
 
@@ -1064,11 +1175,11 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
             )
 
         if metric == "nll":
-            # Focus NLL on the meaningful TWEEDIE-vs-LFGI comparison.  BLEND can
-            # have huge positive NLL at small reference counts, and using those
-            # outliers to choose the y-limits makes the best two methods
-            # indistinguishable.  Keep a linear scale so negative continuous-NLL
-            # values are shown directly.
+            # Focus NLL on the meaningful TWEEDIE-vs-LFGI comparison.  SCALAR
+            # BLEND and MATRIX BLEND can have huge positive NLL at small
+            # reference counts, and using those outliers to choose the y-limits
+            # makes the best two methods indistinguishable.  Keep a linear
+            # scale so negative continuous-NLL values are shown directly.
             y_scale = "linear"
             symlog_linthresh = 1.0
         else:
@@ -1735,7 +1846,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--targets", nargs="+", default=["misaligned_subspace_gmm_d8"])
-    p.add_argument("--methods", nargs="+", default=METHODS, help="Currently informational; script plots TWEEDIE/BLEND/LFGI.")
+    p.add_argument("--methods", nargs="+", default=METHODS, help="Currently informational; script plots TWEEDIE/SCALAR BLEND/MATRIX BLEND/LFGI.")
     p.add_argument("--nref-grid", nargs="+", type=int, default=[64, 128, 256, 512, 1024, 2048])
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--n-samples", type=int, default=1024, help="Reverse-SDE samples per method/repeat/N_ref")
