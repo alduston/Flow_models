@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MNIST PCA Bayesian logistic-regression CE-HLSI benchmark (standalone).
+MNIST PCA Bayesian logistic-regression LFGI benchmark (standalone).
 
 Purpose
 -------
-A minimal non-toy benchmark for the LFGI/CE-HLSI finite-sample story:
+A minimal non-toy benchmark for the LFGI finite-sample story:
   * target is a real-data Bayesian logistic-regression posterior in d=32,
   * negative log-posterior Hessian is PSD everywhere,
   * weak prior + likelihood temperature induce a singular/ill-conditioned score geometry,
-  * compare Tweedie, scalar blend, moment-matrix blend, and CE-HLSI/LFGI using
-    the same OU/SNIS machinery as the main harness.
+  * compare Tweedie, Scalar Blend, moment Matrix Blend, and LFGI using the same OU/SNIS machinery as the main harness.
 
 Default task: MNIST 4-vs-9 classification, anisotropically measured PCA features, d=32.
 
@@ -28,6 +27,13 @@ Outputs
     energy_hist.png
     predictive_bars.png
     samples_<method>.npy
+
+Repeated-run mode (--n_runs K) writes:
+    run_000/, run_001/, ...              # ordinary single-run outputs
+    per_run_metrics.csv                  # long-form metrics for every run/method
+    aggregate_metrics.csv                # mean/std/SEM/n for every metric
+    mnist_table_aggregate.tex            # paper-table fragment with uncertainty
+    aggregate_summary.txt
 
 Typical Colab usage
 -------------------
@@ -57,6 +63,7 @@ import argparse
 import csv
 import math
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -72,6 +79,129 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+
+
+# -----------------------------------------------------------------------------
+# Publication plotting style
+# -----------------------------------------------------------------------------
+
+PUB_DPI = 450
+
+# Direct moment-normal-equation matrix-gate baseline.
+# This is the primal/moment estimator for the optimal operator-valued blend,
+# used as the finite-sample comparator against the Hessian-resolvent LFGI gate.
+MOMENT_MATRIX_RIDGE = float(os.environ.get("LFGI_MOMENT_MATRIX_RIDGE", "1e-8"))
+MOMENT_MATRIX_RIDGE_REL = float(os.environ.get("LFGI_MOMENT_MATRIX_RIDGE_REL", "1e-6"))
+MOMENT_MATRIX_CHUNK = int(os.environ.get("LFGI_MOMENT_MATRIX_CHUNK", "64"))
+
+# Requested paper convention: TWEEDIE=red, SCALAR BLEND=blue, MATRIX BLEND=purple, LFGI=green.
+METHOD_COLORS = {
+    "tweedie": "#D62728",
+    "blend": "#1F77B4",
+    "matrix-blend": "#9467BD",
+    "lfgi": "#2CA02C",
+    "ce-hlsi": "#2CA02C",
+    "ce_hlsi": "#2CA02C",
+    "reference": "#4D4D4D",
+}
+METHOD_MARKERS = {
+    "tweedie": "o",
+    "blend": "s",
+    "matrix-blend": "^",
+    "lfgi": "D",
+    "ce-hlsi": "D",
+    "ce_hlsi": "D",
+}
+
+
+def apply_publication_style() -> None:
+    """Readable-after-scaling defaults for arXiv paper figures."""
+    plt.rcParams.update({
+        "figure.dpi": 120,
+        "savefig.dpi": PUB_DPI,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.035,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "font.size": 13,
+        "axes.titlesize": 15,
+        "axes.labelsize": 14,
+        "xtick.labelsize": 11.5,
+        "ytick.labelsize": 11.5,
+        "legend.fontsize": 11,
+        "axes.linewidth": 1.0,
+        "lines.linewidth": 2.25,
+        "lines.markersize": 5.6,
+        "mathtext.fontset": "stix",
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+    })
+
+
+def method_key(name: str) -> str:
+    key = str(name).strip().lower().replace("_", "-").replace(" ", "-")
+    if key in {"ce-hlsi", "lfgi"}:
+        return "lfgi"
+    if key.startswith("ce-hlsi") or key.startswith("lfgi"):
+        return "lfgi"
+    if key in {"moment-matrix-blend", "matrix-blend", "primal-matrix-blend", "moment-blend"}:
+        return "matrix-blend"
+    if key.startswith("moment-matrix-blend") or key.startswith("matrix-blend") or key.startswith("primal-matrix-blend"):
+        return "matrix-blend"
+    if key.startswith("tweedie"):
+        return "tweedie"
+    if key.startswith("blend") or key.startswith("scalar-blend"):
+        return "blend"
+    if key == "reference":
+        return "reference"
+    return key
+
+
+def method_label(name: str) -> str:
+    raw = str(name)
+    key = method_key(raw)
+    base = {
+        "tweedie": "TWEEDIE",
+        "blend": "SCALAR BLEND",
+        "matrix-blend": "MATRIX BLEND",
+        "lfgi": "LFGI",
+        "reference": "REFERENCE",
+    }.get(key, raw.replace("_", "-").upper())
+    # Keep optional bank-ablation annotations readable if those diagnostics are enabled.
+    low = raw.lower().replace("_", "-")
+    if "xg-bank" in low:
+        return base + " (FULL BANK)"
+    if "xr-gate" in low:
+        return base + " (SCORE GATE)"
+    if "nr" in low and "ng" in low:
+        return base
+    return base
+
+
+def method_color(name: str) -> str:
+    return METHOD_COLORS.get(method_key(name), "#7F7F7F")
+
+
+def method_marker(name: str) -> str:
+    return METHOD_MARKERS.get(method_key(name), "o")
+
+
+def style_axis(ax: plt.Axes, *, grid_axis: str = "both") -> None:
+    ax.grid(True, axis=grid_axis, which="major", alpha=0.24, linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="both", which="major", length=4.0, width=0.9)
+
+
+def save_pub(fig: plt.Figure, out_path: Path) -> None:
+    fig.patch.set_facecolor("white")
+    fig.tight_layout(pad=0.35)
+    fig.savefig(out_path, dpi=PUB_DPI, facecolor="white", transparent=False)
+    plt.close(fig)
+
+
+apply_publication_style()
 
 
 # -----------------------------------------------------------------------------
@@ -125,43 +255,6 @@ def vt(t: torch.Tensor | float) -> torch.Tensor:
 def logit_np(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, 1e-12, 1.0 - 1e-12)
     return np.log(p) - np.log1p(-p)
-
-
-# -----------------------------------------------------------------------------
-# Moment-normal-equation matrix-gate defaults
-# -----------------------------------------------------------------------------
-
-# Direct/moment matrix blend estimates the local operator-valued control-variate
-# gate from conditional moments, rather than from the LFGI Hessian resolvent.
-# The centering convention gives the finite-reference weighted least-squares
-# plug-in without needing the unknown true noisy score s_t(y).
-MOMENT_MATRIX_RIDGE = float(os.environ.get("MNIST_LFGI_MOMENT_MATRIX_RIDGE", "1e-8"))
-MOMENT_MATRIX_RIDGE_REL = float(os.environ.get("MNIST_LFGI_MOMENT_MATRIX_RIDGE_REL", "1e-6"))
-MOMENT_MATRIX_CENTER = os.environ.get("MNIST_LFGI_MOMENT_MATRIX_CENTER", "1").strip() not in {"0", "false", "False"}
-MOMENT_MATRIX_SYM_GATE = os.environ.get("MNIST_LFGI_MOMENT_MATRIX_SYM_GATE", "0").strip() not in {"0", "false", "False"}
-MOMENT_MATRIX_GATE_CLIP = float(os.environ.get("MNIST_LFGI_MOMENT_MATRIX_GATE_CLIP", "1e6"))
-
-
-def method_display_name(name: str) -> str:
-    """Paper-facing method name for figure panels."""
-    key = str(name).strip().lower().replace("_", "-")
-    labels = {
-        "reference": "REFERENCE",
-        "tweedie": "TWEEDIE",
-        "blend": "SCALAR BLEND",
-        "moment-matrix-blend": "MATRIX BLEND",
-        "primal-matrix-blend": "MATRIX BLEND",
-        "matrix-blend": "MATRIX BLEND",
-        "ce-hlsi": "LFGI",
-        "ce-hlsi-xg-bank": "LFGI XG BANK",
-        "ce-hlsi-xr-gate": "LFGI XR GATE",
-        "lfgi": "LFGI",
-    }
-    if key in labels:
-        return labels[key]
-    # Keep ablation names readable without forcing every diagnostic label into
-    # the paper-facing four-method vocabulary.
-    return str(name).replace("_", "-").replace("-", " ").upper()
 
 
 # -----------------------------------------------------------------------------
@@ -597,7 +690,7 @@ def sample_reference_mala_preconditioned(
 
 
 # -----------------------------------------------------------------------------
-# OU/SNIS estimators: Tweedie, scalar blend, moment-matrix blend, CE-HLSI
+# OU/SNIS estimators: Tweedie, coordinatewise blend, LFGI
 # -----------------------------------------------------------------------------
 
 def snis_w(y: torch.Tensor, t: torch.Tensor | float, xr: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
@@ -653,99 +746,68 @@ def est_moment_matrix_blend(
     w: torch.Tensor,
     s0_ref: torch.Tensor,
     *,
-    gate_xr: torch.Tensor | None = None,
-    w_gate: torch.Tensor | None = None,
-    s0_gate_ref: torch.Tensor | None = None,
+    x_gate: torch.Tensor | None = None,
+    wg: torch.Tensor | None = None,
+    s0_gate: torch.Tensor | None = None,
     ridge: float = MOMENT_MATRIX_RIDGE,
     ridge_rel: float = MOMENT_MATRIX_RIDGE_REL,
-    center: bool = MOMENT_MATRIX_CENTER,
-    sym_gate: bool = MOMENT_MATRIX_SYM_GATE,
-    gate_clip: float = MOMENT_MATRIX_GATE_CLIP,
+    chunk: int = MOMENT_MATRIX_CHUNK,
 ) -> torch.Tensor:
-    """Direct moment-normal-equation matrix-gate blend.
+    """Direct primal/moment estimate of the optimal matrix-valued blend.
 
-    This is the empirical primal/moment baseline for the local optimal operator
-    gate.  It estimates the normal-equation gate
+    The gate is estimated from the empirical SNIS normal equation
 
-        G_hat = - N_hat (M_hat + ridge I)^{-1}
+        G_hat = - N_hat (M_hat + ridge I)^{-1},
 
-    from weighted conditional moments of the Tweedie atom b and disagreement
-    d = c - b.  With ``center=True`` the finite-sample plug-in uses centered
-    b and d, which is the weighted least-squares version that does not require
-    the unknown true score s_t(y).
-
-    The estimated matrix gate is applied to the score-bank Tweedie and TSI
-    means as
-
-        s_hat = s_twd + G_hat (s_tsi - s_twd).
-
-    If ``gate_xr`` is supplied, moment-gate estimation uses a separate gate
-    bank while the base score signals still use ``xr``.  This mirrors the
-    independent-bank LFGI comparison.
+    where M_hat = E[d d^T | y,t] and N_hat = E[(b - E[b]) d^T | y,t].
+    The resulting matrix gate is then applied to the estimator-bank discrepancy
+    E[c] - E[b].  If a separate gate bank is provided, moments are estimated
+    from that bank while Tweedie/TSI score signals are estimated from xr.
     """
     a = at(t).to(device=y.device, dtype=y.dtype)
     v = vt(t).to(device=y.device, dtype=y.dtype)
+    x_gate = xr if x_gate is None else x_gate
+    wg = w if wg is None else wg
+    s0_gate = s0_ref if s0_gate is None else s0_gate
 
-    # Score-bank means to which the moment-estimated matrix gate is applied.
-    b_atom = (a * xr[None, :, :] - y[:, None, :]) / v
-    c_atom = s0_ref[None, :, :] / a
-    s_twd = (w[:, :, None] * b_atom).sum(dim=1)
-    s_tsi = (w[:, :, None] * c_atom).sum(dim=1)
+    B, d = y.shape
+    eye = torch.eye(d, dtype=y.dtype, device=y.device)
+    out = torch.empty_like(y)
+    chunk = max(1, int(chunk))
 
-    # Gate-bank atoms for moment estimation.  By default this is the score bank;
-    # with xg it is a separate gate bank analogous to the LFGI Hessian bank.
-    if gate_xr is None:
-        gate_xr = xr
-    if w_gate is None:
-        w_gate = w if gate_xr is xr else snis_w(y, t, gate_xr)
-    if s0_gate_ref is None:
-        s0_gate_ref = s0_ref if gate_xr is xr else None
-        if s0_gate_ref is None:
-            raise ValueError("s0_gate_ref must be supplied when gate_xr differs from xr")
+    tsi_ref_atom = s0_ref[None, :, :] / a
+    tsi_gate_atom = s0_gate[None, :, :] / a
 
-    b_gate = (a * gate_xr[None, :, :] - y[:, None, :]) / v
-    c_gate = s0_gate_ref[None, :, :] / a
-    d_gate = c_gate - b_gate
+    for i in range(0, B, chunk):
+        sl = slice(i, min(i + chunk, B))
+        yb = y[sl]
+        wb = w[sl]
+        wgb = wg[sl]
 
-    if center:
-        b_mean = (w_gate[:, :, None] * b_gate).sum(dim=1)
-        d_mean = (w_gate[:, :, None] * d_gate).sum(dim=1)
-        b_mom = b_gate - b_mean[:, None, :]
-        d_mom = d_gate - d_mean[:, None, :]
-    else:
-        # Since E[d|y,t]=0 at population level, N = E[b d^T].  This uncentered
-        # version is closer to the raw normal equation but noisier in finite SNIS.
-        b_mom = b_gate
-        d_mom = d_gate
+        twd_ref_atom = (a * xr[None, :, :] - yb[:, None, :]) / v
+        s_twd = (wb[:, :, None] * twd_ref_atom).sum(dim=1)
+        s_tsi = (wb[:, :, None] * tsi_ref_atom).sum(dim=1)
+        delta = s_tsi - s_twd
 
-    M = torch.einsum("bn,bni,bnj->bij", w_gate, d_mom, d_mom)
-    N = torch.einsum("bn,bni,bnj->bij", w_gate, b_mom, d_mom)
-    M = sym(torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0))
-    N = torch.nan_to_num(N, nan=0.0, posinf=0.0, neginf=0.0)
+        twd_gate_atom = (a * x_gate[None, :, :] - yb[:, None, :]) / v
+        b_gate_mean = (wgb[:, :, None] * twd_gate_atom).sum(dim=1)
+        d_gate_atom = tsi_gate_atom - twd_gate_atom
+        b_cent = twd_gate_atom - b_gate_mean[:, None, :]
 
-    B, d = M.shape[0], M.shape[-1]
-    eye = torch.eye(d, dtype=M.dtype, device=M.device).expand(B, d, d)
-    tr = torch.diagonal(M, dim1=-2, dim2=-1).sum(dim=-1) / max(d, 1)
-    ridge_vec = float(ridge) + float(ridge_rel) * tr.clamp_min(0.0)
-    M_reg = M + ridge_vec[:, None, None] * eye
+        M = torch.einsum("bn,bni,bnj->bij", wgb, d_gate_atom, d_gate_atom)
+        N = torch.einsum("bn,bni,bnj->bij", wgb, b_cent, d_gate_atom)
+        ridge_scale = M.diagonal(dim1=-2, dim2=-1).mean(dim=-1).clamp_min(0.0)
+        K = M + (float(ridge) + float(ridge_rel) * ridge_scale)[:, None, None] * eye[None, :, :]
 
-    # Solve G M = -N without explicitly constructing M^{-1}.
-    try:
-        G = torch.linalg.solve(M_reg.transpose(-1, -2), (-N).transpose(-1, -2)).transpose(-1, -2)
-    except RuntimeError:
-        G = -torch.matmul(N, torch.linalg.pinv(M_reg))
-    if not bool(torch.isfinite(G).all().detach().cpu().item()):
-        G_pinv = -torch.matmul(N, torch.linalg.pinv(M_reg))
-        G = torch.where(torch.isfinite(G), G, G_pinv)
-    G = torch.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
-    if sym_gate:
-        G = sym(G)
-    if gate_clip is not None and math.isfinite(float(gate_clip)) and float(gate_clip) > 0.0:
-        G = G.clamp(min=-float(gate_clip), max=float(gate_clip))
+        try:
+            G = -torch.linalg.solve(K, N.transpose(-1, -2)).transpose(-1, -2)
+        except RuntimeError:
+            jitter = (10.0 * float(ridge) + 10.0 * float(ridge_rel) * ridge_scale + 1e-7)
+            K = M + jitter[:, None, None] * eye[None, :, :]
+            G = -torch.linalg.solve(K.cpu(), N.cpu().transpose(-1, -2)).transpose(-1, -2).to(y.device)
 
-    out = s_twd + torch.einsum("bij,bj->bi", G, s_tsi - s_twd)
-    clip = float(gate_clip) if gate_clip is not None and math.isfinite(float(gate_clip)) and float(gate_clip) > 0.0 else 1e6
-    return torch.nan_to_num(out, nan=0.0, posinf=clip, neginf=-clip)
+        out[sl] = s_twd + torch.einsum("bij,bj->bi", G, delta)
+    return out
 
 
 def apply_ce_gate(s_twd: torch.Tensor, s_tsi: torch.Tensor, Pbar: torch.Tensor, t, chunk: int = 256) -> torch.Tensor:
@@ -811,24 +873,28 @@ class EstimatorBank:
         )
 
     def score(self, method: str, y: torch.Tensor, t) -> torch.Tensor:
-        method = method.lower().strip()
+        method = method.lower().strip().replace("_", "-").replace(" ", "-")
         w = snis_w(y, t, self.xr)
         if method == "tweedie":
             return est_tweedie(y, t, self.xr, w)
-        if method == "blend":
+        if method in {"blend", "scalar-blend"}:
             return est_blend(y, t, self.xr, w, self.s0)
-        if method in {"moment-matrix-blend", "moment_matrix_blend", "matrix-blend", "matrix_blend", "primal-matrix-blend", "primal_matrix_blend"}:
+        if method in {"moment-matrix-blend", "matrix-blend", "primal-matrix-blend", "moment-blend"}:
             if self.same_gate_bank:
                 wg = w
             else:
                 wg = snis_w(y, t, self.xg)
             return est_moment_matrix_blend(
-                y, t, self.xr, w, self.s0,
-                gate_xr=self.xg,
-                w_gate=wg,
-                s0_gate_ref=self.sg,
+                y,
+                t,
+                self.xr,
+                w,
+                self.s0,
+                x_gate=self.xg,
+                wg=wg,
+                s0_gate=self.sg,
             )
-        if method in {"ce-hlsi", "ce_hlsi", "lfgi"}:
+        if method in {"ce-hlsi", "lfgi"}:
             if self.same_gate_bank:
                 wg = w
             else:
@@ -844,12 +910,12 @@ class ScoreRouter:
     """Route display labels to (bank, base-method) pairs.
 
     The main methods use the estimator bank ``xr`` for Tweedie/TSI signals and,
-    for CE-HLSI, the gate bank ``xg`` for Hessian aggregation.  When
+    for LFGI, the gate bank ``xg`` for Hessian aggregation.  When
     ``--add_bank_ablations`` is enabled, extra labels expose two sanity checks:
       * ``*-xg-bank`` gives blend/Tweedie/CE the full gate bank as their estimator bank;
-      * ``ce-hlsi-xr-gate`` forces CE-HLSI to use only the estimator-prefix gate.
+      * ``ce-hlsi-xr-gate`` forces LFGI to use only the estimator-prefix gate.
 
-    These labels make it obvious whether an apparent CE-HLSI win at tiny
+    These labels make it obvious whether an apparent LFGI win at tiny
     ``n_ref`` is really coming from extra gate-only information.
     """
 
@@ -1081,46 +1147,58 @@ def project2(X: torch.Tensor, mu: torch.Tensor, V2: torch.Tensor) -> np.ndarray:
 
 
 def plot_heatmaps(X_ref: torch.Tensor, samples: Dict[str, torch.Tensor], out_path: Path, title: str):
+    """Publication-ready 2D posterior projection histograms.
+
+    This intentionally omits colorbars: the panels are used comparatively, and
+    the caption/text carry the interpretation.  Shared axes and fixed histogram
+    ranges make the visual comparison stable under minipage scaling.
+    """
     mu, V2 = fit_projection(X_ref)
     arrays = {"reference": project2(X_ref, mu, V2)}
     arrays.update({k: project2(v, mu, V2) for k, v in samples.items()})
     all_xy = np.concatenate(list(arrays.values()), axis=0)
     xlim = np.percentile(all_xy[:, 0], [0.5, 99.5])
     ylim = np.percentile(all_xy[:, 1], [0.5, 99.5])
-    pad_x = 0.1 * (xlim[1] - xlim[0] + 1e-9)
-    pad_y = 0.1 * (ylim[1] - ylim[0] + 1e-9)
+    pad_x = 0.10 * (xlim[1] - xlim[0] + 1e-9)
+    pad_y = 0.10 * (ylim[1] - ylim[0] + 1e-9)
     xlim = (xlim[0] - pad_x, xlim[1] + pad_x)
     ylim = (ylim[0] - pad_y, ylim[1] + pad_y)
+
     names = list(arrays.keys())
-    fig, axs = plt.subplots(1, len(names), figsize=(3.4 * len(names), 3.2), sharex=True, sharey=True)
+    fig, axs = plt.subplots(1, len(names), figsize=(3.35 * len(names), 3.25), sharex=True, sharey=True)
     if len(names) == 1:
         axs = [axs]
-    for ax, name in zip(axs, names):
+
+    for j, (ax, name) in enumerate(zip(axs, names)):
         xy = arrays[name]
-        h = ax.hist2d(xy[:, 0], xy[:, 1], bins=90, range=[xlim, ylim], density=True)
-        ax.set_title(method_display_name(name))
-        ax.set_xlabel("PC1")
-        ax.set_ylabel("PC2")
-    fig.suptitle(title)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+        ax.hist2d(xy[:, 0], xy[:, 1], bins=92, range=[xlim, ylim], density=True, cmap="viridis")
+        ax.set_title(method_label(name), pad=5)
+        ax.set_xlabel("Posterior PC1")
+        if j == 0:
+            ax.set_ylabel("Posterior PC2")
+        else:
+            ax.set_ylabel("")
+        style_axis(ax)
+
+    fig.suptitle("MNIST PCA Logistic-Regression Posterior", fontsize=16, y=1.02)
+    save_pub(fig, out_path)
 
 
 def plot_metric_bars(metrics: Dict[str, Dict[str, float]], out_path: Path):
     keys = ["mmd", "sliced_ks", "ksd", "score_rmse", "energy_kl", "pred_nll", "pred_acc", "ess_proxy"]
+    titles = ["MMD", "Sliced KS", "KSD", "Score RMSE", "Energy KL", "Pred. NLL", "Pred. Acc.", "ESS Proxy"]
     methods = list(metrics.keys())
-    fig, axs = plt.subplots(2, 4, figsize=(14, 6.2))
+    fig, axs = plt.subplots(2, 4, figsize=(14.0, 6.2))
     axs = axs.ravel()
-    for ax, key in zip(axs, keys):
+    labels = [method_label(m) for m in methods]
+    colors = [method_color(m) for m in methods]
+    for ax, key, ttl in zip(axs, keys, titles):
         vals = [metrics[m].get(key, np.nan) for m in methods]
-        ax.bar(methods, vals)
-        ax.set_title(key)
+        ax.bar(labels, vals, color=colors, alpha=0.92)
+        ax.set_title(ttl)
         ax.tick_params(axis="x", rotation=25)
-        ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+        style_axis(ax, grid_axis="y")
+    save_pub(fig, out_path)
 
 
 def plot_energy_hist(target: LogisticPosterior, X_ref: torch.Tensor, samples: Dict[str, torch.Tensor], out_path: Path):
@@ -1128,35 +1206,47 @@ def plot_energy_hist(target: LogisticPosterior, X_ref: torch.Tensor, samples: Di
         Uref = target.energy(X_ref).detach().cpu().numpy()
         Us = {k: target.energy(v).detach().cpu().numpy() for k, v in samples.items()}
     lo, hi = np.percentile(Uref, [0.5, 99.5])
-    bins = np.linspace(lo, hi, 80)
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(Uref, bins=bins, density=True, alpha=0.35, label="reference")
+    bins = np.linspace(lo, hi, 82)
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    ax.hist(Uref, bins=bins, density=True, alpha=0.24, color=method_color("reference"), label="REFERENCE")
     for k, u in Us.items():
-        ax.hist(u, bins=bins, density=True, histtype="step", linewidth=1.8, label=k)
-    ax.set_xlabel("Energy U(theta)")
-    ax.set_ylabel("density")
-    ax.set_title("Energy histogram")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+        ax.hist(
+            u,
+            bins=bins,
+            density=True,
+            histtype="step",
+            linewidth=2.35 if method_key(k) == "lfgi" else 2.0,
+            color=method_color(k),
+            label=method_label(k),
+        )
+    ax.set_xlabel(r"Energy $U(\theta)$")
+    ax.set_ylabel("Density")
+    ax.set_title("Posterior Energy Distribution")
+    ax.legend(frameon=False, loc="best")
+    style_axis(ax)
+    save_pub(fig, out_path)
 
 
 def plot_score_rmse_curves(t_grid: torch.Tensor, curves: Dict[str, List[float]], out_path: Path):
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(5.8, 3.85))
     t_np = t_grid.detach().cpu().numpy()
     for m, vals in curves.items():
-        ax.plot(t_np, vals, marker="o", ms=3, label=m)
-    ax.set_xlabel("t")
-    ax.set_ylabel("RMSE vs high-N Tweedie proxy")
-    ax.set_title("Score RMSE across diffusion times")
+        ax.plot(
+            t_np,
+            vals,
+            marker=method_marker(m),
+            markersize=5.2,
+            linewidth=2.55 if method_key(m) == "lfgi" else 2.15,
+            color=method_color(m),
+            label=method_label(m),
+        )
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel("Score RMSE")
+    ax.set_title("Score RMSE Across Diffusion Times")
     ax.set_yscale("log")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+    ax.legend(frameon=False, loc="best")
+    style_axis(ax)
+    save_pub(fig, out_path)
 
 
 
@@ -1546,33 +1636,26 @@ def plot_path_likelihood_svm_alignment(
     arrays: Dict[str, Dict[str, np.ndarray]],
     svm_info: Dict[str, np.ndarray | float | bool | str],
     out_path: Path,
-    title: str = "SVM agreement inside the path-likelihood ordering",
+    title: str = "Path-Likelihood Rank Calibration",
 ) -> None:
-    """Show whether the likelihood ordering agrees with posterior likelihood and SVM geometry.
+    """Publication-ready top-row-only SVM alignment diagnostic.
 
-    The SVM direction is only a geometric reference for the discriminative task.
-    The most readable diagnostic is not cos(theta, theta_SVM) as an x-axis,
-    because most reasonable classifiers already have cosine near one.  Instead:
-
-      * top row: estimated likelihood percentile versus true likelihood percentile,
-        colored by SVM cosine.  Good density ordering is diagonal; SVM agreement
-        should be high in the upper-right.
-      * bottom row: histograms of SVM cosine for all evaluated samples versus the
-        estimator's top-10% likelihood samples.  This makes the SVM-supporting
-        evidence visible without overloading the main likelihood calibration plot.
+    Each panel compares estimated path-likelihood percentile with the true
+    posterior log-density percentile.  Points are colored by cosine agreement
+    with the linear SVM direction.  The previous bottom-row cosine histograms
+    are intentionally removed for the paper-facing figure.
     """
     methods = list(arrays.keys())
     fig, axs = plt.subplots(
-        2, len(methods),
-        figsize=(4.9 * len(methods), 7.0),
-        gridspec_kw={"height_ratios": [1.35, 1.0]},
-        sharex="row",
+        1,
+        len(methods),
+        figsize=(3.85 * len(methods), 3.75),
+        sharex=True,
+        sharey=True,
     )
     if len(methods) == 1:
-        axs = np.asarray(axs).reshape(2, 1)
+        axs = np.asarray([axs])
 
-    # Common color scale for SVM cosine.  Ignore extreme outliers, and do not let
-    # a failing method dominate the useful range.
     all_cos = []
     for arr in arrays.values():
         cosv = arr.get("svm_cos")
@@ -1592,10 +1675,6 @@ def plot_path_likelihood_svm_alignment(
         cmin, cmax = -1.0, 1.0
 
     last_sc = None
-    hist_min, hist_max = cmin, cmax
-    pad = 0.06 * (hist_max - hist_min + 1e-12)
-    hist_bins = np.linspace(max(-1.0, hist_min - pad), min(1.0, hist_max + pad), 28)
-
     for j, m in enumerate(methods):
         arr = arrays[m]
         cosv = arr.get("svm_cos")
@@ -1611,58 +1690,58 @@ def plot_path_likelihood_svm_alignment(
         rho_et = _safe_corr_np(er, tr)
         rho_ec = _safe_corr_np(er, cv)
         top = er >= 0.90
-        bot = er <= 0.10
         top_mean = float(np.nanmean(cv[top])) if np.any(top) else float("nan")
-        bot_mean = float(np.nanmean(cv[bot])) if np.any(bot) else float("nan")
-        all_mean = float(np.nanmean(cv)) if len(cv) else float("nan")
 
-        ax = axs[0, j]
-        last_sc = ax.scatter(er, tr, c=cv, s=16, alpha=0.74, cmap="viridis", vmin=cmin, vmax=cmax, linewidths=0)
-        ax.plot([0, 1], [0, 1], color="k", linewidth=1.0, alpha=0.50)
-        ax.axvline(0.90, color="k", linestyle=":", linewidth=0.9, alpha=0.40)
-        ax.axhline(0.90, color="k", linestyle=":", linewidth=0.9, alpha=0.40)
-        ax.set_xlim(-0.07, 1.07); ax.set_ylim(-0.07, 1.07)
-        ax.set_title(
-            f"{m}\nrank corr={rho_et:.3g}; rank–SVM={rho_ec:.3g}\n"
-            f"top10 cos={top_mean:.3f}, all={all_mean:.3f}",
-            fontsize=10,
+        ax = axs[j]
+        last_sc = ax.scatter(
+            er,
+            tr,
+            c=cv,
+            s=13,
+            alpha=0.78,
+            cmap="viridis",
+            vmin=cmin,
+            vmax=cmax,
+            linewidths=0,
+            rasterized=True,
         )
-        ax.set_xlabel("estimated likelihood percentile")
-        ax.set_ylabel("true likelihood percentile")
-        ax.grid(alpha=0.22)
+        ax.plot([0, 1], [0, 1], color="0.25", linewidth=1.15, alpha=0.65)
+        ax.axvline(0.90, color="0.25", linestyle=":", linewidth=0.95, alpha=0.45)
+        ax.axhline(0.90, color="0.25", linestyle=":", linewidth=0.95, alpha=0.45)
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title(method_label(m), pad=5, fontsize=15)
+        ann = (
+            rf"$\rho_{{\rm rank}}={rho_et:.2f}$" + "\n"
+            + rf"$\rho_{{\rm SVM}}={rho_ec:.2f}$" + "\n"
+            + rf"top-10 cosine $={top_mean:.2f}$"
+        )
+        ax.text(
+            0.04,
+            0.96,
+            ann,
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=10.2,
+            linespacing=1.15,
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="white", edgecolor="0.85", alpha=0.86),
+        )
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        style_axis(ax)
 
-        # Histogram-only SVM view.  This replaces the previous shaded line plot,
-        # which was visually noisier and less direct.
-        ax = axs[1, j]
-        if len(cv):
-            ax.hist(cv, bins=hist_bins, density=True, histtype="step", linewidth=1.7, label="all samples")
-            if np.any(top):
-                ax.hist(cv[top], bins=hist_bins, density=True, alpha=0.36, label="top 10% by est. likelihood")
-                ax.axvline(top_mean, linewidth=1.4, linestyle="--", label="top10 mean")
-            ax.axvline(all_mean, linewidth=1.2, linestyle=":", label="all mean")
-            if np.isfinite(bot_mean):
-                ax.axvline(bot_mean, linewidth=1.0, linestyle="-.", alpha=0.7, label="bottom10 mean")
-        ax.set_xlabel(r"cos$(\theta,\theta_{\rm SVM})$")
-        ax.set_ylabel("density")
-        ax.set_title(f"SVM cosine distribution\nbottom10={bot_mean:.3f}, top10={top_mean:.3f}", fontsize=10)
-        ax.grid(alpha=0.22)
-        if j == len(methods) - 1:
-            ax.legend(fontsize=8, loc="best", frameon=True)
-
-    # Shared colorbar in a dedicated axis, outside the subplots.  This avoids the
-    # tight-layout/colorbar collision visible in earlier dashboard versions.
+    fig.supxlabel("Estimated likelihood percentile", fontsize=14, y=0.04)
+    fig.supylabel("True likelihood percentile", fontsize=14, x=0.018)
+    fig.subplots_adjust(right=0.915, top=0.80, bottom=0.20, wspace=0.22)
     if last_sc is not None:
-        fig.subplots_adjust(right=0.90, top=0.86, bottom=0.09, hspace=0.42, wspace=0.30)
-        cax = fig.add_axes([0.915, 0.56, 0.014, 0.25])
+        cax = fig.add_axes([0.93, 0.24, 0.014, 0.44])
         cbar = fig.colorbar(last_sc, cax=cax)
-        cbar.set_label(r"cos$(\theta,\theta_{\rm SVM})$", fontsize=10)
-    else:
-        fig.subplots_adjust(top=0.86, bottom=0.09, hspace=0.42, wspace=0.30)
-    fig.suptitle(
-        title + f"\nSVM is a geometric reference only: test acc={float(svm_info['test_acc']):.3f}; method={svm_info['method']}",
-        fontsize=12,
-    )
-    fig.savefig(out_path, dpi=220)
+        cbar.set_label("SVM cosine", fontsize=11)
+        cbar.ax.tick_params(labelsize=10)
+    fig.suptitle(title, fontsize=16, y=0.98)
+    fig.patch.set_facecolor("white")
+    fig.savefig(out_path, dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04, facecolor="white", transparent=False)
     plt.close(fig)
 
 def plot_path_likelihood_cloud_rank(
@@ -1716,7 +1795,7 @@ def plot_path_likelihood_weight_montage(
     Important plotting guard: failing methods such as Blend can produce enormous
     weights.  They are still displayed, but they are excluded from the global
     color normalization whenever at least one non-blend method is available, so
-    they cannot wash out Tweedie/CE-HLSI.
+    they cannot wash out Tweedie/LFGI.
     """
     methods = list(arrays.keys())
     qs = [0.02, 0.25, 0.50, 0.75, 0.98]
@@ -1947,18 +2026,20 @@ def plot_path_likelihood_bars(path_metrics: Dict[str, Dict[str, float]], out_pat
         "path_logp_spearman",
         "path_logp_pairwise_acc",
     ]
+    titles = ["RMSE", "Centered RMSE", "Calibrated RMSE", "Pearson", "Spearman", "Pairwise Acc."]
     methods = list(path_metrics.keys())
-    fig, axs = plt.subplots(2, 3, figsize=(12, 6.5))
+    labels = [method_label(m) for m in methods]
+    colors = [method_color(m) for m in methods]
+    fig, axs = plt.subplots(2, 3, figsize=(11.5, 6.1))
     axs = axs.ravel()
-    for ax, key in zip(axs, keys):
+    for ax, key, ttl in zip(axs, keys, titles):
         vals = [path_metrics[m].get(key, np.nan) for m in methods]
-        ax.bar(methods, vals)
-        ax.set_title(key)
+        ax.bar(labels, vals, color=colors, alpha=0.92)
+        ax.set_title(ttl)
         ax.tick_params(axis="x", rotation=25)
-        ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
+        style_axis(ax, grid_axis="y")
+    fig.suptitle("Path-Integrated Log-Density Diagnostics", fontsize=16, y=1.02)
+    save_pub(fig, out_path)
 
 def ess_energy_proxy(target: LogisticPosterior, X: torch.Tensor) -> float:
     # Lightweight diagnostic: ESS of unnormalized exp(-U) values after centering.
@@ -2017,14 +2098,14 @@ def run_ng_nr_sweep(
     dtype: torch.dtype,
     device: torch.device,
 ) -> None:
-    """Sweep CE-HLSI over N_R at fixed N_G.
+    """Sweep LFGI over N_R at fixed N_G.
 
     The gate/Hessian atlas xg is fixed at size N_G.  For each N_R, the base score
     bank is the first N_R samples of xr_pool.  If --bank_coupling=prefix,
     xr_pool is the same tensor as xg and each swept score bank is a prefix of the
     fixed gate bank.  If --bank_coupling=independent, xr_pool is disjoint from xg.
     We also compute fixed full-bank baselines using xg as their estimator bank:
-    Tweedie_NG, Blend_NG, and CE-HLSI_NG.
+    Tweedie_NG, Blend_NG, and LFGI_NG.
     """
     n_gate = int(xg.shape[0])
     nrefs = parse_int_sweep(args.sweep_n_ref_values, max_value=min(len(xr_pool), n_gate))
@@ -2067,7 +2148,7 @@ def run_ng_nr_sweep(
     router_ng = ScoreRouter()
     router_ng.add("tweedie_NG", bank_ng, "tweedie")
     router_ng.add("blend_NG", bank_ng, "blend")
-    router_ng.add("moment_matrix_NG", bank_ng, "moment-matrix-blend")
+    router_ng.add("matrix_blend_NG", bank_ng, "matrix-blend")
     router_ng.add("ce_hlsi_NG", bank_ng, "ce-hlsi")
     baseline_metrics: Dict[str, Dict[str, float]] = {}
     for label in router_ng.methods:
@@ -2089,7 +2170,7 @@ def run_ng_nr_sweep(
         row.update(met)
         rows.append(row)
 
-    # CE-HLSI sweep over score-bank size, fixed gate bank.
+    # LFGI sweep over score-bank size, fixed gate bank.
     for nr in nrefs:
         label = f"ce_hlsi_NR{nr}_NG{n_gate}"
         print("-" * 80)
@@ -2141,7 +2222,7 @@ def run_ng_nr_sweep(
             writer = csv.DictWriter(f, fieldnames=["method", "n_ref", "n_gate", "score_rmse"])
             writer.writeheader(); writer.writerows(rmse_rows)
 
-    # Plots: each metric versus N_R for CE-HLSI, with horizontal same-N_G baselines.
+    # Plots: each metric versus N_R for LFGI, with horizontal same-N_G baselines.
     metric_names = ["mmd", "sliced_ks", "ksd", "energy_kl", "pred_nll", "pred_acc", "ess_proxy"]
     ce_rows = [r for r in rows if r.get("method") == "ce-hlsi-sweep"]
     xvals = np.array([int(r["n_ref"]) for r in ce_rows], dtype=float)
@@ -2149,7 +2230,7 @@ def run_ng_nr_sweep(
     axs = axs.ravel()
     for ax, metric in zip(axs, metric_names):
         yvals = np.array([float(r[metric]) for r in ce_rows], dtype=float)
-        ax.plot(xvals, yvals, marker="o", ms=3, label="CE-HLSI $(N_R,N_G)$")
+        ax.plot(xvals, yvals, marker="o", ms=3, label="LFGI $(N_R,N_G)$")
         for bname, bmet in baseline_metrics.items():
             if metric in bmet:
                 ax.axhline(float(bmet[metric]), linestyle="--", linewidth=1.0, label=bname)
@@ -2193,7 +2274,7 @@ def run_ng_nr_sweep(
         f.write("\nSame-N_G baselines:\n")
         for bname, bmet in baseline_metrics.items():
             f.write(bname + ": " + ", ".join(f"{k}={v:.6g}" for k, v in bmet.items() if isinstance(v, (float, int))) + "\n")
-        f.write("\nBest CE-HLSI N_R values:\n")
+        f.write("\nBest LFGI N_R values:\n")
         f.write("\n".join(best_lines) + "\n")
 
     # Compact dashboard.
@@ -2212,7 +2293,7 @@ def run_ng_nr_sweep(
         ]
         for bname, bmet in baseline_metrics.items():
             lines.append(f"  {bname}: mmd={bmet['mmd']:.4g}, sliced_ks={bmet['sliced_ks']:.4g}, ksd={bmet['ksd']:.4g}, pred_nll={bmet['pred_nll']:.4g}, pred_acc={bmet['pred_acc']:.4g}")
-        lines += ["", "Best CE-HLSI N_R values:"] + ["  " + s for s in best_lines]
+        lines += ["", "Best LFGI N_R values:"] + ["  " + s for s in best_lines]
         ax.text(0.03, 0.97, "\n".join(lines), va="top", ha="left", family="monospace", fontsize=9)
         pdf.savefig(fig); plt.close(fig)
         for img in ["ng_nr_sweep_metrics.png"]:
@@ -2226,6 +2307,316 @@ def run_ng_nr_sweep(
     print(f"dashboard: {sweep_dir / 'ng_nr_sweep_dashboard.pdf'}")
     print("=" * 80)
 
+
+# -----------------------------------------------------------------------------
+# Repeated-run aggregation
+# -----------------------------------------------------------------------------
+
+TABLE_METRICS = [
+    ("score_rmse", "Score RMSE $\\downarrow$", "down"),
+    ("mmd", "MMD $\\downarrow$", "down"),
+    ("ksd", "KSD $\\downarrow$", "down"),
+    ("energy_kl", "Energy KL $\\downarrow$", "down"),
+    ("pred_acc", "Pred. acc. $\\uparrow$", "up"),
+    ("path_logp_spearman", "Path Spearman $\\uparrow$", "up"),
+    ("path_logp_pairwise_acc", "Pairwise acc. $\\uparrow$", "up"),
+    ("path_logp_centered_rmse", "Path cRMSE $\\downarrow$", "down"),
+]
+BASE_TABLE_METHODS = ["tweedie", "blend", "matrix-blend", "lfgi"]
+TABLE_METHOD_LABELS = {
+    "tweedie": "Tweedie",
+    "blend": "Scalar blend",
+    "matrix-blend": "Matrix blend",
+    "moment-matrix-blend": "Matrix blend",
+    "primal-matrix-blend": "Matrix blend",
+    "lfgi": "LFGI",
+    "ce-hlsi": "LFGI",
+    "reference": "Reference",
+}
+
+
+def _float_or_nan(x) -> float:
+    try:
+        if x is None or x == "":
+            return float("nan")
+        return float(x)
+    except Exception:
+        return float("nan")
+
+
+def _strip_repeated_overrides(argv: List[str]) -> List[str]:
+    """Remove CLI options that parent repeated mode overrides for each child run."""
+    value_opts = {"--n_runs", "--out_dir", "--seed", "--aggregate_uncertainty"}
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in value_opts:
+            i += 2
+            continue
+        if any(tok.startswith(opt + "=") for opt in value_opts):
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _read_metrics_csv(path: Path, run_idx: int, seed: int) -> Tuple[List[Dict[str, object]], List[str]]:
+    rows: List[Dict[str, object]] = []
+    metric_keys: List[str] = []
+    if not path.exists():
+        raise FileNotFoundError(f"Missing metrics file: {path}")
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            method = str(raw.get("method", "")).strip()
+            if not method:
+                continue
+            rec: Dict[str, object] = {"run": int(run_idx), "seed": int(seed), "method": method}
+            for k, v in raw.items():
+                if k == "method":
+                    continue
+                if k not in metric_keys:
+                    metric_keys.append(k)
+                rec[k] = _float_or_nan(v)
+            rows.append(rec)
+    return rows, metric_keys
+
+
+def _method_order(methods: List[str]) -> List[str]:
+    preferred = ["tweedie", "blend", "matrix-blend", "moment-matrix-blend", "primal-matrix-blend", "lfgi", "ce-hlsi", "reference"]
+    out = [m for m in preferred if m in methods]
+    out += sorted([m for m in methods if m not in out])
+    return out
+
+
+def _aggregate_rows(rows: List[Dict[str, object]], metric_keys: List[str]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    methods = _method_order(sorted({str(r["method"]) for r in rows}))
+    agg: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for m in methods:
+        mrows = [r for r in rows if r["method"] == m]
+        agg[m] = {}
+        for k in metric_keys:
+            vals = np.asarray([_float_or_nan(r.get(k, float("nan"))) for r in mrows], dtype=np.float64)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                mean = std = sem = float("nan")
+                n = 0
+            else:
+                mean = float(vals.mean())
+                std = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+                sem = float(std / math.sqrt(vals.size)) if vals.size > 0 else float("nan")
+                n = int(vals.size)
+            agg[m][k] = {"mean": mean, "std": std, "sem": sem, "n": float(n)}
+    return agg
+
+
+def _write_per_run_metrics(rows: List[Dict[str, object]], metric_keys: List[str], out_path: Path) -> None:
+    fieldnames = ["run", "seed", "method"] + list(metric_keys)
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, "") for k in fieldnames})
+
+
+def _write_aggregate_metrics(agg: Dict[str, Dict[str, Dict[str, float]]], metric_keys: List[str], out_path: Path) -> None:
+    fieldnames = ["method"]
+    for k in metric_keys:
+        fieldnames += [f"{k}_mean", f"{k}_std", f"{k}_sem", f"{k}_n"]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for method, mdict in agg.items():
+            row = {"method": method}
+            for k in metric_keys:
+                stats = mdict.get(k, {})
+                row[f"{k}_mean"] = stats.get("mean", float("nan"))
+                row[f"{k}_std"] = stats.get("std", float("nan"))
+                row[f"{k}_sem"] = stats.get("sem", float("nan"))
+                row[f"{k}_n"] = int(stats.get("n", 0)) if np.isfinite(stats.get("n", float("nan"))) else 0
+            writer.writerow(row)
+
+
+def _latex_number(x: float, *, digits: int = 3) -> str:
+    if not np.isfinite(x):
+        return "--"
+    ax = abs(float(x))
+    if ax == 0:
+        return "0"
+    if ax >= 1000.0 or ax < 1e-2:
+        exp = int(math.floor(math.log10(ax)))
+        mant = float(x) / (10.0 ** exp)
+        return f"{mant:.{max(digits-1, 1)}f}{{\\times}}10^{{{exp}}}"
+    if ax >= 100.0:
+        return f"{x:.1f}"
+    if ax >= 10.0:
+        return f"{x:.2f}"
+    return f"{x:.3f}"
+
+
+def _latex_mean_unc(mean: float, unc: float) -> str:
+    if not np.isfinite(mean):
+        return "$--$"
+    if not np.isfinite(unc) or unc == 0:
+        return f"${_latex_number(mean)}$"
+    return f"${_latex_number(mean)}\\pm{_latex_number(unc)}$"
+
+
+def _write_latex_aggregate_table(
+    agg: Dict[str, Dict[str, Dict[str, float]]],
+    out_path: Path,
+    *,
+    n_runs: int,
+    uncertainty: str,
+    n_ref: int,
+    n_gate: int,
+    d: int,
+    classes: Tuple[int, int],
+) -> None:
+    uncertainty = uncertainty.lower().strip()
+    if uncertainty not in {"std", "sem"}:
+        raise ValueError("uncertainty must be 'std' or 'sem'")
+    available = [m for m in BASE_TABLE_METHODS if m in agg]
+    # Backward compatibility if an older run still wrote ce-hlsi.
+    if "lfgi" not in available and "ce-hlsi" in agg:
+        available.append("ce-hlsi")
+
+    best: Dict[str, str] = {}
+    for key, _, direction in TABLE_METRICS:
+        vals = []
+        for m in available:
+            mean = agg.get(m, {}).get(key, {}).get("mean", float("nan"))
+            if np.isfinite(mean):
+                vals.append((m, mean))
+        if vals:
+            best[key] = (max(vals, key=lambda p: p[1]) if direction == "up" else min(vals, key=lambda p: p[1]))[0]
+
+    headers = " & ".join(["Method"] + [label for _, label, _ in TABLE_METRICS])
+    lines = [
+        r"\begin{table}[H]",
+        r"\centering",
+        r"\small",
+        r"\resizebox{\textwidth}{!}{%",
+        r"\begin{tabular}{l" + "r" * len(TABLE_METRICS) + "}",
+        r"\toprule",
+        headers + r" \\",
+        r"\midrule",
+    ]
+    for m in available:
+        label = TABLE_METHOD_LABELS.get(m, method_label(m).title())
+        cells = [label]
+        for key, _, _ in TABLE_METRICS:
+            stats = agg.get(m, {}).get(key, {})
+            mean = stats.get("mean", float("nan"))
+            unc = stats.get(uncertainty, float("nan"))
+            cell = _latex_mean_unc(mean, unc)
+            if best.get(key) == m and np.isfinite(mean):
+                cell = r"\textbf{" + cell + "}"
+            cells.append(cell)
+        lines.append(" & ".join(cells) + r" \\")
+    ref_acc = agg.get("reference", {}).get("pred_acc", {}).get("mean", float("nan"))
+    ref_clause = ""
+    if np.isfinite(ref_acc):
+        ref_clause = f" The reference posterior predictive accuracy is ${_latex_number(ref_acc)}$."
+    unc_name = "standard deviation" if uncertainty == "std" else "standard error"
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular}}",
+        rf"\caption{{MNIST ${classes[0]}$-vs-${classes[1]}$ PCA logistic-regression posterior, $d={d}$, $N_{{\rm ref}}={n_ref}$, $N_{{\rm gate}}={n_gate}$. Entries report mean $\pm$ {unc_name} over {n_runs} independent runs. Predictive accuracy is already saturated by Tweedie and LFGI, but LFGI is the only estimator that simultaneously improves posterior sample quality and recovers a usable posterior likelihood ordering from score path integration.{ref_clause}}}",
+        r"\label{tab:mnist-pca-logreg-results}",
+        r"\end{table}",
+        "",
+    ]
+    out_path.write_text("\n".join(lines))
+
+
+def aggregate_repeated_outputs(run_dirs: List[Path], seeds: List[int], out_dir: Path, args) -> None:
+    rows: List[Dict[str, object]] = []
+    metric_keys_ordered: List[str] = []
+    for r, (run_dir, seed) in enumerate(zip(run_dirs, seeds)):
+        run_rows, keys = _read_metrics_csv(run_dir / "metrics.csv", run_idx=r, seed=seed)
+        rows.extend(run_rows)
+        for k in keys:
+            if k not in metric_keys_ordered:
+                metric_keys_ordered.append(k)
+    if not rows:
+        raise RuntimeError("No per-run metrics rows were found; cannot aggregate repeated run.")
+
+    _write_per_run_metrics(rows, metric_keys_ordered, out_dir / "per_run_metrics.csv")
+    agg = _aggregate_rows(rows, metric_keys_ordered)
+    _write_aggregate_metrics(agg, metric_keys_ordered, out_dir / "aggregate_metrics.csv")
+    _write_latex_aggregate_table(
+        agg,
+        out_dir / "mnist_table_aggregate.tex",
+        n_runs=int(args.n_runs),
+        uncertainty=str(args.aggregate_uncertainty),
+        n_ref=int(args.n_ref),
+        n_gate=int(args.n_gate),
+        d=int(args.d),
+        classes=tuple(args.classes),
+    )
+
+    with open(out_dir / "aggregate_summary.txt", "w") as f:
+        f.write("MNIST PCA logistic-regression repeated-run aggregate\n")
+        f.write(f"n_runs={int(args.n_runs)}\n")
+        f.write(f"base_seed={int(args.seed)}\n")
+        f.write(f"seed_stride={int(args.n_runs_seed_stride)}\n")
+        f.write(f"uncertainty={str(args.aggregate_uncertainty)}\n")
+        f.write("\nRun directories:\n")
+        for r, (run_dir, seed) in enumerate(zip(run_dirs, seeds)):
+            f.write(f"  run={r} seed={seed} dir={run_dir}\n")
+        f.write("\nFiles:\n")
+        f.write("  per_run_metrics.csv\n")
+        f.write("  aggregate_metrics.csv\n")
+        f.write("  mnist_table_aggregate.tex\n")
+
+
+def run_repeated_cli(args, argv: List[str]) -> None:
+    n_runs = int(args.n_runs)
+    if n_runs <= 1:
+        return
+    if bool(getattr(args, "ng_nr_sweep", False)):
+        raise ValueError("--n_runs aggregation currently targets the main MNIST benchmark, not --ng_nr_sweep.")
+    if bool(getattr(args, "skip_sampling", False)):
+        raise ValueError("--n_runs requires sampling/metrics; remove --skip_sampling.")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_cli = _strip_repeated_overrides(list(argv))
+    script_path = Path(__file__).resolve()
+    seeds = [int(args.seed) + int(args.n_runs_seed_stride) * r for r in range(n_runs)]
+    run_dirs = [out_dir / f"run_{r:03d}" for r in range(n_runs)]
+
+    print("=" * 80)
+    print(f"MNIST repeated-run mode: n_runs={n_runs}, base_seed={args.seed}, stride={args.n_runs_seed_stride}")
+    print(f"Output root: {out_dir}")
+    print("Each run writes an ordinary single-run output directory; aggregate CSV/LaTeX are written at the root.")
+    print("=" * 80)
+
+    for r, (run_dir, seed) in enumerate(zip(run_dirs, seeds)):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            sys.executable,
+            str(script_path),
+            *base_cli,
+            "--n_runs", "1",
+            "--out_dir", str(run_dir),
+            "--seed", str(seed),
+        ]
+        print("-" * 80)
+        print(f"[n_runs] run {r + 1}/{n_runs}: seed={seed}, out_dir={run_dir}")
+        print("[n_runs] command:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+    aggregate_repeated_outputs(run_dirs, seeds, out_dir, args)
+    print("=" * 80)
+    print(f"[n_runs done] wrote aggregate outputs to {out_dir}")
+    print(f"aggregate CSV: {out_dir / 'aggregate_metrics.csv'}")
+    print(f"LaTeX table:   {out_dir / 'mnist_table_aggregate.tex'}")
+    print("=" * 80)
+
+
 # -----------------------------------------------------------------------------
 # Main benchmark
 # -----------------------------------------------------------------------------
@@ -2236,6 +2627,12 @@ def main():
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", type=str, default="float64")
     p.add_argument("--seed", type=int, default=123)
+    p.add_argument("--n_runs", type=int, default=1,
+                   help="repeat the full benchmark this many times with seeds seed + r*stride, then aggregate metrics")
+    p.add_argument("--n_runs_seed_stride", type=int, default=1,
+                   help="seed increment between repeated runs")
+    p.add_argument("--aggregate_uncertainty", type=str, default="std", choices=["std", "sem"],
+                   help="uncertainty convention used in the generated aggregate LaTeX table")
     p.add_argument("--classes", type=int, nargs=2, default=(4, 9))
     p.add_argument("--d", type=int, default=32)
     p.add_argument("--max_train", type=int, default=6000)
@@ -2290,19 +2687,23 @@ def main():
     p.add_argument("--skip_sampling", action="store_true", help="only build target/reference diagnostics")
     p.add_argument("--add_bank_ablations", action="store_true",
                    help=("also run diagnostic ablations that use the full gate bank as the estimator bank "
-                         "and CE-HLSI with only the estimator-prefix gate; useful when n_gate >> n_ref"))
+                         "and LFGI with only the estimator-prefix gate; useful when n_gate >> n_ref"))
     p.add_argument("--ng_nr_sweep", action="store_true",
                    help=("run an N_G/N_R ablation instead of the single benchmark: fix N_G and sweep the "
-                         "CE-HLSI score-signal bank size N_R. Same-N_G blend/Tweedie/CE baselines are also run."))
+                         "LFGI score-signal bank size N_R. Same-N_G blend/Tweedie/CE baselines are also run."))
     p.add_argument("--sweep_n_gate", type=int, default=None,
                    help="fixed N_G for --ng_nr_sweep; defaults to --n_gate")
     p.add_argument("--sweep_n_ref_values", type=str, default="1:100",
                    help="N_R values for --ng_nr_sweep, e.g. '1:100', '1:5:100', or '1,2,5,10,20,50,100'")
     p.add_argument("--sweep_save_samples", action="store_true",
-                   help="save every CE-HLSI sweep sample array; off by default to avoid huge outputs")
+                   help="save every LFGI sweep sample array; off by default to avoid huge outputs")
     p.add_argument("--sweep_score_rmse", action="store_true",
                    help="compute score-RMSE for a few representative N_R values during the sweep")
     args = p.parse_args()
+
+    if int(args.n_runs) > 1:
+        run_repeated_cli(args, sys.argv[1:])
+        return
 
     set_seed(args.seed)
     dtype = resolve_dtype(args.dtype)
@@ -2437,14 +2838,14 @@ def main():
     if args.n_ref < 16:
         print(
             "[warning] n_ref is extremely small. Blend and Tweedie use only the estimator bank, "
-            "whereas CE-HLSI uses the larger gate bank for Hessian aggregation when n_gate > n_ref. "
+            "whereas Matrix Blend and LFGI can use the larger gate bank for gate aggregation when n_gate > n_ref. "
             "This is a gate-sample-complexity ablation, not a fair same-information sampler comparison."
         )
     if args.n_gate > 2 * max(args.n_ref, 1):
         print(
-            "[warning] n_gate is much larger than n_ref. If CE-HLSI improves only in this setting, "
+            "[warning] n_gate is much larger than n_ref. If LFGI improves only in this setting, "
             "the improvement is likely coming from the larger curvature atlas. Use --add_bank_ablations "
-            "to compare against blend/tweedie using the same full bank and CE-HLSI using only the score bank as gate. "
+            "to compare against blend/tweedie using the same full bank and LFGI using only the score bank as gate. "
             "Use --bank_coupling independent to test whether score/gate sample coupling is responsible."
         )
 
@@ -2481,11 +2882,6 @@ def main():
         f.write(f"n_ref={args.n_ref} n_gate={args.n_gate} bank_coupling={args.bank_coupling}\n")
         f.write(f"gate_prefix_max_abs_err={prefix_err:.6e}\n")
         f.write(f"add_bank_ablations={bool(args.add_bank_ablations)}\n")
-        f.write(f"moment_matrix_ridge={MOMENT_MATRIX_RIDGE}\n")
-        f.write(f"moment_matrix_ridge_rel={MOMENT_MATRIX_RIDGE_REL}\n")
-        f.write(f"moment_matrix_center={bool(MOMENT_MATRIX_CENTER)}\n")
-        f.write(f"moment_matrix_sym_gate={bool(MOMENT_MATRIX_SYM_GATE)}\n")
-        f.write(f"moment_matrix_gate_clip={MOMENT_MATRIX_GATE_CLIP}\n")
         for k, v in op_stats.items():
             f.write(f"{k}={v}\n")
         f.write(f"MAP Hessian min={float(H_evals.min().cpu()):.6e} max={float(H_evals.max().cpu()):.6e} cond={float((H_evals.max()/H_evals.min()).cpu()):.6e}\n")
@@ -2501,25 +2897,24 @@ def main():
     router = ScoreRouter()
     router.add("tweedie", bank, "tweedie")
     router.add("blend", bank, "blend")
-    router.add("moment-matrix-blend", bank, "moment-matrix-blend")
-    router.add("ce-hlsi", bank, "ce-hlsi")
+    router.add("matrix-blend", bank, "matrix-blend")
+    router.add("lfgi", bank, "lfgi")
 
     if args.add_bank_ablations and args.n_gate > args.n_ref:
         print("[ablation] adding full-gate-bank and score-bank-gate diagnostic methods")
         # Same-information comparison: give all methods the full gate bank as
-        # their estimator bank.  This checks whether CE-HLSI is winning only
+        # their estimator bank.  This checks whether LFGI is winning only
         # because it has access to more samples than blend/Tweedie.
         bank_xg = EstimatorBank(target, xr=xg, xg=xg)
         router.add("tweedie-xg-bank", bank_xg, "tweedie")
         router.add("blend-xg-bank", bank_xg, "blend")
-        router.add("moment-matrix-xg-bank", bank_xg, "moment-matrix-blend")
-        router.add("ce-hlsi-xg-bank", bank_xg, "ce-hlsi")
-        # Gate-ablation comparison: force CE-HLSI and moment-matrix blend to use
-        # only the score/estimator bank for gate construction, even though a
-        # larger xg exists.
+        router.add("matrix-blend-xg-bank", bank_xg, "matrix-blend")
+        router.add("lfgi-xg-bank", bank_xg, "lfgi")
+        # Gate-ablation comparison: force LFGI and Matrix Blend to use only the
+        # score/estimator bank for gate construction, even though a larger xg exists.
         bank_xr_gate = EstimatorBank(target, xr=xr, xg=xr)
-        router.add("moment-matrix-xr-gate", bank_xr_gate, "moment-matrix-blend")
-        router.add("ce-hlsi-xr-gate", bank_xr_gate, "ce-hlsi")
+        router.add("matrix-blend-xr-gate", bank_xr_gate, "matrix-blend")
+        router.add("lfgi-xr-gate", bank_xr_gate, "lfgi")
 
     methods = router.methods
 
@@ -2604,10 +2999,10 @@ def main():
     # Add reference row for predictive metrics only.
     metrics_ref = {"pred_nll": pred_ref["pred_nll"], "pred_acc": pred_ref["pred_acc"]}
 
-    # CSV metrics.
-    metric_keys = sorted({k for dct in metrics.values() for k in dct.keys()})
-    if "runtime_sec" in metric_keys:
-        metric_keys = ["runtime_sec"] + [k for k in metric_keys if k != "runtime_sec"]
+    # CSV metrics.  Keep runtime_sec near the front because it is a method-level
+    # diagnostic rather than a posterior-quality metric.
+    metric_keys_all = sorted({k for dct in metrics.values() for k in dct.keys()})
+    metric_keys = ["runtime_sec"] + [k for k in metric_keys_all if k != "runtime_sec"]
     with open(out_dir / "metrics.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["method"] + metric_keys)
@@ -2623,14 +3018,15 @@ def main():
     plot_score_rmse_curves(t_grid, curves, out_dir / "score_rmse_vs_t.png")
 
     # Predictive bar chart separately so it can include reference.
-    fig, axs = plt.subplots(1, 2, figsize=(8, 3.2))
-    labels = methods + ["reference"]
+    fig, axs = plt.subplots(1, 2, figsize=(8.2, 3.35))
+    labels = [method_label(m) for m in methods] + ["REFERENCE"]
+    colors = [method_color(m) for m in methods] + [method_color("reference")]
     pred_nlls = [metrics[m]["pred_nll"] for m in methods] + [pred_ref["pred_nll"]]
     pred_accs = [metrics[m]["pred_acc"] for m in methods] + [pred_ref["pred_acc"]]
-    axs[0].bar(labels, pred_nlls); axs[0].set_title("test predictive NLL"); axs[0].tick_params(axis="x", rotation=25)
-    axs[1].bar(labels, pred_accs); axs[1].set_title("test predictive accuracy"); axs[1].tick_params(axis="x", rotation=25)
-    for ax in axs: ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout(); fig.savefig(out_dir / "predictive_bars.png", dpi=180); plt.close(fig)
+    axs[0].bar(labels, pred_nlls, color=colors, alpha=0.92); axs[0].set_title("Test Predictive NLL"); axs[0].tick_params(axis="x", rotation=25)
+    axs[1].bar(labels, pred_accs, color=colors, alpha=0.92); axs[1].set_title("Test Predictive Accuracy"); axs[1].tick_params(axis="x", rotation=25)
+    for ax in axs: style_axis(ax, grid_axis="y")
+    save_pub(fig, out_dir / "predictive_bars.png")
 
     # Dashboard PDF.
     with PdfPages(out_dir / "mnist_pca_logreg_dashboard.pdf") as pdf:
