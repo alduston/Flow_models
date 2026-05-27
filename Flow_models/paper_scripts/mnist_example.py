@@ -187,6 +187,88 @@ def method_marker(name: str) -> str:
     return METHOD_MARKERS.get(method_key(name), "o")
 
 
+
+def _lfgi_scale_names(names) -> List[str]:
+    """Methods whose arrays/metrics should define visual scales.
+
+    Paper-facing figures should not let a failed comparator (usually scalar or
+    moment matrix blend) set axis limits or colorbars.  Whenever LFGI is present,
+    its finite results define the visualization scale; otherwise we fall back to
+    all available names so standalone diagnostic calls still work.
+    """
+    names = list(names)
+    lfgi = [m for m in names if method_key(m) == "lfgi"]
+    return lfgi if lfgi else names
+
+
+def _finite_values_np(values) -> np.ndarray:
+    if values is None:
+        return np.array([], dtype=np.float64)
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    return vals[np.isfinite(vals)]
+
+
+def _finite_concat_np(values_list) -> np.ndarray:
+    chunks = [_finite_values_np(v) for v in values_list]
+    chunks = [c for c in chunks if c.size]
+    if not chunks:
+        return np.array([], dtype=np.float64)
+    return np.concatenate(chunks)
+
+
+def _padded_limits_from_values(
+    values,
+    *,
+    q_low: float = 1.0,
+    q_high: float = 99.0,
+    pad_frac: float = 0.08,
+    positive: bool = False,
+    include_zero: bool = False,
+    symmetric: bool = False,
+    fallback: Tuple[float, float] = (0.0, 1.0),
+) -> Tuple[float, float]:
+    vals = _finite_values_np(values)
+    if positive:
+        vals = vals[vals > 0]
+    if vals.size == 0:
+        return fallback
+    if symmetric:
+        hi = float(np.nanpercentile(np.abs(vals), q_high))
+        hi = max(hi, 1e-12)
+        return -hi, hi
+    lo = float(np.nanpercentile(vals, q_low))
+    hi = float(np.nanpercentile(vals, q_high))
+    if include_zero:
+        lo = min(lo, 0.0)
+        hi = max(hi, 0.0)
+    if positive:
+        lo = max(lo, np.min(vals[vals > 0]) if np.any(vals > 0) else 1e-12)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return fallback
+    if hi - lo < 1e-12:
+        center = 0.5 * (hi + lo)
+        width = max(abs(center) * 0.10, 1e-3)
+        lo, hi = center - width, center + width
+    pad = pad_frac * (hi - lo)
+    lo, hi = lo - pad, hi + pad
+    if positive:
+        lo = max(lo, 1e-12)
+    return float(lo), float(hi)
+
+
+def _set_ylim_from_anchor(ax: plt.Axes, anchor_values, *, log: bool = False, include_zero: bool = True) -> None:
+    vals = _finite_values_np(anchor_values)
+    if log:
+        vals = vals[vals > 0]
+        if vals.size:
+            lo, hi = _padded_limits_from_values(vals, q_low=1.0, q_high=99.0, pad_frac=0.12, positive=True, include_zero=False, fallback=(vals.min(), vals.max()))
+            ax.set_ylim(lo, hi)
+        return
+    if vals.size:
+        lo, hi = _padded_limits_from_values(vals, q_low=0.0, q_high=100.0, pad_frac=0.12, include_zero=include_zero)
+        ax.set_ylim(lo, hi)
+
+
 def style_axis(ax: plt.Axes, *, grid_axis: str = "both") -> None:
     ax.grid(True, axis=grid_axis, which="major", alpha=0.24, linewidth=0.8)
     ax.spines["top"].set_visible(False)
@@ -1156,13 +1238,22 @@ def plot_heatmaps(X_ref: torch.Tensor, samples: Dict[str, torch.Tensor], out_pat
     mu, V2 = fit_projection(X_ref)
     arrays = {"reference": project2(X_ref, mu, V2)}
     arrays.update({k: project2(v, mu, V2) for k, v in samples.items()})
-    all_xy = np.concatenate(list(arrays.values()), axis=0)
-    xlim = np.percentile(all_xy[:, 0], [0.5, 99.5])
-    ylim = np.percentile(all_xy[:, 1], [0.5, 99.5])
-    pad_x = 0.10 * (xlim[1] - xlim[0] + 1e-9)
-    pad_y = 0.10 * (ylim[1] - ylim[0] + 1e-9)
-    xlim = (xlim[0] - pad_x, xlim[1] + pad_x)
-    ylim = (ylim[0] - pad_y, ylim[1] + pad_y)
+    scale_names = _lfgi_scale_names(arrays.keys())
+    scale_xy = _finite_concat_np([arrays[k] for k in scale_names if k in arrays])
+    if scale_xy.size == 0:
+        scale_xy = np.concatenate(list(arrays.values()), axis=0)
+    scale_xy = np.asarray(scale_xy, dtype=np.float64).reshape(-1, 2)
+    xlim = _padded_limits_from_values(scale_xy[:, 0], q_low=0.5, q_high=99.5, pad_frac=0.10)
+    ylim = _padded_limits_from_values(scale_xy[:, 1], q_low=0.5, q_high=99.5, pad_frac=0.10)
+
+    bins = 92
+    density_scale_vals = []
+    for k in scale_names:
+        if k in arrays:
+            H, _, _ = np.histogram2d(arrays[k][:, 0], arrays[k][:, 1], bins=bins, range=[xlim, ylim], density=True)
+            density_scale_vals.append(H[np.isfinite(H) & (H > 0)])
+    density_scale = _finite_concat_np(density_scale_vals)
+    density_vmax = float(np.nanpercentile(density_scale, 99.5)) if density_scale.size else None
 
     names = list(arrays.keys())
     fig, axs = plt.subplots(1, len(names), figsize=(3.35 * len(names), 3.25), sharex=True, sharey=True)
@@ -1171,7 +1262,7 @@ def plot_heatmaps(X_ref: torch.Tensor, samples: Dict[str, torch.Tensor], out_pat
 
     for j, (ax, name) in enumerate(zip(axs, names)):
         xy = arrays[name]
-        ax.hist2d(xy[:, 0], xy[:, 1], bins=92, range=[xlim, ylim], density=True, cmap="viridis")
+        ax.hist2d(xy[:, 0], xy[:, 1], bins=bins, range=[xlim, ylim], density=True, cmap="viridis", vmin=0.0, vmax=density_vmax)
         ax.set_title(method_label(name), pad=5)
         ax.set_xlabel("Posterior PC1")
         if j == 0:
@@ -1195,6 +1286,8 @@ def plot_metric_bars(metrics: Dict[str, Dict[str, float]], out_path: Path):
     for ax, key, ttl in zip(axs, keys, titles):
         vals = [metrics[m].get(key, np.nan) for m in methods]
         ax.bar(labels, vals, color=colors, alpha=0.92)
+        anchor_vals = [metrics[m].get(key, np.nan) for m in _lfgi_scale_names(methods) if m in metrics]
+        _set_ylim_from_anchor(ax, anchor_vals, include_zero=True)
         ax.set_title(ttl)
         ax.tick_params(axis="x", rotation=25)
         style_axis(ax, grid_axis="y")
@@ -1205,7 +1298,11 @@ def plot_energy_hist(target: LogisticPosterior, X_ref: torch.Tensor, samples: Di
     with torch.no_grad():
         Uref = target.energy(X_ref).detach().cpu().numpy()
         Us = {k: target.energy(v).detach().cpu().numpy() for k, v in samples.items()}
-    lo, hi = np.percentile(Uref, [0.5, 99.5])
+    scale_methods = _lfgi_scale_names(Us.keys())
+    scale_E = _finite_concat_np([Us[k] for k in scale_methods if k in Us])
+    if scale_E.size == 0:
+        scale_E = _finite_values_np(Uref)
+    lo, hi = _padded_limits_from_values(scale_E, q_low=0.5, q_high=99.5, pad_frac=0.02)
     bins = np.linspace(lo, hi, 82)
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
     ax.hist(Uref, bins=bins, density=True, alpha=0.24, color=method_color("reference"), label="REFERENCE")
@@ -1244,6 +1341,8 @@ def plot_score_rmse_curves(t_grid: torch.Tensor, curves: Dict[str, List[float]],
     ax.set_ylabel("Score RMSE")
     ax.set_title("Score RMSE Across Diffusion Times")
     ax.set_yscale("log")
+    anchor_vals = _finite_concat_np([curves[m] for m in _lfgi_scale_names(curves.keys()) if m in curves])
+    _set_ylim_from_anchor(ax, anchor_vals, log=True, include_zero=False)
     ax.legend(frameon=False, loc="best")
     style_axis(ax)
     save_pub(fig, out_path)
@@ -1415,6 +1514,15 @@ def path_likelihood_diagnostics(
 
 def plot_path_likelihood_diagnostics(arrays: Dict[str, Dict[str, np.ndarray]], out_path: Path) -> None:
     methods = list(arrays.keys())
+    scale_methods = _lfgi_scale_names(methods)
+    scale_delta = _finite_concat_np(
+        [np.concatenate([arrays[m]["exact_delta"], arrays[m]["est_delta"]]) for m in scale_methods if m in arrays]
+    )
+    delta_lim = _padded_limits_from_values(scale_delta, q_low=1.0, q_high=99.0, pad_frac=0.06, fallback=(-1.0, 1.0))
+    scale_resid = _finite_concat_np([arrays[m]["residual"] for m in scale_methods if m in arrays])
+    resid_lim = _padded_limits_from_values(scale_resid, q_low=1.0, q_high=99.0, pad_frac=0.06, fallback=(-1.0, 1.0))
+    resid_bins = np.linspace(resid_lim[0], resid_lim[1], 50)
+
     fig, axs = plt.subplots(2, len(methods), figsize=(4.2 * len(methods), 7.0))
     if len(methods) == 1:
         axs = np.asarray(axs).reshape(2, 1)
@@ -1424,18 +1532,17 @@ def plot_path_likelihood_diagnostics(arrays: Dict[str, Dict[str, np.ndarray]], o
         r = arrays[m]["residual"]
         ax = axs[0, j]
         ax.scatter(y, e, s=8, alpha=0.35)
-        if len(y):
-            lo = np.nanpercentile(np.concatenate([y, e]), 1)
-            hi = np.nanpercentile(np.concatenate([y, e]), 99)
-            ax.plot([lo, hi], [lo, hi], linewidth=1.0)
-            ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
-        ax.set_title(f"{m}: path log-density")
+        lo, hi = delta_lim
+        ax.plot([lo, hi], [lo, hi], linewidth=1.0)
+        ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+        ax.set_title(f"{method_label(m)}: path log-density")
         ax.set_xlabel("true Δ log p")
         ax.set_ylabel("path-integrated Δ log p")
         ax.grid(alpha=0.25)
         ax = axs[1, j]
-        ax.hist(r[np.isfinite(r)], bins=50)
-        ax.set_title(f"{m}: residual")
+        ax.hist(r[np.isfinite(r)], bins=resid_bins)
+        ax.set_xlim(resid_lim)
+        ax.set_title(f"{method_label(m)}: residual")
         ax.set_xlabel("estimated - true Δ log p")
         ax.grid(alpha=0.25)
     fig.tight_layout()
@@ -1458,17 +1565,18 @@ def _project_np_with_reference(X_ref: torch.Tensor, arrays: Dict[str, Dict[str, 
     mu_np = mu.detach().cpu().numpy().astype(np.float64)
     V2_np = V2.detach().cpu().numpy().astype(np.float64)
     xy_by_method = {}
-    all_xy = [((X_ref[:min(len(X_ref), 4096)].detach().cpu().numpy().astype(np.float64) - mu_np) @ V2_np)]
+    ref_xy = ((X_ref[:min(len(X_ref), 4096)].detach().cpu().numpy().astype(np.float64) - mu_np) @ V2_np)
     for m, arr in arrays.items():
         xy = (arr["xs"] - mu_np) @ V2_np
         xy_by_method[m] = xy
-        all_xy.append(xy)
-    all_xy = np.concatenate(all_xy, axis=0)
-    xlim = np.nanpercentile(all_xy[:, 0], [0.5, 99.5])
-    ylim = np.nanpercentile(all_xy[:, 1], [0.5, 99.5])
-    pad_x = 0.08 * (xlim[1] - xlim[0] + 1e-12)
-    pad_y = 0.08 * (ylim[1] - ylim[0] + 1e-12)
-    return xy_by_method, (xlim[0] - pad_x, xlim[1] + pad_x), (ylim[0] - pad_y, ylim[1] + pad_y)
+    scale_methods = _lfgi_scale_names(arrays.keys())
+    scale_xy_list = [xy_by_method[m] for m in scale_methods if m in xy_by_method]
+    if not scale_xy_list:
+        scale_xy_list = [ref_xy] + list(xy_by_method.values())
+    scale_xy = np.concatenate(scale_xy_list, axis=0)
+    xlim = _padded_limits_from_values(scale_xy[:, 0], q_low=0.5, q_high=99.5, pad_frac=0.08)
+    ylim = _padded_limits_from_values(scale_xy[:, 1], q_low=0.5, q_high=99.5, pad_frac=0.08)
+    return xy_by_method, xlim, ylim
 
 
 def plot_path_likelihood_cloud_error(
@@ -1480,6 +1588,15 @@ def plot_path_likelihood_cloud_error(
     """Posterior PCA cloud colored by centered path log-density error."""
     methods = list(arrays.keys())
     xy_by_method, xlim, ylim = _project_np_with_reference(X_ref, arrays)
+    scale_methods = _lfgi_scale_names(methods)
+    scale_rc = []
+    for sm in scale_methods:
+        if sm in arrays:
+            rr = arrays[sm]["residual"].astype(np.float64)
+            scale_rc.append(rr - np.nanmean(rr))
+    vmax = float(np.nanpercentile(np.abs(_finite_concat_np(scale_rc)), 95)) if _finite_concat_np(scale_rc).size else 1.0
+    vmax = max(vmax, 1e-12)
+
     fig, axs = plt.subplots(1, len(methods), figsize=(4.3 * len(methods), 3.8), sharex=True, sharey=True)
     if len(methods) == 1:
         axs = [axs]
@@ -1488,14 +1605,9 @@ def plot_path_likelihood_cloud_error(
         r = arrays[m]["residual"].astype(np.float64)
         rc = r - np.nanmean(r)
         finite = np.isfinite(rc)
-        if finite.any():
-            vmax = np.nanpercentile(np.abs(rc[finite]), 95)
-            vmax = max(float(vmax), 1e-12)
-        else:
-            vmax = 1.0
         sc = ax.scatter(xy[:, 0], xy[:, 1], c=rc, s=9, alpha=0.72, cmap="coolwarm", vmin=-vmax, vmax=vmax, linewidths=0)
         crmse = np.sqrt(np.nanmean((rc[finite]) ** 2)) if finite.any() else np.nan
-        ax.set_title(f"{m}\ncentered RMSE={crmse:.3g}")
+        ax.set_title(f"{method_label(m)}\ncentered RMSE={crmse:.3g}")
         ax.set_xlabel("posterior PC1")
         ax.set_ylabel("posterior PC2")
         ax.set_xlim(xlim); ax.set_ylim(ylim)
@@ -1656,13 +1768,21 @@ def plot_path_likelihood_svm_alignment(
     if len(methods) == 1:
         axs = np.asarray([axs])
 
-    all_cos = []
-    for arr in arrays.values():
+    scale_cos = []
+    for m in _lfgi_scale_names(arrays.keys()):
+        arr = arrays.get(m)
+        if arr is None:
+            continue
         cosv = arr.get("svm_cos")
         if cosv is not None:
-            all_cos.append(np.asarray(cosv, dtype=np.float64))
-    if all_cos:
-        finite_cos = np.concatenate(all_cos)
+            scale_cos.append(np.asarray(cosv, dtype=np.float64))
+    if not scale_cos:
+        for arr in arrays.values():
+            cosv = arr.get("svm_cos")
+            if cosv is not None:
+                scale_cos.append(np.asarray(cosv, dtype=np.float64))
+    if scale_cos:
+        finite_cos = np.concatenate(scale_cos)
         finite_cos = finite_cos[np.isfinite(finite_cos)]
     else:
         finite_cos = np.array([], dtype=np.float64)
@@ -1762,7 +1882,7 @@ def plot_path_likelihood_cloud_rank(
         true_rank = _percentile_rank01_np(arrays[m]["exact_delta"])
         rho = _safe_corr_np(rank, true_rank)
         sc = ax.scatter(xy[:, 0], xy[:, 1], c=rank, s=9, alpha=0.72, cmap="viridis", vmin=0.0, vmax=1.0, linewidths=0)
-        ax.set_title(f"{m}\nrank corr={rho:.3g}")
+        ax.set_title(f"{method_label(m)}\nrank corr={rho:.3g}")
         ax.set_xlabel("posterior PC1")
         ax.set_ylabel("posterior PC2")
         ax.set_xlim(xlim); ax.set_ylim(ylim)
@@ -1792,10 +1912,10 @@ def plot_path_likelihood_weight_montage(
       est: estimator percentile rank; true: exact posterior rank;
       svm: cosine with the linear SVM direction; acc: single-classifier test acc.
 
-    Important plotting guard: failing methods such as Blend can produce enormous
-    weights.  They are still displayed, but they are excluded from the global
-    color normalization whenever at least one non-blend method is available, so
-    they cannot wash out Tweedie/LFGI.
+    Important plotting guard: failing methods can produce enormous weights.
+    They are still displayed, but LFGI-selected samples define the global
+    color normalization whenever LFGI is available, so failed comparators cannot
+    wash out the methods that actually worked.
     """
     methods = list(arrays.keys())
     qs = [0.02, 0.25, 0.50, 0.75, 0.98]
@@ -1821,16 +1941,10 @@ def plot_path_likelihood_weight_montage(
                 imgs.append(img)
         return imgs
 
-    # Common color scale from SVM + non-blend rows only.  This is the key guard
-    # against Blend blow-up destroying the visual scale.
+    # Common color scale from LFGI rows only.  This is the key guard against
+    # scalar/moment matrix blow-up destroying the visual scale.
     imgs_for_scale = []
-    if svm_info is not None:
-        svm_img = _theta_to_pixel_weight_np(np.asarray(svm_info["w"], dtype=np.float64), data)
-        if svm_img is not None:
-            imgs_for_scale.append(svm_img)
-    scale_methods = [m for m in methods if "blend" not in m.lower()]
-    if not scale_methods:
-        scale_methods = methods
+    scale_methods = _lfgi_scale_names(methods)
     for m in scale_methods:
         imgs_for_scale.extend(selected_imgs_for_method(m))
     if imgs_for_scale:
@@ -1891,7 +2005,7 @@ def plot_path_likelihood_weight_montage(
             if row == row_offset:
                 ax.text(0.5, 1.22, qlab, transform=ax.transAxes, ha="center", va="bottom", fontsize=11, fontweight="bold")
             if j == 0:
-                ax.text(-0.12, 0.5, m, transform=ax.transAxes, ha="right", va="center", fontsize=11, fontweight="bold")
+                ax.text(-0.12, 0.5, method_label(m), transform=ax.transAxes, ha="right", va="center", fontsize=11, fontweight="bold")
             acc = _single_classifier_accuracy_np(target, theta)
             cos_val = float(cos_all[idx]) if cos_all is not None and np.isfinite(cos_all[idx]) else float("nan")
             # Residual-like scalar: disagreement between estimator rank and true rank.
@@ -1931,7 +2045,7 @@ def plot_path_likelihood_weight_montage(
     sm = plt.cm.ScalarMappable(cmap="coolwarm", norm=plt.Normalize(vmin=-vmax_global, vmax=vmax_global))
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=cax)
-    cbar.set_label("pixel-space weight\n(non-blend scale)", fontsize=9)
+    cbar.set_label("pixel-space weight\n(LFGI scale)", fontsize=9)
     fig.suptitle(
         title + "\nRows are sorted by each estimator's path likelihood; gap=est rank−true rank; SVM cosine is geometric agreement.",
         fontsize=13,
@@ -1950,7 +2064,7 @@ def plot_path_likelihood_weight_residual_montage(
     """Optional companion montage: selected classifier image minus scaled SVM image.
 
     This makes SVM agreement visually explicit without cluttering the main montage.
-    Each residual uses the same non-blend-normalized color scale.  We subtract the
+    Each residual uses the same LFGI-normalized color scale.  We subtract the
     least-squares scalar multiple of the SVM reference image from each selected
     classifier image, because posterior samples may differ in norm while sharing
     the same discriminative direction.
@@ -1983,8 +2097,8 @@ def plot_path_likelihood_weight_residual_montage(
             else:
                 scale = float(np.sum(img * svm_img) / denom)
                 resid = img - scale * svm_img
-                # Use non-blend methods for normalization if available.
-                if "blend" not in m.lower():
+                # Use LFGI methods for normalization if available.
+                if method_key(m) == "lfgi":
                     residuals_by_cell.append(resid)
             selected[m].append((idx, resid))
     if not residuals_by_cell:
@@ -2006,7 +2120,7 @@ def plot_path_likelihood_weight_residual_montage(
             if i == 0:
                 ax.set_title(qlab, fontsize=10, fontweight="bold")
             if j == 0:
-                ax.text(-0.12, 0.5, m, transform=ax.transAxes, ha="right", va="center", fontsize=11, fontweight="bold")
+                ax.text(-0.12, 0.5, method_label(m), transform=ax.transAxes, ha="right", va="center", fontsize=11, fontweight="bold")
     fig.subplots_adjust(left=0.10, right=0.91, top=0.86, bottom=0.06, hspace=0.35, wspace=0.35)
     cax = fig.add_axes([0.925, 0.28, 0.014, 0.38])
     sm = plt.cm.ScalarMappable(cmap="coolwarm", norm=plt.Normalize(vmin=-vmax, vmax=vmax))
@@ -2035,6 +2149,8 @@ def plot_path_likelihood_bars(path_metrics: Dict[str, Dict[str, float]], out_pat
     for ax, key, ttl in zip(axs, keys, titles):
         vals = [path_metrics[m].get(key, np.nan) for m in methods]
         ax.bar(labels, vals, color=colors, alpha=0.92)
+        anchor_vals = [path_metrics[m].get(key, np.nan) for m in _lfgi_scale_names(methods) if m in path_metrics]
+        _set_ylim_from_anchor(ax, anchor_vals, include_zero=True)
         ax.set_title(ttl)
         ax.tick_params(axis="x", rotation=25)
         style_axis(ax, grid_axis="y")
@@ -2239,6 +2355,9 @@ def run_ng_nr_sweep(
         ax.grid(alpha=0.25)
         if metric in {"mmd", "ksd", "energy_kl", "ess_proxy"}:
             ax.set_yscale("log")
+            _set_ylim_from_anchor(ax, yvals, log=True, include_zero=False)
+        else:
+            _set_ylim_from_anchor(ax, yvals, include_zero=True)
     # Ratio plot in final panel.
     ax = axs[len(metric_names)]
     ax.plot(xvals, n_gate / xvals, marker="o", ms=3)
@@ -3025,6 +3144,9 @@ def main():
     pred_accs = [metrics[m]["pred_acc"] for m in methods] + [pred_ref["pred_acc"]]
     axs[0].bar(labels, pred_nlls, color=colors, alpha=0.92); axs[0].set_title("Test Predictive NLL"); axs[0].tick_params(axis="x", rotation=25)
     axs[1].bar(labels, pred_accs, color=colors, alpha=0.92); axs[1].set_title("Test Predictive Accuracy"); axs[1].tick_params(axis="x", rotation=25)
+    anchor_methods = _lfgi_scale_names(methods)
+    _set_ylim_from_anchor(axs[0], [metrics[m]["pred_nll"] for m in anchor_methods if m in metrics], include_zero=True)
+    _set_ylim_from_anchor(axs[1], [metrics[m]["pred_acc"] for m in anchor_methods if m in metrics], include_zero=True)
     for ax in axs: style_axis(ax, grid_axis="y")
     save_pub(fig, out_dir / "predictive_bars.png")
 
