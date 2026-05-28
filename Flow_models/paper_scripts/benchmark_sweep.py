@@ -27,7 +27,7 @@ Paper-matched headline metrics:
   * Sliced Kolmogorov--Smirnov distance for Funnel.
 
 Run modes:
-  * RUN_MODE = 'paper_sweep'  : the three paper GMM targets: singular GMM d=8, misaligned GMM d=8, misaligned GMM d=24.
+  * RUN_MODE = 'paper_sweep'  : paper targets: misaligned GMM d=8, misaligned GMM d=24, funnel d=10.
   * RUN_MODE = 'dpsmc_full'   : all overlap toy targets.
   * RUN_MODE = 'dpsmc_single' : quick GMM40 d=2 smoke test.
   * RUN_MODE = '<variant>'    : any single target, e.g. ionosphere_20.
@@ -2286,18 +2286,17 @@ def make_dpsmc_overlap_variants(include_blr=False, data_dir=None, include_d50=No
 
 
 def make_paper_sweep_variants():
-    """Three GMM targets used for the paper aggregate table.
+    """Paper-facing targets used for the aggregate benchmark table.
 
-    The sweep is intentionally restricted to the three examples selected for
-    the current paper section:
-      1. d=8 near-singular heterogeneous-curvature GMM;
-      2. d=8 misaligned singular-subspace GMM;
-      3. d=24 misaligned singular-subspace GMM.
+    The sweep is intentionally restricted to the three current paper examples:
+      1. d=8 misaligned singular-subspace GMM;
+      2. d=24 misaligned singular-subspace GMM;
+      3. d=10 Neal funnel with eta^2 controlled by LFGI_BENCH_FUNNEL_ETA2.
     """
     variants = OrderedDict()
-    variants['singular_hetero_gmm_d8'] = SingularHeterogeneousCurvatureGMM8Target()
     variants['misaligned_subspace_gmm_d8'] = MisalignedSingularSubspaceGMMTarget(d=8, rank=3)
     variants['misaligned_subspace_gmm_d24'] = MisalignedSingularSubspaceGMMTarget(d=24, rank=4)
+    variants['funnel_d10'] = FunnelTarget(d=10, eta2=FUNNEL_D10_ETA2)
     return variants
 
 
@@ -6260,7 +6259,7 @@ def resolve_run_mode_variants(run_mode):
     """Resolve LFGI_BENCH_RUN_MODE into (root_dir, variants).
 
     Supported forms:
-      * paper_sweep / paper / section9 -> three paper GMM targets
+      * paper_sweep / paper / section9 -> misaligned GMM d=8, misaligned GMM d=24, funnel d=10
       * dpsmc_full / dpsmc_all / all / full
       * dpsmc_single                 -> gmm40_d2
       * dpsmc_gmm25                  -> gmm40_d25
