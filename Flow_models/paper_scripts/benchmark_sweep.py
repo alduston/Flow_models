@@ -47,6 +47,8 @@ Environment knobs:
   * LFGI_BENCH_N_RUNS or LFGI_BENCH_NUM_RUNS: repeat selected targets and export mean/std aggregate metrics.
   * LFGI_BENCH_PLOT_RUNS=0/1: repeated runs also save dashboards/PNGs; defaults to 1.
   * LFGI_BENCH_STEPS, LFGI_BENCH_T_MAX, LFGI_BENCH_T_MIN
+  * METHODS or LFGI_BENCH_METHODS: comma-separated sampler list, e.g.
+      METHODS=tweedie,scalar_blend,plugin_blend,centered_blend,lfgi
   * LFGI_BENCH_SCORE_RMSE=0/1
   * LFGI_BENCH_AUX_METRICS=0/1
   * LFGI_BENCH_CURL=0/1
@@ -409,16 +411,43 @@ SAMPLER_CONFIGS = OrderedDict([
         'family': 'blend',
         'transition_w': 'ou',
     }),
-    ('primal-matrix-blend', {
-        # Direct moment-normal-equation estimator of the local optimal
-        # operator-valued gate: G_hat = -N_hat M_hat^{-1}.  This is the
-        # primal/moment baseline that LFGI replaces by the Hessian-resolvent
-        # representation at the same population optimum.
+    ('plugin-matrix-blend', {
+        # Uncentered plug-in normal-equation estimator of the local optimal
+        # operator-valued gate:
+        #     G_hat = - E_hat[b d^T] E_hat[d d^T]^{-1}.
+        # This is the old finite-reference primal/moment gate path.  It exposes
+        # empirical disagreement-mean leakage in Gaussian/singular regimes.
         'family': 'primal-matrix-blend',
         'transition_w': 'ou',
         'ridge': PRIMAL_MATRIX_BLEND_RIDGE,
         'ridge_rel': PRIMAL_MATRIX_BLEND_RIDGE_REL,
-        'center': PRIMAL_MATRIX_BLEND_CENTER,
+        'center': False,
+        'sym_gate': PRIMAL_MATRIX_BLEND_SYM_GATE,
+        'gate_clip': PRIMAL_MATRIX_BLEND_GATE_CLIP,
+    }),
+    ('centered-matrix-blend', {
+        # Centered paired-regression estimator of the same population matrix
+        # gate:
+        #     G_hat = - Cov_hat(b,d) Cov_hat(d,d)^{-1}.
+        # This is the fair Hessian-free matrix-gate baseline after removing the
+        # special Gaussian finite-sample mean-leakage artifact.
+        'family': 'primal-matrix-blend',
+        'transition_w': 'ou',
+        'ridge': PRIMAL_MATRIX_BLEND_RIDGE,
+        'ridge_rel': PRIMAL_MATRIX_BLEND_RIDGE_REL,
+        'center': True,
+        'sym_gate': PRIMAL_MATRIX_BLEND_SYM_GATE,
+        'gate_clip': PRIMAL_MATRIX_BLEND_GATE_CLIP,
+    }),
+    ('primal-matrix-blend', {
+        # Backward-compatible legacy name.  Treat the old matrix gate as the
+        # plug-in normal-equation baseline unless callers explicitly request
+        # centered-matrix-blend / centered_blend.
+        'family': 'primal-matrix-blend',
+        'transition_w': 'ou',
+        'ridge': PRIMAL_MATRIX_BLEND_RIDGE,
+        'ridge_rel': PRIMAL_MATRIX_BLEND_RIDGE_REL,
+        'center': False,
         'sym_gate': PRIMAL_MATRIX_BLEND_SYM_GATE,
         'gate_clip': PRIMAL_MATRIX_BLEND_GATE_CLIP,
     }),
@@ -501,7 +530,19 @@ SAMPLER_CONFIGS = OrderedDict([
 
 
 #DEFAULT_SAMPLERS = ['asym-adaptive-mp-ce-static', 'adaptive-mp-ce', 'mp-leaf_ce-hlsi', 'leaf_ce-hlsi', 'ce-hlsi', 'blend', 'tweedie']
-DEFAULT_SAMPLERS = ['tweedie', 'blend', 'primal-matrix-blend', 'ce-hlsi']
+def _env_method_list(default):
+    raw = os.environ.get('METHODS', os.environ.get('LFGI_BENCH_METHODS', '')).strip()
+    if not raw:
+        return list(default)
+    return [s.strip() for s in raw.replace(';', ',').split(',') if s.strip()]
+
+DEFAULT_SAMPLERS = _env_method_list([
+    'tweedie',
+    'blend',
+    'plugin-matrix-blend',
+    'centered-matrix-blend',
+    'ce-hlsi',
+])
 #DEFAULT_SAMPLERS = ['ce-hlsi', 'blend', 'tweedie']
 
 
@@ -510,19 +551,41 @@ _SAMPLER_ALIASES = {
     'tsi': 'tsi',
     'blend': 'blend',
     'blended': 'blend',
-    'primal-matrix-blend': 'primal-matrix-blend',
-    'primal_matrix_blend': 'primal-matrix-blend',
-    'primal matrix blend': 'primal-matrix-blend',
-    'moment-matrix-blend': 'primal-matrix-blend',
-    'moment_matrix_blend': 'primal-matrix-blend',
-    'moment matrix blend': 'primal-matrix-blend',
-    'matrix-blend': 'primal-matrix-blend',
-    'matrix_blend': 'primal-matrix-blend',
-    'matrix blend': 'primal-matrix-blend',
-    'operator-blend': 'primal-matrix-blend',
-    'operator_matrix_blend': 'primal-matrix-blend',
-    'primal': 'primal-matrix-blend',
-    'moment': 'primal-matrix-blend',
+    'scalar-blend': 'blend',
+    'scalar_blend': 'blend',
+    'scalar blend': 'blend',
+    'plugin-matrix-blend': 'plugin-matrix-blend',
+    'plugin_matrix_blend': 'plugin-matrix-blend',
+    'plugin matrix blend': 'plugin-matrix-blend',
+    'plugin-blend': 'plugin-matrix-blend',
+    'plugin_blend': 'plugin-matrix-blend',
+    'plugin blend': 'plugin-matrix-blend',
+    'uncentered-matrix-blend': 'plugin-matrix-blend',
+    'uncentered_matrix_blend': 'plugin-matrix-blend',
+    'uncentered blend': 'plugin-matrix-blend',
+    'primal-matrix-blend': 'plugin-matrix-blend',
+    'primal_matrix_blend': 'plugin-matrix-blend',
+    'primal matrix blend': 'plugin-matrix-blend',
+    'moment-matrix-blend': 'plugin-matrix-blend',
+    'moment_matrix_blend': 'plugin-matrix-blend',
+    'moment matrix blend': 'plugin-matrix-blend',
+    'matrix-blend': 'plugin-matrix-blend',
+    'matrix_blend': 'plugin-matrix-blend',
+    'matrix blend': 'plugin-matrix-blend',
+    'operator-blend': 'plugin-matrix-blend',
+    'operator_matrix_blend': 'plugin-matrix-blend',
+    'primal': 'plugin-matrix-blend',
+    'moment': 'plugin-matrix-blend',
+    'centered-matrix-blend': 'centered-matrix-blend',
+    'centered_matrix_blend': 'centered-matrix-blend',
+    'centered matrix blend': 'centered-matrix-blend',
+    'centered-blend': 'centered-matrix-blend',
+    'centered_blend': 'centered-matrix-blend',
+    'centered blend': 'centered-matrix-blend',
+    'centered-regression': 'centered-matrix-blend',
+    'centered_regression': 'centered-matrix-blend',
+    'regression-blend': 'centered-matrix-blend',
+    'regression_blend': 'centered-matrix-blend',
     'dpsmc-matrix-blend': 'dpsmc-matrix-blend',
     'dpsmc_matrix_blend': 'dpsmc-matrix-blend',
     'dpsmc matrix blend': 'dpsmc-matrix-blend',
@@ -538,6 +601,10 @@ _SAMPLER_ALIASES = {
     'hlsi': 'hlsi',
     'ce-hlsi': 'ce-hlsi',
     'ce_hlsi': 'ce-hlsi',
+    'lfgi': 'ce-hlsi',
+    'lfgi-blend': 'ce-hlsi',
+    'lfgi_blend': 'ce-hlsi',
+    'lfgi blend': 'ce-hlsi',
     'leaf-hlsi': 'leaf_hlsi',
     'leaf_hlsi': 'leaf_hlsi',
     'leaf-ce-hlsi': 'leaf_ce-hlsi',
@@ -3483,9 +3550,11 @@ def est_primal_matrix_blend(y, t, xr, w, target, s0_ref=None,
         M_hat = E_hat[d d^T],     N_hat = E_hat[(b-st) d^T],
         G_hat = - N_hat M_hat^{-1}.
 
-    Since st is unavailable in finite samples, ``center=True`` uses the
-    weighted least-squares equivalent with centered b and d.  The resulting
-    gate is then applied to the score/reference bank as
+    ``center=False`` is the uncentered plug-in mode
+        G_hat = -E_hat[b d^T] E_hat[d d^T]^{-1}.
+    ``center=True`` is the centered paired-regression mode
+        G_hat = -Cov_hat(b,d) Cov_hat(d,d)^{-1}.
+    The resulting gate is then applied to the score/reference bank as
 
         s_hat = E_hat[b] + G_hat (E_hat[c] - E_hat[b]).
 
@@ -5079,7 +5148,7 @@ def summarize_metric_rows(rows, metric_keys=None):
         groups.setdefault(key, []).append(row)
     summary_rows = []
     for (variant, method, dpsmc_metric_name, NR, NG, bank_coupling), group in groups.items():
-        out = {'variant': variant, 'method': method, 'dpsmc_metric_name': dpsmc_metric_name, 'NR': NR, 'NG': NG, 'bank_coupling': bank_coupling, 'n_runs': len(group)}
+        out = {'variant': variant, 'method': method, 'method_label': paper_method_label(method), 'dpsmc_metric_name': dpsmc_metric_name, 'NR': NR, 'NG': NG, 'bank_coupling': bank_coupling, 'n_runs': len(group)}
         for metric in metric_keys:
             vals = np.array([_metric_float(g.get(metric, np.nan)) for g in group], dtype=np.float64)
             vals = vals[np.isfinite(vals)]
@@ -5093,7 +5162,7 @@ def summarize_metric_rows(rows, metric_keys=None):
 
 def _aggregate_fieldnames(metric_keys=None):
     metric_keys = list(metric_keys or AGGREGATE_METRIC_KEYS)
-    fields = ['variant', 'method', 'dpsmc_metric_name', 'NR', 'NG', 'bank_coupling', 'n_runs']
+    fields = ['variant', 'method', 'method_label', 'dpsmc_metric_name', 'NR', 'NG', 'bank_coupling', 'n_runs']
     for metric in metric_keys:
         fields += [f'{metric}_mean', f'{metric}_std', f'{metric}_n', f'{metric}_pm_std']
     return fields
@@ -5108,7 +5177,8 @@ def save_aggregate_latex_table(summary_rows, out_dir, prefix='aggregate_metrics'
     lines.append('Target & Method & Coupling & ' + ' & '.join(metrics) + r' \\')
     lines.append(r'\hline')
     for row in summary_rows:
-        vals = [str(row.get('variant', '')).replace('_', r'\_'), str(row.get('method', '')).replace('_', r'\_'), str(row.get('bank_coupling', '')).replace('_', r'\_')]
+        method_display = row.get('method_label') or paper_method_label(row.get('method', ''))
+        vals = [str(row.get('variant', '')).replace('_', r'\_'), str(method_display).replace('_', r'\_'), str(row.get('bank_coupling', '')).replace('_', r'\_')]
         vals += [str(row.get(f'{m}_pm_std', 'N/A')) for m in metrics]
         lines.append(' & '.join(vals) + r' \\')
     lines.append(r'\end{tabular}')
@@ -5137,7 +5207,8 @@ def print_aggregate_summary(summary_rows, metrics=None):
     print(header)
     print('-' * len(header))
     for row in summary_rows:
-        line = f"{row.get('variant',''):<30s} {row.get('method',''):<16s} {row.get('bank_coupling',''):<12s}"
+        method_display = row.get('method_label') or paper_method_label(row.get('method', ''))
+        line = f"{row.get('variant',''):<30s} {method_display:<24s} {row.get('bank_coupling',''):<12s}"
         for metric in metrics:
             line += f" {row.get(f'{metric}_pm_std', 'N/A'):>22s}"
         print(line)
@@ -5336,7 +5407,7 @@ def build_meta_summary_lines(all_results, methods):
             if 'blend' not in res:
                 continue
             rb = res['blend']
-            for target_name in ('primal-matrix-blend', 'dpsmc-matrix-blend', 'dpsmc-ref-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi'):
+            for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'dpsmc-matrix-blend', 'dpsmc-ref-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi'):
                 if target_name not in res:
                     continue
                 rl = res[target_name]
@@ -5414,9 +5485,11 @@ _apply_publication_rcparams()
 
 PAPER_METHOD_LABELS = {
     'tweedie': 'TWEEDIE',
-    'blend': 'BLEND',
-    'primal-matrix-blend': 'MOMENT MATRIX',
-    'ce-hlsi': 'LFGI',
+    'blend': 'SCALAR BLEND',
+    'plugin-matrix-blend': 'PLUGIN MATRIX BLEND',
+    'centered-matrix-blend': 'CENTERED MATRIX BLEND',
+    'primal-matrix-blend': 'PLUGIN MATRIX BLEND',
+    'ce-hlsi': 'LFGI BLEND',
     'GT floor': 'GT FLOOR',
     'True': 'TRUE',
     'True (MALA)': 'TRUE',
@@ -5433,9 +5506,9 @@ PAPER_METHOD_LABELS = {
     'dpsmc-ref-matrix-blend': 'DPSMC REF. MATRIX BLEND',
     # Backward-compatible display strings from older notebooks/scripts.
     'Tweedie': 'TWEEDIE',
-    'Blended': 'BLEND',
-    'Primal Matrix': 'MOMENT MATRIX',
-    'CE-HLSI': 'LFGI',
+    'Blended': 'SCALAR BLEND',
+    'Primal Matrix': 'PLUGIN MATRIX BLEND',
+    'CE-HLSI': 'LFGI BLEND',
     'Leaf-CE-HLSI': 'LEAF LFGI',
 }
 
@@ -5456,7 +5529,7 @@ def paper_method_label(name):
     key = str(name)
     if key in PAPER_METHOD_LABELS:
         return PAPER_METHOD_LABELS[key]
-    return key.replace('_', '-').replace('ce-hlsi', 'lfgi').upper()
+    return key.replace('_', '-').replace('ce-hlsi', 'lfgi-blend').upper()
 
 
 def paper_target_label(target):
@@ -5477,6 +5550,8 @@ def _style_publication_axis(ax, *, grid=True):
 COLORS = {
     'tweedie':           '#D62728',
     'blend':             '#1F77B4',
+    'plugin-matrix-blend': '#FF7F0E',
+    'centered-matrix-blend': '#9467BD',
     'primal-matrix-blend': '#FF7F0E',
     'ce-hlsi':           '#2CA02C',
     'GT floor':          '#777777',
@@ -5514,6 +5589,8 @@ MARKERS = {
     'surrogate_leaf_ce-hlsi': '<', 'mp-leaf_hlsi': 'p',
     'mp-leaf_ce-hlsi': '*', 'adaptive-mp-ce': '8', 'asym-adaptive-mp-ce': 'd',
     'asym-adaptive-mp-ce-static': 'd', 'asym-adaptive-mp-ce-conditional': 'D', 'blend': 's',
+    'plugin-matrix-blend': 'v',
+    'centered-matrix-blend': '^',
     'primal-matrix-blend': 'v',
     'dpsmc-matrix-blend': 'x', 'dpsmc-ref-matrix-blend': '1',
     'adaptive-leaf_hlsi': 'h', 'adaptive-leaf_ce-hlsi': 'H',
@@ -5855,7 +5932,7 @@ def meta_run(root_dir='outputs_stress_test',
     Parameters
     ----------
     root_dir : str, root output directory
-    methods  : list of str, score estimators (default: TWEEDIE, BLEND, MOMENT MATRIX, LFGI)
+    methods  : list of str, score estimators (default: TWEEDIE, SCALAR BLEND, PLUGIN MATRIX BLEND, CENTERED MATRIX BLEND, LFGI BLEND)
     variants : dict of name → DW4Target, or None to use make_variants()
 
     Returns
@@ -5933,7 +6010,7 @@ def meta_run(root_dir='outputs_stress_test',
         if 'blend' not in res:
             continue
         rb = res['blend']
-        for target_name in ('primal-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi'):
+        for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi'):
             if target_name not in res:
                 continue
             rl = res[target_name]
