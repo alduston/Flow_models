@@ -12,7 +12,8 @@ What it produces
    For each target and each N_ref, it compares:
      - tweedie
      - blend        (coordinatewise plug-in scalar variance-minimizing blend)
-     - matrix-blend (primal/moment-normal-equation matrix-valued gate blend)
+     - plugin-moment       (uncentered primal/moment normal-equation gate)
+     - centered-regression (centered paired-regression matrix gate)
      - lfgi         (operator-valued LFGI Hessian-resolvent gate)
    Metrics saved and plotted:
      - MMD to exact target samples
@@ -22,8 +23,10 @@ What it produces
      - time-averaged noisy-score RMSE against the exact OU-marginal score
 
 2. Gate-estimation sample-complexity sweep on misaligned_subspace_gmm_d8:
-     - primal moment gate: estimates the optimal operator gate directly from
-       conditional moments of Tweedie/TSI atoms.
+     - plugin moment gate: estimates the optimal operator gate from uncentered
+       score moments, using the empirical zero-mean property of d directly.
+     - centered regression gate: estimates the same gate from centered paired
+       regression of b on d, removing the Gaussian empirical-mean artifact.
      - LFGI gate: estimates the same gate by posterior averaging clean Hessians
        and applying G = alpha^2 (alpha^2 I + gamma E[P|y,t])^{-1}.
    A large heldout clean pool is used as the oracle proxy. Gate error is reported
@@ -41,7 +44,8 @@ Publication plotting defaults
 -----------------------------
 The generated figures use paper-facing method names, large typography,
 print-safe line styles, and the color convention
-TWEEDIE=red, SCALAR BLEND=blue, MATRIX BLEND=purple, LFGI=green.
+TWEEDIE=red, SCALAR BLEND=blue, PLUGIN MOMENT=purple,
+CENTERED REGRESSION=orange, LFGI=green.
 
 The script intentionally avoids the full dashboard machinery: no histograms, no
 PCA panels, no curl diagnostics, no auxiliary metrics. It is meant to populate the
@@ -90,23 +94,29 @@ PUB_FIGSIZE = (5.6, 3.75)
 PUB_FIGSIZE_WIDE = (6.0, 3.8)
 
 # Fixed method color convention requested for the paper:
-# TWEEDIE = red, SCALAR BLEND = blue, MATRIX BLEND = purple, LFGI = green.
+# TWEEDIE = red, SCALAR BLEND = blue, PLUGIN MOMENT = purple,
+# CENTERED REGRESSION = orange, LFGI = green.
 # Markers and line styles are also distinct so the curves remain interpretable
 # in grayscale printouts.
 METHOD_STYLES = {
     "tweedie": {"label": "TWEEDIE", "color": "#D62728", "marker": "o", "linestyle": "--"},
     "blend": {"label": "SCALAR BLEND", "color": "#1F77B4", "marker": "s", "linestyle": "-."},
-    "matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "plugin-moment": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "centered-regression": {"label": "CENTERED REG.", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
     "lfgi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
     # Backward-compatible aliases for old raw logs / method names.
     "ce-hlsi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
-    "primal-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "moment-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "plugin-matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "primal-matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "moment-matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "centered-matrix-blend": {"label": "CENTERED REG.", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
 }
 
 GATE_STYLES = {
     "lfgi-hessian": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
-    "primal-moment": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "plugin-moment": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "centered-regression": {"label": "CENTERED REG.", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
 }
 
 TARGET_TITLES = {
@@ -131,7 +141,7 @@ METRIC_LABELS = {
     "score_rmse": "Score RMSE (lower is better)",
 }
 
-# For NLL, SCALAR BLEND and MATRIX BLEND can catastrophically blow up at small
+# For NLL, SCALAR BLEND and moment-gate baselines can catastrophically blow up at small
 # N_ref.  If the y-axis is scaled from all methods, the scientifically relevant
 # separation between TWEEDIE and LFGI is visually compressed.  We therefore keep
 # all methods plotted, but set the NLL axis limits from the comparison methods
@@ -224,7 +234,7 @@ def save_publication_figure(fig: plt.Figure, out_dir: Path, stem: str) -> None:
 def set_nll_focus_ylim(ax: plt.Axes, agg: List[Dict[str, object]]) -> None:
     """Set NLL y-limits from TWEEDIE/LFGI, not catastrophic blend outliers.
 
-    SCALAR BLEND and MATRIX BLEND are still drawn, but values outside the
+    SCALAR BLEND and moment-gate baselines are still drawn, but values outside the
     focused range are clipped by the axis.  This makes the LFGI-vs-TWEEDIE
     separation readable while still showing when the moment-based comparators
     re-enter the credible NLL range at large N_ref.
@@ -672,7 +682,7 @@ def ce_gate_matrix(Pbar: torch.Tensor, t: float | torch.Tensor, gate_clip: float
 
 
 
-def primal_matrix_blend_from_weights(
+def matrix_gate_atoms_from_weights(
     y: torch.Tensor,
     t: float | torch.Tensor,
     ref: ReferenceBank,
@@ -680,17 +690,21 @@ def primal_matrix_blend_from_weights(
     *,
     ridge: float = 1e-10,
     gate_clip: float = 0.0,
-) -> torch.Tensor:
-    """Primal moment-normal-equation matrix blend score estimator.
+    centered: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return a matrix-gate score estimate and its gate/moment diagnostics.
 
-    This is the direct finite-reference implementation of the local operator
-    control-variate optimum.  It estimates
-        G = -Cov(b,d) Cov(d,d)^{-1},    d = c - b,
-    using the same OU/SNIS posterior weights as the scalar blend, then returns
-        E[b|y] + G (E[c|y] - E[b|y]).
+    Both primal gates target the same population operator-gate normal equation,
+    but they use different finite-reference moment estimators.
 
-    LFGI uses the Hessian-resolvent identity to estimate the same population
-    gate more stably; this method is the moment-based comparator.
+    ``centered=False`` is the old plug-in moment gate.  It estimates
+        G = - E[b d^T] E[d d^T]^{-1}
+    by using the population identity E[d]=0 directly at finite N.
+
+    ``centered=True`` is the paired centered-regression gate.  It estimates
+        G = - Cov(b,d) Cov(d,d)^{-1}
+    by first subtracting the empirical weighted means.  This removes the special
+    Gaussian empirical-mean artifact while preserving the same population gate.
     """
     a = at(t).to(y).clamp_min(1e-30)
     g = vt(t).to(y).clamp_min(1e-30)
@@ -705,10 +719,15 @@ def primal_matrix_blend_from_weights(
     c_bar = torch.einsum("bn,bnd->bd", w, c_atom)
     d_bar = c_bar - b_bar
 
-    bc = b_atom - b_bar.unsqueeze(1)
-    dc = d_atom - d_bar.unsqueeze(1)
-    C = torch.einsum("bn,bni,bnj->bij", w, bc, dc)
-    D = sym(torch.einsum("bn,bni,bnj->bij", w, dc, dc))
+    if centered:
+        b_gate_atom = b_atom - b_bar.unsqueeze(1)
+        d_gate_atom = d_atom - d_bar.unsqueeze(1)
+    else:
+        b_gate_atom = b_atom
+        d_gate_atom = d_atom
+
+    C = torch.einsum("bn,bni,bnj->bij", w, b_gate_atom, d_gate_atom)
+    D = sym(torch.einsum("bn,bni,bnj->bij", w, d_gate_atom, d_gate_atom))
 
     # Add an absolute ridge to the disagreement covariance.  The primal normal
     # equation is intentionally left as the statistically difficult baseline;
@@ -727,7 +746,52 @@ def primal_matrix_blend_from_weights(
         S = S.clamp(max=float(gate_clip))
         G = torch.einsum("bij,bj,bjk->bik", U, S, Vh)
 
-    return b_bar + torch.einsum("bij,bj->bi", G, d_bar)
+    score = b_bar + torch.einsum("bij,bj->bi", G, d_bar)
+    return score, G, D, b_bar, d_bar
+
+
+def plugin_matrix_blend_from_weights(
+    y: torch.Tensor,
+    t: float | torch.Tensor,
+    ref: ReferenceBank,
+    w: torch.Tensor,
+    *,
+    ridge: float = 1e-10,
+    gate_clip: float = 0.0,
+) -> torch.Tensor:
+    """Uncentered primal plug-in moment-gate score estimator."""
+    score, _, _, _, _ = matrix_gate_atoms_from_weights(
+        y,
+        t,
+        ref,
+        w,
+        ridge=ridge,
+        gate_clip=gate_clip,
+        centered=False,
+    )
+    return score
+
+
+def centered_regression_blend_from_weights(
+    y: torch.Tensor,
+    t: float | torch.Tensor,
+    ref: ReferenceBank,
+    w: torch.Tensor,
+    *,
+    ridge: float = 1e-10,
+    gate_clip: float = 0.0,
+) -> torch.Tensor:
+    """Centered paired-regression matrix-gate score estimator."""
+    score, _, _, _, _ = matrix_gate_atoms_from_weights(
+        y,
+        t,
+        ref,
+        w,
+        ridge=ridge,
+        gate_clip=gate_clip,
+        centered=True,
+    )
+    return score
 
 
 def estimate_score_chunk(
@@ -771,9 +835,21 @@ def estimate_score_chunk(
             lam_twd = ((va - cab) / den).clamp(0.0, 1.0)
             outs.append((1.0 - lam_twd) * am + lam_twd * bm)
             continue
-        if method in {"matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"}:
+        if method in {"plugin-moment", "plugin-matrix-blend", "matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"}:
             outs.append(
-                primal_matrix_blend_from_weights(
+                plugin_matrix_blend_from_weights(
+                    yb,
+                    t,
+                    ref,
+                    w,
+                    ridge=primal_ridge,
+                    gate_clip=gate_clip,
+                )
+            )
+            continue
+        if method in {"centered-regression", "centered-matrix-blend", "centered-moment", "centered-primal", "regression-moment"}:
+            outs.append(
+                centered_regression_blend_from_weights(
                     yb,
                     t,
                     ref,
@@ -992,7 +1068,7 @@ def time_avg_score_rmse(
 # -----------------------------------------------------------------------------
 
 
-METHODS = ["tweedie", "blend", "matrix-blend", "lfgi"]
+METHODS = ["tweedie", "blend", "plugin-moment", "centered-regression", "lfgi"]
 DISPLAY = {m: METHOD_STYLES[m]["label"] for m in METHODS}
 
 
@@ -1001,8 +1077,10 @@ def method_aliases(method: str) -> List[str]:
     key = method.lower().replace("_", "-")
     if key == "lfgi":
         return ["lfgi", "ce-hlsi"]
-    if key == "matrix-blend":
-        return ["matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"]
+    if key == "plugin-moment":
+        return ["plugin-moment", "plugin-matrix-blend", "matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"]
+    if key == "centered-regression":
+        return ["centered-regression", "centered-matrix-blend", "centered-moment", "centered-primal", "regression-moment"]
     return [key]
 
 
@@ -1176,7 +1254,7 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
 
         if metric == "nll":
             # Focus NLL on the meaningful TWEEDIE-vs-LFGI comparison.  SCALAR
-            # BLEND and MATRIX BLEND can have huge positive NLL at small
+            # BLEND and moment-gate baselines can have huge positive NLL at small
             # reference counts, and using those outliers to choose the y-limits
             # makes the best two methods indistinguishable.  Keep a linear
             # scale so negative continuous-NLL values are shown directly.
@@ -1221,14 +1299,20 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
 # -----------------------------------------------------------------------------
 
 
-def weighted_primal_gate(
+def weighted_matrix_gate(
     y: torch.Tensor,
     t: float,
     ref: ReferenceBank,
     ridge: float,
     chunk: int = 64,
+    centered: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Estimate G* = -Cov(b,d) Cov(d,d)^{-1}; return G and D=Cov(d,d)."""
+    """Estimate a primal matrix gate; return G and the fitted D moment.
+
+    ``centered=False`` gives the old uncentered plug-in gate
+    -E[b d^T] E[d d^T]^{-1}.  ``centered=True`` gives the paired centered
+    regression gate -Cov(b,d) Cov(d,d)^{-1}.
+    """
     outs_G: List[torch.Tensor] = []
     outs_D: List[torch.Tensor] = []
     a = at(t).to(y).clamp_min(1e-30)
@@ -1243,10 +1327,14 @@ def weighted_primal_gate(
         d_atom = c_atom - b_atom
         b_bar = torch.einsum("bn,bnd->bd", w, b_atom)
         d_bar = torch.einsum("bn,bnd->bd", w, d_atom)
-        bc = b_atom - b_bar.unsqueeze(1)
-        dc = d_atom - d_bar.unsqueeze(1)
-        C = torch.einsum("bn,bni,bnj->bij", w, bc, dc)
-        D = sym(torch.einsum("bn,bni,bnj->bij", w, dc, dc))
+        if centered:
+            b_gate_atom = b_atom - b_bar.unsqueeze(1)
+            d_gate_atom = d_atom - d_bar.unsqueeze(1)
+        else:
+            b_gate_atom = b_atom
+            d_gate_atom = d_atom
+        C = torch.einsum("bn,bni,bnj->bij", w, b_gate_atom, d_gate_atom)
+        D = sym(torch.einsum("bn,bni,bnj->bij", w, d_gate_atom, d_gate_atom))
         A = D + float(ridge) * eye.unsqueeze(0)
         try:
             G = -torch.linalg.solve(A, C.transpose(-1, -2)).transpose(-1, -2)
@@ -1255,6 +1343,26 @@ def weighted_primal_gate(
         outs_G.append(torch.nan_to_num(G, nan=0.0, posinf=1e12, neginf=-1e12))
         outs_D.append(D)
     return torch.cat(outs_G, dim=0), torch.cat(outs_D, dim=0)
+
+
+def weighted_plugin_gate(
+    y: torch.Tensor,
+    t: float,
+    ref: ReferenceBank,
+    ridge: float,
+    chunk: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return weighted_matrix_gate(y, t, ref, ridge, chunk=chunk, centered=False)
+
+
+def weighted_centered_regression_gate(
+    y: torch.Tensor,
+    t: float,
+    ref: ReferenceBank,
+    ridge: float,
+    chunk: int = 64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return weighted_matrix_gate(y, t, ref, ridge, chunk=chunk, centered=True)
 
 
 def lfgi_gate_from_ref(
@@ -1301,7 +1409,10 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
 
         oracle_ref = make_reference_bank(target, args.gate_n_oracle)
         G_star = lfgi_gate_from_ref(yq, float(t), oracle_ref, gate_clip=args.gate_clip, chunk=args.gate_chunk)
-        _, D_star = weighted_primal_gate(yq, float(t), oracle_ref, ridge=args.primal_ridge, chunk=args.gate_chunk)
+        # Use a large-bank centered covariance as the risk geometry D_star.
+        # At population level E[d]=0, so centered and uncentered disagreement
+        # covariances coincide; centering only reduces oracle Monte Carlo noise.
+        _, D_star = weighted_centered_regression_gate(yq, float(t), oracle_ref, ridge=args.primal_ridge, chunk=args.gate_chunk)
         tweedie_gap = risk_weighted_gate_error(
             torch.zeros_like(G_star), G_star, D_star
         ).mean().clamp_min(1e-30)
@@ -1317,8 +1428,13 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
                 print(f"    t={t:g} N_gate={n_gate:5d} rep={rep:02d}")
                 t_start = time.time()
                 G_lfgi = lfgi_gate_from_ref(yq, float(t), ref, gate_clip=args.gate_clip, chunk=args.gate_chunk)
-                G_primal, _ = weighted_primal_gate(yq, float(t), ref, ridge=args.primal_ridge, chunk=args.gate_chunk)
-                for label, G_hat in [("lfgi-hessian", G_lfgi), ("primal-moment", G_primal)]:
+                G_plugin, _ = weighted_plugin_gate(yq, float(t), ref, ridge=args.primal_ridge, chunk=args.gate_chunk)
+                G_centered, _ = weighted_centered_regression_gate(yq, float(t), ref, ridge=args.primal_ridge, chunk=args.gate_chunk)
+                for label, G_hat in [
+                    ("plugin-moment", G_plugin),
+                    ("centered-regression", G_centered),
+                    ("lfgi-hessian", G_lfgi),
+                ]:
                     abs_excess = risk_weighted_gate_error(G_hat, G_star, D_star)
                     fro_rel = fro_relative_gate_error(G_hat, G_star)
                     rows.append({
@@ -1352,7 +1468,7 @@ def aggregate_gate_rows(rows: List[Dict[str, object]], target_name: str) -> List
     ]
     for t in sorted({float(r["t"]) for r in rows if r.get("target") == target_name}):
         for n in sorted({int(r["n_gate"]) for r in rows if r.get("target") == target_name and float(r["t"]) == t}):
-            for est in ["lfgi-hessian", "primal-moment"]:
+            for est in ["plugin-moment", "centered-regression", "lfgi-hessian"]:
                 sub = [r for r in rows if r.get("target") == target_name and float(r["t"]) == t and int(r["n_gate"]) == n and r.get("gate_estimator") == est]
                 if not sub:
                     continue
@@ -1381,7 +1497,7 @@ def plot_gate_sweep(rows: List[Dict[str, object]], target_name: str, out_dir: Pa
             fig, ax = plt.subplots(figsize=PUB_FIGSIZE_WIDE)
             positive: List[float] = []
 
-            for est in ["lfgi-hessian", "primal-moment"]:
+            for est in ["plugin-moment", "centered-regression", "lfgi-hessian"]:
                 sub = [r for r in agg if r["t"] == t and r["gate_estimator"] == est]
                 if not sub:
                     continue
@@ -1846,7 +1962,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--targets", nargs="+", default=["misaligned_subspace_gmm_d8"])
-    p.add_argument("--methods", nargs="+", default=METHODS, help="Currently informational; script plots TWEEDIE/SCALAR BLEND/MATRIX BLEND/LFGI.")
+    p.add_argument("--methods", nargs="+", default=METHODS, help="Currently informational; script plots TWEEDIE/SCALAR BLEND/PLUGIN MOMENT/CENTERED REGRESSION/LFGI.")
     p.add_argument("--nref-grid", nargs="+", type=int, default=[64, 128, 256, 512, 1024, 2048])
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--n-samples", type=int, default=1024, help="Reverse-SDE samples per method/repeat/N_ref")
