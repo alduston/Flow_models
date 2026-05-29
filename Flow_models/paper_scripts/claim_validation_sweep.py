@@ -75,6 +75,7 @@ import csv
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,34 +94,104 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 
 PUB_DPI = 450
-PUB_FIGSIZE = (5.6, 3.75)
-PUB_FIGSIZE_WIDE = (6.0, 3.8)
+PUB_FIGSIZE = (6.35, 4.85)
+PUB_FIGSIZE_WIDE = (6.8, 4.9)
+PUB_FIGSIZE_DIAGNOSTIC = (14.2, 5.15)
 
 # Fixed method color convention requested for the paper:
-# TWEEDIE = red, SCALAR BLEND = blue, PLUGIN MOMENT = purple,
-# CENTERED REGRESSION = orange, LFGI = green.
+# TWEEDIE = red, SCALAR BLEND = blue, MATRIX BLEND = purple,
+# CENTERED BLEND = orange, LFGI = green.
 # Markers and line styles are also distinct so the curves remain interpretable
 # in grayscale printouts.
 METHOD_STYLES = {
     "tweedie": {"label": "TWEEDIE", "color": "#D62728", "marker": "o", "linestyle": "--"},
     "blend": {"label": "SCALAR BLEND", "color": "#1F77B4", "marker": "s", "linestyle": "-."},
-    "plugin-moment": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "centered-regression": {"label": "CENTERED REG.", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
+    "plugin-moment": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "centered-regression": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
     "lfgi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
     # Backward-compatible aliases for old raw logs / method names.
     "ce-hlsi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
-    "matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "plugin-matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "primal-matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "moment-matrix-blend": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "centered-matrix-blend": {"label": "CENTERED REG.", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
+    "scalar-blend": {"label": "SCALAR BLEND", "color": "#1F77B4", "marker": "s", "linestyle": "-."},
+    "plugin-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "plugin-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "primal-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "moment-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "centered-blend": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
+    "centered-matrix-blend": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
 }
 
 GATE_STYLES = {
     "lfgi-hessian": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
-    "plugin-moment": {"label": "PLUGIN MOMENT", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "centered-regression": {"label": "CENTERED REG.", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
+    "plugin-moment": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
+    "centered-regression": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
 }
+
+
+DEFAULT_METHODS = ["tweedie", "blend", "plugin-moment", "centered-regression", "lfgi"]
+
+METHOD_CANONICAL_ALIASES = {
+    "tweedie": "tweedie",
+    "twd": "tweedie",
+    "blend": "blend",
+    "scalar": "blend",
+    "scalar-blend": "blend",
+    "plugin-blend": "plugin-moment",
+    "plugin-moment": "plugin-moment",
+    "matrix-blend": "plugin-moment",
+    "plugin-matrix-blend": "plugin-moment",
+    "primal-matrix-blend": "plugin-moment",
+    "moment-matrix-blend": "plugin-moment",
+    "moment-blend": "plugin-moment",
+    "primal-moment": "plugin-moment",
+    "centered-blend": "centered-regression",
+    "centered-regression": "centered-regression",
+    "centered-matrix-blend": "centered-regression",
+    "centered-moment": "centered-regression",
+    "centered-primal": "centered-regression",
+    "regression-moment": "centered-regression",
+    "lfgi": "lfgi",
+    "ce-hlsi": "lfgi",
+}
+
+
+def canonical_method_name(method: str) -> str:
+    key = str(method).strip().lower().replace("_", "-")
+    key = METHOD_CANONICAL_ALIASES.get(key, key)
+    if key not in DEFAULT_METHODS:
+        valid = ", ".join(["tweedie", "scalar_blend", "plugin_blend", "centered_blend", "lfgi"])
+        raise ValueError(f"Unknown method {method!r}; valid choices include {valid}.")
+    return key
+
+
+def parse_methods_arg(methods: Optional[Sequence[str]]) -> List[str]:
+    if methods is None:
+        return list(DEFAULT_METHODS)
+    tokens: List[str] = []
+    for item in methods:
+        tokens.extend(tok for tok in str(item).replace(",", " ").split() if tok)
+    if not tokens:
+        return list(DEFAULT_METHODS)
+    out: List[str] = []
+    for tok in tokens:
+        key = canonical_method_name(tok)
+        if key not in out:
+            out.append(key)
+    return out
+
+
+def legend_top_right(ax: plt.Axes, *, fontsize: Optional[float] = None, handlelength: float = 2.8) -> None:
+    ax.legend(
+        frameon=True,
+        fancybox=False,
+        framealpha=0.88,
+        facecolor="white",
+        edgecolor="0.85",
+        loc="upper right",
+        handlelength=handlelength,
+        borderaxespad=0.35,
+        fontsize=fontsize,
+    )
 
 TARGET_TITLES = {
     "misaligned_subspace_gmm_d8": r"Misaligned GMM ($d=8$)",
@@ -817,7 +888,7 @@ def estimate_score_chunk(
     gate_clip: float = 0.0,
     primal_ridge: float = 1e-10,
 ) -> torch.Tensor:
-    method = method.lower().replace("_", "-")
+    method = canonical_method_name(method)
     outs: List[torch.Tensor] = []
     if gate_ref is None:
         gate_ref = ref
@@ -1081,8 +1152,8 @@ def time_avg_score_rmse(
 # -----------------------------------------------------------------------------
 
 
-METHODS = ["tweedie", "blend", "plugin-moment", "centered-regression", "lfgi"]
-DISPLAY = {m: METHOD_STYLES[m]["label"] for m in METHODS}
+METHODS = DEFAULT_METHODS
+DISPLAY = {m: METHOD_STYLES[m]["label"] for m in DEFAULT_METHODS}
 
 
 def method_aliases(method: str) -> List[str]:
@@ -1102,6 +1173,7 @@ def run_metric_sweeps(args) -> List[Dict[str, object]]:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     targets = [make_target(t) for t in args.targets]
+    methods = parse_methods_arg(args.methods)
 
     for target in targets:
         print(f"\n[metric sweep] target={target.name}, d={target.d}")
@@ -1115,7 +1187,7 @@ def run_metric_sweeps(args) -> List[Dict[str, object]]:
                 np.random.seed(seed_here % (2**32 - 1))
                 ref = make_reference_bank(target, int(nref))
 
-                for method in METHODS:
+                for method in methods:
                     print(f"  N_ref={nref:5d} rep={rep:02d} method={method}")
                     t0 = time.time()
                     def score_fn(y, t, method=method, ref=ref):
@@ -1181,7 +1253,7 @@ def run_metric_sweeps(args) -> List[Dict[str, object]]:
                         "seconds": time.time() - t0,
                     })
                     flush_csv(out_dir / "metric_sweep_raw.csv", rows)
-        plot_metric_sweep(rows, target.name, out_dir)
+        plot_metric_sweep(rows, target.name, out_dir, methods=methods)
     return rows
 
 
@@ -1200,11 +1272,12 @@ def flush_csv(path: Path, rows: List[Dict[str, object]]) -> None:
             writer.writerow(r)
 
 
-def aggregate_metric_rows(rows: List[Dict[str, object]], target_name: str) -> List[Dict[str, object]]:
+def aggregate_metric_rows(rows: List[Dict[str, object]], target_name: str, methods: Optional[Sequence[str]] = None) -> List[Dict[str, object]]:
     out = []
+    methods = parse_methods_arg(methods)
     metrics = ["mmd", "sw2", "nll", "ksd", "score_rmse"]
     for nref in sorted({int(r["n_ref"]) for r in rows if r.get("target") == target_name}):
-        for method in METHODS:
+        for method in methods:
             aliases = set(method_aliases(method))
             sub = [r for r in rows if r.get("target") == target_name and int(r["n_ref"]) == nref and str(r.get("method", "")).lower().replace("_", "-") in aliases]
             if not sub:
@@ -1218,8 +1291,9 @@ def aggregate_metric_rows(rows: List[Dict[str, object]], target_name: str) -> Li
     return out
 
 
-def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_dir: Path) -> None:
-    agg = aggregate_metric_rows(all_rows, target_name)
+def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_dir: Path, methods: Optional[Sequence[str]] = None) -> None:
+    methods = parse_methods_arg(methods)
+    agg = aggregate_metric_rows(all_rows, target_name, methods=methods)
     if not agg:
         return
     flush_csv(out_dir / f"metric_sweep_summary_{target_name}.csv", agg)
@@ -1229,7 +1303,7 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
         fig, ax = plt.subplots(figsize=PUB_FIGSIZE)
         positive: List[float] = []
 
-        for method in METHODS:
+        for method in methods:
             # Accept backward-compatible raw-log aliases.
             method_keys = set(method_aliases(method))
             sub = [r for r in agg if str(r["method"]).lower().replace("_", "-") in method_keys]
@@ -1301,7 +1375,7 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
         ax.set_xlabel(r"Reference count $N_{\rm ref}$")
         ax.set_ylabel(METRIC_LABELS[metric])
         ax.set_title(f"{METRIC_TITLES[metric]}\n{paper_target_title(target_name)}", pad=7)
-        ax.legend(frameon=False, loc="best", handlelength=2.8, borderaxespad=0.3)
+        legend_top_right(ax, handlelength=2.8)
 
         stem = f"{target_name}_{metric}_vs_nref"
         save_publication_figure(fig, out_dir, stem)
@@ -1639,7 +1713,7 @@ def plot_gate_sweep(rows: List[Dict[str, object]], target_name: str, out_dir: Pa
                 f"{GATE_METRIC_TITLES[metric]}\n{paper_target_title(target_name)}, $t={float(t):g}$",
                 pad=7,
             )
-            ax.legend(frameon=False, loc="best", handlelength=2.8, borderaxespad=0.3)
+            legend_top_right(ax, handlelength=2.8)
 
             stem = f"{target_name}_gate_{metric}_t{str(t).replace('.', 'p')}_vs_ngate"
             save_publication_figure(fig, out_dir, stem)
@@ -1709,7 +1783,7 @@ def plot_gate_ratio_diagnostics(rows: List[Dict[str, object]], target_name: str,
         ax.set_xlabel(r"Predicted ratio $\mathcal{C}_{\mathrm{cen}}/\mathcal{C}_{\mathrm{LFGI}}$")
         ax.set_ylabel(r"Actual ratio $E_{\mathrm{cen}}^{(N)}/E_{\mathrm{LFGI}}^{(N)}$")
         ax.set_title(f"Predicted vs. actual gate difficulty\n{paper_target_title(target_name)}, $t={float(t):g}$", pad=7)
-        ax.legend(frameon=False, loc="best", handlelength=1.8, borderaxespad=0.3, fontsize=9.5)
+        legend_top_right(ax, fontsize=9.5, handlelength=1.8)
         stem = f"{target_name}_gate_predicted_vs_actual_ratio_t{str(t).replace('.', 'p')}"
         save_publication_figure(fig, out_dir, stem)
 
@@ -1733,7 +1807,7 @@ def plot_gate_ratio_diagnostics(rows: List[Dict[str, object]], target_name: str,
             ax.set_xlabel(r"Gate-bank size $N_g$")
             ax.set_ylabel(r"Centered/LFGI difficulty ratio")
             ax.set_title(f"Median predicted and actual ratio\n{paper_target_title(target_name)}, $t={float(t):g}$", pad=7)
-            ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
+            legend_top_right(ax, handlelength=2.4)
             stem = f"{target_name}_gate_ratio_medians_t{str(t).replace('.', 'p')}"
             save_publication_figure(fig, out_dir, stem)
 
@@ -1910,6 +1984,17 @@ def residual_coupling_stats_chunk(
     D_trace = torch.diagonal(D, dim1=-2, dim2=-1).sum(-1).clamp_min(1e-300)
     residual_cross_orthogonality = R_energy / torch.sqrt(R_trace * D_trace)
 
+    # Direct pieces of the centered-primal side of the relative-advantage
+    # inequality.  The population normal equation has E[r_* d^T]=0, so the
+    # dominant finite-bank scale is the variance of the empirical residual
+    # cross moment after preconditioning by M^{-1/2}.
+    R_Dinv = right_solve_sym(Rrd, D, ridge=float(ridge))
+    residual_cross_preconditioned_sq = (R_Dinv * Rrd).sum(dim=(-1, -2)).clamp_min(0.0)
+    D_eigs = safe_sym_eigvalsh(D, name="D_residual_stats").clamp_min(0.0)
+    rho_t = torch.as_tensor(float(ridge), dtype=D.dtype, device=D.device).clamp_min(0.0)
+    normal_eq_inverse_factor = (D_eigs / (D_eigs + rho_t).clamp_min(1e-300)).amax(dim=-1).square()
+    centered_lhs_no_neff = residual_leverage_product * normal_eq_inverse_factor
+
     entropy, top1_mass, top2_mass = component_entropy_diagnostics(target, yb, float(t))
 
     return {
@@ -1920,6 +2005,9 @@ def residual_coupling_stats_chunk(
         "residual_leverage_top1pct_mass": top1pct_mass,
         "residual_cross_cov_fro": R_energy,
         "residual_cross_orthogonality": residual_cross_orthogonality,
+        "residual_cross_preconditioned_sq": residual_cross_preconditioned_sq,
+        "normal_eq_inverse_factor": normal_eq_inverse_factor,
+        "centered_lhs_no_neff": centered_lhs_no_neff,
         "component_entropy": entropy,
         "component_top1_mass": top1_mass,
         "component_top2_mass": top2_mass,
@@ -2080,8 +2168,12 @@ def compute_learnability_diagnostics(
             lfgi_complexity_proxy = float("nan")
             centered_complexity_proxy = float("nan")
             residual_hessian_ratio = float("nan")
+            lfgi_rhs_term = float("nan")
+            centered_lhs_term = float("nan")
+            relative_advantage_ratio = float("nan")
             cond_A = float("nan")
 
+            ess_j = float(ess[j].detach().cpu())
             residual_norm2 = float(residual_stats["residual_norm2"][j].detach().cpu())
             disagreement_leverage_mean = float(residual_stats["disagreement_leverage_mean"][j].detach().cpu())
             residual_leverage_product = float(residual_stats["residual_leverage_product"][j].detach().cpu())
@@ -2089,6 +2181,11 @@ def compute_learnability_diagnostics(
             residual_leverage_top1pct_mass = float(residual_stats["residual_leverage_top1pct_mass"][j].detach().cpu())
             residual_cross_cov_fro = float(residual_stats["residual_cross_cov_fro"][j].detach().cpu())
             residual_cross_orthogonality = float(residual_stats["residual_cross_orthogonality"][j].detach().cpu())
+            residual_cross_preconditioned_sq = float(residual_stats["residual_cross_preconditioned_sq"][j].detach().cpu())
+            normal_eq_inverse_factor = float(residual_stats["normal_eq_inverse_factor"][j].detach().cpu())
+            centered_lhs_no_neff = float(residual_stats["centered_lhs_no_neff"][j].detach().cpu())
+            if np.isfinite(centered_lhs_no_neff) and ess_j > 1e-300:
+                centered_lhs_term = centered_lhs_no_neff / ess_j
             component_entropy = float(residual_stats["component_entropy"][j].detach().cpu())
             component_top1_mass = float(residual_stats["component_top1_mass"][j].detach().cpu())
             component_top2_mass = float(residual_stats["component_top2_mass"][j].detach().cpu())
@@ -2141,6 +2238,10 @@ def compute_learnability_diagnostics(
                         lfgi_complexity_proxy = float(alpha4_lambdaB_identity * vA2)
                         if lfgi_complexity_proxy > 1e-300:
                             residual_hessian_ratio = float(residual_leverage_product / lfgi_complexity_proxy)
+                            if ess_j > 1e-300:
+                                lfgi_rhs_term = float(lfgi_complexity_proxy / ess_j)
+                                if np.isfinite(centered_lhs_term) and lfgi_rhs_term > 1e-300:
+                                    relative_advantage_ratio = float(centered_lhs_term / lfgi_rhs_term)
                         if og > 1e-300:
                             sufficient_complexity_proxy = float(lfgi_complexity_proxy / og)
                             centered_complexity_proxy = float(residual_leverage_product / og)
@@ -2180,6 +2281,12 @@ def compute_learnability_diagnostics(
                 "residual_leverage_top1pct_mass": residual_leverage_top1pct_mass,
                 "residual_cross_cov_fro": residual_cross_cov_fro,
                 "residual_cross_orthogonality": residual_cross_orthogonality,
+                "residual_cross_preconditioned_sq": residual_cross_preconditioned_sq,
+                "normal_eq_inverse_factor": normal_eq_inverse_factor,
+                "centered_lhs_no_neff": centered_lhs_no_neff,
+                "centered_lhs_term": centered_lhs_term,
+                "lfgi_rhs_term": lfgi_rhs_term,
+                "relative_advantage_ratio": relative_advantage_ratio,
                 "component_entropy": component_entropy,
                 "component_top1_mass": component_top1_mass,
                 "component_top2_mass": component_top2_mass,
@@ -2212,6 +2319,12 @@ def aggregate_learnability_rows(rows: List[Dict[str, object]], target_name: str)
         "residual_leverage_top1pct_mass",
         "residual_cross_cov_fro",
         "residual_cross_orthogonality",
+        "residual_cross_preconditioned_sq",
+        "normal_eq_inverse_factor",
+        "centered_lhs_no_neff",
+        "centered_lhs_term",
+        "lfgi_rhs_term",
+        "relative_advantage_ratio",
         "component_entropy",
         "component_top1_mass",
         "component_top2_mass",
@@ -2264,6 +2377,20 @@ def _plot_summary_series(
         ax.fill_between(xs, lo, hi, alpha=0.16, linewidth=0.0)
 
 
+def _annotate_plot_window(ax: plt.Axes, plot_t_max: Optional[float]) -> None:
+    if plot_t_max is not None:
+        ax.text(
+            0.98,
+            0.035,
+            rf"plot window: $t\leq {plot_t_max:g}$",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8.5,
+            color="0.35",
+        )
+
+
 def plot_learnability_diagnostics(
     rows: List[Dict[str, object]],
     target_name: str,
@@ -2282,129 +2409,189 @@ def plot_learnability_diagnostics(
         if not plot_summary:
             plot_summary = summary
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.85))
+    pd_vals = [float(r.get("abar_pd_fraction", float("nan"))) for r in plot_summary]
+    pd_note = bool(np.isfinite(pd_vals).all() and min(pd_vals) < 1.0)
+
+    # Primary paper-facing diagnostic: both sides of the relative-advantage
+    # comparison in Eq. (relative-advantage-regime), using query-level effective
+    # sample size.  The centered side is the residual/leverage scale for the
+    # empirical primal normal equation; the LFGI side is the Hessian-resolvent
+    # concentration scale.
+    fig, axes = plt.subplots(1, 3, figsize=PUB_FIGSIZE_DIAGNOSTIC)
 
     ax = axes[0]
     _plot_summary_series(
         ax,
         plot_summary,
-        "sufficient_complexity_proxy",
-        label=r"$\alpha_t^4\Lambda_B\,v_A^2/\mathcal{G}_\star$",
-        marker="o",
-    )
-    style_axis(ax, log_x=False, y_scale="log")
-    ax.set_xlabel(r"Diffusion time $t$")
-    ax.set_ylabel(r"Required-reference proxy")
-    ax.set_title(r"Derived complexity proxy", pad=7)
-
-    ax = axes[1]
-    _plot_summary_series(ax, plot_summary, "alpha4_lambdaB_identity", label=r"$\alpha_t^4\Lambda_B$", marker="D")
-    xs = np.asarray([float(r["t"]) for r in plot_summary], dtype=float)
-    bound = np.asarray([float(r.get("psd_cancellation_bound_d_over_gamma_median", float("nan"))) for r in plot_summary], dtype=float)
-    mask = np.isfinite(xs) & np.isfinite(bound)
-    if mask.any():
-        order = np.argsort(xs[mask])
-        ax.plot(xs[mask][order], bound[mask][order], linestyle="--", linewidth=2.0, label=r"PSD bound $d/\gamma_t$")
-    style_axis(ax, log_x=False, y_scale="log")
-    ax.set_xlabel(r"Diffusion time $t$")
-    ax.set_ylabel(r"Sharpened pole factor")
-    ax.set_title(r"Resolvent cancellation scale", pad=7)
-    ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
-
-    ax = axes[2]
-    _plot_summary_series(ax, plot_summary, "oracle_gain_rel_to_D_trace", label=r"$\mathcal{G}_\star/\operatorname{tr}(D)$", marker="s")
-    style_axis(ax, log_x=False, y_scale="linear")
-    ax.set_xlabel(r"Diffusion time $t$")
-    ax.set_ylabel(r"Normalized oracle gain")
-    ax.set_title(r"Gain available to capture", pad=7)
-    ax.set_ylim(bottom=0.0)
-
-    for ax in axes:
-        pd_vals = [float(r.get("abar_pd_fraction", float("nan"))) for r in plot_summary]
-        if np.isfinite(pd_vals).all() and min(pd_vals) < 1.0:
-            ax.text(0.02, 0.04, "excludes non-PD A queries", transform=ax.transAxes, fontsize=8.5, color="0.35")
-        if plot_t_max is not None:
-            ax.text(0.98, 0.04, rf"plot window: $t\leq {plot_t_max:g}$", transform=ax.transAxes, ha="right", fontsize=8.5, color="0.35")
-
-    fig.suptitle(f"LFGI learnability diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
-    fig.tight_layout(pad=0.45, w_pad=1.15)
-    stem = f"{target_name}_lfgi_learnability_diagnostics"
-    fig.savefig(out_dir / f"{stem}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
-    fig.savefig(out_dir / f"{stem}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
-    plt.close(fig)
-
-    # Section-9.3 residual-coupling diagnostics: centered-primal numerator side
-    # versus LFGI Hessian-variation denominator side, plus atom-level interaction.
-    fig2, axes2 = plt.subplots(1, 3, figsize=(13.6, 3.85))
-
-    ax = axes2[0]
-    _plot_summary_series(
-        ax,
-        plot_summary,
-        "centered_complexity_proxy",
-        label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{G}_\star$",
+        "centered_lhs_term",
+        label=r"centered LHS",
         marker="v",
     )
     _plot_summary_series(
         ax,
         plot_summary,
-        "sufficient_complexity_proxy",
-        label=r"$\mathcal{C}_{\mathrm{LFGI}}/\mathcal{G}_\star$",
+        "lfgi_rhs_term",
+        label=r"LFGI RHS",
         marker="D",
         linestyle="--",
     )
     style_axis(ax, log_x=False, y_scale="log")
     ax.set_xlabel(r"Diffusion time $t$")
-    ax.set_ylabel(r"Gain-normalized complexity")
-    ax.set_title(r"Centered vs. LFGI proxies", pad=7)
-    ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
+    ax.set_ylabel(r"Per-query finite-$N$ scale")
+    ax.set_title(r"Relative-advantage terms", pad=7)
+    legend_top_right(ax, handlelength=2.4)
 
-    ax = axes2[1]
+    ax = axes[1]
     _plot_summary_series(
         ax,
         plot_summary,
-        "residual_hessian_ratio",
-        label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{C}_{\mathrm{LFGI}}$",
+        "relative_advantage_ratio",
+        label=r"centered/LFGI",
         marker="o",
     )
+    style_axis(ax, log_x=False, y_scale="log")
+    ax.axhline(1.0, linestyle="--", linewidth=1.3, color="0.45")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Difficulty ratio")
+    ax.set_title(r"Predicted separation", pad=7)
+    legend_top_right(ax, handlelength=2.4)
+
+    ax = axes[2]
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "centered_lhs_no_neff",
+        label=r"centered numerator",
+        marker="v",
+    )
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "lfgi_complexity_proxy",
+        label=r"LFGI numerator",
+        marker="D",
+        linestyle="--",
+    )
+    style_axis(ax, log_x=False, y_scale="log")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Complexity before $N_{\rm eff}$")
+    ax.set_title(r"Reference-independent scales", pad=7)
+    legend_top_right(ax, handlelength=2.4)
+
+    for ax in axes:
+        if pd_note:
+            ax.text(0.02, 0.035, "excludes non-PD A queries", transform=ax.transAxes, fontsize=8.5, color="0.35")
+        _annotate_plot_window(ax, plot_t_max)
+
+    fig.suptitle(f"Gate-estimation learnability diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
+    fig.tight_layout(pad=0.55, w_pad=1.35)
+    stem = f"{target_name}_lfgi_learnability_diagnostics"
+    fig.savefig(out_dir / f"{stem}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    fig.savefig(out_dir / f"{stem}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+
+    # Secondary diagnostic: decompose the two sides into the quantities appearing
+    # in the text.  This is intended for deciding what to report, not necessarily
+    # for the main paper figure.
+    fig2, axes2 = plt.subplots(1, 3, figsize=PUB_FIGSIZE_DIAGNOSTIC)
+
+    ax = axes2[0]
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "residual_leverage_product",
+        label=r"$\|\widehat R_dM^{-1/2}\|_F^2$ scale",
+        marker="v",
+    )
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "normal_eq_inverse_factor",
+        label=r"inverse factor",
+        marker="s",
+        linestyle="--",
+    )
+    style_axis(ax, log_x=False, y_scale="log")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Centered-primal ingredients")
+    ax.set_title(r"Residual leakage and inverse factor", pad=7)
+    legend_top_right(ax, handlelength=2.2)
+
+    ax = axes2[1]
+    _plot_summary_series(ax, plot_summary, "alpha4_lambdaB_identity", label=r"$\alpha_t^4\Lambda_B$", marker="D")
+    _plot_summary_series(ax, plot_summary, "vA2", label=r"$v_A^2$", marker="o", linestyle="--")
+    xs = np.asarray([float(r["t"]) for r in plot_summary], dtype=float)
+    bound = np.asarray([float(r.get("psd_cancellation_bound_d_over_gamma_median", float("nan"))) for r in plot_summary], dtype=float)
+    mask = np.isfinite(xs) & np.isfinite(bound)
+    if mask.any():
+        order = np.argsort(xs[mask])
+        ax.plot(xs[mask][order], bound[mask][order], linestyle=":", linewidth=2.0, label=r"PSD bound $d/\gamma_t$")
+    style_axis(ax, log_x=False, y_scale="log")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"LFGI-resolvent ingredients")
+    ax.set_title(r"Hessian-side factors", pad=7)
+    legend_top_right(ax, handlelength=2.2)
+
+    ax = axes2[2]
+    _plot_summary_series(ax, plot_summary, "oracle_gain_rel_to_D_trace", label=r"$\mathcal{G}_\star/\operatorname{tr}(D)$", marker="s")
+    _plot_summary_series(ax, plot_summary, "component_entropy", label=r"component entropy", marker="^", linestyle="--")
+    style_axis(ax, log_x=False, y_scale="linear")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Context")
+    ax.set_title(r"Gain and responsibility overlap", pad=7)
+    ax.set_ylim(bottom=0.0)
+    legend_top_right(ax, handlelength=2.2)
+
+    for ax in axes2:
+        if pd_note:
+            ax.text(0.02, 0.035, "excludes non-PD A queries", transform=ax.transAxes, fontsize=8.5, color="0.35")
+        _annotate_plot_window(ax, plot_t_max)
+
+    fig2.suptitle(f"Relative-advantage factorization: {paper_target_title(target_name)}", y=1.02, fontsize=16)
+    fig2.tight_layout(pad=0.55, w_pad=1.35)
+    stem2 = f"{target_name}_relative_advantage_factorization"
+    fig2.savefig(out_dir / f"{stem2}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    fig2.savefig(out_dir / f"{stem2}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig2)
+
+    # Retain the residual-coupling figure as a lower-level debugging view.
+    fig3, axes3 = plt.subplots(1, 3, figsize=PUB_FIGSIZE_DIAGNOSTIC)
+
+    ax = axes3[0]
+    _plot_summary_series(ax, plot_summary, "centered_complexity_proxy", label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{G}_\star$", marker="v")
+    _plot_summary_series(ax, plot_summary, "sufficient_complexity_proxy", label=r"$\mathcal{C}_{\mathrm{LFGI}}/\mathcal{G}_\star$", marker="D", linestyle="--")
+    style_axis(ax, log_x=False, y_scale="log")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Gain-normalized complexity")
+    ax.set_title(r"Centered vs. LFGI proxies", pad=7)
+    legend_top_right(ax, handlelength=2.4)
+
+    ax = axes3[1]
+    _plot_summary_series(ax, plot_summary, "residual_hessian_ratio", label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{C}_{\mathrm{LFGI}}$", marker="o")
     style_axis(ax, log_x=False, y_scale="log")
     ax.axhline(1.0, linestyle="--", linewidth=1.3, color="0.45")
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Residual/Hessian ratio")
     ax.set_title(r"Predicted relative difficulty", pad=7)
 
-    ax = axes2[2]
-    _plot_summary_series(
-        ax,
-        plot_summary,
-        "residual_leverage_interaction",
-        label=r"interaction",
-        marker="s",
-    )
-    _plot_summary_series(
-        ax,
-        plot_summary,
-        "residual_leverage_top1pct_mass",
-        label=r"top 1% mass",
-        marker="^",
-        linestyle="--",
-    )
+    ax = axes3[2]
+    _plot_summary_series(ax, plot_summary, "residual_leverage_interaction", label=r"interaction", marker="s")
+    _plot_summary_series(ax, plot_summary, "residual_leverage_top1pct_mass", label=r"top 1% mass", marker="^", linestyle="--")
     style_axis(ax, log_x=False, y_scale="linear")
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Atom-level concentration")
     ax.set_title(r"Residual-leverage interaction", pad=7)
-    ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
+    legend_top_right(ax, handlelength=2.4)
 
-    for ax in axes2:
-        if plot_t_max is not None:
-            ax.text(0.98, 0.04, rf"plot window: $t\leq {plot_t_max:g}$", transform=ax.transAxes, ha="right", fontsize=8.5, color="0.35")
+    for ax in axes3:
+        _annotate_plot_window(ax, plot_t_max)
 
-    fig2.suptitle(f"Residual-coupling diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
-    fig2.tight_layout(pad=0.45, w_pad=1.15)
-    stem2 = f"{target_name}_residual_coupling_diagnostics"
-    fig2.savefig(out_dir / f"{stem2}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
-    fig2.savefig(out_dir / f"{stem2}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
-    plt.close(fig2)
+    fig3.suptitle(f"Residual-coupling diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
+    fig3.tight_layout(pad=0.55, w_pad=1.35)
+    stem3 = f"{target_name}_residual_coupling_diagnostics"
+    fig3.savefig(out_dir / f"{stem3}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    fig3.savefig(out_dir / f"{stem3}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig3)
     return summary
 
 def run_learnability_diagnostics(args) -> List[Dict[str, object]]:
@@ -2454,7 +2641,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--targets", nargs="+", default=["misaligned_subspace_gmm_d8"])
-    p.add_argument("--methods", nargs="+", default=METHODS, help="Currently informational; script plots TWEEDIE/SCALAR BLEND/PLUGIN MOMENT/CENTERED REGRESSION/LFGI.")
+    p.add_argument("--methods", nargs="+", default=DEFAULT_METHODS, help="Comma- or space-separated metric-sweep methods. Aliases accepted: tweedie, scalar_blend, plugin_blend, centered_blend, lfgi.")
     p.add_argument("--nref-grid", nargs="+", type=int, default=[64, 128, 256, 512, 1024, 2048])
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--n-samples", type=int, default=1024, help="Reverse-SDE samples per method/repeat/N_ref")
@@ -2504,12 +2691,25 @@ def save_run_config(args) -> None:
 
 
 def main() -> None:
-    args = build_argparser().parse_args()
+    # Be forgiving of notebook line breaks that accidentally produce `-- methods`.
+    argv = sys.argv[1:]
+    cleaned: List[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--" and i + 1 < len(argv) and argv[i + 1].replace("_", "-") == "methods":
+            cleaned.append("--methods")
+            i += 2
+            continue
+        cleaned.append(argv[i])
+        i += 1
+    args = build_argparser().parse_args(cleaned)
+    args.methods = parse_methods_arg(args.methods)
     set_runtime(args.device, args.dtype, args.seed)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     save_run_config(args)
     print(f"device={current_device()} dtype={torch.get_default_dtype()} out={args.out_dir}")
     print(f"targets={args.targets}")
+    print(f"metric methods={args.methods}")
 
     all_metric_rows: List[Dict[str, object]] = []
     all_gate_rows: List[Dict[str, object]] = []
