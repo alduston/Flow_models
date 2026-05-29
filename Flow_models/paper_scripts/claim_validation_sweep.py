@@ -94,9 +94,9 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 
 PUB_DPI = 450
-PUB_FIGSIZE = (6.45, 5.75)
-PUB_FIGSIZE_WIDE = (7.0, 5.65)
-PUB_FIGSIZE_DIAGNOSTIC = (14.6, 5.8)
+PUB_FIGSIZE = (6.45, 5.35)
+PUB_FIGSIZE_WIDE = (7.0, 5.25)
+PUB_FIGSIZE_DIAGNOSTIC = (14.6, 5.45)
 
 # Fixed method color convention requested for the paper:
 # TWEEDIE = red, SCALAR BLEND = blue, MATRIX BLEND = purple,
@@ -180,34 +180,92 @@ def parse_methods_arg(methods: Optional[Sequence[str]]) -> List[str]:
     return out
 
 
-def legend_top_right(ax: plt.Axes, *, fontsize: Optional[float] = None, handlelength: float = 2.8) -> None:
-    """Place legends in the upper-right corner with an opaque white box.
+def legend_best(ax: plt.Axes, *, fontsize: Optional[float] = None, handlelength: float = 2.8) -> None:
+    """Use Matplotlib's best-placement legend with an opaque white box.
 
-    The explicit bbox anchor avoids matplotlib's ``loc='best'`` behavior and
-    keeps the legend out of the lower-left curve bundle seen in the old score
-    RMSE panels.  Metric plots add extra top headroom before this is called, so
-    this upper-right placement has blank vertical space to occupy.
+    We previously forced legends into the upper-right corner, but the diagnostic
+    panels sometimes put important curves there.  ``loc="best"`` is more
+    robust after we add a small amount of headroom and set y-limits from the
+    plotted median/mean lines rather than from uncertainty bands.
     """
     ax.legend(
         frameon=True,
         fancybox=False,
-        framealpha=0.94,
+        framealpha=0.92,
         facecolor="white",
         edgecolor="0.80",
-        loc="upper right",
-        bbox_to_anchor=(0.985, 0.985),
+        loc="best",
         handlelength=handlelength,
-        borderaxespad=0.0,
+        borderaxespad=0.35,
         fontsize=fontsize,
     )
 
 
-def add_top_y_headroom(ax: plt.Axes, *, frac: float = 0.38) -> None:
-    """Add vertical headroom so an upper-right legend does not cover curves.
+def legend_top_right(ax: plt.Axes, *, fontsize: Optional[float] = None, handlelength: float = 2.8) -> None:
+    """Backward-compatible name; now delegates to best-placement legend."""
+    legend_best(ax, fontsize=fontsize, handlelength=handlelength)
 
-    For log-y panels, headroom is multiplicative in log space.  For linear and
-    symlog panels, it is additive in data space.
+
+def _line_y_values_for_limits(ax: plt.Axes) -> np.ndarray:
+    """Finite y-values from labelled data lines, excluding error bars/bands.
+
+    Errorbar cap lines and helper lines usually have private/no-legend labels.
+    Uncertainty bands live in collections, so ignoring collections lets shaded
+    q10--q90 regions go offscreen instead of blowing up the axis range.
     """
+    vals: List[float] = []
+    for line in ax.lines:
+        label = str(line.get_label())
+        if not label or label.startswith("_"):
+            continue
+        y = np.asarray(line.get_ydata(orig=False), dtype=float).reshape(-1)
+        vals.extend([float(v) for v in y if np.isfinite(v)])
+    return np.asarray(vals, dtype=float)
+
+
+def set_y_limits_from_lines(
+    ax: plt.Axes,
+    *,
+    top_frac: float = 0.14,
+    bottom_frac: float = 0.06,
+    include_zero_bottom: bool = False,
+) -> None:
+    """Set y-limits from plotted mean/median lines, not uncertainty bands.
+
+    ``top_frac`` keeps a small amount of vertical room for legends.  The shaded
+    uncertainty regions are intentionally allowed to clip when they are huge.
+    """
+    vals = _line_y_values_for_limits(ax)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return
+    scale = ax.get_yscale()
+    if scale == "log":
+        vals = vals[vals > 0.0]
+        if vals.size == 0:
+            return
+        lo = float(np.min(vals))
+        hi = float(np.max(vals))
+        if not (np.isfinite(lo) and np.isfinite(hi) and hi > 0.0 and lo > 0.0):
+            return
+        log_lo, log_hi = math.log10(lo), math.log10(hi)
+        span = max(log_hi - log_lo, 1e-6)
+        ax.set_ylim(10.0 ** (log_lo - bottom_frac * span), 10.0 ** (log_hi + top_frac * span))
+    else:
+        lo = float(np.min(vals))
+        hi = float(np.max(vals))
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return
+        span = max(hi - lo, max(abs(hi), abs(lo), 1.0) * 1e-6)
+        new_lo = lo - bottom_frac * span
+        new_hi = hi + top_frac * span
+        if include_zero_bottom:
+            new_lo = min(0.0, new_lo)
+        ax.set_ylim(new_lo, new_hi)
+
+
+def add_top_y_headroom(ax: plt.Axes, *, frac: float = 0.14) -> None:
+    """Small legacy headroom helper for places that do not use line limits."""
     try:
         y0, y1 = ax.get_ylim()
     except Exception:
@@ -349,12 +407,9 @@ def set_nll_focus_ylim(ax: plt.Axes, agg: List[Dict[str, object]]) -> None:
         if str(r.get("method", "")).lower() not in NLL_YLIM_METHODS:
             continue
         mean = float(r.get("nll_mean", float("nan")))
-        std = float(r.get("nll_std", 0.0))
         if not np.isfinite(mean):
             continue
-        if not np.isfinite(std):
-            std = 0.0
-        vals.extend([mean - std, mean, mean + std])
+        vals.append(mean)
 
     vals_arr = np.asarray([v for v in vals if np.isfinite(v)], dtype=float)
     if vals_arr.size < 2:
@@ -1403,14 +1458,18 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
         style_axis(ax, log_x=True, y_scale=y_scale, symlog_linthresh=symlog_linthresh)
         if metric == "nll":
             set_nll_focus_ylim(ax, agg)
-        # Leave blank vertical room for the fixed upper-right legend.
-        add_top_y_headroom(ax, frac=0.42 if metric == "score_rmse" else 0.34)
+        # Set limits from method mean curves only; error bars may clip if huge.
+        # Keep modest headroom so loc="best" has a little space to work with.
+        if metric != "nll":
+            set_y_limits_from_lines(ax, top_frac=0.16 if metric == "score_rmse" else 0.12, bottom_frac=0.05)
+        else:
+            add_top_y_headroom(ax, frac=0.10)
         ax.set_xlabel(r"Reference count $N_{\rm ref}$")
         ax.set_ylabel(METRIC_LABELS[metric])
         ax.set_title(f"{METRIC_TITLES[metric]}\n{paper_target_title(target_name)}", pad=7)
-        legend_top_right(ax, handlelength=2.8)
+        legend_best(ax, handlelength=2.8)
 
-        stem = f"{target_name}_{metric}_vs_nref"
+        stem = f"{metric}_vs_nref_{target_name}"
         save_publication_figure(fig, out_dir, stem)
 
 
@@ -1740,15 +1799,16 @@ def plot_gate_sweep(rows: List[Dict[str, object]], target_name: str, out_dir: Pa
 
             use_log_y = len(positive) >= 2
             style_axis(ax, log_x=True, log_y=use_log_y)
+            set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.05)
             ax.set_xlabel(r"Gate-bank size $N_g$")
             ax.set_ylabel(GATE_METRIC_LABELS[metric])
             ax.set_title(
                 f"{GATE_METRIC_TITLES[metric]}\n{paper_target_title(target_name)}, $t={float(t):g}$",
                 pad=7,
             )
-            legend_top_right(ax, handlelength=2.8)
+            legend_best(ax, handlelength=2.8)
 
-            stem = f"{target_name}_gate_{metric}_t{str(t).replace('.', 'p')}_vs_ngate"
+            stem = f"gate_capture_{metric}_vs_ngate_t{str(t).replace('.', 'p')}_{target_name}"
             save_publication_figure(fig, out_dir, stem)
 
 
@@ -1816,8 +1876,8 @@ def plot_gate_ratio_diagnostics(rows: List[Dict[str, object]], target_name: str,
         ax.set_xlabel(r"Predicted ratio $\mathcal{C}_{\mathrm{cen}}/\mathcal{C}_{\mathrm{LFGI}}$")
         ax.set_ylabel(r"Actual ratio $E_{\mathrm{cen}}^{(N)}/E_{\mathrm{LFGI}}^{(N)}$")
         ax.set_title(f"Predicted vs. actual gate difficulty\n{paper_target_title(target_name)}, $t={float(t):g}$", pad=7)
-        legend_top_right(ax, fontsize=9.5, handlelength=1.8)
-        stem = f"{target_name}_gate_predicted_vs_actual_ratio_t{str(t).replace('.', 'p')}"
+        legend_best(ax, fontsize=9.5, handlelength=1.8)
+        stem = f"gate_ratio_predicted_vs_actual_t{str(t).replace('.', 'p')}_{target_name}"
         save_publication_figure(fig, out_dir, stem)
 
     if summary:
@@ -1840,8 +1900,8 @@ def plot_gate_ratio_diagnostics(rows: List[Dict[str, object]], target_name: str,
             ax.set_xlabel(r"Gate-bank size $N_g$")
             ax.set_ylabel(r"Centered/LFGI difficulty ratio")
             ax.set_title(f"Median predicted and actual ratio\n{paper_target_title(target_name)}, $t={float(t):g}$", pad=7)
-            legend_top_right(ax, handlelength=2.4)
-            stem = f"{target_name}_gate_ratio_medians_t{str(t).replace('.', 'p')}"
+            legend_best(ax, handlelength=2.4)
+            stem = f"gate_ratio_medians_t{str(t).replace('.', 'p')}_{target_name}"
             save_publication_figure(fig, out_dir, stem)
 
 
@@ -2469,10 +2529,11 @@ def plot_learnability_diagnostics(
         linestyle="--",
     )
     style_axis(ax, log_x=False, y_scale="log")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.06)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Per-query finite-$N$ scale")
     ax.set_title(r"Relative-advantage terms", pad=7)
-    legend_top_right(ax, handlelength=2.4)
+    legend_best(ax, handlelength=2.4)
 
     ax = axes[1]
     _plot_summary_series(
@@ -2484,10 +2545,11 @@ def plot_learnability_diagnostics(
     )
     style_axis(ax, log_x=False, y_scale="log")
     ax.axhline(1.0, linestyle="--", linewidth=1.3, color="0.45")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.06)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Difficulty ratio")
     ax.set_title(r"Predicted separation", pad=7)
-    legend_top_right(ax, handlelength=2.4)
+    legend_best(ax, handlelength=2.4)
 
     ax = axes[2]
     _plot_summary_series(
@@ -2506,10 +2568,11 @@ def plot_learnability_diagnostics(
         linestyle="--",
     )
     style_axis(ax, log_x=False, y_scale="log")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.06)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Complexity before $N_{\rm eff}$")
     ax.set_title(r"Reference-independent scales", pad=7)
-    legend_top_right(ax, handlelength=2.4)
+    legend_best(ax, handlelength=2.4)
 
     for ax in axes:
         if pd_note:
@@ -2518,7 +2581,7 @@ def plot_learnability_diagnostics(
 
     fig.suptitle(f"Gate-estimation learnability diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
     fig.tight_layout(pad=0.55, w_pad=1.35)
-    stem = f"{target_name}_lfgi_learnability_diagnostics"
+    stem = f"lfgi_learnability_diagnostics_{target_name}"
     fig.savefig(out_dir / f"{stem}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
     fig.savefig(out_dir / f"{stem}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig)
@@ -2545,10 +2608,11 @@ def plot_learnability_diagnostics(
         linestyle="--",
     )
     style_axis(ax, log_x=False, y_scale="log")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.06)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Centered-primal ingredients")
     ax.set_title(r"Residual leakage and inverse factor", pad=7)
-    legend_top_right(ax, handlelength=2.2)
+    legend_best(ax, handlelength=2.2)
 
     ax = axes2[1]
     _plot_summary_series(ax, plot_summary, "alpha4_lambdaB_identity", label=r"$\alpha_t^4\Lambda_B$", marker="D")
@@ -2560,20 +2624,21 @@ def plot_learnability_diagnostics(
         order = np.argsort(xs[mask])
         ax.plot(xs[mask][order], bound[mask][order], linestyle=":", linewidth=2.0, label=r"PSD bound $d/\gamma_t$")
     style_axis(ax, log_x=False, y_scale="log")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.06)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"LFGI-resolvent ingredients")
     ax.set_title(r"Hessian-side factors", pad=7)
-    legend_top_right(ax, handlelength=2.2)
+    legend_best(ax, handlelength=2.2)
 
     ax = axes2[2]
     _plot_summary_series(ax, plot_summary, "oracle_gain_rel_to_D_trace", label=r"$\mathcal{G}_\star/\operatorname{tr}(D)$", marker="s")
     _plot_summary_series(ax, plot_summary, "component_entropy", label=r"component entropy", marker="^", linestyle="--")
     style_axis(ax, log_x=False, y_scale="linear")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.02, include_zero_bottom=True)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Context")
     ax.set_title(r"Gain and responsibility overlap", pad=7)
-    ax.set_ylim(bottom=0.0)
-    legend_top_right(ax, handlelength=2.2)
+    legend_best(ax, handlelength=2.2)
 
     for ax in axes2:
         if pd_note:
@@ -2582,7 +2647,7 @@ def plot_learnability_diagnostics(
 
     fig2.suptitle(f"Relative-advantage factorization: {paper_target_title(target_name)}", y=1.02, fontsize=16)
     fig2.tight_layout(pad=0.55, w_pad=1.35)
-    stem2 = f"{target_name}_relative_advantage_factorization"
+    stem2 = f"relative_advantage_factorization_{target_name}"
     fig2.savefig(out_dir / f"{stem2}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
     fig2.savefig(out_dir / f"{stem2}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig2)
@@ -2594,15 +2659,17 @@ def plot_learnability_diagnostics(
     _plot_summary_series(ax, plot_summary, "centered_complexity_proxy", label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{G}_\star$", marker="v")
     _plot_summary_series(ax, plot_summary, "sufficient_complexity_proxy", label=r"$\mathcal{C}_{\mathrm{LFGI}}/\mathcal{G}_\star$", marker="D", linestyle="--")
     style_axis(ax, log_x=False, y_scale="log")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.06)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Gain-normalized complexity")
     ax.set_title(r"Centered vs. LFGI proxies", pad=7)
-    legend_top_right(ax, handlelength=2.4)
+    legend_best(ax, handlelength=2.4)
 
     ax = axes3[1]
     _plot_summary_series(ax, plot_summary, "residual_hessian_ratio", label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{C}_{\mathrm{LFGI}}$", marker="o")
     style_axis(ax, log_x=False, y_scale="log")
     ax.axhline(1.0, linestyle="--", linewidth=1.3, color="0.45")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.06)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Residual/Hessian ratio")
     ax.set_title(r"Predicted relative difficulty", pad=7)
@@ -2611,17 +2678,18 @@ def plot_learnability_diagnostics(
     _plot_summary_series(ax, plot_summary, "residual_leverage_interaction", label=r"interaction", marker="s")
     _plot_summary_series(ax, plot_summary, "residual_leverage_top1pct_mass", label=r"top 1% mass", marker="^", linestyle="--")
     style_axis(ax, log_x=False, y_scale="linear")
+    set_y_limits_from_lines(ax, top_frac=0.12, bottom_frac=0.02, include_zero_bottom=True)
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Atom-level concentration")
     ax.set_title(r"Residual-leverage interaction", pad=7)
-    legend_top_right(ax, handlelength=2.4)
+    legend_best(ax, handlelength=2.4)
 
     for ax in axes3:
         _annotate_plot_window(ax, plot_t_max)
 
     fig3.suptitle(f"Residual-coupling diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
     fig3.tight_layout(pad=0.55, w_pad=1.35)
-    stem3 = f"{target_name}_residual_coupling_diagnostics"
+    stem3 = f"residual_coupling_diagnostics_{target_name}"
     fig3.savefig(out_dir / f"{stem3}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
     fig3.savefig(out_dir / f"{stem3}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig3)
