@@ -47,8 +47,8 @@ Publication plotting defaults
 -----------------------------
 The generated figures use paper-facing method names, large typography,
 print-safe line styles, and the color convention
-TWEEDIE=red, SCALAR BLEND=blue, PLUGIN MOMENT=purple,
-CENTERED REGRESSION=orange, LFGI=green.
+TWEEDIE=red, SCALAR BLEND=blue, MATRIX BLEND=purple,
+MOMENT BLEND=orange, LFGI=green.
 
 The script intentionally avoids the full dashboard machinery: no histograms, no
 PCA panels, no curl diagnostics, no auxiliary metrics. It is meant to populate the
@@ -251,7 +251,14 @@ def set_y_limits_from_lines(
             return
         log_lo, log_hi = math.log10(lo), math.log10(hi)
         span = max(log_hi - log_lo, 1e-6)
-        ax.set_ylim(10.0 ** (log_lo - bottom_frac * span), 10.0 ** (log_hi + top_frac * span))
+        # Avoid pathological smoke-test values from producing infinite ticks.
+        # Real diagnostics live many orders below these caps; clipping only
+        # affects degenerate tiny-bank runs.
+        y0_exp = float(np.clip(log_lo - bottom_frac * span, -50.0, 50.0))
+        y1_exp = float(np.clip(log_hi + top_frac * span, -50.0, 50.0))
+        if y1_exp <= y0_exp:
+            y1_exp = min(50.0, y0_exp + 1.0)
+        ax.set_ylim(10.0 ** y0_exp, 10.0 ** y1_exp)
     else:
         lo = float(np.min(vals))
         hi = float(np.max(vals))
@@ -800,6 +807,29 @@ def snis_weights(y: torch.Tensor, t: float | torch.Tensor, xr: torch.Tensor) -> 
     lw = lw - lw.max(dim=1, keepdim=True).values
     w = torch.exp(lw)
     return w / w.sum(dim=1, keepdim=True).clamp_min(1e-30)
+
+
+def finite_bank_posterior_ess(
+    y: torch.Tensor,
+    t: float | torch.Tensor,
+    ref: ReferenceBank,
+    *,
+    chunk: int = 256,
+) -> torch.Tensor:
+    """SNIS effective sample size for each query under a finite reference bank.
+
+    This is the finite-N_eff that appears in the LFGI side of the primitive
+    relative-advantage inequality.  Earlier diagnostics used the oracle-bank ESS
+    from the time-only learnability pass, making the LFGI RHS artificially flat
+    as N_g varied.
+    """
+    outs: List[torch.Tensor] = []
+    for i in range(0, y.shape[0], chunk):
+        yb = y[i : i + chunk]
+        w = snis_weights(yb, t, ref.x)
+        ess = 1.0 / w.square().sum(dim=1).clamp_min(1e-300)
+        outs.append(ess)
+    return torch.cat(outs, dim=0)
 
 
 def tweedie_from_weights(y: torch.Tensor, t: float | torch.Tensor, ref: ReferenceBank, w: torch.Tensor) -> torch.Tensor:
@@ -1689,9 +1719,26 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
                         ridge=args.primal_ridge,
                         chunk=args.gate_chunk,
                     )
+                    finite_ess = finite_bank_posterior_ess(
+                        yq,
+                        float(t),
+                        ref,
+                        chunk=args.gate_chunk,
+                    )
                     actual_ratio = safe_ratio(centered_excess, lfgi_excess)
                     for q in range(yq.shape[0]):
                         pred = prediction_by_query.get(q, {})
+                        lfgi_complexity_q = float(pred.get("lfgi_complexity_proxy", float("nan")))
+                        finite_ess_q = float(finite_ess[q].detach().cpu())
+                        if np.isfinite(lfgi_complexity_q) and np.isfinite(finite_ess_q) and finite_ess_q > 0.0:
+                            finite_lfgi_rhs_q = lfgi_complexity_q / finite_ess_q
+                        else:
+                            finite_lfgi_rhs_q = float("nan")
+                        centered_lhs_q = float(identity["centered_identity_rhs"][q].detach().cpu())
+                        if np.isfinite(centered_lhs_q) and np.isfinite(finite_lfgi_rhs_q) and finite_lfgi_rhs_q > 0.0:
+                            finite_adv_ratio_q = centered_lhs_q / finite_lfgi_rhs_q
+                        else:
+                            finite_adv_ratio_q = float("nan")
                         ratio_rows.append({
                             "experiment": "gate_ratio_prediction",
                             "target": target.name,
@@ -1709,6 +1756,10 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
                             "predicted_lfgi_rhs_term": float(pred.get("lfgi_rhs_term", float("nan"))),
                             "predicted_centered_lhs_term": float(pred.get("centered_lhs_term", float("nan"))),
                             "predicted_posterior_ess": float(pred.get("posterior_ess", float("nan"))),
+                            "finite_posterior_ess": finite_ess_q,
+                            "finite_posterior_ess_fraction": finite_ess_q / max(float(n_gate), 1.0) if np.isfinite(finite_ess_q) else float("nan"),
+                            "finite_lfgi_rhs_term": finite_lfgi_rhs_q,
+                            "finite_relative_advantage_ratio": finite_adv_ratio_q,
                             "residual_norm2": float(pred.get("residual_norm2", float("nan"))),
                             "residual_leverage_product": float(pred.get("residual_leverage_product", float("nan"))),
                             "residual_leverage_interaction": float(pred.get("residual_leverage_interaction", float("nan"))),
@@ -1830,6 +1881,10 @@ def aggregate_gate_ratio_rows(rows: List[Dict[str, object]], target_name: str) -
         "predicted_centered_complexity_proxy",
         "predicted_lfgi_complexity_proxy",
         "predicted_posterior_ess",
+        "finite_posterior_ess",
+        "finite_posterior_ess_fraction",
+        "finite_lfgi_rhs_term",
+        "finite_relative_advantage_ratio",
         "residual_cross_moment_energy",
         "empirical_inverse_amplification",
         "residual_leverage_interaction",
@@ -1938,8 +1993,8 @@ def plot_finite_n_relative_advantage(summary: List[Dict[str, object]], target_na
     panel_specs = [
         ("centered_identity_rhs_median", r"centered LHS", r"$\|\widehat R_d M^{-1/2}\|_F^2\,\|M^{1/2}(\widehat M+\rho I)^{-1}M^{1/2}\|_{\mathrm{op}}^2$"),
         (None, r"centered factors", r"primitive factors"),
-        ("predicted_lfgi_rhs_term_median", r"LFGI RHS", r"$\alpha_t^4\Lambda_B \, v_A^2 / N_{\mathrm{eff}}$"),
-        (None, r"predicted advantage ratio", r"centered/LFGI"),
+        ("finite_lfgi_rhs_term_median", r"LFGI RHS", r"$\alpha_t^4\Lambda_B \, v_A^2 / N_{\mathrm{eff}}^{(N_g)}$"),
+        (None, r"finite advantage ratio", r"centered/LFGI"),
     ]
 
     for ax, (metric, title, ylabel) in zip(axes, panel_specs):
@@ -1967,15 +2022,14 @@ def plot_finite_n_relative_advantage(summary: List[Dict[str, object]], target_na
                         ax.plot(xs[mask2], y2[mask2], marker="s", linestyle="--", linewidth=2.0, color=color, alpha=0.95, label=rf"inverse, $t={t:g}$")
                 else:
                     y1 = np.asarray([float(r.get("centered_identity_rhs_median", float("nan"))) for r in sub], dtype=float)[order]
-                    y2 = np.asarray([float(r.get("predicted_lfgi_rhs_term_median", float("nan"))) for r in sub], dtype=float)[order]
-                    ratio = np.divide(y1, y2, out=np.full_like(y1, np.nan), where=np.isfinite(y1) & np.isfinite(y2) & (y2 > 0.0))
+                    ratio = np.asarray([float(r.get("finite_relative_advantage_ratio_median", float("nan"))) for r in sub], dtype=float)[order]
                     mask = np.isfinite(xs) & np.isfinite(ratio) & (ratio > 0.0)
                     if mask.any():
                         ax.plot(xs[mask], ratio[mask], marker="o", linestyle="-", linewidth=2.1, color=color, label=rf"$t={t:g}$")
 
         style_axis(ax, log_x=True, y_scale="log")
         set_y_limits_from_lines(ax, top_frac=0.10, bottom_frac=0.06)
-        if title == r"predicted advantage ratio":
+        if title == r"finite advantage ratio":
             ax.axhline(1.0, linestyle=":", linewidth=1.2, color="0.45")
         ax.set_xlabel(r"Gate-bank size $N_g$")
         ax.set_ylabel(ylabel)
