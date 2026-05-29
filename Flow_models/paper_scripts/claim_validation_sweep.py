@@ -94,9 +94,9 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 
 PUB_DPI = 450
-PUB_FIGSIZE = (6.35, 4.85)
-PUB_FIGSIZE_WIDE = (6.8, 4.9)
-PUB_FIGSIZE_DIAGNOSTIC = (14.2, 5.15)
+PUB_FIGSIZE = (6.45, 5.75)
+PUB_FIGSIZE_WIDE = (7.0, 5.65)
+PUB_FIGSIZE_DIAGNOSTIC = (14.6, 5.8)
 
 # Fixed method color convention requested for the paper:
 # TWEEDIE = red, SCALAR BLEND = blue, MATRIX BLEND = purple,
@@ -181,17 +181,48 @@ def parse_methods_arg(methods: Optional[Sequence[str]]) -> List[str]:
 
 
 def legend_top_right(ax: plt.Axes, *, fontsize: Optional[float] = None, handlelength: float = 2.8) -> None:
+    """Place legends in the upper-right corner with an opaque white box.
+
+    The explicit bbox anchor avoids matplotlib's ``loc='best'`` behavior and
+    keeps the legend out of the lower-left curve bundle seen in the old score
+    RMSE panels.  Metric plots add extra top headroom before this is called, so
+    this upper-right placement has blank vertical space to occupy.
+    """
     ax.legend(
         frameon=True,
         fancybox=False,
-        framealpha=0.88,
+        framealpha=0.94,
         facecolor="white",
-        edgecolor="0.85",
+        edgecolor="0.80",
         loc="upper right",
+        bbox_to_anchor=(0.985, 0.985),
         handlelength=handlelength,
-        borderaxespad=0.35,
+        borderaxespad=0.0,
         fontsize=fontsize,
     )
+
+
+def add_top_y_headroom(ax: plt.Axes, *, frac: float = 0.38) -> None:
+    """Add vertical headroom so an upper-right legend does not cover curves.
+
+    For log-y panels, headroom is multiplicative in log space.  For linear and
+    symlog panels, it is additive in data space.
+    """
+    try:
+        y0, y1 = ax.get_ylim()
+    except Exception:
+        return
+    if not (np.isfinite(y0) and np.isfinite(y1)) or y1 <= y0:
+        return
+    scale = ax.get_yscale()
+    if scale == "log" and y0 > 0.0 and y1 > 0.0:
+        log0 = math.log10(y0)
+        log1 = math.log10(y1)
+        span = max(log1 - log0, 1e-12)
+        ax.set_ylim(y0, 10.0 ** (log1 + frac * span))
+    else:
+        span = max(y1 - y0, 1e-12)
+        ax.set_ylim(y0, y1 + frac * span)
 
 TARGET_TITLES = {
     "misaligned_subspace_gmm_d8": r"Misaligned GMM ($d=8$)",
@@ -1372,6 +1403,8 @@ def plot_metric_sweep(all_rows: List[Dict[str, object]], target_name: str, out_d
         style_axis(ax, log_x=True, y_scale=y_scale, symlog_linthresh=symlog_linthresh)
         if metric == "nll":
             set_nll_focus_ylim(ax, agg)
+        # Leave blank vertical room for the fixed upper-right legend.
+        add_top_y_headroom(ax, frac=0.42 if metric == "score_rmse" else 0.34)
         ax.set_xlabel(r"Reference count $N_{\rm ref}$")
         ax.set_ylabel(METRIC_LABELS[metric])
         ax.set_title(f"{METRIC_TITLES[metric]}\n{paper_target_title(target_name)}", pad=7)
@@ -2641,7 +2674,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--targets", nargs="+", default=["misaligned_subspace_gmm_d8"])
-    p.add_argument("--methods", nargs="+", default=DEFAULT_METHODS, help="Comma- or space-separated metric-sweep methods. Aliases accepted: tweedie, scalar_blend, plugin_blend, centered_blend, lfgi.")
+    p.add_argument("--methods", nargs="+", default=None, help="Comma- or space-separated metric-sweep methods. Aliases accepted: tweedie, scalar_blend, plugin_blend, centered_blend, lfgi. Example: --methods tweedie,scalar_blend,centered_blend,lfgi")
     p.add_argument("--nref-grid", nargs="+", type=int, default=[64, 128, 256, 512, 1024, 2048])
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--n-samples", type=int, default=1024, help="Reverse-SDE samples per method/repeat/N_ref")
@@ -2691,16 +2724,26 @@ def save_run_config(args) -> None:
 
 
 def main() -> None:
-    # Be forgiving of notebook line breaks that accidentally produce `-- methods`.
+    # Be forgiving of notebook line breaks that accidentally produce
+    # `-- methods ...` instead of `--methods ...`.  We also accept
+    # `-- methods=tweedie,lfgi` and singular `method`.
     argv = sys.argv[1:]
     cleaned: List[str] = []
     i = 0
     while i < len(argv):
-        if argv[i] == "--" and i + 1 < len(argv) and argv[i + 1].replace("_", "-") == "methods":
-            cleaned.append("--methods")
-            i += 2
-            continue
-        cleaned.append(argv[i])
+        tok = argv[i]
+        if tok == "--" and i + 1 < len(argv):
+            nxt = argv[i + 1]
+            nxt_norm = nxt.strip().lower().replace("_", "-")
+            if nxt_norm in {"methods", "method"}:
+                cleaned.append("--methods")
+                i += 2
+                continue
+            if nxt_norm.startswith("methods=") or nxt_norm.startswith("method="):
+                cleaned.append("--methods=" + nxt.split("=", 1)[1])
+                i += 2
+                continue
+        cleaned.append(tok)
         i += 1
     args = build_argparser().parse_args(cleaned)
     args.methods = parse_methods_arg(args.methods)
