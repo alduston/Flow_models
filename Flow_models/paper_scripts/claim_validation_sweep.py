@@ -100,31 +100,32 @@ PUB_FIGSIZE_DIAGNOSTIC = (14.6, 5.45)
 
 # Fixed method color convention requested for the paper:
 # TWEEDIE = red, SCALAR BLEND = blue, MATRIX BLEND = purple,
-# CENTERED BLEND = orange, LFGI = green.
+# MOMENT BLEND = orange, LFGI = green.
 # Markers and line styles are also distinct so the curves remain interpretable
 # in grayscale printouts.
 METHOD_STYLES = {
     "tweedie": {"label": "TWEEDIE", "color": "#D62728", "marker": "o", "linestyle": "--"},
     "blend": {"label": "SCALAR BLEND", "color": "#1F77B4", "marker": "s", "linestyle": "-."},
-    "plugin-moment": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "centered-regression": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
+    "plugin-moment": {"label": "MOMENT BLEND", "color": "#FF7F0E", "marker": "^", "linestyle": ":"},
+    "centered-regression": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "v", "linestyle": "-"},
     "lfgi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
     # Backward-compatible aliases for old raw logs / method names.
     "ce-hlsi": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
     "scalar-blend": {"label": "SCALAR BLEND", "color": "#1F77B4", "marker": "s", "linestyle": "-."},
-    "plugin-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "plugin-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "primal-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "moment-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "centered-blend": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
-    "centered-matrix-blend": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
+    "plugin-blend": {"label": "MOMENT BLEND", "color": "#FF7F0E", "marker": "^", "linestyle": ":"},
+    "moment-blend": {"label": "MOMENT BLEND", "color": "#FF7F0E", "marker": "^", "linestyle": ":"},
+    "plugin-matrix-blend": {"label": "MOMENT BLEND", "color": "#FF7F0E", "marker": "^", "linestyle": ":"},
+    "primal-matrix-blend": {"label": "MOMENT BLEND", "color": "#FF7F0E", "marker": "^", "linestyle": ":"},
+    "moment-matrix-blend": {"label": "MOMENT BLEND", "color": "#FF7F0E", "marker": "^", "linestyle": ":"},
+    "matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "v", "linestyle": "-"},
+    "centered-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "v", "linestyle": "-"},
+    "centered-matrix-blend": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "v", "linestyle": "-"},
 }
 
 GATE_STYLES = {
     "lfgi-hessian": {"label": "LFGI", "color": "#2CA02C", "marker": "D", "linestyle": "-"},
-    "plugin-moment": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "^", "linestyle": ":"},
-    "centered-regression": {"label": "CENTERED BLEND", "color": "#FF7F0E", "marker": "v", "linestyle": "-"},
+    "plugin-moment": {"label": "MOMENT BLEND", "color": "#FF7F0E", "marker": "^", "linestyle": ":"},
+    "centered-regression": {"label": "MATRIX BLEND", "color": "#9467BD", "marker": "v", "linestyle": "-"},
 }
 
 
@@ -138,12 +139,12 @@ METHOD_CANONICAL_ALIASES = {
     "scalar-blend": "blend",
     "plugin-blend": "plugin-moment",
     "plugin-moment": "plugin-moment",
-    "matrix-blend": "plugin-moment",
+    "moment-blend": "plugin-moment",
     "plugin-matrix-blend": "plugin-moment",
     "primal-matrix-blend": "plugin-moment",
     "moment-matrix-blend": "plugin-moment",
-    "moment-blend": "plugin-moment",
     "primal-moment": "plugin-moment",
+    "matrix-blend": "centered-regression",
     "centered-blend": "centered-regression",
     "centered-regression": "centered-regression",
     "centered-matrix-blend": "centered-regression",
@@ -1248,9 +1249,9 @@ def method_aliases(method: str) -> List[str]:
     if key == "lfgi":
         return ["lfgi", "ce-hlsi"]
     if key == "plugin-moment":
-        return ["plugin-moment", "plugin-matrix-blend", "matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"]
+        return ["plugin-moment", "plugin-blend", "plugin-matrix-blend", "primal-matrix-blend", "moment-matrix-blend", "moment-blend", "primal-moment"]
     if key == "centered-regression":
-        return ["centered-regression", "centered-matrix-blend", "centered-moment", "centered-primal", "regression-moment"]
+        return ["centered-regression", "matrix-blend", "centered-blend", "centered-matrix-blend", "centered-moment", "centered-primal", "regression-moment"]
     return [key]
 
 
@@ -1705,6 +1706,9 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
                             "predicted_residual_hessian_ratio": float(pred.get("residual_hessian_ratio", float("nan"))),
                             "predicted_centered_complexity_proxy": float(pred.get("centered_complexity_proxy", float("nan"))),
                             "predicted_lfgi_complexity_proxy": float(pred.get("lfgi_complexity_proxy", float("nan"))),
+                            "predicted_lfgi_rhs_term": float(pred.get("lfgi_rhs_term", float("nan"))),
+                            "predicted_centered_lhs_term": float(pred.get("centered_lhs_term", float("nan"))),
+                            "predicted_posterior_ess": float(pred.get("posterior_ess", float("nan"))),
                             "residual_norm2": float(pred.get("residual_norm2", float("nan"))),
                             "residual_leverage_product": float(pred.get("residual_leverage_product", float("nan"))),
                             "residual_leverage_interaction": float(pred.get("residual_leverage_interaction", float("nan"))),
@@ -1821,6 +1825,11 @@ def aggregate_gate_ratio_rows(rows: List[Dict[str, object]], target_name: str) -
         "lfgi_gate_excess",
         "centered_identity_rhs",
         "centered_identity_rel_error",
+        "predicted_centered_lhs_term",
+        "predicted_lfgi_rhs_term",
+        "predicted_centered_complexity_proxy",
+        "predicted_lfgi_complexity_proxy",
+        "predicted_posterior_ess",
         "residual_cross_moment_energy",
         "empirical_inverse_amplification",
         "residual_leverage_interaction",
@@ -1903,6 +1912,82 @@ def plot_gate_ratio_diagnostics(rows: List[Dict[str, object]], target_name: str,
             legend_best(ax, handlelength=2.4)
             stem = f"gate_ratio_medians_t{str(t).replace('.', 'p')}_{target_name}"
             save_publication_figure(fig, out_dir, stem)
+
+        plot_finite_n_relative_advantage(summary, target_name, out_dir)
+
+
+
+def plot_finite_n_relative_advantage(summary: List[Dict[str, object]], target_name: str, out_dir: Path) -> None:
+    """Finite-bank diagnostic for the primitive relative-advantage inequality.
+
+    Uses the paired gate-ratio diagnostics so both the centered-primal side and
+    the matched LFGI RHS are evaluated on the same noisy queries, diffusion
+    times, and finite gate-bank sizes.
+    """
+    if not summary:
+        return
+
+    t_values = sorted({float(r["t"]) for r in summary if r.get("target") == target_name})
+    if not t_values:
+        return
+
+    cmap = plt.get_cmap("tab10")
+    colors = {t: cmap(i % 10) for i, t in enumerate(t_values)}
+    fig, axes = plt.subplots(1, 4, figsize=(18.2, 5.2))
+
+    panel_specs = [
+        ("centered_identity_rhs_median", r"centered LHS", r"$\|\widehat R_d M^{-1/2}\|_F^2\,\|M^{1/2}(\widehat M+\rho I)^{-1}M^{1/2}\|_{\mathrm{op}}^2$"),
+        (None, r"centered factors", r"primitive factors"),
+        ("predicted_lfgi_rhs_term_median", r"LFGI RHS", r"$\alpha_t^4\Lambda_B \, v_A^2 / N_{\mathrm{eff}}$"),
+        (None, r"predicted advantage ratio", r"centered/LFGI"),
+    ]
+
+    for ax, (metric, title, ylabel) in zip(axes, panel_specs):
+        for t in t_values:
+            sub = [r for r in summary if r.get("target") == target_name and float(r["t"]) == t]
+            xs = np.asarray([float(r["n_gate"]) for r in sub], dtype=float)
+            order = np.argsort(xs)
+            xs = xs[order]
+            color = colors[t]
+
+            if metric is not None:
+                ys = np.asarray([float(r.get(metric, float("nan"))) for r in sub], dtype=float)[order]
+                mask = np.isfinite(xs) & np.isfinite(ys) & (ys > 0.0)
+                if mask.any():
+                    ax.plot(xs[mask], ys[mask], marker="o", linestyle="-", linewidth=2.1, color=color, label=rf"$t={t:g}$")
+            else:
+                if title == r"centered factors":
+                    y1 = np.asarray([float(r.get("residual_cross_moment_energy_median", float("nan"))) for r in sub], dtype=float)[order]
+                    y2 = np.asarray([float(r.get("empirical_inverse_amplification_median", float("nan"))) for r in sub], dtype=float)[order]
+                    mask1 = np.isfinite(xs) & np.isfinite(y1) & (y1 > 0.0)
+                    mask2 = np.isfinite(xs) & np.isfinite(y2) & (y2 > 0.0)
+                    if mask1.any():
+                        ax.plot(xs[mask1], y1[mask1], marker="o", linestyle="-", linewidth=2.0, color=color, label=rf"residual, $t={t:g}$")
+                    if mask2.any():
+                        ax.plot(xs[mask2], y2[mask2], marker="s", linestyle="--", linewidth=2.0, color=color, alpha=0.95, label=rf"inverse, $t={t:g}$")
+                else:
+                    y1 = np.asarray([float(r.get("centered_identity_rhs_median", float("nan"))) for r in sub], dtype=float)[order]
+                    y2 = np.asarray([float(r.get("predicted_lfgi_rhs_term_median", float("nan"))) for r in sub], dtype=float)[order]
+                    ratio = np.divide(y1, y2, out=np.full_like(y1, np.nan), where=np.isfinite(y1) & np.isfinite(y2) & (y2 > 0.0))
+                    mask = np.isfinite(xs) & np.isfinite(ratio) & (ratio > 0.0)
+                    if mask.any():
+                        ax.plot(xs[mask], ratio[mask], marker="o", linestyle="-", linewidth=2.1, color=color, label=rf"$t={t:g}$")
+
+        style_axis(ax, log_x=True, y_scale="log")
+        set_y_limits_from_lines(ax, top_frac=0.10, bottom_frac=0.06)
+        if title == r"predicted advantage ratio":
+            ax.axhline(1.0, linestyle=":", linewidth=1.2, color="0.45")
+        ax.set_xlabel(r"Gate-bank size $N_g$")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, pad=7)
+        legend_best(ax, fontsize=9.4, handlelength=2.1)
+
+    fig.suptitle(f"Finite-$N$ relative-advantage diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
+    fig.tight_layout(pad=0.55, w_pad=1.2)
+    stem = f"finite_n_relative_advantage_{target_name}"
+    fig.savefig(out_dir / f"{stem}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    fig.savefig(out_dir / f"{stem}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
 
 
 # -----------------------------------------------------------------------------
