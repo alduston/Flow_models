@@ -33,10 +33,13 @@ What it produces
    in the risk-weighted norm induced by D = E[(c-b)(c-b)^T | y,t], not merely
    Frobenius norm.
 
-3. Hessian-resolvent learnability diagnostics on misaligned_subspace_gmm_d8:
+3. Hessian-resolvent and residual-coupling learnability diagnostics on
+   misaligned_subspace_gmm_d8:
      - relative conditional-Hessian fluctuation v_A^2,
      - sharpened pole/cancellation factor alpha^4 Lambda_B,
-     - oracle gain G_star, optionally normalized by tr(D).
+     - oracle gain G_star, optionally normalized by tr(D),
+     - centered-primal residual/leverage proxy E[||r_*||^2 d^T M^{-1}d | y,t],
+     - the section-9.3 ratio C_cen / C_LFGI and query-level interaction terms.
    These populate the theory placeholder panels following the gate-capture
    figures in the manuscript.
 
@@ -563,20 +566,30 @@ class MisalignedSingularSubspaceGMMTarget(AnalyticTarget):
         cov_scores = second - sbar.unsqueeze(-1) * sbar.unsqueeze(-2)
         return sym(Pbar - cov_scores)
 
-    def score_t(self, y: torch.Tensor, t: float | torch.Tensor) -> torch.Tensor:
+    def component_posterior_t(self, y: torch.Tensor, t: float | torch.Tensor) -> torch.Tensor:
+        """Exact OU-time posterior over mixture components for diagnostics."""
         a = at(t).to(y)
         g = vt(t).to(y)
         means_t = a * self.means.to(y)
         covs_t = a.square() * self.covs.to(y) + g * torch.eye(self.d, dtype=y.dtype, device=y.device).unsqueeze(0)
         Ps_t = torch.linalg.inv(sym(covs_t))
-        # log N(y; a mu_k, cov_t_k) - log K
         sign, logdet = torch.linalg.slogdet(covs_t)
         diff = y.unsqueeze(1) - means_t.unsqueeze(0)
         Pdiff = torch.einsum("kij,bkj->bki", Ps_t, diff)
         mahal = (diff * Pdiff).sum(-1)
         log_comp = -0.5 * (self.d * math.log(2.0 * math.pi) + logdet.unsqueeze(0) + mahal)
         log_comp = log_comp - math.log(self.n_components)
-        w = torch.softmax(log_comp, dim=1)
+        return torch.softmax(log_comp, dim=1)
+
+    def score_t(self, y: torch.Tensor, t: float | torch.Tensor) -> torch.Tensor:
+        a = at(t).to(y)
+        g = vt(t).to(y)
+        means_t = a * self.means.to(y)
+        covs_t = a.square() * self.covs.to(y) + g * torch.eye(self.d, dtype=y.dtype, device=y.device).unsqueeze(0)
+        Ps_t = torch.linalg.inv(sym(covs_t))
+        diff = y.unsqueeze(1) - means_t.unsqueeze(0)
+        Pdiff = torch.einsum("kij,bkj->bki", Ps_t, diff)
+        w = self.component_posterior_t(y, t)
         comp_scores = -Pdiff
         return torch.einsum("bk,bki->bi", w, comp_scores)
 
@@ -1393,12 +1406,34 @@ def fro_relative_gate_error(G_hat: torch.Tensor, G_star: torch.Tensor) -> torch.
     return num / den
 
 
+def right_solve_sym(R: torch.Tensor, A: torch.Tensor, ridge: float = 0.0) -> torch.Tensor:
+    """Return R @ (A + ridge I)^{-1} for symmetric positive-semidefinite A.
+
+    Supports both single matrices and batches.  The fallback deliberately uses a
+    pseudoinverse rather than crashing a long diagnostic sweep when a finite
+    reference bank gives a nearly singular disagreement covariance.
+    """
+    A = sym(A)
+    if ridge and ridge > 0:
+        eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
+        A = A + float(ridge) * eye.reshape((1,) * (A.ndim - 2) + eye.shape)
+    try:
+        return torch.linalg.solve(A, R.transpose(-1, -2)).transpose(-1, -2)
+    except RuntimeError:
+        return R @ torch.linalg.pinv(A)
+
+
+def safe_ratio(num: torch.Tensor, den: torch.Tensor, floor: float = 1e-300) -> torch.Tensor:
+    return num / den.clamp_min(torch.as_tensor(float(floor), dtype=den.dtype, device=den.device))
+
+
 def run_gate_sweep(args) -> List[Dict[str, object]]:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     target = make_target(args.gate_target)
     print(f"\n[gate sweep] target={target.name}, d={target.d}")
     rows: List[Dict[str, object]] = []
+    ratio_rows: List[Dict[str, object]] = []
 
     for t in args.gate_t_grid:
         print(f"  oracle construction at t={t:g}")
@@ -1418,6 +1453,23 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
         ).mean().clamp_min(1e-30)
         D_trace = torch.diagonal(D_star, dim1=-2, dim2=-1).sum(-1).mean().clamp_min(1e-30)
 
+        # Query-level section-9.3 predictors on exactly the same noisy states used
+        # in the finite-N gate sweep.  These are paired later with actual
+        # centered-vs-LFGI gate errors for predicted-vs-actual scatter plots.
+        prediction_by_query: Dict[int, Dict[str, object]] = {}
+        if not getattr(args, "skip_gate_ratio_diagnostics", False):
+            pred_rows = compute_learnability_diagnostics(
+                target,
+                yq,
+                float(t),
+                oracle_ref,
+                gate_clip=args.gate_clip,
+                chunk=min(args.gate_chunk, 8),
+                eig_floor=args.learnability_eig_floor,
+                z_eig_chunk=args.learnability_z_eig_chunk,
+            )
+            prediction_by_query = {int(r["query_index"]): r for r in pred_rows}
+
         for rep in range(args.gate_repeats):
             seed_here = args.seed + 91_000 * rep + int(10_000 * t)
             torch.manual_seed(seed_here)
@@ -1430,12 +1482,14 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
                 G_lfgi = lfgi_gate_from_ref(yq, float(t), ref, gate_clip=args.gate_clip, chunk=args.gate_chunk)
                 G_plugin, _ = weighted_plugin_gate(yq, float(t), ref, ridge=args.primal_ridge, chunk=args.gate_chunk)
                 G_centered, _ = weighted_centered_regression_gate(yq, float(t), ref, ridge=args.primal_ridge, chunk=args.gate_chunk)
+                excess_by_label: Dict[str, torch.Tensor] = {}
                 for label, G_hat in [
                     ("plugin-moment", G_plugin),
                     ("centered-regression", G_centered),
                     ("lfgi-hessian", G_lfgi),
                 ]:
                     abs_excess = risk_weighted_gate_error(G_hat, G_star, D_star)
+                    excess_by_label[label] = abs_excess
                     fro_rel = fro_relative_gate_error(G_hat, G_star)
                     rows.append({
                         "experiment": "gate_sample_complexity",
@@ -1453,8 +1507,55 @@ def run_gate_sweep(args) -> List[Dict[str, object]]:
                         "fro_relative_median": float(fro_rel.median().detach().cpu()),
                         "seconds": time.time() - t_start,
                     })
+
+                if prediction_by_query:
+                    centered_excess = excess_by_label["centered-regression"]
+                    lfgi_excess = excess_by_label["lfgi-hessian"]
+                    identity = finite_centered_identity_diagnostics(
+                        target,
+                        yq,
+                        float(t),
+                        ref,
+                        G_star,
+                        D_star,
+                        centered_excess,
+                        ridge=args.primal_ridge,
+                        chunk=args.gate_chunk,
+                    )
+                    actual_ratio = safe_ratio(centered_excess, lfgi_excess)
+                    for q in range(yq.shape[0]):
+                        pred = prediction_by_query.get(q, {})
+                        ratio_rows.append({
+                            "experiment": "gate_ratio_prediction",
+                            "target": target.name,
+                            "d": target.d,
+                            "t": float(t),
+                            "n_gate": int(n_gate),
+                            "repeat": int(rep),
+                            "query_index": int(q),
+                            "centered_gate_excess": float(centered_excess[q].detach().cpu()),
+                            "lfgi_gate_excess": float(lfgi_excess[q].detach().cpu()),
+                            "actual_centered_vs_lfgi_error_ratio": float(actual_ratio[q].detach().cpu()),
+                            "predicted_residual_hessian_ratio": float(pred.get("residual_hessian_ratio", float("nan"))),
+                            "predicted_centered_complexity_proxy": float(pred.get("centered_complexity_proxy", float("nan"))),
+                            "predicted_lfgi_complexity_proxy": float(pred.get("lfgi_complexity_proxy", float("nan"))),
+                            "residual_norm2": float(pred.get("residual_norm2", float("nan"))),
+                            "residual_leverage_product": float(pred.get("residual_leverage_product", float("nan"))),
+                            "residual_leverage_interaction": float(pred.get("residual_leverage_interaction", float("nan"))),
+                            "residual_leverage_top1pct_mass": float(pred.get("residual_leverage_top1pct_mass", float("nan"))),
+                            "component_entropy": float(pred.get("component_entropy", float("nan"))),
+                            "centered_identity_rhs": float(identity["centered_identity_rhs"][q].detach().cpu()),
+                            "residual_cross_moment_energy": float(identity["residual_cross_moment_energy"][q].detach().cpu()),
+                            "empirical_inverse_amplification": float(identity["empirical_inverse_amplification"][q].detach().cpu()),
+                            "centered_identity_rel_error": float(identity["centered_identity_rel_error"][q].detach().cpu()),
+                            "seconds": time.time() - t_start,
+                        })
+                    flush_csv(out_dir / "gate_ratio_diagnostics_raw.csv", ratio_rows)
+
                 flush_csv(out_dir / "gate_sample_complexity_raw.csv", rows)
         plot_gate_sweep(rows, target.name, out_dir)
+        if ratio_rows:
+            plot_gate_ratio_diagnostics(ratio_rows, target.name, out_dir)
     return rows
 
 
@@ -1544,6 +1645,99 @@ def plot_gate_sweep(rows: List[Dict[str, object]], target_name: str, out_dir: Pa
             save_publication_figure(fig, out_dir, stem)
 
 
+def aggregate_gate_ratio_rows(rows: List[Dict[str, object]], target_name: str) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    metrics = [
+        "predicted_residual_hessian_ratio",
+        "actual_centered_vs_lfgi_error_ratio",
+        "centered_gate_excess",
+        "lfgi_gate_excess",
+        "centered_identity_rhs",
+        "centered_identity_rel_error",
+        "residual_cross_moment_energy",
+        "empirical_inverse_amplification",
+        "residual_leverage_interaction",
+        "residual_leverage_top1pct_mass",
+        "component_entropy",
+    ]
+    for t in sorted({float(r["t"]) for r in rows if r.get("target") == target_name}):
+        for n in sorted({int(r["n_gate"]) for r in rows if r.get("target") == target_name and float(r["t"]) == t}):
+            sub = [r for r in rows if r.get("target") == target_name and float(r["t"]) == t and int(r["n_gate"]) == n]
+            if not sub:
+                continue
+            row: Dict[str, object] = {"target": target_name, "t": t, "n_gate": n, "n_query_repeat": len(sub)}
+            for metric in metrics:
+                stats = finite_summary([float(r.get(metric, float("nan"))) for r in sub])
+                for stat_name, value in stats.items():
+                    row[f"{metric}_{stat_name}"] = value
+            out.append(row)
+    return out
+
+
+def plot_gate_ratio_diagnostics(rows: List[Dict[str, object]], target_name: str, out_dir: Path) -> None:
+    if not rows:
+        return
+    summary = aggregate_gate_ratio_rows(rows, target_name)
+    flush_csv(out_dir / f"gate_ratio_diagnostics_summary_{target_name}.csv", summary)
+
+    for t in sorted({float(r["t"]) for r in rows if r.get("target") == target_name}):
+        sub_t = [r for r in rows if r.get("target") == target_name and float(r["t"]) == t]
+        if not sub_t:
+            continue
+
+        fig, ax = plt.subplots(figsize=PUB_FIGSIZE_WIDE)
+        finite_xy: List[Tuple[float, float]] = []
+        for n_gate in sorted({int(r["n_gate"]) for r in sub_t}):
+            sub = [r for r in sub_t if int(r["n_gate"]) == n_gate]
+            x = np.asarray([float(r.get("predicted_residual_hessian_ratio", float("nan"))) for r in sub], dtype=float)
+            y = np.asarray([float(r.get("actual_centered_vs_lfgi_error_ratio", float("nan"))) for r in sub], dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y) & (x > 0.0) & (y > 0.0)
+            if not mask.any():
+                continue
+            finite_xy.extend(list(zip(x[mask].tolist(), y[mask].tolist())))
+            ax.scatter(x[mask], y[mask], s=28, alpha=0.62, label=rf"$N_g={n_gate}$")
+
+        if finite_xy:
+            arr = np.asarray(finite_xy, dtype=float)
+            lo = float(np.nanmin(arr))
+            hi = float(np.nanmax(arr))
+            lo = max(lo, 1e-12)
+            hi = max(hi, lo * 10.0)
+            grid = np.geomspace(lo, hi, 128)
+            ax.plot(grid, grid, linestyle="--", linewidth=1.4, color="0.45", label="1:1")
+        style_axis(ax, log_x=True, y_scale="log")
+        ax.set_xlabel(r"Predicted ratio $\mathcal{C}_{\mathrm{cen}}/\mathcal{C}_{\mathrm{LFGI}}$")
+        ax.set_ylabel(r"Actual ratio $E_{\mathrm{cen}}^{(N)}/E_{\mathrm{LFGI}}^{(N)}$")
+        ax.set_title(f"Predicted vs. actual gate difficulty\n{paper_target_title(target_name)}, $t={float(t):g}$", pad=7)
+        ax.legend(frameon=False, loc="best", handlelength=1.8, borderaxespad=0.3, fontsize=9.5)
+        stem = f"{target_name}_gate_predicted_vs_actual_ratio_t{str(t).replace('.', 'p')}"
+        save_publication_figure(fig, out_dir, stem)
+
+    if summary:
+        for t in sorted({float(r["t"]) for r in summary if r.get("target") == target_name}):
+            sub = [r for r in summary if r.get("target") == target_name and float(r["t"]) == t]
+            fig, ax = plt.subplots(figsize=PUB_FIGSIZE_WIDE)
+            xs = np.asarray([float(r["n_gate"]) for r in sub], dtype=float)
+            pred = np.asarray([float(r.get("predicted_residual_hessian_ratio_median", float("nan"))) for r in sub], dtype=float)
+            actual = np.asarray([float(r.get("actual_centered_vs_lfgi_error_ratio_median", float("nan"))) for r in sub], dtype=float)
+            mask_p = np.isfinite(xs) & np.isfinite(pred) & (pred > 0)
+            mask_a = np.isfinite(xs) & np.isfinite(actual) & (actual > 0)
+            if mask_p.any():
+                order = np.argsort(xs[mask_p])
+                ax.plot(xs[mask_p][order], pred[mask_p][order], marker="o", linestyle="--", linewidth=2.2, label="predicted")
+            if mask_a.any():
+                order = np.argsort(xs[mask_a])
+                ax.plot(xs[mask_a][order], actual[mask_a][order], marker="D", linestyle="-", linewidth=2.5, label="actual")
+            style_axis(ax, log_x=True, y_scale="log")
+            ax.axhline(1.0, linestyle="--", linewidth=1.2, color="0.45")
+            ax.set_xlabel(r"Gate-bank size $N_g$")
+            ax.set_ylabel(r"Centered/LFGI difficulty ratio")
+            ax.set_title(f"Median predicted and actual ratio\n{paper_target_title(target_name)}, $t={float(t):g}$", pad=7)
+            ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
+            stem = f"{target_name}_gate_ratio_medians_t{str(t).replace('.', 'p')}"
+            save_publication_figure(fig, out_dir, stem)
+
+
 # -----------------------------------------------------------------------------
 # Hessian-resolvent learnability diagnostics
 # -----------------------------------------------------------------------------
@@ -1630,6 +1824,175 @@ def safe_batched_sym_op_norm(
     return torch.cat(out, dim=0)
 
 
+def component_entropy_diagnostics(target: AnalyticTarget, y: torch.Tensor, t: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return mixture-component entropy, top mass, and top-two mass when available."""
+    n = y.shape[0]
+    nan = torch.full((n,), float("nan"), dtype=y.dtype, device=y.device)
+    if not hasattr(target, "component_posterior_t"):
+        return nan, nan, nan
+    try:
+        pi = getattr(target, "component_posterior_t")(y, t)
+    except Exception:
+        return nan, nan, nan
+    pi = pi.clamp_min(1e-30)
+    entropy = -(pi * pi.log()).sum(dim=1)
+    sorted_pi = torch.sort(pi, dim=1, descending=True).values
+    top1 = sorted_pi[:, 0]
+    top2 = sorted_pi[:, : min(2, sorted_pi.shape[1])].sum(dim=1)
+    return entropy, top1, top2
+
+
+def residual_coupling_stats_chunk(
+    target: AnalyticTarget,
+    yb: torch.Tensor,
+    t: float,
+    ref: ReferenceBank,
+    w: torch.Tensor,
+    G_star: torch.Tensor,
+    D: torch.Tensor,
+    *,
+    ridge: float,
+    centered_residual: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Query-level centered-primal residual/leverage diagnostics.
+
+    The main proxy is
+        E_w[||r_*||^2 (d-dbar)^T (M+rho I)^{-1} (d-dbar)],
+    where r_* = b - s_t(y) + G_* d and M = Cov_w(d,d).  This is the
+    numerator-side object in the residual-coupling versus Hessian-variation
+    comparison.  We also expose factored terms and a tail-concentration measure
+    to distinguish "large residual" from "residuals live in dangerous leverage
+    directions".
+    """
+    d = int(yb.shape[1])
+    a = at(float(t)).to(yb).clamp_min(1e-30)
+    g = vt(float(t)).to(yb).clamp_min(1e-30)
+
+    b_atom = -(yb.unsqueeze(1) - a * ref.x.unsqueeze(0)) / g
+    c_atom = (ref.s0.unsqueeze(0) / a).expand(yb.shape[0], -1, -1)
+    d_atom = c_atom - b_atom
+    d_bar = torch.einsum("bn,bnd->bd", w, d_atom)
+    dc = d_atom - d_bar.unsqueeze(1)
+
+    s_true = target.score_t(yb, float(t))
+    Gd_atom = torch.einsum("bij,bnj->bni", G_star, d_atom)
+    r_atom = b_atom - s_true.unsqueeze(1) + Gd_atom
+    r_bar = torch.einsum("bn,bnd->bd", w, r_atom)
+    rc = r_atom - r_bar.unsqueeze(1) if centered_residual else r_atom
+
+    # h_i = d_i^T M^{-1} d_i in the centered disagreement coordinates.
+    M_inv_dc = right_solve_sym(dc, D, ridge=float(ridge))
+    leverage = (dc * M_inv_dc).sum(dim=-1).clamp_min(0.0)
+    r2 = rc.square().sum(dim=-1).clamp_min(0.0)
+    weighted_product_atom = w * r2 * leverage
+
+    residual_norm2 = (w * r2).sum(dim=1)
+    disagreement_leverage_mean = (w * leverage).sum(dim=1)
+    residual_leverage_product = weighted_product_atom.sum(dim=1)
+    residual_leverage_interaction = safe_ratio(
+        residual_leverage_product,
+        residual_norm2.clamp_min(1e-300) * disagreement_leverage_mean.clamp_min(1e-300),
+    )
+
+    # Weighted mass of the top 1% largest atom contributions.  This flags rare
+    # high-leverage residual particles that dominate the centered estimator.
+    n_ref = weighted_product_atom.shape[1]
+    top_k = max(1, int(math.ceil(0.01 * n_ref)))
+    top_vals = torch.topk(weighted_product_atom, k=top_k, dim=1).values.sum(dim=1)
+    top1pct_mass = safe_ratio(top_vals, residual_leverage_product)
+
+    # Cross-covariance between residual atoms and disagreement atoms.  This is
+    # the object whose empirical fluctuation drives centered primal gate error.
+    Rrd = torch.einsum("bn,bni,bnj->bij", w, rc, dc)
+    R_energy = Rrd.square().sum(dim=(-1, -2)).sqrt()
+    R_cov = sym(torch.einsum("bn,bni,bnj->bij", w, rc, rc))
+    R_trace = torch.diagonal(R_cov, dim1=-2, dim2=-1).sum(-1).clamp_min(1e-300)
+    D_trace = torch.diagonal(D, dim1=-2, dim2=-1).sum(-1).clamp_min(1e-300)
+    residual_cross_orthogonality = R_energy / torch.sqrt(R_trace * D_trace)
+
+    entropy, top1_mass, top2_mass = component_entropy_diagnostics(target, yb, float(t))
+
+    return {
+        "residual_norm2": residual_norm2,
+        "disagreement_leverage_mean": disagreement_leverage_mean,
+        "residual_leverage_product": residual_leverage_product,
+        "residual_leverage_interaction": residual_leverage_interaction,
+        "residual_leverage_top1pct_mass": top1pct_mass,
+        "residual_cross_cov_fro": R_energy,
+        "residual_cross_orthogonality": residual_cross_orthogonality,
+        "component_entropy": entropy,
+        "component_top1_mass": top1_mass,
+        "component_top2_mass": top2_mass,
+    }
+
+
+def finite_centered_identity_diagnostics(
+    target: AnalyticTarget,
+    y: torch.Tensor,
+    t: float,
+    ref: ReferenceBank,
+    G_star: torch.Tensor,
+    D_star: torch.Tensor,
+    centered_excess: torch.Tensor,
+    *,
+    ridge: float,
+    chunk: int,
+) -> Dict[str, torch.Tensor]:
+    """Finite-bank centered-regression identity diagnostics.
+
+    For a finite gate bank, form R_hat = Cov_hat(r_*, d) and compare the actual
+    risk-weighted centered-gate error with the normal-equation proxy
+        tr[(R_hat M_hat^{-1}) D_* (R_hat M_hat^{-1})^T].
+    This decomposes centered-primal failure into residual cross-moment energy and
+    additional amplification from the empirical inverse M_hat^{-1}.
+    """
+    rhs_out: List[torch.Tensor] = []
+    cross_out: List[torch.Tensor] = []
+    amp_out: List[torch.Tensor] = []
+    rel_out: List[torch.Tensor] = []
+    a = at(float(t)).to(y).clamp_min(1e-30)
+    g = vt(float(t)).to(y).clamp_min(1e-30)
+
+    for i in range(0, y.shape[0], chunk):
+        yb = y[i : i + chunk]
+        Gb = G_star[i : i + chunk]
+        Db = D_star[i : i + chunk]
+        actual_b = centered_excess[i : i + chunk]
+        w = snis_weights(yb, float(t), ref.x)
+        b_atom = -(yb.unsqueeze(1) - a * ref.x.unsqueeze(0)) / g
+        c_atom = (ref.s0.unsqueeze(0) / a).expand(yb.shape[0], -1, -1)
+        d_atom = c_atom - b_atom
+        d_bar = torch.einsum("bn,bnd->bd", w, d_atom)
+        dc = d_atom - d_bar.unsqueeze(1)
+        Mhat = sym(torch.einsum("bn,bni,bnj->bij", w, dc, dc))
+
+        s_true = target.score_t(yb, float(t))
+        r_atom = b_atom - s_true.unsqueeze(1) + torch.einsum("bij,bnj->bni", Gb, d_atom)
+        r_bar = torch.einsum("bn,bnd->bd", w, r_atom)
+        rc = r_atom - r_bar.unsqueeze(1)
+        Rhat = torch.einsum("bn,bni,bnj->bij", w, rc, dc)
+
+        X_emp = right_solve_sym(Rhat, Mhat, ridge=float(ridge))
+        rhs = torch.einsum("bij,bjk,bik->b", X_emp, Db, X_emp).clamp_min(0.0)
+
+        X_star = right_solve_sym(Rhat, Db, ridge=float(ridge))
+        cross = torch.einsum("bij,bjk,bik->b", X_star, Db, X_star).clamp_min(0.0)
+        amp = safe_ratio(rhs, cross)
+        rel = (rhs - actual_b).abs() / actual_b.clamp_min(1e-300)
+
+        rhs_out.append(rhs)
+        cross_out.append(cross)
+        amp_out.append(amp)
+        rel_out.append(rel)
+
+    return {
+        "centered_identity_rhs": torch.cat(rhs_out, dim=0),
+        "residual_cross_moment_energy": torch.cat(cross_out, dim=0),
+        "empirical_inverse_amplification": torch.cat(amp_out, dim=0),
+        "centered_identity_rel_error": torch.cat(rel_out, dim=0),
+    }
+
+
 def compute_learnability_diagnostics(
     target: AnalyticTarget,
     y: torch.Tensor,
@@ -1683,6 +2046,17 @@ def compute_learnability_diagnostics(
 
         oracle_gain = risk_weighted_gate_error(torch.zeros_like(G_star), G_star, D)
         D_trace = torch.diagonal(D, dim1=-2, dim2=-1).sum(-1).clamp_min(1e-30)
+        residual_stats = residual_coupling_stats_chunk(
+            target,
+            yb,
+            float(t),
+            ref,
+            w,
+            G_star,
+            D,
+            ridge=float(eig_floor),
+            centered_residual=True,
+        )
         hbar_eigs = safe_sym_eigvalsh(Hbar, name="Hbar")
         abar_eigs = safe_sym_eigvalsh(Abar, name="Abar")
 
@@ -1703,7 +2077,21 @@ def compute_learnability_diagnostics(
             alpha4_lambdaB_empirical_D = float("nan")
             alpha4_lambdaB_over_psd_bound = float("nan")
             sufficient_complexity_proxy = float("nan")
+            lfgi_complexity_proxy = float("nan")
+            centered_complexity_proxy = float("nan")
+            residual_hessian_ratio = float("nan")
             cond_A = float("nan")
+
+            residual_norm2 = float(residual_stats["residual_norm2"][j].detach().cpu())
+            disagreement_leverage_mean = float(residual_stats["disagreement_leverage_mean"][j].detach().cpu())
+            residual_leverage_product = float(residual_stats["residual_leverage_product"][j].detach().cpu())
+            residual_leverage_interaction = float(residual_stats["residual_leverage_interaction"][j].detach().cpu())
+            residual_leverage_top1pct_mass = float(residual_stats["residual_leverage_top1pct_mass"][j].detach().cpu())
+            residual_cross_cov_fro = float(residual_stats["residual_cross_cov_fro"][j].detach().cpu())
+            residual_cross_orthogonality = float(residual_stats["residual_cross_orthogonality"][j].detach().cpu())
+            component_entropy = float(residual_stats["component_entropy"][j].detach().cpu())
+            component_top1_mass = float(residual_stats["component_top1_mass"][j].detach().cpu())
+            component_top2_mass = float(residual_stats["component_top2_mass"][j].detach().cpu())
 
             if is_pd:
                 try:
@@ -1749,8 +2137,13 @@ def compute_learnability_diagnostics(
                     psd_bound = float(d / float(g.detach().cpu()))
                     alpha4_lambdaB_over_psd_bound = alpha4_lambdaB_identity / max(psd_bound, 1e-300)
                     og = float(oracle_gain[j].detach().cpu())
-                    if np.isfinite(vA2) and np.isfinite(alpha4_lambdaB_identity) and og > 1e-300:
-                        sufficient_complexity_proxy = float((alpha4_lambdaB_identity * vA2) / og)
+                    if np.isfinite(vA2) and np.isfinite(alpha4_lambdaB_identity):
+                        lfgi_complexity_proxy = float(alpha4_lambdaB_identity * vA2)
+                        if lfgi_complexity_proxy > 1e-300:
+                            residual_hessian_ratio = float(residual_leverage_product / lfgi_complexity_proxy)
+                        if og > 1e-300:
+                            sufficient_complexity_proxy = float(lfgi_complexity_proxy / og)
+                            centered_complexity_proxy = float(residual_leverage_product / og)
                     cond_A = max_a / max(min_a, 1e-300)
 
             rows.append({
@@ -1777,6 +2170,19 @@ def compute_learnability_diagnostics(
                 "alpha4_lambdaB_empirical_D": alpha4_lambdaB_empirical_D,
                 "alpha4_lambdaB_over_psd_bound": alpha4_lambdaB_over_psd_bound,
                 "sufficient_complexity_proxy": sufficient_complexity_proxy,
+                "centered_complexity_proxy": centered_complexity_proxy,
+                "lfgi_complexity_proxy": lfgi_complexity_proxy,
+                "residual_hessian_ratio": residual_hessian_ratio,
+                "residual_norm2": residual_norm2,
+                "disagreement_leverage_mean": disagreement_leverage_mean,
+                "residual_leverage_product": residual_leverage_product,
+                "residual_leverage_interaction": residual_leverage_interaction,
+                "residual_leverage_top1pct_mass": residual_leverage_top1pct_mass,
+                "residual_cross_cov_fro": residual_cross_cov_fro,
+                "residual_cross_orthogonality": residual_cross_orthogonality,
+                "component_entropy": component_entropy,
+                "component_top1_mass": component_top1_mass,
+                "component_top2_mass": component_top2_mass,
                 "psd_cancellation_bound_d_over_gamma": float(d / float(g.detach().cpu())),
                 "oracle_gain": float(oracle_gain[j].detach().cpu()),
                 "oracle_gain_rel_to_D_trace": float((oracle_gain[j] / D_trace[j]).detach().cpu()),
@@ -1796,6 +2202,19 @@ def aggregate_learnability_rows(rows: List[Dict[str, object]], target_name: str)
         "relative_hessian_R_mean",
         "relative_hessian_R_q90",
         "sufficient_complexity_proxy",
+        "centered_complexity_proxy",
+        "lfgi_complexity_proxy",
+        "residual_hessian_ratio",
+        "residual_norm2",
+        "disagreement_leverage_mean",
+        "residual_leverage_product",
+        "residual_leverage_interaction",
+        "residual_leverage_top1pct_mass",
+        "residual_cross_cov_fro",
+        "residual_cross_orthogonality",
+        "component_entropy",
+        "component_top1_mass",
+        "component_top2_mass",
         "alpha4_lambdaB_identity",
         "alpha4_lambdaB_empirical_D",
         "alpha4_lambdaB_over_psd_bound",
@@ -1870,7 +2289,7 @@ def plot_learnability_diagnostics(
         ax,
         plot_summary,
         "sufficient_complexity_proxy",
-        label=r"$\alpha_t^4\Lambda_B\,v_A^2/\mathcal G_\star$",
+        label=r"$\alpha_t^4\Lambda_B\,v_A^2/\mathcal{G}_\star$",
         marker="o",
     )
     style_axis(ax, log_x=False, y_scale="log")
@@ -1893,7 +2312,7 @@ def plot_learnability_diagnostics(
     ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
 
     ax = axes[2]
-    _plot_summary_series(ax, plot_summary, "oracle_gain_rel_to_D_trace", label=r"$\mathcal G_\star/\mathrm{tr}(D)$", marker="s")
+    _plot_summary_series(ax, plot_summary, "oracle_gain_rel_to_D_trace", label=r"$\mathcal{G}_\star/\operatorname{tr}(D)$", marker="s")
     style_axis(ax, log_x=False, y_scale="linear")
     ax.set_xlabel(r"Diffusion time $t$")
     ax.set_ylabel(r"Normalized oracle gain")
@@ -1913,6 +2332,79 @@ def plot_learnability_diagnostics(
     fig.savefig(out_dir / f"{stem}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
     fig.savefig(out_dir / f"{stem}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
     plt.close(fig)
+
+    # Section-9.3 residual-coupling diagnostics: centered-primal numerator side
+    # versus LFGI Hessian-variation denominator side, plus atom-level interaction.
+    fig2, axes2 = plt.subplots(1, 3, figsize=(13.6, 3.85))
+
+    ax = axes2[0]
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "centered_complexity_proxy",
+        label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{G}_\star$",
+        marker="v",
+    )
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "sufficient_complexity_proxy",
+        label=r"$\mathcal{C}_{\mathrm{LFGI}}/\mathcal{G}_\star$",
+        marker="D",
+        linestyle="--",
+    )
+    style_axis(ax, log_x=False, y_scale="log")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Gain-normalized complexity")
+    ax.set_title(r"Centered vs. LFGI proxies", pad=7)
+    ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
+
+    ax = axes2[1]
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "residual_hessian_ratio",
+        label=r"$\mathcal{C}_{\mathrm{cen}}/\mathcal{C}_{\mathrm{LFGI}}$",
+        marker="o",
+    )
+    style_axis(ax, log_x=False, y_scale="log")
+    ax.axhline(1.0, linestyle="--", linewidth=1.3, color="0.45")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Residual/Hessian ratio")
+    ax.set_title(r"Predicted relative difficulty", pad=7)
+
+    ax = axes2[2]
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "residual_leverage_interaction",
+        label=r"interaction",
+        marker="s",
+    )
+    _plot_summary_series(
+        ax,
+        plot_summary,
+        "residual_leverage_top1pct_mass",
+        label=r"top 1% mass",
+        marker="^",
+        linestyle="--",
+    )
+    style_axis(ax, log_x=False, y_scale="linear")
+    ax.set_xlabel(r"Diffusion time $t$")
+    ax.set_ylabel(r"Atom-level concentration")
+    ax.set_title(r"Residual-leverage interaction", pad=7)
+    ax.legend(frameon=False, loc="best", handlelength=2.4, borderaxespad=0.3)
+
+    for ax in axes2:
+        if plot_t_max is not None:
+            ax.text(0.98, 0.04, rf"plot window: $t\leq {plot_t_max:g}$", transform=ax.transAxes, ha="right", fontsize=8.5, color="0.35")
+
+    fig2.suptitle(f"Residual-coupling diagnostics: {paper_target_title(target_name)}", y=1.02, fontsize=16)
+    fig2.tight_layout(pad=0.45, w_pad=1.15)
+    stem2 = f"{target_name}_residual_coupling_diagnostics"
+    fig2.savefig(out_dir / f"{stem2}.pdf", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
+    fig2.savefig(out_dir / f"{stem2}.png", dpi=PUB_DPI, bbox_inches="tight", pad_inches=0.035)
+    plt.close(fig2)
     return summary
 
 def run_learnability_diagnostics(args) -> List[Dict[str, object]]:
@@ -1987,6 +2479,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gate-t-grid", nargs="+", type=float, default=[0.04, 0.08, 0.16])
     p.add_argument("--gate-chunk", type=int, default=32)
     p.add_argument("--primal-ridge", type=float, default=1e-10)
+    p.add_argument("--skip-gate-ratio-diagnostics", action="store_true", help="Skip paired predicted-vs-actual residual/Hessian gate-ratio diagnostics inside the gate sweep.")
 
     p.add_argument("--skip-learnability-diagnostics", action="store_true")
     p.add_argument("--learnability-target", type=str, default=None, help="Target for v_A/Lambda_B/oracle-gain diagnostics. Defaults to --gate-target.")
