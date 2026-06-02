@@ -97,6 +97,14 @@ import numpy as np
 import torch
 
 
+# Funnel plotting defaults copied from the benchmark sweep convention.  These
+# robust quantile limits keep the long right tail from collapsing the visible
+# neck/body geometry into a tiny corner of the panel.
+FUNNEL_HEATMAP_X_Q_LOW = float(os.environ.get("LFGI_BENCH_FUNNEL_HEATMAP_X_Q_LOW", "0.5"))
+FUNNEL_HEATMAP_X_Q_HIGH = float(os.environ.get("LFGI_BENCH_FUNNEL_HEATMAP_X_Q_HIGH", "99.0"))
+FUNNEL_HEATMAP_Y_Q_ABS = float(os.environ.get("LFGI_BENCH_FUNNEL_HEATMAP_Y_Q_ABS", "99.0"))
+
+
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
@@ -527,6 +535,26 @@ def make_time_grid(cfg: Config, steps: int, *, direction: str, device, dtype) ->
         return torch.exp(logs)
     raise RuntimeError(f"Unhandled time_schedule={schedule!r}")
 
+def time_grid_step_stats(ts: torch.Tensor) -> Dict[str, float]:
+    """Diagnostics for auditing nonuniform time integration.
+
+    The integrators below step in the physical OU time variable t.  A log-linear
+    schedule therefore only changes the locations of the t-grid points; each
+    quadrature/drift update must still be multiplied by the actual interval
+    h = t_{j+1} - t_j (or its positive reverse-time counterpart).  If we ever
+    reparameterize the ODE itself by u = log t, the vector field/integrand would
+    need an additional dt/du = t factor.  This code intentionally does not do
+    that; it performs ordinary trapezoidal integration on a nonuniform t-grid.
+    """
+    if ts.numel() < 2:
+        return {"dt_min": 0.0, "dt_max": 0.0, "dt_sum": 0.0}
+    dt = torch.abs(ts[1:] - ts[:-1])
+    return {
+        "dt_min": safe_float(dt.min()),
+        "dt_max": safe_float(dt.max()),
+        "dt_sum": safe_float(dt.sum()),
+    }
+
 
 def standard_normal_logprob(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1]
@@ -880,6 +908,17 @@ class NealFunnelTarget:
             logk = const - 0.5 * torch.sum(diff * diff, dim=-1) / gamma
             outs.append(torch.logsumexp(logk, dim=1) - math.log(int(bank.shape[0])))
         return torch.nan_to_num(torch.cat(outs, dim=0), nan=-1.0e6, posinf=1.0e6, neginf=-1.0e6)
+
+    def plot_projection(self, x: torch.Tensor, fit_ref: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return benchmark-sweep funnel display coordinates.
+
+        The benchmark plots Neal funnels in native (x_1, x_2) coordinates, not
+        in a PCA projection.  This matters when normalize_target=True: the
+        sampler operates in whitened coordinates for fair N(0,I) initialization,
+        but the plot should be mapped back to the native funnel variables so the
+        visual convention matches benchmark_sweep.py.
+        """
+        return self._to_native(x)[:, :2]
 
     def target_info(self) -> Dict[str, object]:
         return {
@@ -1615,6 +1654,7 @@ def reverse_ou_heun_sde(
     use_final_denoise = bool(cfg.final_denoise if final_denoise is None else final_denoise)
     y = torch.randn((n, d), device=device, dtype=dtype, generator=generator)
     ts = make_time_grid(cfg, int(cfg.n_steps), direction="reverse", device=device, dtype=dtype)
+    ts_stats = time_grid_step_stats(ts)
     max_abs_score = 0.0
     fail = False
     fail_reason = ""
@@ -1662,6 +1702,9 @@ def reverse_ou_heun_sde(
         "sampler_t_min": float(t_min),
         "sampler_t_max": float(t_max),
         "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
+        "sampler_dt_min": float(ts_stats["dt_min"]),
+        "sampler_dt_max": float(ts_stats["dt_max"]),
+        "sampler_dt_sum": float(ts_stats["dt_sum"]),
     }
 
 
@@ -1703,6 +1746,7 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
     # Use the same user-selected time interval and schedule as the reverse sampler,
     # but in the forward direction for endpoint density evaluation.
     ts = make_time_grid(cfg, int(cfg.pf_steps), direction="forward", device=bank.device, dtype=bank.dtype)
+    ts_stats = time_grid_step_stats(ts)
     batch = max(int(cfg.rho_batch), 1)
     d = int(x0.shape[1])
     outs: List[torch.Tensor] = []
@@ -1716,6 +1760,8 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
         for j in range(int(cfg.pf_steps)):
             t = float(ts[j].item())
             tn = float(ts[j + 1].item())
+            # Physical-time interval.  For log_linear this is nonuniform Δt,
+            # not a unit log-time step, so no extra dt/dlog(t) factor appears.
             h = tn - t
             s, div = bank_score_and_divergence(bank, x, t, method, cfg)
             s = clamp_norm(s, cfg.score_clip)
@@ -1756,6 +1802,9 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
         "pf_t_min": float(effective_time_bounds(cfg)[0]),
         "pf_t_max": float(effective_time_bounds(cfg)[1]),
         "pf_time_schedule": canonical_time_schedule(cfg.time_schedule),
+        "pf_dt_min": float(ts_stats["dt_min"]),
+        "pf_dt_max": float(ts_stats["dt_max"]),
+        "pf_dt_sum": float(ts_stats["dt_sum"]),
         "pf_max_abs_div": float(max_abs_div),
         "pf_max_abs_state": float(max_abs_state),
         "pf_logq_mean": safe_float(logq_all.mean()),
@@ -2107,18 +2156,75 @@ def project_np(x: torch.Tensor, mean: np.ndarray, basis: np.ndarray) -> np.ndarr
     return (X - mean[None, :]) @ basis
 
 
-def plot_heatmap_panel(ax, pts2: np.ndarray, title: str, lims: Tuple[float, float, float, float], cfg: Config, vmax: Optional[float] = None):
-    H, xe, ye = np.histogram2d(pts2[:, 0], pts2[:, 1], bins=int(cfg.hist_bins), range=[[lims[0], lims[1]], [lims[2], lims[3]]], density=False)
+def _is_funnel_target(target) -> bool:
+    return isinstance(target, NealFunnelTarget) or str(getattr(target, "name", "")).startswith("funnel_d")
+
+
+def _heatmap_from_points(
+    pts2: np.ndarray,
+    lims: Tuple[float, float, float, float],
+    cfg: Config,
+    *,
+    bins: Optional[int] = None,
+    density: bool = False,
+) -> np.ndarray:
+    bins = int(cfg.hist_bins if bins is None else bins)
+    H, _xe, _ye = np.histogram2d(
+        pts2[:, 0],
+        pts2[:, 1],
+        bins=bins,
+        range=[[lims[0], lims[1]], [lims[2], lims[3]]],
+        density=bool(density),
+    )
     H = H.T.astype(np.float64)
-    if H.sum() > 0:
+    if not density and H.sum() > 0:
         H = H / H.sum()
+    H[~np.isfinite(H)] = 0.0
+    return H
+
+
+def plot_heatmap_panel(
+    ax,
+    pts2: np.ndarray,
+    title: str,
+    lims: Tuple[float, float, float, float],
+    cfg: Config,
+    vmax: Optional[float] = None,
+    *,
+    bins: Optional[int] = None,
+    density: bool = False,
+    gamma: Optional[float] = None,
+    aspect: str = "auto",
+    interpolation: str = "nearest",
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
+    show_ticks: bool = False,
+):
+    H = _heatmap_from_points(pts2, lims, cfg, bins=bins, density=density)
     if vmax is None:
         vals = H[H > 0]
         vmax = float(np.quantile(vals, float(cfg.hist_vmax_quantile))) if vals.size else 1.0
-    ax.imshow(H, origin="lower", extent=lims, aspect="auto", norm=PowerNorm(gamma=float(cfg.hist_gamma), vmin=0.0, vmax=max(vmax, 1.0e-12)))
+    gamma = float(cfg.hist_gamma if gamma is None else gamma)
+    ax.imshow(
+        H,
+        origin="lower",
+        extent=lims,
+        aspect=aspect,
+        interpolation=interpolation,
+        norm=PowerNorm(gamma=gamma, vmin=0.0, vmax=max(float(vmax), 1.0e-12)),
+    )
     ax.set_title(title, fontsize=10)
-    ax.set_xticks([])
-    ax.set_yticks([])
+    if xlabel is not None:
+        ax.set_xlabel(xlabel)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+    if not show_ticks:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    else:
+        ax.tick_params(axis="both", labelsize=9, length=2.5, width=0.7)
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.8)
     return vmax
 
 
@@ -2132,39 +2238,136 @@ def make_projection_limits(arrays: List[np.ndarray], pad: float = 0.08) -> Tuple
     return float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1])
 
 
+def make_funnel_projection_limits(arrays: List[np.ndarray]) -> Tuple[float, float, float, float]:
+    """Benchmark-sweep robust plotting limits for Neal funnel panels."""
+    Z = np.concatenate(arrays, axis=0)
+    x_lo, x_hi = np.percentile(Z[:, 0], [FUNNEL_HEATMAP_X_Q_LOW, FUNNEL_HEATMAP_X_Q_HIGH])
+    y_abs = float(np.percentile(np.abs(Z[:, 1]), FUNNEL_HEATMAP_Y_Q_ABS))
+    x_pad = 0.06 * max(float(x_hi - x_lo), 1.0e-9)
+    y_pad = 0.06 * max(2.0 * y_abs, 1.0e-9)
+    return float(x_lo - x_pad), float(x_hi + x_pad), float(-y_abs - y_pad), float(y_abs + y_pad)
+
+
+def shared_heatmap_vmax(
+    arrays: List[np.ndarray],
+    lims: Tuple[float, float, float, float],
+    cfg: Config,
+    *,
+    bins: Optional[int] = None,
+    density: bool = False,
+    q_percent: Optional[float] = None,
+) -> float:
+    positives: List[np.ndarray] = []
+    for arr in arrays:
+        if arr is None or len(arr) < 1:
+            continue
+        H = _heatmap_from_points(arr, lims, cfg, bins=bins, density=density)
+        z = H[np.isfinite(H) & (H > 0.0)]
+        if z.size:
+            positives.append(z)
+    if not positives:
+        return 1.0
+    vals = np.concatenate(positives)
+    if q_percent is None:
+        # Generic path uses cfg.hist_vmax_quantile as a [0,1] quantile.
+        vmax = float(np.quantile(vals, float(cfg.hist_vmax_quantile)))
+    else:
+        # Benchmark-sweep funnel path uses a percentile, default 98.5.
+        vmax = float(np.percentile(vals, float(q_percent)))
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = float(np.max(vals))
+    return max(float(vmax), 1.0e-12)
+
+
 def save_heatmaps(outdir: str, target, truth: torch.Tensor, init_refs: torch.Tensor, samples_by_family_round: Dict[str, List[torch.Tensor]], cfg: Config):
-    mean, basis = fit_pca_projection(truth)
-    np.savez(os.path.join(outdir, "projection_basis.npz"), mean=mean, basis=basis)
-    truth2 = project_np(truth, mean, basis)
-    init2 = project_np(init_refs, mean, basis)
+    is_funnel = _is_funnel_target(target)
+
+    if is_funnel and hasattr(target, "plot_projection"):
+        def to_plot_np(x: torch.Tensor) -> np.ndarray:
+            return target.plot_projection(x, fit_ref=truth).detach().cpu().double().numpy()
+        # The saved file keeps the same name as before but now records that this
+        # is the native benchmark-sweep funnel projection rather than PCA.
+        np.savez(
+            os.path.join(outdir, "projection_basis.npz"),
+            projection="funnel_native_x1_x2",
+            normalized_target=bool(getattr(target, "normalized", False)),
+            scale=as_numpy(getattr(target, "scale", torch.ones(int(target.d), device=target.device, dtype=target.dtype))),
+        )
+        projection_title = f"Funnel coordinates — Neal Funnel ($d={int(getattr(target, 'd', truth.shape[1]))}$)"
+        axis_labels = (r"$x_1$", r"$x_2$")
+        panel_aspect = "auto"
+        heatmap_bins = 100
+        heatmap_density = True
+        heatmap_gamma = min(max(float(os.environ.get("LFGI_BENCH_HEATMAP_GAMMA", "0.42")), 0.05), 1.0)
+        heatmap_vmax_q = float(os.environ.get("LFGI_BENCH_HEATMAP_VMAX_Q", "98.5"))
+        heatmap_interp = os.environ.get("LFGI_BENCH_HEATMAP_INTERP", "nearest").strip() or "nearest"
+    else:
+        mean, basis = fit_pca_projection(truth)
+        np.savez(os.path.join(outdir, "projection_basis.npz"), mean=mean, basis=basis, projection="pca")
+        def to_plot_np(x: torch.Tensor) -> np.ndarray:
+            return project_np(x, mean, basis)
+        projection_title = f"PCA heatmaps: {getattr(target, 'name', getattr(target, '__class__', type(target)).__name__)}"
+        axis_labels = (None, None)
+        panel_aspect = "auto"
+        heatmap_bins = None
+        heatmap_density = False
+        heatmap_gamma = float(cfg.hist_gamma)
+        heatmap_vmax_q = None
+        heatmap_interp = "nearest"
+
+    truth2 = to_plot_np(truth)
+    init2 = to_plot_np(init_refs)
+    family_order = list(samples_by_family_round.keys())
+
+    all_arrays = [truth2, init2]
     final_arrays = [truth2, init2]
-    for fam, arrs in samples_by_family_round.items():
+    for fam in family_order:
+        arrs = samples_by_family_round.get(fam, [])
+        for x in arrs:
+            all_arrays.append(to_plot_np(x))
         if arrs:
-            final_arrays.append(project_np(arrs[-1], mean, basis))
-    lims = make_projection_limits(final_arrays)
-    vmax = None
-    # Use truth's nonzero quantile as shared scale so weak/spread methods remain visible.
-    H_truth, _, _ = np.histogram2d(truth2[:, 0], truth2[:, 1], bins=int(cfg.hist_bins), range=[[lims[0], lims[1]], [lims[2], lims[3]]])
-    H_truth = H_truth.T
-    if H_truth.sum() > 0:
-        H_truth = H_truth / H_truth.sum()
-        vals = H_truth[H_truth > 0]
-        if vals.size:
-            vmax = float(np.quantile(vals, float(cfg.hist_vmax_quantile)))
+            final_arrays.append(to_plot_np(arrs[-1]))
+
+    lims = make_funnel_projection_limits(all_arrays) if is_funnel else make_projection_limits(final_arrays)
+    vmax = shared_heatmap_vmax(
+        all_arrays if is_funnel else [truth2],
+        lims,
+        cfg,
+        bins=heatmap_bins,
+        density=heatmap_density,
+        q_percent=heatmap_vmax_q,
+    )
 
     init_label = "Initial target refs" if canonical_initial_reference_mode(cfg.initial_reference_mode) == "target" else "Initial N(0,I) prior refs"
     panels = [("Target truth (eval only)", truth2), (init_label, init2)]
-    family_order = list(samples_by_family_round.keys())
     for fam in family_order:
         if samples_by_family_round.get(fam):
-            panels.append((f"{fam} alternating DRC round {len(samples_by_family_round[fam])}", project_np(samples_by_family_round[fam][-1], mean, basis)))
+            panels.append((f"{fam} alternating DRC round {len(samples_by_family_round[fam])}", to_plot_np(samples_by_family_round[fam][-1])))
+
     fig, axes = plt.subplots(1, len(panels), figsize=(4.0 * len(panels), 4.0), constrained_layout=True)
     if len(panels) == 1:
         axes = [axes]
-    for ax, (title, pts) in zip(axes, panels):
-        plot_heatmap_panel(ax, pts, title, lims, cfg, vmax=vmax)
-    fig.suptitle(f"PCA heatmaps: {getattr(target, 'name', getattr(target, '__class__', type(target)).__name__)}", fontsize=12)
-    fig.savefig(os.path.join(outdir, "heatmaps_final.png"), dpi=220)
+    for ci, (ax, (title, pts)) in enumerate(zip(axes, panels)):
+        plot_heatmap_panel(
+            ax,
+            pts,
+            title,
+            lims,
+            cfg,
+            vmax=vmax,
+            bins=heatmap_bins,
+            density=heatmap_density,
+            gamma=heatmap_gamma,
+            aspect=panel_aspect,
+            interpolation=heatmap_interp,
+            xlabel=axis_labels[0] if is_funnel else None,
+            ylabel=axis_labels[1] if (is_funnel and ci == 0) else None,
+            show_ticks=bool(is_funnel),
+        )
+        if is_funnel and ci > 0:
+            ax.set_yticklabels([])
+    fig.suptitle(projection_title, fontsize=12 if not is_funnel else 15.5)
+    fig.savefig(os.path.join(outdir, "heatmaps_final.png"), dpi=220, bbox_inches="tight")
     plt.close(fig)
 
     ncols = int(cfg.n_rounds) + 2
@@ -2172,19 +2375,43 @@ def save_heatmaps(outdir: str, target, truth: torch.Tensor, init_refs: torch.Ten
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.1 * ncols, 3.1 * nrows), constrained_layout=True)
     axes = np.asarray(axes).reshape(nrows, ncols)
     for row, fam in enumerate(family_order):
-        plot_heatmap_panel(axes[row, 0], truth2, "Target", lims, cfg, vmax=vmax)
-        plot_heatmap_panel(axes[row, 1], init2, f"{fam}: {init_label}", lims, cfg, vmax=vmax)
+        plot_heatmap_panel(
+            axes[row, 0], truth2, "Target", lims, cfg, vmax=vmax,
+            bins=heatmap_bins, density=heatmap_density, gamma=heatmap_gamma,
+            aspect=panel_aspect, interpolation=heatmap_interp,
+            xlabel=axis_labels[0] if is_funnel else None,
+            ylabel=axis_labels[1] if is_funnel else None,
+            show_ticks=bool(is_funnel),
+        )
+        plot_heatmap_panel(
+            axes[row, 1], init2, f"{fam}: {init_label}", lims, cfg, vmax=vmax,
+            bins=heatmap_bins, density=heatmap_density, gamma=heatmap_gamma,
+            aspect=panel_aspect, interpolation=heatmap_interp,
+            xlabel=axis_labels[0] if is_funnel else None,
+            ylabel=None,
+            show_ticks=bool(is_funnel),
+        )
+        if is_funnel:
+            axes[row, 1].set_yticklabels([])
         arrs = samples_by_family_round.get(fam, [])
         for j in range(int(cfg.n_rounds)):
             ax = axes[row, j + 2]
             if j < len(arrs):
-                plot_heatmap_panel(ax, project_np(arrs[j], mean, basis), f"{fam}: round {j+1}", lims, cfg, vmax=vmax)
+                plot_heatmap_panel(
+                    ax, to_plot_np(arrs[j]), f"{fam}: round {j+1}", lims, cfg, vmax=vmax,
+                    bins=heatmap_bins, density=heatmap_density, gamma=heatmap_gamma,
+                    aspect=panel_aspect, interpolation=heatmap_interp,
+                    xlabel=axis_labels[0] if is_funnel else None,
+                    ylabel=None,
+                    show_ticks=bool(is_funnel),
+                )
+                if is_funnel:
+                    ax.set_yticklabels([])
             else:
                 ax.axis("off")
     fig.suptitle("Alternating DRC progression by estimator family", fontsize=12)
-    fig.savefig(os.path.join(outdir, "heatmaps_by_round.png"), dpi=220)
+    fig.savefig(os.path.join(outdir, "heatmaps_by_round.png"), dpi=220, bbox_inches="tight")
     plt.close(fig)
-
 
 def save_metric_curves(outdir: str, rows: List[Dict[str, object]]):
     try:
@@ -2304,6 +2531,12 @@ def blank_pf_info(method: str, reason: str = "skipped") -> Dict[str, float | boo
         "pf_skip_reason": reason,
         "pf_failed_frac": 0.0,
         "pf_steps": 0,
+        "pf_t_min": float("nan"),
+        "pf_t_max": float("nan"),
+        "pf_time_schedule": "none",
+        "pf_dt_min": float("nan"),
+        "pf_dt_max": float("nan"),
+        "pf_dt_sum": float("nan"),
         "pf_max_abs_div": float("nan"),
         "pf_max_abs_state": float("nan"),
         "pf_logq_mean": float("nan"),
