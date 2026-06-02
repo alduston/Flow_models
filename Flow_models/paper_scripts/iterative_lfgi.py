@@ -4,7 +4,7 @@
 alternating_drc_lfgi_vs_blend_misaligned8d.py
 
 Compare alternating density-ratio-corrected bootstrapping from isotropic
-Gaussian prior samples on a selectable normalized target.
+Gaussian-prior or oracle-target reference samples on a selectable normalized target.
 
 Targets now include the original d=8 misaligned singular-subspace GMM,
 the d=10 Neal funnel stress test from the benchmark sweep, and intermediate-dimensional
@@ -21,10 +21,10 @@ This is the exact test described in the chat:
     concentration, heterogeneous anisotropy, and exact autograd Hessians.
   * Normalization: targets are affinely whitened so E[X]≈0 and Cov[X]≈I.
     Therefore the initial N(0,I) prior bank has the same global location and
-    volume as the target, but it is not a target sample bank.
+    volume as the target, but it is not a target sample bank unless --initial_reference_mode target is used.
   * Inputs available to the estimators: prior/reference coordinates, target
     energy/log-density, target gradient/score, and target Hessian at those
-    coordinates.  Target samples are used only for evaluation metrics/plots.
+    coordinates.  Target samples are used for evaluation metrics/plots, and optionally for oracle initial references with --initial_reference_mode target.
   * Methods: selected with --methods.  Atomic estimators include Blend,
     CE-HLSI/LFGI, MP-Leaf-LFGI, Tweedie, and None.  Hybrid tokens use
     transport_correction order, e.g. blend_lfgi, lfgi_blend, tweedie_lfgi,
@@ -174,7 +174,13 @@ class Config:
 
     # Alternating rounds
     n_rounds: int = 4
-    initial_weight_mode: str = "prior_ratio"  # prior_ratio or zero
+    # Initial proposal/reference law:
+    #   prior/gaussian : draw the initial split-compatible pool from N(0,I).
+    #   target/oracle  : draw the initial split-compatible pool from the target.
+    #                    This is an oracle-reference stability test; initial
+    #                    density-ratio weights are forced to zero because q0=p0.
+    initial_reference_mode: str = "prior"
+    initial_weight_mode: str = "prior_ratio"  # prior_ratio or zero; ignored for target initial references
     # Comma-separated estimator pairs to run. Atomic aliases such as blend,
     # lfgi/ce-hlsi, or leaf-lfgi/mp-leaf-lfgi mean diagonal transport/correction.
     # Hybrid aliases use transport_correction order, e.g. blend_lfgi or lfgi_blend.
@@ -277,6 +283,50 @@ def canonical_bank_coupling(value: str) -> str:
     if key not in aliases:
         raise ValueError(f"Unknown bank_coupling={value!r}; use shared, prefix, or independent")
     return aliases[key]
+
+
+def canonical_initial_reference_mode(value: str) -> str:
+    """Normalize user-facing aliases for the initial proposal/reference law."""
+    key = str(value or "prior").strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "prior": "prior",
+        "gaussian": "prior",
+        "normal": "prior",
+        "naive": "prior",
+        "naive-gaussian": "prior",
+        "n0i": "prior",
+        "n-0-i": "prior",
+        "target": "target",
+        "oracle": "target",
+        "oracle-target": "target",
+        "truth": "target",
+        "true": "target",
+        "p0": "target",
+    }
+    if key not in aliases:
+        raise ValueError(f"Unknown initial_reference_mode={value!r}; use prior or target")
+    return aliases[key]
+
+
+def make_initial_reference_pool(target, cfg: Config, n_pool: int, generator: torch.Generator) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """Draw the initial split-compatible proposal/reference pool.
+
+    ``prior`` is the original naive Gaussian start.  ``target`` is an oracle
+    start: the proposal/reference coordinates are target samples, so the
+    correct initial density ratio is zero before the first alternating update.
+    """
+    mode = canonical_initial_reference_mode(cfg.initial_reference_mode)
+    n_pool = int(n_pool)
+    if mode == "prior":
+        x = torch.randn((n_pool, int(target.d)), device=target.device, dtype=target.dtype, generator=generator)
+    elif mode == "target":
+        x = target.sample(n_pool, generator=generator).detach()
+    else:
+        raise RuntimeError(f"Unhandled initial_reference_mode={mode!r}")
+    return x.detach(), {
+        "initial_reference_mode": mode,
+        "initial_reference_n": int(x.shape[0]),
+    }
 
 
 def effective_gate_n(cfg: Config) -> int:
@@ -1992,12 +2042,12 @@ def make_projection_limits(arrays: List[np.ndarray], pad: float = 0.08) -> Tuple
     return float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1])
 
 
-def save_heatmaps(outdir: str, target, truth: torch.Tensor, prior: torch.Tensor, samples_by_family_round: Dict[str, List[torch.Tensor]], cfg: Config):
+def save_heatmaps(outdir: str, target, truth: torch.Tensor, init_refs: torch.Tensor, samples_by_family_round: Dict[str, List[torch.Tensor]], cfg: Config):
     mean, basis = fit_pca_projection(truth)
     np.savez(os.path.join(outdir, "projection_basis.npz"), mean=mean, basis=basis)
     truth2 = project_np(truth, mean, basis)
-    prior2 = project_np(prior, mean, basis)
-    final_arrays = [truth2, prior2]
+    init2 = project_np(init_refs, mean, basis)
+    final_arrays = [truth2, init2]
     for fam, arrs in samples_by_family_round.items():
         if arrs:
             final_arrays.append(project_np(arrs[-1], mean, basis))
@@ -2012,7 +2062,8 @@ def save_heatmaps(outdir: str, target, truth: torch.Tensor, prior: torch.Tensor,
         if vals.size:
             vmax = float(np.quantile(vals, float(cfg.hist_vmax_quantile)))
 
-    panels = [("Target truth (eval only)", truth2), ("Initial N(0,I) prior refs", prior2)]
+    init_label = "Initial target refs" if canonical_initial_reference_mode(cfg.initial_reference_mode) == "target" else "Initial N(0,I) prior refs"
+    panels = [("Target truth (eval only)", truth2), (init_label, init2)]
     family_order = list(samples_by_family_round.keys())
     for fam in family_order:
         if samples_by_family_round.get(fam):
@@ -2032,7 +2083,7 @@ def save_heatmaps(outdir: str, target, truth: torch.Tensor, prior: torch.Tensor,
     axes = np.asarray(axes).reshape(nrows, ncols)
     for row, fam in enumerate(family_order):
         plot_heatmap_panel(axes[row, 0], truth2, "Target", lims, cfg, vmax=vmax)
-        plot_heatmap_panel(axes[row, 1], prior2, f"{fam}: prior refs", lims, cfg, vmax=vmax)
+        plot_heatmap_panel(axes[row, 1], init2, f"{fam}: {init_label}", lims, cfg, vmax=vmax)
         arrs = samples_by_family_round.get(fam, [])
         for j in range(int(cfg.n_rounds)):
             ax = axes[row, j + 2]
@@ -2097,20 +2148,40 @@ def write_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 @torch.no_grad()
-def initial_log_weights(target, prior_refs: torch.Tensor, cfg: Config) -> Tuple[torch.Tensor, Dict[str, float | bool | str]]:
+def initial_log_weights(target, init_refs: torch.Tensor, cfg: Config) -> Tuple[torch.Tensor, Dict[str, float | bool | str]]:
+    ref_mode = canonical_initial_reference_mode(cfg.initial_reference_mode)
+    if ref_mode == "target":
+        # Oracle target references represent q0=p0, so log pi - log q0 is zero.
+        # Using prior_ratio here would answer a different question and would
+        # artificially reweight exact target samples by p0/N(0,I).
+        rho = torch.zeros((init_refs.shape[0],), device=init_refs.device, dtype=init_refs.dtype)
+        ess, ess_frac = log_weight_ess(rho)
+        return rho, {
+            "initial_reference_mode": ref_mode,
+            "initial_weight_mode": "zero_oracle_target",
+            "initial_rho_ess": ess,
+            "initial_rho_ess_frac": ess_frac,
+            "initial_weight_mode_requested": str(cfg.initial_weight_mode),
+        }
+
     mode = str(cfg.initial_weight_mode).lower()
     if mode == "zero":
-        rho = torch.zeros((prior_refs.shape[0],), device=prior_refs.device, dtype=prior_refs.dtype)
+        rho = torch.zeros((init_refs.shape[0],), device=init_refs.device, dtype=init_refs.dtype)
         ess, ess_frac = log_weight_ess(rho)
-        return rho, {"initial_weight_mode": "zero", "initial_rho_ess": ess, "initial_rho_ess_frac": ess_frac}
+        return rho, {
+            "initial_reference_mode": ref_mode,
+            "initial_weight_mode": "zero",
+            "initial_rho_ess": ess,
+            "initial_rho_ess_frac": ess_frac,
+        }
     if mode != "prior_ratio":
         raise ValueError("initial_weight_mode must be prior_ratio or zero")
-    raw = target.log_prob(prior_refs, t=0.0) - standard_normal_logprob(prior_refs)
+    raw = target.log_prob(init_refs, t=0.0) - standard_normal_logprob(init_refs)
     rho, info = finalize_density_ratio_weights(raw, cfg)
     info = {f"initial_{k}": v for k, v in info.items()}
+    info["initial_reference_mode"] = ref_mode
     info["initial_weight_mode"] = "prior_ratio"
     return rho, info
-
 
 
 
@@ -2173,12 +2244,12 @@ def run_family(
     transport_method: str,
     correction_method: str,
     target,
-    prior_refs: torch.Tensor,
+    init_refs: torch.Tensor,
     init_rho: torch.Tensor,
     truth: torch.Tensor,
     cfg: Config,
 ) -> Tuple[List[torch.Tensor], List[Dict[str, object]], List[Dict[str, object]]]:
-    current_pool = prior_refs.detach().clone()
+    current_pool = init_refs.detach().clone()
     current_rho = init_rho.detach().clone()
     samples_by_round: List[torch.Tensor] = []
     metric_rows: List[Dict[str, object]] = []
@@ -2596,6 +2667,7 @@ def run(cfg: Config) -> None:
         "actual_device": str(device),
         "effective_gate_n": int(effective_gate_n(cfg)),
         "effective_bank_coupling": canonical_bank_coupling(cfg.bank_coupling),
+        "effective_initial_reference_mode": canonical_initial_reference_mode(cfg.initial_reference_mode),
         "proposal_pool_n": int(proposal_pool_size(cfg)),
         "target_moment_mean_norm": target.moment_mean_norm,
         "target_moment_cov_frob_err": target.moment_cov_frob_err,
@@ -2615,17 +2687,22 @@ def run(cfg: Config) -> None:
         flush=True,
     )
 
-    prior_gen = make_generator(int(cfg.seed + 101), device)
-    prior_refs = torch.randn((int(init_pool_n), int(target.d)), device=device, dtype=dtype, generator=prior_gen)
-    prior_score_refs, prior_score_rho0, prior_gate_refs, prior_gate_rho0, prior_split_info = split_score_gate_banks(
-        prior_refs,
-        torch.zeros((prior_refs.shape[0],), device=device, dtype=dtype),
+    init_gen = make_generator(int(cfg.seed + 101), device)
+    init_refs, init_ref_info = make_initial_reference_pool(target, cfg, init_pool_n, init_gen)
+    init_score_refs, init_score_rho0, init_gate_refs, init_gate_rho0, init_split_info = split_score_gate_banks(
+        init_refs,
+        torch.zeros((init_refs.shape[0],), device=device, dtype=dtype),
         cfg,
     )
     truth_gen = make_generator(int(cfg.seed + 202), device)
     truth = target.sample(int(cfg.n_truth), generator=truth_gen).detach()
-    init_rho, init_info = initial_log_weights(target, prior_refs, cfg)
-    print(f"Initial weights: mode={init_info['initial_weight_mode']}, ESS/N={init_info.get('initial_rho_ess_frac', init_info.get('initial_rho_ess_frac', float('nan'))):.3f}", flush=True)
+    init_rho, init_info = initial_log_weights(target, init_refs, cfg)
+    init_info.update(init_ref_info)
+    print(
+        f"Initial references: mode={init_info['initial_reference_mode']}; "
+        f"weights={init_info['initial_weight_mode']}; ESS/N={init_info.get('initial_rho_ess_frac', float('nan')):.3f}",
+        flush=True,
+    )
 
     # Baseline rows: truth floor against another truth draw, and prior bank metrics.
     metric_rows: List[Dict[str, object]] = []
@@ -2633,21 +2710,21 @@ def run(cfg: Config) -> None:
     baseline_gen = make_generator(int(cfg.seed + 303), device)
     truth2 = target.sample(min(int(cfg.n_truth), int(cfg.metrics_max_n)), generator=baseline_gen).detach()
     metric_rows.append({"kind": "baseline", "family": "TARGET_FLOOR", "method": "TARGET_FLOOR", "round": 0, **compute_metrics(target, truth2, truth, None, cfg, baseline_gen)})
-    metric_rows.append({"kind": "baseline", "family": "PRIOR_REFS", "method": "PRIOR_REFS", "round": 0, **compute_metrics(target, prior_score_refs, truth, None, cfg, baseline_gen), **init_info, **prior_split_info})
+    metric_rows.append({"kind": "baseline", "family": "INIT_REFS", "method": f"INIT_REFS_{init_info['initial_reference_mode']}", "round": 0, **compute_metrics(target, init_score_refs, truth, None, cfg, baseline_gen), **init_info, **init_split_info})
 
     all_samples: Dict[str, List[torch.Tensor]] = {}
     method_specs = selected_method_specs(cfg.methods)
     print("Selected method pairs: " + ", ".join([f"{fam} (S={tm}, R={cm})" for fam, tm, cm in method_specs]), flush=True)
     for family, transport_method, correction_method in method_specs:
         print(f"\n=== Running alternating DRC pair: {family} (S={transport_method}, R={correction_method}) ===", flush=True)
-        samples_by_round, rows, stages = run_family(family, transport_method, correction_method, target, prior_refs, init_rho, truth, cfg)
+        samples_by_round, rows, stages = run_family(family, transport_method, correction_method, target, init_refs, init_rho, truth, cfg)
         all_samples[family] = samples_by_round
         metric_rows.extend(rows)
         stage_rows.extend(stages)
 
     write_csv(os.path.join(cfg.outdir, "metrics_by_round.csv"), metric_rows)
     write_csv(os.path.join(cfg.outdir, "stage_diagnostics.csv"), stage_rows)
-    save_heatmaps(cfg.outdir, target, truth, prior_score_refs, all_samples, cfg)
+    save_heatmaps(cfg.outdir, target, truth, init_score_refs, all_samples, cfg)
     save_metric_curves(cfg.outdir, metric_rows)
 
     print("\nDone. Wrote:", flush=True)
@@ -2656,7 +2733,7 @@ def run(cfg: Config) -> None:
 
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Alternating DRC hybrid test: choose target plus transport/correction score estimators from prior samples.")
+    p = argparse.ArgumentParser(description="Alternating DRC hybrid test: choose target, initial references, and transport/correction score estimators.")
     defaults = Config()
     for field_name, default_value in asdict(defaults).items():
         arg = "--" + field_name
