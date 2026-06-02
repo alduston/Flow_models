@@ -58,6 +58,7 @@ python alternating_drc_lfgi_vs_blend_targets.py \
   --device cuda --dtype float64 \
   --n_ref 3000 --n_samples 3000 --n_truth 12000 \
   --n_rounds 4 --n_steps 150 --pf_steps 64 \
+  --t_min 0.005 --t_max 3.0 --time_schedule linear \
   --methods blend_blend,blend_lfgi,lfgi_blend,lfgi_lfgi,tweedie_lfgi,lfgi_none,none_lfgi
 
 python alternating_drc_lfgi_vs_blend_targets.py \
@@ -190,9 +191,14 @@ class Config:
     #   grid/full   = full transport/correction grid over blend, lfgi, leaf-lfgi, tweedie, none
     methods: str = "blend_blend,blend_lfgi,lfgi_blend,lfgi_lfgi"
 
-    # Reverse OU sampler
-    t_start: float = 3.0
-    t_end: float = 0.005
+    # Reverse OU sampler / probability-flow time interval.
+    # The old names t_start/t_end are kept as aliases for backward compatibility;
+    # t_max/t_min are the canonical knobs used below.
+    t_min: float = 0.005
+    t_max: float = 3.0
+    time_schedule: str = "linear"  # linear or log_linear
+    t_start: float = 3.0  # legacy alias for t_max
+    t_end: float = 0.005  # legacy alias for t_min
     n_steps: int = 150
     final_denoise: bool = False  # keep PF-compatible endpoint law by default
     eval_final_denoise: bool = False
@@ -449,6 +455,77 @@ def alpha_gamma(t: float | torch.Tensor, *, device=None, dtype=None) -> Tuple[to
     alpha = torch.exp(-t)
     gamma = 1.0 - torch.exp(-2.0 * t)
     return alpha, gamma
+
+
+def canonical_time_schedule(value: str) -> str:
+    """Normalize sampler/PF time-grid aliases."""
+    key = str(value or "linear").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "linear": "linear",
+        "lin": "linear",
+        "uniform": "linear",
+        "uniform_t": "linear",
+        "log_linear": "log_linear",
+        "loglinear": "log_linear",
+        "log": "log_linear",
+        "log_t": "log_linear",
+        "geometric": "log_linear",
+        "geom": "log_linear",
+    }
+    if key not in aliases:
+        raise ValueError(f"Unknown time_schedule={value!r}; use linear or log_linear")
+    return aliases[key]
+
+
+def effective_time_bounds(cfg: Config) -> Tuple[float, float]:
+    """Return canonical (t_min, t_max), accepting legacy t_end/t_start aliases."""
+    default = Config()
+    # Prefer explicit new names.  If only a legacy alias differs from the default,
+    # promote it so old command lines keep their previous behavior.
+    t_min = float(cfg.t_min)
+    t_max = float(cfg.t_max)
+    if float(cfg.t_min) == float(default.t_min) and float(cfg.t_end) != float(default.t_end):
+        t_min = float(cfg.t_end)
+    if float(cfg.t_max) == float(default.t_max) and float(cfg.t_start) != float(default.t_start):
+        t_max = float(cfg.t_start)
+    if not math.isfinite(t_min) or not math.isfinite(t_max):
+        raise ValueError(f"Nonfinite time bounds: t_min={t_min}, t_max={t_max}")
+    if t_min <= 0.0:
+        raise ValueError(f"t_min must be positive for OU weights and log schedules; got {t_min}")
+    if t_max <= t_min:
+        raise ValueError(f"Require t_max > t_min; got t_min={t_min}, t_max={t_max}")
+    return t_min, t_max
+
+
+def make_time_grid(cfg: Config, steps: int, *, direction: str, device, dtype) -> torch.Tensor:
+    """Build the sampler/PF time grid.
+
+    direction='reverse' gives t_max -> t_min for reverse SDE sampling.
+    direction='forward' gives t_min -> t_max for PF density evaluation.
+    """
+    n_steps = int(steps)
+    if n_steps < 1:
+        raise ValueError(f"steps must be >= 1; got {steps}")
+    t_min, t_max = effective_time_bounds(cfg)
+    schedule = canonical_time_schedule(cfg.time_schedule)
+    if schedule == "linear":
+        lo = torch.tensor(t_min, device=device, dtype=dtype)
+        hi = torch.tensor(t_max, device=device, dtype=dtype)
+        if direction == "forward":
+            return torch.linspace(lo, hi, n_steps + 1, device=device, dtype=dtype)
+        if direction == "reverse":
+            return torch.linspace(hi, lo, n_steps + 1, device=device, dtype=dtype)
+    elif schedule == "log_linear":
+        log_lo = math.log(max(t_min, 1.0e-12))
+        log_hi = math.log(max(t_max, t_min + 1.0e-12))
+        if direction == "forward":
+            logs = torch.linspace(log_lo, log_hi, n_steps + 1, device=device, dtype=dtype)
+        elif direction == "reverse":
+            logs = torch.linspace(log_hi, log_lo, n_steps + 1, device=device, dtype=dtype)
+        else:
+            raise ValueError(f"direction must be forward or reverse; got {direction!r}")
+        return torch.exp(logs)
+    raise RuntimeError(f"Unhandled time_schedule={schedule!r}")
 
 
 def standard_normal_logprob(x: torch.Tensor) -> torch.Tensor:
@@ -1537,7 +1614,7 @@ def reverse_ou_heun_sde(
     n = int(cfg.n_samples if n_samples is None else n_samples)
     use_final_denoise = bool(cfg.final_denoise if final_denoise is None else final_denoise)
     y = torch.randn((n, d), device=device, dtype=dtype, generator=generator)
-    ts = torch.linspace(float(cfg.t_start), float(cfg.t_end), int(cfg.n_steps) + 1, device=device, dtype=dtype)
+    ts = make_time_grid(cfg, int(cfg.n_steps), direction="reverse", device=device, dtype=dtype)
     max_abs_score = 0.0
     fail = False
     fail_reason = ""
@@ -1566,8 +1643,9 @@ def reverse_ou_heun_sde(
             fail, fail_reason = True, "nonfinite state"
             break
     if not fail and use_final_denoise:
-        tf = torch.tensor(float(cfg.t_end), device=device, dtype=dtype)
-        sf = clamp_norm(score_fn(y, float(cfg.t_end)), cfg.score_clip)
+        t_min, _t_max = effective_time_bounds(cfg)
+        tf = torch.tensor(t_min, device=device, dtype=dtype)
+        sf = clamp_norm(score_fn(y, t_min), cfg.score_clip)
         max_abs_score = max(max_abs_score, safe_float(sf.abs().max()))
         if torch.isfinite(sf).all():
             alpha, gamma = alpha_gamma(tf)
@@ -1576,7 +1654,15 @@ def reverse_ou_heun_sde(
                 y = torch.clamp(y, min=-float(cfg.sample_clip), max=float(cfg.sample_clip))
         else:
             fail, fail_reason = True, "nonfinite final score"
-    return y.detach(), {"failed": bool(fail), "fail_reason": fail_reason, "max_abs_score": float(max_abs_score)}
+    t_min, t_max = effective_time_bounds(cfg)
+    return y.detach(), {
+        "failed": bool(fail),
+        "fail_reason": fail_reason,
+        "max_abs_score": float(max_abs_score),
+        "sampler_t_min": float(t_min),
+        "sampler_t_max": float(t_max),
+        "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
+    }
 
 
 @torch.no_grad()
@@ -1614,9 +1700,9 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
     """
     if x0.numel() == 0:
         return torch.empty((0,), device=bank.device, dtype=bank.dtype), {"pf_failed_frac": 0.0}
-    t0 = max(float(cfg.t_end), 1.0e-6)
-    t1 = max(float(cfg.t_start), t0 + 1.0e-6)
-    ts = torch.linspace(t0, t1, int(cfg.pf_steps) + 1, device=bank.device, dtype=bank.dtype)
+    # Use the same user-selected time interval and schedule as the reverse sampler,
+    # but in the forward direction for endpoint density evaluation.
+    ts = make_time_grid(cfg, int(cfg.pf_steps), direction="forward", device=bank.device, dtype=bank.dtype)
     batch = max(int(cfg.rho_batch), 1)
     d = int(x0.shape[1])
     outs: List[torch.Tensor] = []
@@ -1667,6 +1753,9 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
         "pf_divergence_mode": str(cfg.pf_divergence),
         "pf_failed_frac": float(failed_total) / float(max(1, x0.shape[0])),
         "pf_steps": int(cfg.pf_steps),
+        "pf_t_min": float(effective_time_bounds(cfg)[0]),
+        "pf_t_max": float(effective_time_bounds(cfg)[1]),
+        "pf_time_schedule": canonical_time_schedule(cfg.time_schedule),
         "pf_max_abs_div": float(max_abs_div),
         "pf_max_abs_state": float(max_abs_state),
         "pf_logq_mean": safe_float(logq_all.mean()),
@@ -1959,8 +2048,9 @@ def moment_errors(samples: torch.Tensor) -> Tuple[float, float]:
 def fisher_rmse(target, score_fn: Callable[[torch.Tensor, float], torch.Tensor], cfg: Config, generator: torch.Generator) -> float:
     if int(cfg.fisher_n_t) <= 0 or int(cfg.fisher_n_per_t) <= 0:
         return float("nan")
-    t_min = max(float(cfg.t_end), 1.0e-6)
-    t_max = max(float(cfg.t_start), t_min)
+    t_min, t_max = effective_time_bounds(cfg)
+    t_min = max(float(t_min), 1.0e-6)
+    t_max = max(float(t_max), t_min)
     if cfg.fisher_time_grid == "linear":
         t_grid = torch.linspace(t_min, t_max, int(cfg.fisher_n_t), device=target.device, dtype=target.dtype)
     else:
@@ -2288,6 +2378,9 @@ def run_family(
                 "max_abs_score": 0.0,
                 "transport_none": True,
                 "generated_n": int(samples_all.shape[0]),
+                "sampler_t_min": float(effective_time_bounds(cfg)[0]),
+                "sampler_t_max": float(effective_time_bounds(cfg)[1]),
+                "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
             }
         else:
             # This is the field used to generate R_{j+1}.  We generate enough
@@ -2337,6 +2430,9 @@ def run_family(
             "sampler_failed": bool(sampler_info.get("failed", False)),
             "sampler_fail_reason": str(sampler_info.get("fail_reason", "")),
             "sampler_max_abs_score": safe_float(sampler_info.get("max_abs_score", float("nan"))),
+            "sampler_t_min": safe_float(sampler_info.get("sampler_t_min", effective_time_bounds(cfg)[0])),
+            "sampler_t_max": safe_float(sampler_info.get("sampler_t_max", effective_time_bounds(cfg)[1])),
+            "sampler_time_schedule": str(sampler_info.get("sampler_time_schedule", canonical_time_schedule(cfg.time_schedule))),
             "generated_n": int(sampler_info.get("generated_n", samples_all.shape[0])),
             "elapsed_sec_so_far": float(time.time() - round_t0),
             **metrics,
@@ -2668,6 +2764,9 @@ def run(cfg: Config) -> None:
         "effective_gate_n": int(effective_gate_n(cfg)),
         "effective_bank_coupling": canonical_bank_coupling(cfg.bank_coupling),
         "effective_initial_reference_mode": canonical_initial_reference_mode(cfg.initial_reference_mode),
+        "effective_t_min": float(effective_time_bounds(cfg)[0]),
+        "effective_t_max": float(effective_time_bounds(cfg)[1]),
+        "effective_time_schedule": canonical_time_schedule(cfg.time_schedule),
         "proposal_pool_n": int(proposal_pool_size(cfg)),
         "target_moment_mean_norm": target.moment_mean_norm,
         "target_moment_cov_frob_err": target.moment_cov_frob_err,
@@ -2683,7 +2782,8 @@ def run(cfg: Config) -> None:
     init_pool_n = proposal_pool_size(cfg)
     print(
         f"  device={device}, dtype={dtype}, n_ref={cfg.n_ref}, gate_n={effective_gate_n(cfg)}, "
-        f"bank_coupling={cfg.bank_coupling}, pool_n={init_pool_n}, n_samples={cfg.n_samples}, n_rounds={cfg.n_rounds}",
+        f"bank_coupling={cfg.bank_coupling}, pool_n={init_pool_n}, n_samples={cfg.n_samples}, n_rounds={cfg.n_rounds}, "
+        f"t_min={effective_time_bounds(cfg)[0]:.6g}, t_max={effective_time_bounds(cfg)[1]:.6g}, schedule={canonical_time_schedule(cfg.time_schedule)}",
         flush=True,
     )
 
@@ -2749,7 +2849,22 @@ def parse_args() -> Config:
         else:
             p.add_argument(arg, type=str, default=default_value)
     ns = p.parse_args()
-    return Config(**vars(ns))
+
+    # Backward compatibility: old command lines used --t_start/--t_end.
+    # The canonical flags are now --t_max/--t_min; promote changed legacy
+    # aliases only when the new flag is still at its default.
+    if float(ns.t_max) == float(defaults.t_max) and float(ns.t_start) != float(defaults.t_start):
+        ns.t_max = float(ns.t_start)
+    if float(ns.t_min) == float(defaults.t_min) and float(ns.t_end) != float(defaults.t_end):
+        ns.t_min = float(ns.t_end)
+    ns.t_start = float(ns.t_max)
+    ns.t_end = float(ns.t_min)
+    ns.time_schedule = canonical_time_schedule(ns.time_schedule)
+
+    cfg = Config(**vars(ns))
+    # Fail fast for invalid interval/schedule.
+    effective_time_bounds(cfg)
+    return cfg
 
 
 if __name__ == "__main__":
