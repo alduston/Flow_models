@@ -14,6 +14,7 @@ Default suite:
   * Singular Gaussian, d=8
   * Misaligned singular subspace GMM, d=8 and d=24
   * Singular heterogeneous-curvature GMM, d=8
+  * Nonlinear sine inverse problem, d=8 (clean/residual GN-Hessian variants)
   * GMM40, d=2
   * GMM40, d=25
   * Rings, d=2
@@ -30,6 +31,7 @@ Run modes:
   * RUN_MODE = 'paper_sweep'  : paper targets: misaligned GMM d=8, misaligned GMM d=24, funnel d=10.
   * RUN_MODE = 'dpsmc_full'   : all overlap toy targets.
   * RUN_MODE = 'dpsmc_single' : quick GMM40 d=2 smoke test.
+  * RUN_MODE = 'gn_hessian_sweep' : nonlinear inverse clean/residual GN-vs-full Hessian targets.
   * RUN_MODE = '<variant>'    : any single target, e.g. ionosphere_20.
   * RUN_MODE = 'a,b,c'        : comma-separated subset of targets.
   * RUN_MODE = 'dw4_full'     : legacy DW-4 stress suite.
@@ -46,9 +48,12 @@ Environment knobs:
         independent : xr and xg are disjoint reference draws.
   * LFGI_BENCH_N_RUNS or LFGI_BENCH_NUM_RUNS: repeat selected targets and export mean/std aggregate metrics.
   * LFGI_BENCH_PLOT_RUNS=0/1: repeated runs also save dashboards/PNGs; defaults to 1.
-  * LFGI_BENCH_STEPS, LFGI_BENCH_T_MAX, LFGI_BENCH_T_MIN
+  * LFGI_BENCH_STEPS, LFGI_BENCH_T_MAX, LFGI_BENCH_T_MIN, LFGI_BENCH_TIME_SCHEDULE=linear|log_linear
+  * LFGI_BENCH_MALA_STATIONARITY=0/1 plus LFGI_BENCH_MALA_STATIONARITY_N/STEPS/CHECKPOINTS
+  * LFGI_BENCH_MALA_STATIONARITY_STEP_SIZE overrides the exact-MALA refresh step.
+    If unset, hard inverse targets use conservative target-specific defaults.
   * METHODS or LFGI_BENCH_METHODS: comma-separated sampler list, e.g.
-      METHODS=tweedie,scalar_blend,plugin_blend,centered_blend,lfgi
+      METHODS=tweedie,scalar_blend,plugin_blend,centered_blend,lfgi,gn_lfgi
   * LFGI_BENCH_SCORE_RMSE=0/1
   * LFGI_BENCH_AUX_METRICS=0/1
   * LFGI_BENCH_CURL=0/1
@@ -489,6 +494,17 @@ SAMPLER_CONFIGS = OrderedDict([
         'hlsi_gate_mode': 'base',
         'hlsi_gate_law': 'CE',
         'transition_w': 'ou',
+        'hessian_source': 'true',
+    }),
+    ('gn_lfgi', {
+        # Same CE/LFGI algebra as ce-hlsi, but the local curvature bank uses
+        # target.gn_hessian(x) when the target exposes it. Targets without a
+        # GN proxy fall back to the regular full Hessian.
+        'family': 'hlsi',
+        'hlsi_gate_mode': 'base',
+        'hlsi_gate_law': 'CE',
+        'transition_w': 'ou',
+        'hessian_source': 'gn',
     }),
     ('leaf_hlsi', {
         'family': 'hlsi',
@@ -605,6 +621,14 @@ _SAMPLER_ALIASES = {
     'lfgi-blend': 'ce-hlsi',
     'lfgi_blend': 'ce-hlsi',
     'lfgi blend': 'ce-hlsi',
+    'gn_lfgi': 'gn_lfgi',
+    'gn-lfgi': 'gn_lfgi',
+    'gn lfgi': 'gn_lfgi',
+    'gauss-newton-lfgi': 'gn_lfgi',
+    'gauss_newton_lfgi': 'gn_lfgi',
+    'gauss newton lfgi': 'gn_lfgi',
+    'gn-ce-hlsi': 'gn_lfgi',
+    'gn_ce_hlsi': 'gn_lfgi',
     'leaf-hlsi': 'leaf_hlsi',
     'leaf_hlsi': 'leaf_hlsi',
     'leaf-ce-hlsi': 'leaf_ce-hlsi',
@@ -706,6 +730,26 @@ def canonical_transition_w(value):
     return aliases[key]
 
 
+def canonical_hessian_source(value):
+    """Normalize the curvature source used by HLSI/LFGI precomputation."""
+    key = str(value or 'true').strip().lower().replace('_', '-').replace(' ', '-')
+    aliases = {
+        'true': 'true', 'full': 'true', 'exact': 'true', 'target': 'true',
+        'hessian': 'true', 'regular': 'true',
+        'gn': 'gn', 'gauss-newton': 'gn', 'gaussnewton': 'gn',
+        'gauss-newton-hessian': 'gn', 'gn-hessian': 'gn',
+    }
+    if key not in aliases:
+        raise ValueError(f'Unknown hessian_source={value!r}; use true/full or gn/gauss_newton')
+    return aliases[key]
+
+
+def sampler_hessian_source(cfg):
+    if cfg is None:
+        return 'true'
+    return canonical_hessian_source(cfg.get('hessian_source', 'true'))
+
+
 def _clone_sampler_cfg(cfg):
     return dict(cfg)
 
@@ -738,6 +782,7 @@ def normalize_sampler_config(label, cfg=None):
     if cfg['family'] == 'hlsi':
         cfg['hlsi_gate_mode'] = canonical_gate_mode(cfg.get('hlsi_gate_mode', 'base'))
         cfg['hlsi_gate_law'] = canonical_gate_law(cfg.get('hlsi_gate_law', 'dirac'))
+        cfg['hessian_source'] = canonical_hessian_source(cfg.get('hessian_source', 'true'))
     return name, cfg
 
 
@@ -1572,6 +1617,479 @@ class ProductBananaTarget(GenericPotentialTarget):
         ])
 
 
+class NonlinearSineInverseD8Target(GenericPotentialTarget):
+    """Small nonlinear Gaussian inverse problem for full-vs-GN LFGI tests.
+
+    Observation model:
+        y = F(x) + noise,
+        F(x) = A x + beta * sin(B x),
+        x ~ N(0, tau^2 I), noise ~ N(0, sigma_y^2 I).
+
+    The full negative-log-posterior Hessian is
+        tau^{-2} I + sigma_y^{-2} [J^T J + sum_i r_i Hess F_i],
+    while the Gauss--Newton proxy is the PSD matrix
+        tau^{-2} I + sigma_y^{-2} J^T J.
+    """
+
+    def __init__(self, variant='clean', d=8, m=16, seed=123,
+                 beta=None, sigma_y=None, tau=2.0,
+                 obs_noise=None, obs_bias_scale=None,
+                 nonlinearity_scale=1.0):
+        self.D = int(d)
+        self.d = int(d)
+        self.m = int(m)
+        self.seed = int(seed)
+        self.variant = str(variant).strip().lower().replace('-', '_')
+        self.tau = float(tau)
+        self.nonlinearity_scale = float(nonlinearity_scale)
+
+        if self.variant in {'clean', 'small_residual', 'small'}:
+            self.beta = float(0.35 if beta is None else beta)
+            self.sigma_y = float(0.45 if sigma_y is None else sigma_y)
+            self.obs_noise = float(0.05 if obs_noise is None else obs_noise)
+            self.obs_bias_scale = float(0.0 if obs_bias_scale is None else obs_bias_scale)
+            self.variant_key = 'clean'
+        elif self.variant in {'residual', 'large_residual', 'mismatch'}:
+            self.beta = float(0.65 if beta is None else beta)
+            self.sigma_y = float(0.30 if sigma_y is None else sigma_y)
+            self.obs_noise = float(0.20 if obs_noise is None else obs_noise)
+            self.obs_bias_scale = float(0.55 if obs_bias_scale is None else obs_bias_scale)
+            self.variant_key = 'residual'
+        else:
+            raise ValueError("NonlinearSineInverseD8Target variant must be 'clean' or 'residual'")
+
+        rng = np.random.RandomState(self.seed)
+        QA, _ = np.linalg.qr(rng.normal(size=(self.m, self.m)))
+        QB, RB = np.linalg.qr(rng.normal(size=(self.d, self.d)))
+        QB = QB @ np.diag(np.sign(np.diag(RB)) + (np.diag(RB) == 0))
+        svals = np.geomspace(5.0, 0.08, self.d)
+        A_np = QA[:, :self.d] @ np.diag(svals) @ QB.T
+
+        B_np = rng.normal(size=(self.m, self.d)) / math.sqrt(self.d)
+        row_norm = np.linalg.norm(B_np, axis=1, keepdims=True)
+        B_np = self.nonlinearity_scale * B_np / np.maximum(row_norm, 1e-12)
+
+        x_true_np = rng.normal(size=self.d)
+        x_true_np = 0.85 * x_true_np / max(np.linalg.norm(x_true_np), 1e-12) * math.sqrt(self.d)
+
+        def forward_np(x):
+            z = B_np @ x
+            return A_np @ x + self.beta * np.sin(z)
+
+        y_np = forward_np(x_true_np) + self.obs_noise * rng.normal(size=self.m)
+        if self.obs_bias_scale != 0.0:
+            # Deterministic model mismatch in observation space; this leaves a
+            # meaningful residual-curvature term near posterior mass.
+            bias = rng.normal(size=self.m)
+            bias = bias / max(np.linalg.norm(bias), 1e-12)
+            y_np = y_np + self.obs_bias_scale * math.sqrt(self.m) * self.sigma_y * bias
+
+        self.A = torch.tensor(A_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.Bmat = torch.tensor(B_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.x_true = torch.tensor(x_true_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.y_obs = torch.tensor(y_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.svals = torch.tensor(svals, dtype=torch.get_default_dtype(), device=DEVICE)
+
+        self.variant_name = f'nonlinear_sine_inverse_d{self.d}_{self.variant_key}'
+        self.variant_desc = (
+            f'Nonlinear sine inverse problem ({self.variant_key}), d={self.d}, m={self.m}, '
+            f'beta={self.beta:g}, sigma_y={self.sigma_y:g}, tau={self.tau:g}, '
+            f'obs_noise={self.obs_noise:g}, obs_bias_scale={self.obs_bias_scale:g}'
+        )
+        self.benchmark_metric = 'sliced_ks'
+        self.benchmark_metric_label = 'Sliced KS'
+        self.metric_n_projections = int(os.environ.get('LFGI_BENCH_KS_PROJ', '1000'))
+        self.paper_second_moment = self.d * (self.tau ** 2)
+        self.paper_sigma = self.tau
+        self.paper_R = float(svals[0])
+        self.paper_tau = self.sigma_y
+
+    def _forward_and_jacobian(self, x):
+        A = self.A.to(device=x.device, dtype=x.dtype)
+        Bmat = self.Bmat.to(device=x.device, dtype=x.dtype)
+        y_obs = self.y_obs.to(device=x.device, dtype=x.dtype)
+        z = x @ Bmat.T
+        sin_z = torch.sin(z)
+        cos_z = torch.cos(z)
+        Fx = x @ A.T + self.beta * sin_z
+        residual = Fx - y_obs.unsqueeze(0)
+        J = A.unsqueeze(0) + self.beta * cos_z.unsqueeze(-1) * Bmat.unsqueeze(0)
+        return Fx, residual, J, z, sin_z
+
+    def forward_map(self, x):
+        Fx, _, _, _, _ = self._forward_and_jacobian(x)
+        return Fx
+
+    def log_prob(self, x):
+        _, residual, _, _, _ = self._forward_and_jacobian(x)
+        data_U = 0.5 * residual.square().sum(dim=1) / (self.sigma_y ** 2)
+        prior_U = 0.5 * x.square().sum(dim=1) / (self.tau ** 2)
+        return -(data_U + prior_U)
+
+    def score(self, x):
+        _, residual, J, _, _ = self._forward_and_jacobian(x)
+        grad_U = torch.einsum('bmd,bm->bd', J, residual) / (self.sigma_y ** 2)
+        grad_U = grad_U + x / (self.tau ** 2)
+        return -grad_U
+
+    def gn_hessian(self, x):
+        _, _, J, _, _ = self._forward_and_jacobian(x)
+        Bsz = x.shape[0]
+        eye = torch.eye(self.d, dtype=x.dtype, device=x.device).unsqueeze(0)
+        H = torch.einsum('bmi,bmj->bij', J, J) / (self.sigma_y ** 2)
+        H = H + eye.expand(Bsz, -1, -1) / (self.tau ** 2)
+        return sym(H)
+
+    def hessian(self, x):
+        _, residual, _, _, sin_z = self._forward_and_jacobian(x)
+        Bmat = self.Bmat.to(device=x.device, dtype=x.dtype)
+        H = self.gn_hessian(x)
+        # Hess F_i = - beta sin(b_i^T x) b_i b_i^T.
+        coeff = (-self.beta * residual * sin_z) / (self.sigma_y ** 2)
+        H_resid = torch.einsum('bm,mi,mj->bij', coeff, Bmat, Bmat)
+        return sym(H + H_resid)
+
+    def sample_reference(self, n, device=DEVICE, **kwargs):
+        return self.sample_mala(n, device=device, **kwargs)
+
+    def plot_projection(self, x, fit_ref=None):
+        _, _, Vh = torch.linalg.svd(self.A.to(device=x.device, dtype=x.dtype), full_matrices=False)
+        V = Vh[:2].T
+        return x @ V
+
+    def scalar_diagnostic_values(self, x):
+        with torch.no_grad():
+            _, residual, _, _, _ = self._forward_and_jacobian(x)
+            energy = (-self.log_prob(x)).detach().cpu().numpy()
+            res_norm = torch.linalg.norm(residual, dim=1).detach().cpu().numpy()
+            radius = torch.linalg.norm(x, dim=1).detach().cpu().numpy()
+            full_H = self.hessian(x[:min(len(x), 512)])
+            gn_H = self.gn_hessian(x[:min(len(x), 512)])
+            diff_rel = (
+                torch.linalg.norm(full_H - gn_H, dim=(1, 2)) /
+                torch.linalg.norm(full_H, dim=(1, 2)).clamp_min(1e-30)
+            ).detach().cpu().numpy()
+        return OrderedDict([
+            ('energy', (energy, 'Energy U(x)')),
+            ('residual_norm', (res_norm, 'Observation residual ||F(x)-y||')),
+            ('radius', (radius, 'Radius ||x||')),
+            ('full_gn_hess_rel', (diff_rel, 'Relative ||H-H_GN||_F / ||H||_F')),
+        ])
+
+
+class MaskedMultiscaleSineInverseTarget(GenericPotentialTarget):
+    """Masked multiscale nonlinear inverse problem for GN-vs-full LFGI stress tests.
+
+    This is a synthetic analogue of the MNIST PCA logistic-regression stressor:
+    a deliberately anisotropic, masked/sparse observation operator creates stiff,
+    mid, and weakly observed directions, while nonlinear sine/quadratic residual
+    structure creates a full-Hessian residual-curvature term that the
+    Gauss--Newton proxy drops.
+
+    Observation model:
+        y = F(x) + noise + optional model-mismatch bias,
+        F_i(x) = a_i^T x + beta sin(b_i^T x) + q_amp[(c_i^T x)^2 - center_i],
+        x ~ N(0, tau^2 I), noise ~ N(0, sigma_y^2 I).
+
+    Full precision:
+        tau^{-2}I + sigma_y^{-2}[J^T J + sum_i r_i Hess F_i].
+    Gauss--Newton precision:
+        tau^{-2}I + sigma_y^{-2} J^T J.
+    """
+
+    def __init__(self, variant='d16', seed=321, d=None, m=None,
+                 beta=None, quad_amp=None, sigma_y=None, tau=None,
+                 obs_noise=None, obs_bias_scale=None,
+                 stiff_rank=None, mid_rank=None,
+                 stiff_scale=None, mid_scale=None, sloppy_scale=None):
+        self.variant = str(variant).strip().lower().replace('-', '_')
+        self.seed = int(seed)
+
+        presets = {
+            # Harder than the original d=8 sine inverse, but still a reasonable
+            # smoke/diagnostic target.  Stiff directions are sharp; sloppy
+            # directions are only weakly linearly observed and carry the nonlinear
+            # residual structure.
+            'd16': dict(d=16, m=24, beta=0.70, quad_amp=0.070, sigma_y=0.28,
+                        tau=2.75, obs_noise=0.10, obs_bias_scale=0.25,
+                        stiff_rank=5, mid_rank=5, stiff_scale=12.0,
+                        mid_scale=1.0, sloppy_scale=0.035,
+                        variant_key='masked_multiscale_inverse_d16'),
+            'hard': dict(d=16, m=24, beta=0.70, quad_amp=0.070, sigma_y=0.28,
+                         tau=2.75, obs_noise=0.10, obs_bias_scale=0.25,
+                         stiff_rank=5, mid_rank=5, stiff_scale=12.0,
+                         mid_scale=1.0, sloppy_scale=0.035,
+                         variant_key='masked_multiscale_inverse_d16'),
+            # Residual-curvature stress test.  This is designed to expose the
+            # difference between a PSD GN precision and an indefinite full Hessian
+            # residual term without making the target intentionally broken.
+            'd16_residual': dict(d=16, m=28, beta=0.95, quad_amp=0.120, sigma_y=0.22,
+                                 tau=3.0, obs_noise=0.18, obs_bias_scale=0.80,
+                                 stiff_rank=5, mid_rank=5, stiff_scale=16.0,
+                                 mid_scale=1.0, sloppy_scale=0.020,
+                                 variant_key='masked_multiscale_inverse_d16_residual'),
+            'residual': dict(d=16, m=28, beta=0.95, quad_amp=0.120, sigma_y=0.22,
+                             tau=3.0, obs_noise=0.18, obs_bias_scale=0.80,
+                             stiff_rank=5, mid_rank=5, stiff_scale=16.0,
+                             mid_scale=1.0, sloppy_scale=0.020,
+                             variant_key='masked_multiscale_inverse_d16_residual'),
+            # MNIST-like dimension stress.  This one is intentionally not the
+            # cheapest default target; use it when the d=16 residual case is too
+            # easy or when testing N_ref/N_gate scaling.
+            'd32_residual': dict(d=32, m=56, beta=0.85, quad_amp=0.090, sigma_y=0.24,
+                                 tau=3.0, obs_noise=0.16, obs_bias_scale=0.65,
+                                 stiff_rank=8, mid_rank=8, stiff_scale=14.0,
+                                 mid_scale=1.0, sloppy_scale=0.018,
+                                 variant_key='masked_multiscale_inverse_d32_residual'),
+            'd32': dict(d=32, m=56, beta=0.85, quad_amp=0.090, sigma_y=0.24,
+                        tau=3.0, obs_noise=0.16, obs_bias_scale=0.65,
+                        stiff_rank=8, mid_rank=8, stiff_scale=14.0,
+                        mid_scale=1.0, sloppy_scale=0.018,
+                        variant_key='masked_multiscale_inverse_d32_residual'),
+        }
+        if self.variant not in presets:
+            raise ValueError(
+                "MaskedMultiscaleSineInverseTarget variant must be one of "
+                f"{sorted(presets)}; got {variant!r}"
+            )
+        p = dict(presets[self.variant])
+        overrides = dict(d=d, m=m, beta=beta, quad_amp=quad_amp,
+                         sigma_y=sigma_y, tau=tau, obs_noise=obs_noise,
+                         obs_bias_scale=obs_bias_scale, stiff_rank=stiff_rank,
+                         mid_rank=mid_rank, stiff_scale=stiff_scale,
+                         mid_scale=mid_scale, sloppy_scale=sloppy_scale)
+        for k, v in overrides.items():
+            if v is not None:
+                p[k] = v
+
+        self.D = int(p['d'])
+        self.d = int(p['d'])
+        self.m = int(p['m'])
+        self.beta = float(p['beta'])
+        self.quad_amp = float(p['quad_amp'])
+        self.sigma_y = float(p['sigma_y'])
+        self.tau = float(p['tau'])
+        self.obs_noise = float(p['obs_noise'])
+        self.obs_bias_scale = float(p['obs_bias_scale'])
+        self.stiff_rank = int(p['stiff_rank'])
+        self.mid_rank = int(p['mid_rank'])
+        self.sloppy_rank = self.d - self.stiff_rank - self.mid_rank
+        self.stiff_scale = float(p['stiff_scale'])
+        self.mid_scale = float(p['mid_scale'])
+        self.sloppy_scale = float(p['sloppy_scale'])
+        self.variant_key = str(p['variant_key'])
+        if self.sloppy_rank <= 0:
+            raise ValueError('Need positive sloppy rank for masked multiscale inverse target')
+
+        rng = np.random.RandomState(self.seed)
+
+        def signed_qr(shape):
+            Q, R = np.linalg.qr(rng.normal(size=shape))
+            s = np.sign(np.diag(R))
+            s[s == 0] = 1.0
+            return Q @ np.diag(s)
+
+        R = signed_qr((self.d, self.d))
+        stiff_idx = np.arange(0, self.stiff_rank)
+        mid_idx = np.arange(self.stiff_rank, self.stiff_rank + self.mid_rank)
+        sloppy_idx = np.arange(self.stiff_rank + self.mid_rank, self.d)
+
+        # Prescribed multiscale right-acting spectrum, analogous to the MNIST
+        # spectral feature operator but independent of external data.
+        s_stiff = np.geomspace(self.stiff_scale, max(self.mid_scale * 2.0, 2.0), self.stiff_rank)
+        s_mid = np.geomspace(self.mid_scale, max(self.sloppy_scale * 8.0, 0.15), self.mid_rank)
+        s_sloppy = np.geomspace(self.sloppy_scale, self.sloppy_scale * 0.35, self.sloppy_rank)
+        scales = np.concatenate([s_stiff, s_mid, s_sloppy]).astype(np.float64)
+
+        def sparse_mask_row(groups, weights, nnz=3):
+            row = np.zeros(self.d, dtype=np.float64)
+            choices = []
+            probs = np.asarray(weights, dtype=np.float64)
+            probs = probs / probs.sum()
+            for _ in range(nnz):
+                g = rng.choice(len(groups), p=probs)
+                choices.append(rng.choice(groups[g]))
+            for j in choices:
+                row[j] += rng.normal()
+            norm = np.linalg.norm(row)
+            if norm < 1e-12:
+                row[rng.randint(0, self.d)] = 1.0
+                norm = 1.0
+            return row / norm
+
+        groups = [stiff_idx, mid_idx, sloppy_idx]
+        A_latent = []
+        B_latent = []
+        C_latent = []
+        for i in range(self.m):
+            # Linear rows are masked/sparse but still include a small number of
+            # stiff/mid/sloppy combinations.  Nonlinear rows are biased toward
+            # mid/sloppy directions so the weakly observed part of the posterior
+            # carries the non-Gaussian residual structure.
+            if i % 4 == 0:
+                wa = [0.75, 0.20, 0.05]
+            elif i % 4 == 1:
+                wa = [0.30, 0.55, 0.15]
+            elif i % 4 == 2:
+                wa = [0.12, 0.38, 0.50]
+            else:
+                wa = [0.20, 0.25, 0.55]
+            A_latent.append(sparse_mask_row(groups, wa, nnz=3))
+            B_latent.append(sparse_mask_row(groups, [0.10, 0.35, 0.55], nnz=3))
+            C_latent.append(sparse_mask_row(groups, [0.05, 0.30, 0.65], nnz=2))
+        A_latent = np.stack(A_latent, axis=0)
+        B_latent = np.stack(B_latent, axis=0)
+        C_latent = np.stack(C_latent, axis=0)
+
+        # Apply the multiscale spectrum only to the linear measurement operator;
+        # nonlinear features stay normalized but are rotated into the same hidden
+        # stiff/sloppy coordinates.
+        A_np = A_latent @ np.diag(scales) @ R.T
+        B_np = B_latent @ R.T
+        C_np = C_latent @ R.T
+
+        # A moderately off-origin truth makes sine/quadratic residual curvature
+        # visible on posterior mass while preserving stable tails from the prior
+        # and quadratic observation term.
+        x_true_latent = rng.normal(size=self.d)
+        x_true_latent = x_true_latent / max(np.linalg.norm(x_true_latent), 1e-12)
+        amp = 0.90 * math.sqrt(self.d)
+        x_true_np = amp * (R @ x_true_latent)
+
+        quad_center = (self.tau ** 2) * ((C_np ** 2).sum(axis=1))
+
+        def forward_np(x):
+            zB = B_np @ x
+            zC = C_np @ x
+            return A_np @ x + self.beta * np.sin(zB) + self.quad_amp * (zC ** 2 - quad_center)
+
+        y_np = forward_np(x_true_np) + self.obs_noise * self.sigma_y * rng.normal(size=self.m)
+        if self.obs_bias_scale != 0.0:
+            # Structured mismatch mostly in the nonlinear rows.  This is what
+            # keeps the full residual Hessian nontrivial near posterior mass.
+            bias_latent = rng.normal(size=self.m)
+            bias_latent = bias_latent / max(np.linalg.norm(bias_latent), 1e-12)
+            y_np = y_np + self.obs_bias_scale * math.sqrt(self.m) * self.sigma_y * bias_latent
+
+        self.A = torch.tensor(A_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.Bmat = torch.tensor(B_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.Cmat = torch.tensor(C_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.x_true = torch.tensor(x_true_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.y_obs = torch.tensor(y_np, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.linear_scales = torch.tensor(scales, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.rotation = torch.tensor(R, dtype=torch.get_default_dtype(), device=DEVICE)
+        self.quad_center = torch.tensor(quad_center, dtype=torch.get_default_dtype(), device=DEVICE)
+
+        self.variant_name = self.variant_key
+        self.variant_desc = (
+            f'Masked multiscale nonlinear inverse problem, d={self.d}, m={self.m}, '
+            f'beta={self.beta:g}, quad_amp={self.quad_amp:g}, sigma_y={self.sigma_y:g}, tau={self.tau:g}, '
+            f'scales=({self.stiff_scale:g},{self.mid_scale:g},{self.sloppy_scale:g}), '
+            f'ranks=({self.stiff_rank},{self.mid_rank},{self.sloppy_rank}), '
+            f'obs_noise={self.obs_noise:g}, obs_bias_scale={self.obs_bias_scale:g}'
+        )
+        self.benchmark_metric = 'sliced_ks'
+        self.benchmark_metric_label = 'Sliced KS'
+        self.metric_n_projections = int(os.environ.get('LFGI_BENCH_KS_PROJ', '1000'))
+        self.paper_second_moment = self.d * (self.tau ** 2)
+        self.paper_sigma = self.tau
+        self.paper_R = self.stiff_scale
+        self.paper_tau = self.sigma_y
+
+    def _forward_terms(self, x):
+        A = self.A.to(device=x.device, dtype=x.dtype)
+        Bmat = self.Bmat.to(device=x.device, dtype=x.dtype)
+        Cmat = self.Cmat.to(device=x.device, dtype=x.dtype)
+        y_obs = self.y_obs.to(device=x.device, dtype=x.dtype)
+        quad_center = self.quad_center.to(device=x.device, dtype=x.dtype)
+        zB = x @ Bmat.T
+        zC = x @ Cmat.T
+        sin_zB = torch.sin(zB)
+        cos_zB = torch.cos(zB)
+        Fx = x @ A.T + self.beta * sin_zB + self.quad_amp * (zC.square() - quad_center.unsqueeze(0))
+        residual = Fx - y_obs.unsqueeze(0)
+        J = (
+            A.unsqueeze(0)
+            + self.beta * cos_zB.unsqueeze(-1) * Bmat.unsqueeze(0)
+            + 2.0 * self.quad_amp * zC.unsqueeze(-1) * Cmat.unsqueeze(0)
+        )
+        return Fx, residual, J, zB, sin_zB, zC
+
+    def forward_map(self, x):
+        Fx, *_ = self._forward_terms(x)
+        return Fx
+
+    def log_prob(self, x):
+        _, residual, _, _, _, _ = self._forward_terms(x)
+        data_U = 0.5 * residual.square().sum(dim=1) / (self.sigma_y ** 2)
+        prior_U = 0.5 * x.square().sum(dim=1) / (self.tau ** 2)
+        return -(data_U + prior_U)
+
+    def score(self, x):
+        _, residual, J, _, _, _ = self._forward_terms(x)
+        grad_U = torch.einsum('bmd,bm->bd', J, residual) / (self.sigma_y ** 2)
+        grad_U = grad_U + x / (self.tau ** 2)
+        return -grad_U
+
+    def gn_hessian(self, x):
+        _, _, J, _, _, _ = self._forward_terms(x)
+        Bsz = x.shape[0]
+        eye = torch.eye(self.d, dtype=x.dtype, device=x.device).unsqueeze(0)
+        H = torch.einsum('bmi,bmj->bij', J, J) / (self.sigma_y ** 2)
+        H = H + eye.expand(Bsz, -1, -1) / (self.tau ** 2)
+        return sym(H)
+
+    def hessian(self, x):
+        _, residual, _, _, sin_zB, _ = self._forward_terms(x)
+        Bmat = self.Bmat.to(device=x.device, dtype=x.dtype)
+        Cmat = self.Cmat.to(device=x.device, dtype=x.dtype)
+        H = self.gn_hessian(x)
+        coeff_sin = (-self.beta * residual * sin_zB) / (self.sigma_y ** 2)
+        coeff_quad = (2.0 * self.quad_amp * residual) / (self.sigma_y ** 2)
+        H_sin = torch.einsum('bm,mi,mj->bij', coeff_sin, Bmat, Bmat)
+        H_quad = torch.einsum('bm,mi,mj->bij', coeff_quad, Cmat, Cmat)
+        return sym(H + H_sin + H_quad)
+
+    def sample_reference(self, n, device=DEVICE, **kwargs):
+        return self.sample_mala(n, device=device, **kwargs)
+
+    def plot_projection(self, x, fit_ref=None):
+        R = self.rotation.to(device=x.device, dtype=x.dtype)
+        # Plot the two stiffest latent coordinates, which are the most
+        # interpretable analogues of the MNIST posterior PCA panels.
+        return x @ R[:, :2]
+
+    def scalar_diagnostic_values(self, x):
+        with torch.no_grad():
+            _, residual, _, _, _, _ = self._forward_terms(x)
+            energy = (-self.log_prob(x)).detach().cpu().numpy()
+            res_norm = torch.linalg.norm(residual, dim=1).detach().cpu().numpy()
+            radius = torch.linalg.norm(x, dim=1).detach().cpu().numpy()
+            latent = x @ self.rotation.to(device=x.device, dtype=x.dtype)
+            sloppy = latent[:, self.stiff_rank + self.mid_rank:]
+            sloppy_radius = torch.linalg.norm(sloppy, dim=1).detach().cpu().numpy()
+            Hx = x[:min(len(x), 512)]
+            full_H = self.hessian(Hx)
+            gn_H = self.gn_hessian(Hx)
+            diff_rel = (
+                torch.linalg.norm(full_H - gn_H, dim=(1, 2)) /
+                torch.linalg.norm(full_H, dim=(1, 2)).clamp_min(1e-30)
+            ).detach().cpu().numpy()
+            lam_full = torch.linalg.eigvalsh(sym(full_H))
+            lam_gn = torch.linalg.eigvalsh(sym(gn_H))
+            full_min = lam_full[:, 0].detach().cpu().numpy()
+            gn_cond = (lam_gn[:, -1] / lam_gn[:, 0].clamp_min(1e-30)).detach().cpu().numpy()
+        return OrderedDict([
+            ('energy', (energy, 'Energy U(x)')),
+            ('residual_norm', (res_norm, 'Observation residual ||F(x)-y||')),
+            ('radius', (radius, 'Radius ||x||')),
+            ('sloppy_radius', (sloppy_radius, 'Sloppy latent radius')),
+            ('full_gn_hess_rel', (diff_rel, 'Relative ||H-H_GN||_F / ||H||_F')),
+            ('full_hess_lam_min', (full_min, 'Full Hessian minimum eigenvalue')),
+            ('gn_hess_cond', (gn_cond, 'GN Hessian condition number')),
+        ])
+
+
 class SingularGaussianD8Target(GenericPotentialTarget):
     """Near-singular Gaussian claim-verification target in R^8.
 
@@ -2250,6 +2768,8 @@ def make_dpsmc_overlap_variants(include_blr=False, data_dir=None, include_d50=No
         ('misaligned_subspace_gmm_d8', MisalignedSingularSubspaceGMMTarget(d=8, rank=3)),
         ('misaligned_subspace_gmm_d24', MisalignedSingularSubspaceGMMTarget(d=24, rank=4)),
         ('singular_hetero_gmm_d8', SingularHeterogeneousCurvatureGMM8Target()),
+        ('nonlinear_sine_inverse_d8_clean', NonlinearSineInverseD8Target(variant='clean')),
+        ('nonlinear_sine_inverse_d8_residual', NonlinearSineInverseD8Target(variant='residual')),
         ('gmm40_d2', GMM40Target(d=2, seed=0)),
         ('gmm40_d25', GMM40Target(d=25, seed=0)),
         ('rings_d2', RingsTarget(sigma=0.15)),
@@ -2300,6 +2820,31 @@ def make_paper_sweep_variants():
     return variants
 
 
+def make_gn_hessian_sweep_variants():
+    """Nonlinear inverse targets for full-Hessian vs Gauss--Newton LFGI.
+
+    The first two d=8 targets are cheap sanity checks.  The masked multiscale
+    targets are the intended stress tests: they combine singular/stiff scores
+    with non-Gaussian residual-curvature structure, analogous to the MNIST PCA
+    operator stressor but without external data dependencies.
+    """
+    variants = OrderedDict()
+    variants['nonlinear_sine_inverse_d8_clean'] = NonlinearSineInverseD8Target(variant='clean')
+    variants['nonlinear_sine_inverse_d8_residual'] = NonlinearSineInverseD8Target(variant='residual')
+    variants['masked_multiscale_inverse_d16'] = MaskedMultiscaleSineInverseTarget(variant='d16')
+    variants['masked_multiscale_inverse_d16_residual'] = MaskedMultiscaleSineInverseTarget(variant='d16_residual')
+    return variants
+
+
+def make_gn_hessian_hard_variants():
+    """Hard GN-vs-full inverse targets, including the d=32 MNIST-like stress case."""
+    variants = OrderedDict()
+    variants['masked_multiscale_inverse_d16'] = MaskedMultiscaleSineInverseTarget(variant='d16')
+    variants['masked_multiscale_inverse_d16_residual'] = MaskedMultiscaleSineInverseTarget(variant='d16_residual')
+    variants['masked_multiscale_inverse_d32_residual'] = MaskedMultiscaleSineInverseTarget(variant='d32_residual')
+    return variants
+
+
 # ==============================================================
 # OU-process helpers
 # ==============================================================
@@ -2324,6 +2869,14 @@ def snis_w(y, t, xr):
 
 def sym(A):
     return 0.5 * (A + A.transpose(-1, -2))
+
+
+def target_hessian_proxy(target, x, source='true'):
+    """Return the requested local curvature matrix for HLSI/LFGI."""
+    source = canonical_hessian_source(source)
+    if source == 'gn' and hasattr(target, 'gn_hessian'):
+        return sym(target.gn_hessian(x))
+    return sym(target.hessian(x))
 
 
 def apply_raw_ce_gate(s_twd, s_tsi, Pbar, a2, v, eps=1e-30):
@@ -2475,7 +3028,7 @@ def est_tsi(y, t, xr, w, target, s0_ref=None):
 def est_hlsi(y, t, xr, w, target, lmin=1e-4, lmax=1e6, precomp=None):
     a  = at(t); a2 = a ** 2; v = vt(t)
     if precomp is None:
-        H  = target.hessian(xr)
+        H  = target_hessian_proxy(target, xr, 'true')
         s0 = target.score(xr)
         lam, V = torch.linalg.eigh(H)
     else:
@@ -2500,7 +3053,7 @@ def est_hlsi(y, t, xr, w, target, lmin=1e-4, lmax=1e6, precomp=None):
 
 
 def est_ce_hlsi(y, t, xr, w, target, lmin=HESS_MIN, lmax=HESS_MAX, precomp=None,
-                gate_xr=None, gate_precomp=None, w_gate=None):
+                gate_xr=None, gate_precomp=None, w_gate=None, hessian_source='true'):
     """Canonical LFGI / exact SNIS gate using the full raw Hessian.
 
     ``xr``/``w`` define the estimator bank used for Tweedie and TSI.
@@ -2524,7 +3077,7 @@ def est_ce_hlsi(y, t, xr, w, target, lmin=HESS_MIN, lmax=HESS_MAX, precomp=None,
             gate_precomp = precomp
             P_ref = gate_precomp.get('P_raw', gate_precomp.get('H_ce'))
         else:
-            P_ref = sym(target.hessian(gate_xr))
+            P_ref = target_hessian_proxy(target, gate_xr, hessian_source)
     else:
         P_ref = gate_precomp.get('P_raw', gate_precomp.get('H_ce'))
     if P_ref is None:
@@ -2568,11 +3121,13 @@ def compute_adaptive_p_leaf(target, xr, eigvals, eigvecs, lmin=1e-4,
 def precompute_leaf_hlsi(target, xr, lmin=HESS_MIN, lmax=HESS_MAX, p_leaf=P_LEAF,
                          use_fd_hessian=False, fd_eps=1e-4,
                          adaptive_delta_vals=(0.05, 0.1, 0.2),
-                         adaptive_p_min=0.1, adaptive_p_max=100.0):
+                         adaptive_p_min=0.1, adaptive_p_max=100.0,
+                         hessian_source='true'):
+    hessian_source = canonical_hessian_source(hessian_source)
     if use_fd_hessian:
         H = target.hessian_fd(xr, eps=fd_eps)
     else:
-        H = target.hessian(xr)
+        H = target_hessian_proxy(target, xr, hessian_source)
     H  = 0.5 * (H + H.transpose(1, 2))
     s0 = target.score(xr)
     eigvals, eigvecs = torch.linalg.eigh(H)
@@ -2617,6 +3172,7 @@ def precompute_leaf_hlsi(target, xr, lmin=HESS_MIN, lmax=HESS_MAX, p_leaf=P_LEAF
         'trusted':     trusted,
         'is_non_psd':  is_non_psd,
         'H_ce':        H_ce,
+        'hessian_source': hessian_source,
     }
 
 
@@ -3710,9 +4266,51 @@ def est_dpsmc_matrix_blend(y, t, xr, w, target, s0_ref=None, cov='snis',
 
 
 # ==============================================================
+# Reverse-time grid helpers
+# ==============================================================
+def canonical_time_schedule(value):
+    """Normalize reverse sampler time-discretization schedule name."""
+    key = str(value or 'linear').strip().lower().replace('_', '-').replace(' ', '-')
+    aliases = {
+        'linear': 'linear', 'lin': 'linear', 'uniform': 'linear', 'uniform-t': 'linear',
+        'log-linear': 'log_linear', 'loglinear': 'log_linear', 'log': 'log_linear',
+        'geometric': 'log_linear', 'geom': 'log_linear', 'exponential': 'log_linear',
+    }
+    if key not in aliases:
+        raise ValueError(f"Unknown time schedule {value!r}; use linear or log_linear")
+    return aliases[key]
+
+
+def make_reverse_time_grid(t_max, t_min, n_steps, *, schedule='linear', dtype=None, device=None):
+    """Construct decreasing reverse-time grid from t_max to t_min.
+
+    ``linear`` uses uniform spacing in diffusion time t.
+    ``log_linear`` uses uniform spacing in log(t), i.e. geometric spacing in t,
+    which allocates many more steps near the final denoising time.
+    """
+    dtype = torch.get_default_dtype() if dtype is None else dtype
+    device = DEVICE if device is None else device
+    t_max = float(t_max)
+    t_min = float(t_min)
+    n_steps = int(n_steps)
+    schedule = canonical_time_schedule(schedule)
+    if n_steps < 1:
+        raise ValueError(f'n_steps must be >= 1, got {n_steps}')
+    if not (t_max > t_min >= 0.0):
+        raise ValueError(f'Expected t_max > t_min >= 0, got t_max={t_max}, t_min={t_min}')
+    if schedule == 'linear':
+        return torch.linspace(t_max, t_min, n_steps + 1, dtype=dtype, device=device)
+    if t_min <= 0.0:
+        raise ValueError('log_linear time schedule requires LFGI_BENCH_T_MIN > 0')
+    return torch.exp(torch.linspace(
+        math.log(t_max), math.log(t_min), n_steps + 1, dtype=dtype, device=device
+    ))
+
+# ==============================================================
 # Heun predictor–corrector reverse SDE
 # ==============================================================
 def heun_sde(score_fn, n, d, n_steps=200, t_max=3.0, t_min=0.015, device=DEVICE,
+             time_schedule='linear',
              return_trajectory=False, trajectory_n=64, trajectory_time_grid=24):
     """Heun predictor-corrector reverse SDE.
 
@@ -3721,8 +4319,8 @@ def heun_sde(score_fn, n, d, n_steps=200, t_max=3.0, t_min=0.015, device=DEVICE,
     roughly ``trajectory_time_grid`` time slices.  This is used for curl
     diagnostics without changing the sampler dynamics.
     """
-    ts  = torch.linspace(t_max, t_min, n_steps + 1,
-                         dtype=torch.get_default_dtype(), device=device)
+    ts  = make_reverse_time_grid(t_max, t_min, n_steps, schedule=time_schedule,
+                                 dtype=torch.get_default_dtype(), device=device)
     y   = torch.randn(n, d, dtype=torch.get_default_dtype(), device=device)
     ms  = 0.0
     fail = False
@@ -4011,6 +4609,479 @@ def dpsmc_benchmark_metric_name(target):
     return getattr(target, 'benchmark_metric_label', None) or getattr(target, 'benchmark_metric', 'W2')
 
 
+
+def sliced_w2_distance(X, Y, n_projections=256, max_points=None, seed=0):
+    """Sliced 2-Wasserstein distance with random 1D projections.
+
+    This is intentionally cheap and reference-sample based.  It is useful for
+    the MALA stationarity diagnostic because it gives a distributional shift
+    scale that is more geometric than KS and less brittle than KDE metrics in
+    moderate/high dimension.
+    """
+    if X.dim() > 2:
+        X = X.reshape(X.shape[0], -1)
+    if Y.dim() > 2:
+        Y = Y.reshape(Y.shape[0], -1)
+    if max_points is None:
+        max_points = int(os.environ.get('LFGI_BENCH_METRIC_MAX', '4096'))
+    n = min(int(max_points), X.shape[0], Y.shape[0])
+    if n <= 1:
+        return float('inf')
+    X = X[_randperm(X.shape[0], device=X.device)[:n]]
+    Y = Y[_randperm(Y.shape[0], device=Y.device)[:n]]
+    d = X.shape[1]
+    gen = torch.Generator(device=X.device)
+    gen.manual_seed(int(seed))
+    dirs = torch.randn(int(n_projections), d, generator=gen, dtype=X.dtype, device=X.device)
+    dirs = dirs / torch.linalg.norm(dirs, dim=1, keepdim=True).clamp_min(1e-30)
+    Xp = torch.sort(X @ dirs.T, dim=0).values
+    Yp = torch.sort(Y @ dirs.T, dim=0).values
+    return float(torch.sqrt((Xp - Yp).square().mean()).detach().cpu().item())
+
+
+def _parse_int_list_env(name, default):
+    raw = os.environ.get(name, None)
+    if raw is None or str(raw).strip() == '':
+        raw = default
+    vals = []
+    for tok in str(raw).replace(';', ',').split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        vals.append(int(tok))
+    return vals
+
+
+def _target_lp_score_chunked(target, x, chunk=1024):
+    """Evaluate target log-density and score in chunks.
+
+    Some targets use analytic scores and some use autograd internally.  Chunking
+    keeps the stationarity diagnostic from becoming the memory bottleneck.
+    """
+    lps, scores = [], []
+    chunk = max(1, int(chunk))
+    for lo in range(0, x.shape[0], chunk):
+        xb = x[lo:lo + chunk].detach()
+        lps.append(target.log_prob(xb).detach())
+        scores.append(target.score(xb).detach())
+    return torch.cat(lps, dim=0), torch.cat(scores, dim=0)
+
+
+def exact_mala_refresh_from_samples(target, x0, step_size, n_steps,
+                                    checkpoints=(1, 5, 20), chunk=1024):
+    """Run exact-target MALA initialized from an arbitrary sample cloud.
+
+    The kernel uses the true target log_prob and score.  If x0 is stationary for
+    the target, finite-dimensional statistics should not drift systematically.
+    Returned snapshots are keyed by checkpoint step.
+    """
+    x = x0.detach().clone()
+    h = float(step_size)
+    if h <= 0.0:
+        raise ValueError(f'MALA stationarity step_size must be positive, got {h}')
+    n_steps = int(n_steps)
+    checkpoints = sorted({int(c) for c in checkpoints if int(c) >= 0 and int(c) <= n_steps})
+    if n_steps not in checkpoints:
+        checkpoints.append(n_steps)
+    checkpoint_set = set(checkpoints)
+    sqrt_2h = math.sqrt(2.0 * h)
+    lp_x, sx = _target_lp_score_chunked(target, x, chunk=chunk)
+    snapshots = {}
+    accept_counts = {}
+    accepted_total = 0
+    total = 0
+    if 0 in checkpoint_set:
+        snapshots[0] = x.detach().clone()
+        accept_counts[0] = 0.0
+    for step in range(1, n_steps + 1):
+        noise = torch.randn_like(x)
+        x_prop = x + h * sx + sqrt_2h * noise
+        lp_prop, sx_prop = _target_lp_score_chunked(target, x_prop, chunk=chunk)
+        log_q_fwd = -((x_prop - x - h * sx) ** 2).sum(dim=1) / (4.0 * h)
+        log_q_bwd = -((x - x_prop - h * sx_prop) ** 2).sum(dim=1) / (4.0 * h)
+        log_alpha = (lp_prop - lp_x + log_q_bwd - log_q_fwd).clamp(max=0.0)
+        acc = torch.rand(x.shape[0], dtype=x.dtype, device=x.device) < log_alpha.exp()
+        mask = acc[:, None]
+        x = torch.where(mask, x_prop, x)
+        lp_x = torch.where(acc, lp_prop, lp_x)
+        sx = torch.where(mask, sx_prop, sx)
+        accepted_total += int(acc.sum().detach().cpu().item())
+        total += int(acc.numel())
+        if step in checkpoint_set:
+            snapshots[step] = x.detach().clone()
+            accept_counts[step] = accepted_total / max(total, 1)
+    return snapshots, accept_counts
+
+
+def _empirical_mean_cov(X):
+    if X.dim() > 2:
+        X = X.reshape(X.shape[0], -1)
+    X = X.detach()
+    if X.shape[0] <= 1:
+        mu = X.mean(dim=0)
+        cov = torch.zeros((X.shape[1], X.shape[1]), dtype=X.dtype, device=X.device)
+        return mu, cov
+    mu = X.mean(dim=0)
+    Xc = X - mu.unsqueeze(0)
+    cov = (Xc.T @ Xc) / max(int(X.shape[0]) - 1, 1)
+    return mu, sym(cov)
+
+
+def _mean_se_np(vals):
+    vals = np.asarray(vals, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return float('nan'), float('nan')
+    se = float(vals.std(ddof=1) / math.sqrt(vals.size)) if vals.size > 1 else 0.0
+    return float(vals.mean()), se
+
+
+def _target_scalar_means_for_stationarity(target, x, max_n=1024):
+    """Mean scalar diagnostics exposed by a target, with conservative fallback."""
+    out = OrderedDict()
+    if not hasattr(target, 'scalar_diagnostic_values'):
+        return out
+    try:
+        xs = x[:min(int(max_n), x.shape[0])]
+        vals = target.scalar_diagnostic_values(xs)
+        for key, payload in vals.items():
+            try:
+                arr = payload[0] if isinstance(payload, (tuple, list)) else payload
+                arr = np.asarray(arr, dtype=np.float64).reshape(-1)
+                arr = arr[np.isfinite(arr)]
+                if arr.size:
+                    out[f'diag_{key}_mean'] = float(arr.mean())
+                    out[f'diag_{key}_std'] = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+            except Exception:
+                continue
+    except Exception as exc:
+        out['diag_error'] = repr(exc)
+    return out
+
+
+def _stationarity_row(target, method, checkpoint, x0, xk, x_ref,
+                      accept_rate, metric_max=1024, n_proj=256,
+                      scalar_max=1024, mala_step_size=float('nan')):
+    """Summarize before/after exact-MALA drift for one method/checkpoint."""
+    n = min(int(metric_max), x0.shape[0], xk.shape[0], x_ref.shape[0])
+    x0m = x0[:n]
+    xkm = xk[:n]
+    xrm = x_ref[:n]
+    with torch.no_grad():
+        U0 = (-target.log_prob(x0m)).detach().cpu().double().numpy()
+        Uk = (-target.log_prob(xkm)).detach().cpu().double().numpy()
+        dU = Uk - U0
+        mu_ref, cov_ref = _empirical_mean_cov(xrm)
+        mu0, cov0 = _empirical_mean_cov(x0m)
+        muk, covk = _empirical_mean_cov(xkm)
+        r20 = (x0m - mu_ref.unsqueeze(0)).square().sum(dim=1).detach().cpu().double().numpy()
+        r2k = (xkm - mu_ref.unsqueeze(0)).square().sum(dim=1).detach().cpu().double().numpy()
+        dr2 = r2k - r20
+        cov_ref_norm = torch.linalg.norm(cov_ref).clamp_min(1e-30)
+        cov_rel_ref_before = float((torch.linalg.norm(cov0 - cov_ref) / cov_ref_norm).detach().cpu().item())
+        cov_rel_ref_after = float((torch.linalg.norm(covk - cov_ref) / cov_ref_norm).detach().cpu().item())
+        cov_rel_after_before = float((torch.linalg.norm(covk - cov0) / torch.linalg.norm(cov0).clamp_min(1e-30)).detach().cpu().item())
+        mean_shift_before_ref = float(torch.linalg.norm(mu0 - mu_ref).detach().cpu().item())
+        mean_shift_after_ref = float(torch.linalg.norm(muk - mu_ref).detach().cpu().item())
+        mean_shift_after_before = float(torch.linalg.norm(muk - mu0).detach().cpu().item())
+        cov_trace_before = float(torch.trace(cov0).detach().cpu().item())
+        cov_trace_after = float(torch.trace(covk).detach().cpu().item())
+        cov_trace_ref = float(torch.trace(cov_ref).detach().cpu().item())
+
+    dU_mean, dU_se = _mean_se_np(dU)
+    dr2_mean, dr2_se = _mean_se_np(dr2)
+    row = OrderedDict([
+        ('method', method),
+        ('checkpoint', int(checkpoint)),
+        ('n', int(n)),
+        ('accept_rate_cumulative', float(accept_rate)),
+        ('mala_step_size', float(mala_step_size)),
+        ('energy_before_mean', float(np.nanmean(U0))),
+        ('energy_after_mean', float(np.nanmean(Uk))),
+        ('energy_delta_mean', dU_mean),
+        ('energy_delta_se', dU_se),
+        ('logp_delta_mean', -dU_mean if np.isfinite(dU_mean) else float('nan')),
+        ('radius2_before_mean', float(np.nanmean(r20))),
+        ('radius2_after_mean', float(np.nanmean(r2k))),
+        ('radius2_delta_mean', dr2_mean),
+        ('radius2_delta_se', dr2_se),
+        ('cov_trace_ref', cov_trace_ref),
+        ('cov_trace_before', cov_trace_before),
+        ('cov_trace_after', cov_trace_after),
+        ('cov_trace_delta', cov_trace_after - cov_trace_before),
+        ('cov_rel_ref_before', cov_rel_ref_before),
+        ('cov_rel_ref_after', cov_rel_ref_after),
+        ('cov_rel_after_before', cov_rel_after_before),
+        ('mean_shift_ref_before', mean_shift_before_ref),
+        ('mean_shift_ref_after', mean_shift_after_ref),
+        ('mean_shift_after_before', mean_shift_after_before),
+    ])
+    # Distributional distances.  These can be the expensive part, so they are
+    # computed on the stationarity metric cap rather than on the whole cloud.
+    try:
+        row['mmd_ref_before'] = mmd(x0m, xrm)
+        row['mmd_ref_after'] = mmd(xkm, xrm)
+        row['mmd_after_before'] = mmd(xkm, x0m)
+    except Exception:
+        row['mmd_ref_before'] = row['mmd_ref_after'] = row['mmd_after_before'] = float('nan')
+    try:
+        row['sliced_ks_ref_before'] = sliced_ks_distance(x0m, xrm, n_projections=n_proj, max_points=n, seed=17)
+        row['sliced_ks_ref_after'] = sliced_ks_distance(xkm, xrm, n_projections=n_proj, max_points=n, seed=17)
+        row['sliced_ks_after_before'] = sliced_ks_distance(xkm, x0m, n_projections=n_proj, max_points=n, seed=17)
+    except Exception:
+        row['sliced_ks_ref_before'] = row['sliced_ks_ref_after'] = row['sliced_ks_after_before'] = float('nan')
+    try:
+        row['sliced_w2_ref_before'] = sliced_w2_distance(x0m, xrm, n_projections=n_proj, max_points=n, seed=19)
+        row['sliced_w2_ref_after'] = sliced_w2_distance(xkm, xrm, n_projections=n_proj, max_points=n, seed=19)
+        row['sliced_w2_after_before'] = sliced_w2_distance(xkm, x0m, n_projections=n_proj, max_points=n, seed=19)
+    except Exception:
+        row['sliced_w2_ref_before'] = row['sliced_w2_ref_after'] = row['sliced_w2_after_before'] = float('nan')
+
+    before_diag = _target_scalar_means_for_stationarity(target, x0m, max_n=scalar_max)
+    after_diag = _target_scalar_means_for_stationarity(target, xkm, max_n=scalar_max)
+    for key, val in before_diag.items():
+        row[key + '_before'] = val
+    for key, val in after_diag.items():
+        row[key + '_after'] = val
+    for key in before_diag.keys() & after_diag.keys():
+        if key.endswith('_mean'):
+            try:
+                row[key + '_delta'] = float(after_diag[key]) - float(before_diag[key])
+            except Exception:
+                pass
+    return row
+
+
+def plot_mala_stationarity_heatmaps(before_by_method, after_by_method, x_ref, target,
+                                     out_dir='outputs', filename='stationarity_mala_heatmaps.png'):
+    """Two-row before/after projection heatmap for exact-MALA refresh drift."""
+    os.makedirs(out_dir, exist_ok=True)
+    methods = [m for m in before_by_method.keys() if m in after_by_method]
+    if not methods:
+        return None
+    with torch.no_grad():
+        if isinstance(target, DW4Target) and getattr(target, 'D', None) == 8:
+            coord_getter = lambda s: DW4Target.all_coords(s)
+            ref_coords_t = coord_getter(x_ref)
+            axis_labels = (r'$z_1$', r'$z_2$')
+            panel_aspect = 'equal'
+            projection_label = 'single-particle marginal'
+        elif isinstance(target, FunnelTarget):
+            coord_getter = lambda s: target.plot_projection(s, fit_ref=x_ref)
+            ref_coords_t = coord_getter(x_ref)
+            axis_labels = (r'$x_1$', r'$x_2$')
+            panel_aspect = 'auto'
+            projection_label = 'funnel coordinates'
+        else:
+            coord_getter = (lambda s: target.plot_projection(s, fit_ref=x_ref)) if hasattr(target, 'plot_projection') else (lambda s: s[:, :2])
+            ref_coords_t = coord_getter(x_ref)
+            axis_labels = (r'$z_1$', r'$z_2$')
+            panel_aspect = 'equal'
+            projection_label = '2D projection'
+        ref_coords = ref_coords_t.detach().cpu().numpy()
+        coords_before = {m: coord_getter(before_by_method[m]).detach().cpu().numpy() for m in methods}
+        coords_after = {m: coord_getter(after_by_method[m]).detach().cpu().numpy() for m in methods}
+    extent_coords = [ref_coords]
+    for m in methods:
+        extent_coords.extend([coords_before[m], coords_after[m]])
+    extent_coords = np.concatenate(extent_coords, axis=0)
+    if isinstance(target, FunnelTarget):
+        x_lo, x_hi = np.percentile(extent_coords[:, 0], [FUNNEL_D10_HEATMAP_X_Q_LOW, FUNNEL_D10_HEATMAP_X_Q_HIGH])
+        y_abs = float(np.percentile(np.abs(extent_coords[:, 1]), FUNNEL_D10_HEATMAP_Y_Q_ABS))
+        x_pad = 0.06 * max(x_hi - x_lo, 1e-9)
+        y_pad = 0.06 * max(2.0 * y_abs, 1e-9)
+        lo = np.array([x_lo - x_pad, -y_abs - y_pad], dtype=np.float64)
+        hi = np.array([x_hi + x_pad,  y_abs + y_pad], dtype=np.float64)
+    else:
+        lo = np.percentile(extent_coords, 0.5, axis=0) - 0.15
+        hi = np.percentile(extent_coords, 99.5, axis=0) + 0.15
+    xedges = np.linspace(lo[0], hi[0], 101)
+    yedges = np.linspace(lo[1], hi[1], 101)
+    extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
+
+    def make_hist(coords):
+        H, _, _ = np.histogram2d(coords[:, 0], coords[:, 1], bins=[xedges, yedges], density=True)
+        return H.T
+
+    Hs = []
+    for m in methods:
+        Hs.append(make_hist(coords_before[m]))
+        Hs.append(make_hist(coords_after[m]))
+    from matplotlib import colors as mcolors
+    positive = [H[np.isfinite(H) & (H > 0.0)] for H in Hs]
+    positive = [z for z in positive if z.size]
+    if positive:
+        vmax = float(np.percentile(np.concatenate(positive), float(os.environ.get('LFGI_BENCH_HEATMAP_VMAX_Q', '98.5'))))
+    else:
+        vmax = 1.0
+    vmax = max(vmax, 1e-12)
+    gamma = float(os.environ.get('LFGI_BENCH_HEATMAP_GAMMA', '0.42'))
+    norm = mcolors.PowerNorm(gamma=min(max(gamma, 0.05), 1.0), vmin=0.0, vmax=vmax)
+    interp = os.environ.get('LFGI_BENCH_HEATMAP_INTERP', 'nearest').strip() or 'nearest'
+
+    nc = len(methods)
+    fig_w = max(7.0, 2.55 * nc)
+    fig, axes = plt.subplots(2, nc, figsize=(fig_w, 5.25), squeeze=False, sharex=True, sharey=True)
+    for j, m in enumerate(methods):
+        for row_idx, coords, row_label in [(0, coords_before[m], 'before'), (1, coords_after[m], 'after exact MALA')]:
+            ax = axes[row_idx, j]
+            H = make_hist(coords)
+            ax.imshow(H, origin='lower', extent=extent, aspect=panel_aspect, interpolation=interp, norm=norm)
+            if row_idx == 0:
+                ax.set_title(paper_method_label(m), fontsize=12.2, pad=4)
+            if j == 0:
+                ax.set_ylabel(row_label + '\n' + axis_labels[1], fontsize=10.5)
+            else:
+                ax.set_yticklabels([])
+            if row_idx == 1:
+                ax.set_xlabel(axis_labels[0], fontsize=10.5)
+            else:
+                ax.set_xticklabels([])
+            ax.tick_params(axis='both', labelsize=8.5, length=2.2, width=0.65)
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.75)
+    target_label = paper_target_label(target)
+    fig.suptitle(f'Exact-MALA stationarity refresh: before vs after ({projection_label}) — {target_label}', fontsize=14.5, y=1.01)
+    fig.tight_layout(pad=0.25, w_pad=0.28, h_pad=0.28)
+    path = os.path.join(out_dir, filename)
+    fig.savefig(path, dpi=PUB_HEATMAP_DPI, bbox_inches='tight')
+    _close_fig(fig)
+    return path
+
+
+def plot_mala_stationarity_summary(rows, out_dir='outputs', filename='stationarity_mala_summary.png'):
+    """Small bar summary of final exact-MALA drift diagnostics."""
+    rows = list(rows)
+    if not rows:
+        return None
+    final_ckpt = max(int(r.get('checkpoint', 0)) for r in rows)
+    rows = [r for r in rows if int(r.get('checkpoint', 0)) == final_ckpt]
+    if not rows:
+        return None
+    methods = [r['method'] for r in rows]
+    keys = [
+        ('energy_delta_mean', r'$\Delta$ energy'),
+        ('radius2_delta_mean', r'$\Delta$ radius$^2$'),
+        ('cov_trace_delta', r'$\Delta$ cov trace'),
+        ('sliced_w2_ref_before', 'SW2 to ref before'),
+        ('sliced_w2_ref_after', 'SW2 to ref after'),
+        ('cov_rel_ref_before', 'CovRel ref before'),
+        ('cov_rel_ref_after', 'CovRel ref after'),
+        ('accept_rate_cumulative', 'MALA accept'),
+    ]
+    fig, axes = plt.subplots(2, 4, figsize=(17.5, 7.2))
+    axes = axes.ravel()
+    colors = [COLORS.get(m, '#777777') for m in methods]
+    labels = [paper_method_label(m) for m in methods]
+    for ax, (key, title) in zip(axes, keys):
+        vals = []
+        for r in rows:
+            try:
+                vals.append(float(r.get(key, np.nan)))
+            except Exception:
+                vals.append(float('nan'))
+        ax.bar(range(len(methods)), vals, color=colors, alpha=0.90)
+        ax.axhline(0.0, color='#555555', lw=0.9, ls='--', alpha=0.55)
+        ax.set_title(title, fontsize=11.0)
+        ax.set_xticks(range(len(methods)))
+        ax.set_xticklabels(labels, rotation=30, ha='right', fontsize=8.5)
+        _style_publication_axis(ax, grid=True)
+    fig.suptitle(f'Exact-MALA stationarity drift after {final_ckpt} steps', fontsize=14.5)
+    fig.tight_layout()
+    path = os.path.join(out_dir, filename)
+    fig.savefig(path, dpi=PUB_DPI, bbox_inches='tight')
+    _close_fig(fig)
+    return path
+
+
+def run_mala_stationarity_benchmark(results, methods, target, x_ref, out_dir='outputs',
+                                    step_size=1e-3, n_steps=25, checkpoints=(1, 5, 25),
+                                    n_samples=2048, metric_max=1024, n_proj=256,
+                                    chunk=1024, scalar_max=1024):
+    """Run exact-MALA refresh stationarity benchmark for all methods.
+
+    Saves a long-form CSV and two figures:
+      * stationarity_mala_diagnostics.csv
+      * stationarity_mala_heatmaps.png
+      * stationarity_mala_summary.png
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    n_steps = int(n_steps)
+    checkpoints = sorted({int(c) for c in checkpoints if 0 <= int(c) <= n_steps})
+    if n_steps not in checkpoints:
+        checkpoints.append(n_steps)
+    before_by_method = OrderedDict()
+    after_by_method = OrderedDict()
+    rows = []
+    final_ckpt = max(checkpoints) if checkpoints else n_steps
+    print(f"\n[5] Exact-MALA stationarity benchmark …")
+    print(f"    n={int(n_samples)}, step_size={float(step_size):.4g}, steps={n_steps}, checkpoints={checkpoints}, metric_max={metric_max}, n_proj={n_proj}")
+    for m in methods:
+        r = results.get(m, {})
+        x_all = r.get('samples', None) if isinstance(r, dict) else None
+        if not torch.is_tensor(x_all) or x_all.shape[0] < 5:
+            continue
+        n = min(int(n_samples), int(x_all.shape[0]))
+        # Use a random subset so the refresh diagnostic is not tied to the
+        # visual ordering of generated samples.  Before/after remain paired.
+        idx = _randperm(x_all.shape[0], device=x_all.device)[:n]
+        x0 = x_all[idx].detach().contiguous()
+        try:
+            snapshots, acc = exact_mala_refresh_from_samples(
+                target, x0, step_size=float(step_size), n_steps=n_steps,
+                checkpoints=checkpoints, chunk=chunk,
+            )
+        except Exception as exc:
+            print(f"    {m:<26s} stationarity FAILED: {exc}")
+            continue
+        before_by_method[m] = x0
+        after_by_method[m] = snapshots[final_ckpt]
+        for ckpt in checkpoints:
+            if ckpt not in snapshots:
+                continue
+            row = _stationarity_row(
+                target, m, ckpt, x0, snapshots[ckpt], x_ref,
+                accept_rate=acc.get(ckpt, float('nan')),
+                metric_max=metric_max, n_proj=n_proj, scalar_max=scalar_max,
+                mala_step_size=float(step_size),
+            )
+            rows.append(row)
+            if ckpt == final_ckpt:
+                # Keep a compact summary on the method result so the ordinary
+                # metrics CSV can expose the final refresh drift without forcing
+                # users to open the long-form stationarity CSV.
+                r['mala_stationarity'] = dict(row)
+                print(
+                    f"    {m:<26s} accept={row['accept_rate_cumulative']:.3f} "
+                    f"dE={row['energy_delta_mean']:+.4g}±{row['energy_delta_se']:.2g} "
+                    f"dR2={row['radius2_delta_mean']:+.4g} "
+                    f"SW2ref {row['sliced_w2_ref_before']:.4g}->{row['sliced_w2_ref_after']:.4g} "
+                    f"CovRel {row['cov_rel_ref_before']:.4g}->{row['cov_rel_ref_after']:.4g}"
+                )
+    # Long-form diagnostics CSV with unioned fields because target scalar
+    # diagnostics vary by target class.
+    csv_path = os.path.join(out_dir, 'stationarity_mala_diagnostics.csv')
+    if rows:
+        fieldnames = []
+        seen = set()
+        for row in rows:
+            for k in row.keys():
+                if k not in seen:
+                    seen.add(k); fieldnames.append(k)
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, '') for k in fieldnames})
+        print(f"    stationarity CSV saved to {csv_path}")
+    else:
+        csv_path = None
+    heatmap_path = plot_mala_stationarity_heatmaps(before_by_method, after_by_method, x_ref, target, out_dir=out_dir)
+    summary_path = plot_mala_stationarity_summary(rows, out_dir=out_dir)
+    paths = dict(stationarity_csv=csv_path, stationarity_mala_heatmaps=heatmap_path, stationarity_mala_summary=summary_path)
+    return rows, before_by_method, after_by_method, paths
+
+
 def ess_kde(samples, target, n_max=1000):
     from sklearn.neighbors import KernelDensity
     n    = min(len(samples), n_max)
@@ -4215,6 +5286,11 @@ MALA_PRESETS = {
     'funnel_d10': dict(step_size=0.0015, n_chains=64, burnin=80_000, thin=50),
     'dw4_hardened': dict(step_size=0.008, n_chains=64, burnin=120_000, thin=80),
     'singular_dw4_hardened': dict(step_size=0.0015, n_chains=64, burnin=120_000, thin=80),
+    'nonlinear_sine_inverse_d8_clean': dict(step_size=0.006, n_chains=64, burnin=60_000, thin=40),
+    'nonlinear_sine_inverse_d8_residual': dict(step_size=0.0035, n_chains=64, burnin=80_000, thin=50),
+    'masked_multiscale_inverse_d16': dict(step_size=0.0015, n_chains=96, burnin=100_000, thin=60),
+    'masked_multiscale_inverse_d16_residual': dict(step_size=0.0010, n_chains=96, burnin=120_000, thin=70),
+    'masked_multiscale_inverse_d32_residual': dict(step_size=0.00055, n_chains=128, burnin=140_000, thin=80),
 }
 
 
@@ -4316,6 +5392,7 @@ def run(target, out_dir='outputs', methods=None):
     N_STEPS   = int(os.environ.get('LFGI_BENCH_STEPS', '300'))
     T_MAX     = float(os.environ.get('LFGI_BENCH_T_MAX', '3.0'))
     T_MIN     = float(os.environ.get('LFGI_BENCH_T_MIN', '0.00025'))
+    TIME_SCHEDULE = canonical_time_schedule(os.environ.get('LFGI_BENCH_TIME_SCHEDULE', os.environ.get('TIME_SCHEDULE', 'linear')))
     N_TIME_GRID  = int(os.environ.get('LFGI_BENCH_TIME_GRID', '300'))
     DO_SCORE_RMSE = os.environ.get('LFGI_BENCH_SCORE_RMSE', '1').strip() not in {'0', 'false', 'False'}
     DO_AUX_METRICS = os.environ.get('LFGI_BENCH_AUX_METRICS', '1').strip() not in {'0', 'false', 'False'}
@@ -4327,6 +5404,20 @@ def run(target, out_dir='outputs', methods=None):
     CURL_FD_EPS = float(os.environ.get('LFGI_BENCH_CURL_FD_EPS', str(CURL_FD_EPS_DEFAULT)))
     CURL_CHUNK = int(os.environ.get('LFGI_BENCH_CURL_CHUNK', str(CURL_CHUNK_DEFAULT)))
     CURL_T_MIN = float(os.environ.get('LFGI_BENCH_CURL_T_MIN', str(CURL_T_MIN_DEFAULT)))
+    DO_MALA_STATIONARITY = _env_bool(
+        'LFGI_BENCH_MALA_STATIONARITY',
+        default=_env_bool('LFGI_BENCH_STATIONARITY', default=True),
+    )
+    MALA_STAT_N = int(os.environ.get('LFGI_BENCH_MALA_STATIONARITY_N', os.environ.get('LFGI_BENCH_STATIONARITY_N', '2048')))
+    MALA_STAT_STEPS = int(os.environ.get('LFGI_BENCH_MALA_STATIONARITY_STEPS', os.environ.get('LFGI_BENCH_STATIONARITY_STEPS', '25')))
+    MALA_STAT_CHECKPOINTS = _parse_int_list_env(
+        'LFGI_BENCH_MALA_STATIONARITY_CHECKPOINTS',
+        os.environ.get('LFGI_BENCH_STATIONARITY_CHECKPOINTS', '1,5,25'),
+    )
+    MALA_STAT_METRIC_MAX = int(os.environ.get('LFGI_BENCH_MALA_STATIONARITY_METRIC_MAX', os.environ.get('LFGI_BENCH_STATIONARITY_METRIC_MAX', '1024')))
+    MALA_STAT_N_PROJ = int(os.environ.get('LFGI_BENCH_MALA_STATIONARITY_PROJ', os.environ.get('LFGI_BENCH_STATIONARITY_PROJ', '256')))
+    MALA_STAT_CHUNK = int(os.environ.get('LFGI_BENCH_MALA_STATIONARITY_CHUNK', os.environ.get('LFGI_BENCH_STATIONARITY_CHUNK', '1024')))
+    MALA_STAT_SCALAR_MAX = int(os.environ.get('LFGI_BENCH_MALA_STATIONARITY_SCALAR_MAX', os.environ.get('LFGI_BENCH_STATIONARITY_SCALAR_MAX', '1024')))
     D = int(getattr(target, 'D', getattr(target, 'd', DW4Target.D)))
 
     os.makedirs(out_dir, exist_ok=True)
@@ -4346,10 +5437,12 @@ def run(target, out_dir='outputs', methods=None):
         gate_bank_msg = 'independent/disjoint banks: xr and xg are separate reference draws'
     else:
         gate_bank_msg = str(BANK_COUPLING)
-    print(f"  sizes: NR={NR}, NG={NG} ({gate_bank_msg}; bank_coupling={BANK_COUPLING}), NS={NS}, NT={NT}, NR_LARGE={NR_LARGE}, steps={N_STEPS}, time_grid={N_TIME_GRID}")
+    print(f"  sizes: NR={NR}, NG={NG} ({gate_bank_msg}; bank_coupling={BANK_COUPLING}), NS={NS}, NT={NT}, NR_LARGE={NR_LARGE}, steps={N_STEPS}, time_schedule={TIME_SCHEDULE}, time_grid={N_TIME_GRID}")
     print(f"  metric flags: aux={DO_AUX_METRICS}, score_rmse={DO_SCORE_RMSE}, curl={DO_CURL}, copying={DO_COPYING}, metric_max={os.environ.get('LFGI_BENCH_METRIC_MAX', '4096')}")
     if DO_CURL:
         print(f"  curl diagnostic: n={CURL_TRAJ_N}, time_grid={CURL_TIME_GRID}, probes={CURL_PROBES}, fd_eps={CURL_FD_EPS:g}, chunk={CURL_CHUNK}, t_min_filter={CURL_T_MIN:g}")
+    if DO_MALA_STATIONARITY:
+        print(f"  MALA stationarity: n={MALA_STAT_N}, steps={MALA_STAT_STEPS}, checkpoints={MALA_STAT_CHECKPOINTS}, metric_max={MALA_STAT_METRIC_MAX}, proj={MALA_STAT_N_PROJ}")
     for key in ['paper_second_moment', 'paper_sigma', 'paper_R', 'paper_tau']:
         if hasattr(target, key):
             print(f"  {key}={getattr(target, key)}")
@@ -4445,6 +5538,8 @@ def run(target, out_dir='outputs', methods=None):
 
     precomp = None
     precomp_gate = None
+    precomp_by_source = {}
+    precomp_gate_by_source = {}
     precomp_adaptive = None
     precomp_adaptive_gate = None
     s0_gate_only = None
@@ -4455,33 +5550,59 @@ def run(target, out_dir='outputs', methods=None):
 
     if need_precomp:
         # ---- Precompute spectral data ----
-        print("\n[2] Precomputing exact Hessian spectral data …")
-        gpu_log('before Hessian precompute', reset_peak=True)
-        t0 = time.time()
-        precomp = precompute_leaf_hlsi(
-            target, xr, lmin=HESS_MIN, lmax=HESS_MAX,
-            p_leaf=P_LEAF, use_fd_hessian=False,
-        )
-        print(f"    Done ({time.time()-t0:.1f}s)")
-        gpu_log('after Hessian precompute')
+        requested_sources = OrderedDict()
+        for _cfg in sampler_configs.values():
+            if sampler_needs_base_precomp(_cfg):
+                requested_sources[sampler_hessian_source(_cfg)] = None
+        if not requested_sources:
+            requested_sources['true'] = None
+        print("\n[2] Precomputing Hessian spectral data …")
+        for _source in requested_sources.keys():
+            source_label = 'Gauss--Newton proxy' if _source == 'gn' else 'full target Hessian'
+            print(f"    source={_source} ({source_label})")
+            gpu_log(f'before Hessian precompute [{_source}]', reset_peak=True)
+            t0 = time.time()
+            precomp_by_source[_source] = precompute_leaf_hlsi(
+                target, xr, lmin=HESS_MIN, lmax=HESS_MAX,
+                p_leaf=P_LEAF, use_fd_hessian=False,
+                hessian_source=_source,
+            )
+            print(f"    Done ({time.time()-t0:.1f}s)")
+            gpu_log(f'after Hessian precompute [{_source}]')
 
+            lam_src = precomp_by_source[_source]['lam'].detach().cpu().numpy()
+            print(f"    Hessian eigenvalues [{_source}]: min={lam_src.min():.3e}, "
+                  f"max={lam_src.max():.3e}, "
+                  f"frac_non_psd={100*(lam_src < 0).mean():.1f}%")
+            if _source == 'gn' and not hasattr(target, 'gn_hessian'):
+                print("    target has no gn_hessian; gn source fell back to full target Hessian.")
+        precomp = precomp_by_source.get('true', next(iter(precomp_by_source.values())))
         lam_np = precomp['lam'].detach().cpu().numpy()
         n_bad = int((precomp['lam'] < 0).sum().item())
-        print(f"    Hessian eigenvalues: min={lam_np.min():.3e}, "
-              f"max={lam_np.max():.3e}, "
-              f"frac_non_psd={100*(lam_np < 0).mean():.1f}%")
         print("    LFGI uses P_raw directly: no spectral truncation or PSD projection.")
 
     if need_base_leaf_gate:
+        requested_gate_sources = OrderedDict()
+        for _cfg in sampler_configs.values():
+            if (
+                _cfg.get('family') == 'hlsi'
+                and canonical_gate_law(_cfg.get('hlsi_gate_law', 'dirac')) == 'CE'
+                and canonical_gate_mode(_cfg.get('hlsi_gate_mode', 'base')) in {'base', 'leaf'}
+            ):
+                requested_gate_sources[sampler_hessian_source(_cfg)] = None
         print(f"\n[2g] Precomputing separate LFGI gate spectral data (NG={NG}) …")
-        gpu_log('before gate Hessian precompute', reset_peak=True)
-        t0 = time.time()
-        precomp_gate = precompute_leaf_hlsi(
-            target, xg, lmin=HESS_MIN, lmax=HESS_MAX,
-            p_leaf=P_LEAF, use_fd_hessian=False,
-        )
-        print(f"    Done ({time.time()-t0:.1f}s)")
-        gpu_log('after gate Hessian precompute')
+        for _source in requested_gate_sources.keys():
+            print(f"    source={_source}")
+            gpu_log(f'before gate Hessian precompute [{_source}]', reset_peak=True)
+            t0 = time.time()
+            precomp_gate_by_source[_source] = precompute_leaf_hlsi(
+                target, xg, lmin=HESS_MIN, lmax=HESS_MAX,
+                p_leaf=P_LEAF, use_fd_hessian=False,
+                hessian_source=_source,
+            )
+            print(f"    Done ({time.time()-t0:.1f}s)")
+            gpu_log(f'after gate Hessian precompute [{_source}]')
+        precomp_gate = precomp_gate_by_source.get('true', next(iter(precomp_gate_by_source.values()), None))
 
     if need_primal_matrix_gate and GATE_BANK_SEPARATE and precomp_gate is None:
         print(f"\n[2m] Precomputing separate primal moment-gate scores (NG={NG}) …")
@@ -4581,9 +5702,10 @@ def run(target, out_dir='outputs', methods=None):
             if precomp_adaptive is None:
                 raise RuntimeError('Adaptive-leaf sampler requested but precomp_adaptive was not built')
             return precomp_adaptive
-        if precomp is None:
-            raise RuntimeError(f'{mode} sampler requested but base precomp was not built')
-        return precomp
+        source = sampler_hessian_source(sampler_configs.get(method_name, {}))
+        if source not in precomp_by_source:
+            raise RuntimeError(f'{mode} sampler requested source={source!r} but that base precomp was not built')
+        return precomp_by_source[source]
 
     def _gate_precomp_for_mode(mode, method_name=None):
         if not GATE_BANK_SEPARATE:
@@ -4597,9 +5719,10 @@ def run(target, out_dir='outputs', methods=None):
             if precomp_adaptive_gate is None:
                 raise RuntimeError('Adaptive-leaf sampler requested separate gate bank but precomp_adaptive_gate was not built')
             return precomp_adaptive_gate
-        if precomp_gate is None:
-            raise RuntimeError(f'{mode} sampler requested separate gate bank but precomp_gate was not built')
-        return precomp_gate
+        source = sampler_hessian_source(sampler_configs.get(method_name, {}))
+        if source not in precomp_gate_by_source:
+            raise RuntimeError(f'{mode} sampler requested separate gate bank source={source!r} but that gate precomp was not built')
+        return precomp_gate_by_source[source]
 
     # ---- Score estimator closures ----
     def make_fn(method_name, cfg):
@@ -4681,7 +5804,8 @@ def run(target, out_dir='outputs', methods=None):
                     return est_ce_hlsi(y, t, xr, w, target, precomp=pc,
                                        lmin=HESS_MIN, lmax=HESS_MAX,
                                        gate_xr=xg if GATE_BANK_SEPARATE else xr,
-                                       gate_precomp=gpc, w_gate=w_gate)
+                                       gate_precomp=gpc, w_gate=w_gate,
+                                       hessian_source=sampler_hessian_source(cfg))
                 if gate_mode in {'leaf', 'adaptive-leaf'}:
                     return est_leaf_ce_hlsi(y, t, xr, w, target, precomp=pc,
                                             lmin=HESS_MIN, lmax=HESS_MAX,
@@ -4735,13 +5859,14 @@ def run(target, out_dir='outputs', methods=None):
                 samp, ms, fail, traj_y, traj_t = heun_sde(
                     fn, NS, D, n_steps=N_STEPS,
                     t_max=T_MAX, t_min=T_MIN, device=DEVICE,
+                    time_schedule=TIME_SCHEDULE,
                     return_trajectory=True,
                     trajectory_n=CURL_TRAJ_N,
                     trajectory_time_grid=CURL_TIME_GRID,
                 )
             else:
                 samp, ms, fail = heun_sde(fn, NS, D, n_steps=N_STEPS,
-                                          t_max=T_MAX, t_min=T_MIN, device=DEVICE)
+                                          t_max=T_MAX, t_min=T_MIN, device=DEVICE, time_schedule=TIME_SCHEDULE)
                 traj_y, traj_t = [], []
             gpu_log(f'after sampling {m}')
         ok  = torch.isfinite(samp).all(dim=1)
@@ -4890,6 +6015,23 @@ def run(target, out_dir='outputs', methods=None):
           f" {gt_copy['mean_d_train']:8.4f} {gt_copy['mean_d_test']:8.4f}"
           f" {gt_copy['ratio']:7.3f}")
 
+    # ---- Exact-target MALA stationarity refresh diagnostic ----
+    stationarity_paths = {}
+    if DO_MALA_STATIONARITY:
+        MALA_STAT_STEP_SIZE, MALA_STAT_STEP_SOURCE = resolve_mala_stationarity_step_size(vname, mala_kw)
+        print(f"  MALA stationarity step_size={MALA_STAT_STEP_SIZE:.4g} ({MALA_STAT_STEP_SOURCE})")
+        stationarity_rows, stationarity_before, stationarity_after, stationarity_paths = run_mala_stationarity_benchmark(
+            results, list(method_names) + ['GT floor'], target, xt, out_dir=out_dir,
+            step_size=MALA_STAT_STEP_SIZE,
+            n_steps=MALA_STAT_STEPS,
+            checkpoints=MALA_STAT_CHECKPOINTS,
+            n_samples=MALA_STAT_N,
+            metric_max=MALA_STAT_METRIC_MAX,
+            n_proj=MALA_STAT_N_PROJ,
+            chunk=MALA_STAT_CHUNK,
+            scalar_max=MALA_STAT_SCALAR_MAX,
+        )
+
     # ---- Summary table ----
     plot_methods = list(method_names) + ['GT floor']
     print("\n" + "=" * 80)
@@ -4946,7 +6088,7 @@ def run(target, out_dir='outputs', methods=None):
         gate_bank_prefix_coupled=bool(BANK_COUPLING == 'prefix'),
         gate_bank_independent=bool(BANK_COUPLING == 'independent'),
         NS=NS, NT=NT, NR_LARGE=NR_LARGE,
-        N_STEPS=N_STEPS, T_MIN=T_MIN, T_MAX=T_MAX, N_TIME_GRID=N_TIME_GRID,
+        N_STEPS=N_STEPS, T_MIN=T_MIN, T_MAX=T_MAX, TIME_SCHEDULE=TIME_SCHEDULE, N_TIME_GRID=N_TIME_GRID,
         ref_source=ref_source,
         headline_metric=dpsmc_benchmark_metric_name(target),
         do_score_rmse=DO_SCORE_RMSE,
@@ -4957,6 +6099,17 @@ def run(target, out_dir='outputs', methods=None):
         curl_probes=CURL_PROBES,
         curl_fd_eps=CURL_FD_EPS,
         curl_t_min_filter=CURL_T_MIN,
+        do_mala_stationarity=DO_MALA_STATIONARITY,
+        mala_stationarity_n=MALA_STAT_N,
+        mala_stationarity_steps=MALA_STAT_STEPS,
+        mala_stationarity_checkpoints=','.join(str(x) for x in MALA_STAT_CHECKPOINTS),
+        mala_stationarity_metric_max=MALA_STAT_METRIC_MAX,
+        mala_stationarity_n_proj=MALA_STAT_N_PROJ,
+        mala_stationarity_step_size=float(locals().get('MALA_STAT_STEP_SIZE', float('nan'))),
+        mala_stationarity_step_source=str(locals().get('MALA_STAT_STEP_SOURCE', '')),
+        mala_stationarity_csv=(stationarity_paths or {}).get('stationarity_csv', ''),
+        mala_stationarity_heatmaps=(stationarity_paths or {}).get('stationarity_mala_heatmaps', ''),
+        mala_stationarity_summary=(stationarity_paths or {}).get('stationarity_mala_summary', ''),
         mala_preset=dict(mala_kw),
     )
     if need_precomp and np.isfinite(lam_np).any():
@@ -5063,8 +6216,31 @@ def save_metrics_csv(results, methods, target, out_dir='outputs'):
             'copying': cd.get('copying', False),
             'n_samples_valid': int(r.get('samples', torch.empty(0)).shape[0]) if isinstance(r, dict) and torch.is_tensor(r.get('samples', None)) else np.nan,
         })
+        sd = r.get('mala_stationarity', {}) if isinstance(r, dict) else {}
+        if isinstance(sd, dict) and sd:
+            for sk in [
+                'checkpoint', 'accept_rate_cumulative',
+                'energy_delta_mean', 'energy_delta_se', 'radius2_delta_mean', 'radius2_delta_se',
+                'cov_trace_delta', 'cov_rel_ref_before', 'cov_rel_ref_after',
+                'cov_rel_after_before', 'mean_shift_ref_before', 'mean_shift_ref_after',
+                'mmd_ref_before', 'mmd_ref_after', 'mmd_after_before',
+                'sliced_ks_ref_before', 'sliced_ks_ref_after', 'sliced_ks_after_before',
+                'sliced_w2_ref_before', 'sliced_w2_ref_after', 'sliced_w2_after_before',
+            ]:
+                row['mala_stationarity_' + sk] = sd.get(sk, np.nan)
+            for sk, sv in sd.items():
+                if str(sk).startswith('diag_'):
+                    row['mala_stationarity_' + sk] = sv
         rows.append(row)
-    fieldnames = list(rows[0].keys()) if rows else ['method']
+    if rows:
+        fieldnames = []
+        seen = set()
+        for row in rows:
+            for k in row.keys():
+                if k not in seen:
+                    seen.add(k); fieldnames.append(k)
+    else:
+        fieldnames = ['method']
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -5320,6 +6496,8 @@ def make_variant_pdf_dashboard(results, xt, xr, methods, target, out_dir='output
         ordered = [
             ('metrics_bar', 'Metric bar charts'),
             ('heatmaps', 'Single-particle marginal heatmaps'),
+            ('stationarity_mala_heatmaps', 'Exact-MALA stationarity heatmaps'),
+            ('stationarity_mala_summary', 'Exact-MALA stationarity summary'),
             ('pairwise_dist', 'Inter-particle distance'),
             ('radial', 'Particle radius'),
             ('energy', 'Energy histogram'),
@@ -5406,7 +6584,7 @@ def build_meta_summary_lines(all_results, methods):
             if 'blend' not in res:
                 continue
             rb = res['blend']
-            for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'dpsmc-matrix-blend', 'dpsmc-ref-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi'):
+            for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'dpsmc-matrix-blend', 'dpsmc-ref-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi', 'gn_lfgi'):
                 if target_name not in res:
                     continue
                 rl = res[target_name]
@@ -5489,6 +6667,7 @@ PAPER_METHOD_LABELS = {
     'centered-matrix-blend': 'CENTERED MATRIX BLEND',
     'primal-matrix-blend': 'PLUGIN MATRIX BLEND',
     'ce-hlsi': 'LFGI BLEND',
+    'gn_lfgi': 'GN-LFGI BLEND',
     'GT floor': 'GT FLOOR',
     'True': 'TRUE',
     'True (MALA)': 'TRUE',
@@ -5516,6 +6695,12 @@ PAPER_TARGET_LABELS = {
     'misaligned_subspace_gmm_d8': r'Misaligned GMM ($d=8$)',
     'misaligned_subspace_gmm_d24': r'Misaligned GMM ($d=24$)',
     'singular_heterogeneous_gmm_d8': r'Heterogeneous GMM ($d=8$)',
+    'singular_hetero_gmm_d8': r'Heterogeneous GMM ($d=8$)',
+    'nonlinear_sine_inverse_d8_clean': r'Nonlinear inverse, clean ($d=8$)',
+    'nonlinear_sine_inverse_d8_residual': r'Nonlinear inverse, residual ($d=8$)',
+    'masked_multiscale_inverse_d16': r'Masked multiscale inverse ($d=16$)',
+    'masked_multiscale_inverse_d16_residual': r'Masked multiscale inverse, residual ($d=16$)',
+    'masked_multiscale_inverse_d32_residual': r'Masked multiscale inverse, residual ($d=32$)',
     'gmm40_d2': r'GMM40 ($d=2$)',
     'gmm40_d25': r'GMM40 ($d=25$)',
     'rings_d2': r'Rings ($d=2$)',
@@ -5553,6 +6738,7 @@ COLORS = {
     'centered-matrix-blend': '#9467BD',
     'primal-matrix-blend': '#FF7F0E',
     'ce-hlsi':           '#2CA02C',
+    'gn_lfgi':           '#008B8B',
     'GT floor':          '#777777',
     'tsi':               '#9467BD',
     'hlsi':              '#2CA02C',
@@ -5584,7 +6770,7 @@ COLORS = {
 
 MARKERS = {
     'tweedie': 'o', 'tsi': 's', 'hlsi': '^', 'surrogate_hlsi': '>',
-    'leaf_hlsi': 'P', 'ce-hlsi': 'D', 'leaf_ce-hlsi': 'X',
+    'leaf_hlsi': 'P', 'ce-hlsi': 'D', 'gn_lfgi': 'h', 'leaf_ce-hlsi': 'X',
     'surrogate_leaf_ce-hlsi': '<', 'mp-leaf_hlsi': 'p',
     'mp-leaf_ce-hlsi': '*', 'adaptive-mp-ce': '8', 'asym-adaptive-mp-ce': 'd',
     'asym-adaptive-mp-ce-static': 'd', 'asym-adaptive-mp-ce-conditional': 'D', 'blend': 's',
@@ -5597,6 +6783,40 @@ MARKERS = {
     'Tweedie': 'o', 'TSI': 's', 'HLSI': '^', 'CE-HLSI': 'D',
     'Leaf-HLSI': 'P', 'Leaf-CE-HLSI': 'X', 'Blended': 's', 'Primal Matrix': 'v',
 }
+
+
+# Exact-MALA stationarity refresh should be a local stationarity probe, not a
+# long aggressive re-sampler.  The reference-MALA step size can be much too
+# large for the deliberately ill-conditioned masked inverse targets because the
+# stationarity test is initialized from off-target sampler clouds rather than
+# from a warmed, tuned chain.  These conservative defaults can still be
+# overridden by LFGI_BENCH_MALA_STATIONARITY_STEP_SIZE.
+MALA_STATIONARITY_STEP_PRESETS = {
+    'masked_multiscale_inverse_d16': 7.5e-5,
+    'masked_multiscale_inverse_d16_residual': 5.0e-5,
+    'masked_multiscale_inverse_d32_residual': 2.5e-5,
+}
+
+
+def resolve_mala_stationarity_step_size(vname, mala_kw):
+    """Resolve exact-MALA refresh step size and a source label.
+
+    Priority:
+      1. LFGI_BENCH_MALA_STATIONARITY_STEP_SIZE, if explicitly set.
+      2. Target-specific conservative stationarity preset, for hard inverse targets.
+      3. LFGI_BENCH_MALA_STATIONARITY_STEP_SCALE * reference MALA step_size.
+    """
+    raw_h = os.environ.get('LFGI_BENCH_MALA_STATIONARITY_STEP_SIZE', '').strip()
+    if raw_h:
+        return float(raw_h), 'env:LFGI_BENCH_MALA_STATIONARITY_STEP_SIZE'
+    key = str(vname)
+    if key in MALA_STATIONARITY_STEP_PRESETS:
+        return float(MALA_STATIONARITY_STEP_PRESETS[key]), 'target_preset'
+    step_scale = float(os.environ.get(
+        'LFGI_BENCH_MALA_STATIONARITY_STEP_SCALE',
+        os.environ.get('LFGI_BENCH_STATIONARITY_STEP_SCALE', '0.35'),
+    ))
+    return step_scale * float(mala_kw.get('step_size', 0.005)), f'scale:{step_scale:g}*reference_mala'
 
 
 
@@ -5874,6 +7094,15 @@ def plot(results, xt, xr, methods, target, out_dir='outputs'):
         plot_paths[hist_name] = hist_path
         _close_fig(fig_h)
 
+    # ---- 4. Optional exact-MALA stationarity figures generated during run() ----
+    for _key, _fname in [
+        ('stationarity_mala_heatmaps', 'stationarity_mala_heatmaps.png'),
+        ('stationarity_mala_summary', 'stationarity_mala_summary.png'),
+    ]:
+        _path = os.path.join(out_dir, _fname)
+        if os.path.exists(_path):
+            plot_paths[_key] = _path
+
     dashboard_path = make_variant_pdf_dashboard(results, xt, xr, methods, target, out_dir=out_dir, plot_paths=plot_paths)
     plot_paths['dashboard'] = dashboard_path
     print(f"  Figures and dashboard saved to {out_dir}/")
@@ -6009,7 +7238,7 @@ def meta_run(root_dir='outputs_stress_test',
         if 'blend' not in res:
             continue
         rb = res['blend']
-        for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi'):
+        for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi', 'gn_lfgi'):
             if target_name not in res:
                 continue
             rl = res[target_name]
@@ -6137,6 +7366,25 @@ def _canonical_dpsmc_target_key(token):
         'hetero_gmm': 'singular_hetero_gmm_d8',
         'singular_hetero_gmm': 'singular_hetero_gmm_d8',
         'singular_heterogeneous_gmm': 'singular_hetero_gmm_d8',
+        'nonlinear_inverse': 'nonlinear_sine_inverse_d8_clean',
+        'nonlinear_sine_inverse': 'nonlinear_sine_inverse_d8_clean',
+        'nonlinear_sine_inverse_clean': 'nonlinear_sine_inverse_d8_clean',
+        'nonlinear_sine_inverse_d8_clean': 'nonlinear_sine_inverse_d8_clean',
+        'nonlinear_inverse_clean': 'nonlinear_sine_inverse_d8_clean',
+        'gn_inverse_clean': 'nonlinear_sine_inverse_d8_clean',
+        'nonlinear_sine_inverse_residual': 'nonlinear_sine_inverse_d8_residual',
+        'nonlinear_sine_inverse_d8_residual': 'nonlinear_sine_inverse_d8_residual',
+        'nonlinear_inverse_residual': 'nonlinear_sine_inverse_d8_residual',
+        'gn_inverse_residual': 'nonlinear_sine_inverse_d8_residual',
+        'masked_multiscale_inverse': 'masked_multiscale_inverse_d16',
+        'masked_multiscale_inverse_d16': 'masked_multiscale_inverse_d16',
+        'masked_multiscale_inverse_residual': 'masked_multiscale_inverse_d16_residual',
+        'masked_multiscale_inverse_d16_residual': 'masked_multiscale_inverse_d16_residual',
+        'masked_multiscale_inverse_d32': 'masked_multiscale_inverse_d32_residual',
+        'masked_multiscale_inverse_d32_residual': 'masked_multiscale_inverse_d32_residual',
+        'gn_inverse_hard': 'masked_multiscale_inverse_d16',
+        'gn_inverse_hard_residual': 'masked_multiscale_inverse_d16_residual',
+        'gn_inverse_d32_residual': 'masked_multiscale_inverse_d32_residual',
         'ionosphere35': 'ionosphere',
         'ionosphere_d35': 'ionosphere',
         'ionosphere20': 'ionosphere_20',
@@ -6193,6 +7441,16 @@ def _make_one_dpsmc_variant(token):
         return key, MisalignedSingularSubspaceGMMTarget(d=24, rank=4)
     if key == 'singular_hetero_gmm_d8':
         return key, SingularHeterogeneousCurvatureGMM8Target()
+    if key == 'nonlinear_sine_inverse_d8_clean':
+        return key, NonlinearSineInverseD8Target(variant='clean')
+    if key == 'nonlinear_sine_inverse_d8_residual':
+        return key, NonlinearSineInverseD8Target(variant='residual')
+    if key == 'masked_multiscale_inverse_d16':
+        return key, MaskedMultiscaleSineInverseTarget(variant='d16')
+    if key == 'masked_multiscale_inverse_d16_residual':
+        return key, MaskedMultiscaleSineInverseTarget(variant='d16_residual')
+    if key == 'masked_multiscale_inverse_d32_residual':
+        return key, MaskedMultiscaleSineInverseTarget(variant='d32_residual')
     if key == 'gmm40_d2':
         return key, GMM40Target(d=2, seed=0)
     if key == 'gmm40_d25':
@@ -6273,6 +7531,10 @@ def resolve_run_mode_variants(run_mode):
 
     if key in {'paper_sweep', 'paper', 'section9', 'section_9'}:
         return 'outputs_paper_sweep', make_paper_sweep_variants()
+    if key in {'gn_hessian_sweep', 'gn_sweep', 'gn_inverse_sweep', 'nonlinear_inverse_sweep'}:
+        return 'outputs_gn_hessian_sweep', make_gn_hessian_sweep_variants()
+    if key in {'gn_hessian_hard_sweep', 'gn_hard_sweep', 'gn_inverse_hard_sweep', 'masked_multiscale_inverse_sweep'}:
+        return 'outputs_gn_hessian_hard_sweep', make_gn_hessian_hard_variants()
     if key in {'dpsmc_full', 'dpsmc_all', 'all', 'full'}:
         include_blr = os.environ.get('LFGI_BENCH_INCLUDE_BLR', '0').strip() in {'1', 'true', 'True'}
         return 'outputs_dpsmc_overlap', make_dpsmc_overlap_variants(include_blr=include_blr)
@@ -6299,6 +7561,13 @@ def resolve_run_mode_variants(run_mode):
         'rings_d32', 'rings32', 'singular_rings_d32', 'singular_rings32',
         'banana_d32', 'banana32', 'product_banana32', 'product_banana_d32',
         'singular_banana_d32', 'singular_banana32',
+        'nonlinear_sine_inverse_d8_clean', 'nonlinear_sine_inverse_clean', 'nonlinear_inverse_clean',
+        'nonlinear_sine_inverse_d8_residual', 'nonlinear_sine_inverse_residual', 'nonlinear_inverse_residual',
+        'nonlinear_inverse', 'nonlinear_sine_inverse', 'gn_inverse_clean', 'gn_inverse_residual',
+        'masked_multiscale_inverse', 'masked_multiscale_inverse_d16',
+        'masked_multiscale_inverse_residual', 'masked_multiscale_inverse_d16_residual',
+        'masked_multiscale_inverse_d32', 'masked_multiscale_inverse_d32_residual',
+        'gn_inverse_hard', 'gn_inverse_hard_residual', 'gn_inverse_d32_residual',
         'dw4_hardened', 'singular_dw4_hardened',
     }
     dpsmc_keys = {
@@ -6309,6 +7578,13 @@ def resolve_run_mode_variants(run_mode):
         'misaligned_subspace_gmm24',
         'singular_gmm', 'hetero_gmm', 'singular_hetero_gmm',
         'singular_heterogeneous_gmm',
+        'nonlinear_sine_inverse_d8_clean', 'nonlinear_sine_inverse_clean', 'nonlinear_inverse_clean',
+        'nonlinear_sine_inverse_d8_residual', 'nonlinear_sine_inverse_residual', 'nonlinear_inverse_residual',
+        'nonlinear_inverse', 'nonlinear_sine_inverse', 'gn_inverse_clean', 'gn_inverse_residual',
+        'masked_multiscale_inverse', 'masked_multiscale_inverse_d16',
+        'masked_multiscale_inverse_residual', 'masked_multiscale_inverse_d16_residual',
+        'masked_multiscale_inverse_d32', 'masked_multiscale_inverse_d32_residual',
+        'gn_inverse_hard', 'gn_inverse_hard_residual', 'gn_inverse_d32_residual',
         'gmm40_d2', 'gmm40_d25', 'gmm40_d50', 'rings_d2', 'funnel_d10',
         'ionosphere', 'ionosphere_20',
         'gmm2', 'gmm25', 'gmm50', 'gmm40_2', 'gmm40_25', 'gmm40_50',
