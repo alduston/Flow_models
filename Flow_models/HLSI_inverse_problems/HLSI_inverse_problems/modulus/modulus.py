@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """Inverse hyperelastic shear-mod# -*- coding: utf-8 -*-
-"""Inverse hyperelastic shear-modulus imaging on a regular grid.
 
 This script is a lightweight, compute-conscious modification of the current
 Darcy-flow experiment structure. It keeps the shared sampling harness in
