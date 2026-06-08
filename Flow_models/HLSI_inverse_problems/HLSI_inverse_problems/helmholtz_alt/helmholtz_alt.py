@@ -704,13 +704,13 @@ DOMAIN_RADIUS = 1.0
 # KL latent parameterization of m(x).  The HW truth is discontinuous, so the
 # latent truth below is a least-squares projection.  Field metrics are computed
 # against the actual discontinuous truth, not only this projected alpha.
-num_truncated_series = 48
+num_truncated_series = 32
 ell = 0.32
 sigma_prior = 0.22
 
 # HW Problem II defaults.
 HELMHOLTZ_K_DEFAULT = 5.0
-NOISE_REL = 0.01
+NOISE_REL = 0.05
 
 # The assignment PDF does not specify the actual point-source coordinates; the
 # starter code may. These are outside the unit disk and match the simple defaults
@@ -727,18 +727,18 @@ N_HOLDOUT_RECEIVERS = None
 # Dense real Helmholtz solves can be numerically close to resonance on a coarse
 # graph-Laplacian disk. Keep this at 0.0 for the closest HW match. If JAX reports
 # singular solves, try 1e-8 or 1e-6.
-HELMHOLTZ_SOLVE_SHIFT = 0.0
+HELMHOLTZ_SOLVE_SHIFT = 1e-8
 
 # Sampler controls. Matched to the pasted active CE-HLSI bootstrap run.
 ACTIVE_DIM = num_truncated_series
-DEFAULT_N_GEN = 7000
-N_REF = 7000
+DEFAULT_N_GEN = 5000
+N_REF = 5000
 BUILD_GNL_BANKS = False
 # Match the pasted active-run script: pipeline precomputes PoU-capable banks even
 # though the active CE bootstrap chain uses L / None weights.
 INCLUDE_POU = True
 PLOT_NORMALIZER = 'best'
-HESS_MIN = 1e-10
+HESS_MIN = -1e10
 HESS_MAX = 1e10
 GNL_PILOT_N = 512
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
@@ -931,17 +931,18 @@ def make_sampler_configs(include_pou=INCLUDE_POU):
     run-info tables, dashboards, and comparisons use the same names.
     """
     return OrderedDict([
-    ('CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('HLSI1', {'init': 'HLSI', 'init_weights': 'L', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('CE-HLSI1', {'ref_source': 'HLSI1','init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-HLSI2', {'ref_source': 'CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False}),
     ('CE-HLSI3', {'ref_source': 'CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('CE-HLSI4', {'ref_source': 'CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False}),
     ('CE-HLSI5', {'ref_source': 'CE-HLSI4', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
 
-    ('DRC-CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('DRC-CE-HLSI1', {'ref_source': 'HLSI1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
     ('DRC-CE-HLSI2', {'ref_source': 'DRC-CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
     ('DRC-CE-HLSI3', {'ref_source': 'DRC-CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
     ('DRC-CE-HLSI4', {'ref_source': 'DRC-CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('DRC-CE-HLSI5', {'ref_source': 'DRC-CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('DRC-CE-HLSI5', {'ref_source': 'DRC-CE-HLSI4', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
     ])
 
 
