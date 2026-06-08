@@ -7,8 +7,8 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-#THIS_DIR = os.getcwd() # if on collab
-THIS_DIR = os.path.dirname(os.path.abspath(__file__)) # if not on collab
+THIS_DIR = os.getcwd() # if on collab
+#THIS_DIR = os.path.dirname(os.path.abspath(__file__)) # if not on collab
 
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
@@ -763,8 +763,8 @@ HESS_MIN = 1e-6
 HESS_MAX = 1e8
 GNL_PILOT_N = 512
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
-DEFAULT_N_GEN = 1500
-N_REF = 1500
+DEFAULT_N_GEN = 2000
+N_REF = 250
 BUILD_GNL_BANKS = False
 
 configure_sampling(
@@ -779,11 +779,45 @@ configure_sampling(
     gnl_stiff_lambda_cut=GNL_STIFF_LAMBDA_CUT,
     gnl_use_dominant_particle_newton=True,
 )
-run_results_info = init_run_results('helmholtz_scattering_hlsi')
+# Use the module-qualified call and then explicitly synchronize sampling.py's
+# run-results globals.  In long notebook sessions, stale matplotlib show hooks
+# from a previous experiment can otherwise keep writing late diagnostics into
+# the previous run directory (for example Allen--Cahn).
+run_results_info = sampling.init_run_results('helmholtz_scattering_hlsi')
 DASHBOARD_PDF_PATH = os.path.join(
     run_results_info['run_results_dir'],
     f"{run_results_info['run_results_stem']}_summary_dashboard.pdf",
 )
+
+
+def _sync_sampling_run_results_context():
+    """Force sampling.py's figure-save hook to target this Helmholtz run.
+
+    This script imports/reloads sampling.py, but in Colab/IPython it is still
+    possible to have a stale ``plt.show`` hook or stale module globals from the
+    previous experiment.  Keep this local guard before every plot save/show so
+    complex-field, boundary-trace, and curvature figures land in the active
+    Helmholtz run-results directory and are picked up by the dashboard.
+    """
+    sampling.RUN_TIMESTAMP = run_results_info['run_timestamp']
+    sampling.RUN_RESULTS_ROOT = run_results_info['run_results_root']
+    sampling.RUN_RESULTS_DIR = run_results_info['run_results_dir']
+    sampling.RUN_RESULTS_STEM = run_results_info['run_results_stem']
+    # Reinstall the current sampling module's patched show hook if an older
+    # imported module left a different one attached to matplotlib.
+    try:
+        if plt.show is not sampling._patched_show:
+            plt.show = sampling._patched_show
+    except Exception:
+        pass
+
+
+def _save_open_figures_to_current_helmholtz_run():
+    _sync_sampling_run_results_context()
+    return sampling._save_all_open_figures_to_run_results()
+
+
+_sync_sampling_run_results_context()
 
 # ==========================================
 # Execution
@@ -816,16 +850,35 @@ lik_model, lik_aux = make_physics_likelihood(
 )
 posterior_score_fn = make_posterior_score_fn(lik_model)
 
+
 SAMPLER_CONFIGS = OrderedDict([
     ('CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI2', {'ref_source': 'CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI3', {'ref_source': 'CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI4', {'ref_source': 'CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+    ('CE-HLSI2', {'ref_source': 'CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False}),
+    ('CE-HLSI3', {'ref_source': 'CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False}),
+    ('CE-HLSI4', {'ref_source': 'CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True }),
+
 
     ('DRC-CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('DRC-CE-HLSI2', {'ref_source': 'DRC-CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('DRC-CE-HLSI3', {'ref_source': 'DRC-CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('DRC-CE-HLSI2', {'ref_source': 'DRC-CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('DRC-CE-HLSI3', {'ref_source': 'DRC-CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
     ('DRC-CE-HLSI4', {'ref_source': 'DRC-CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    #('DRC-CE-HLSI5', {'ref_source': 'DRC-CE-HLSI4', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+
+     # S1: CE-HLSI projection
+    # R1: ratio-only DRC-R, no sampling, hidden from metrics
+    # S2: weighted CE-HLSI projection using R1 carried weights
+    # repeat
+    ('ALT-DRC-CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
+
+    ('ALT-DRC-R1', {'ref_source': 'ALT-DRC-CE-HLSI1', 'init': 'DRC-R', 'init_weights': 'None', 'transition_w': 'ou'  ,'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('ALT-DRC-CE-HLSI2', {'ref_source': 'ALT-DRC-R1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou' ,'include_results': False, 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+
+    ('ALT-DRC-R2', {'ref_source': 'ALT-DRC-CE-HLSI2', 'init': 'DRC-R', 'init_weights': 'None', 'transition_w': 'ou', 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('ALT-DRC-CE-HLSI3', {'ref_source': 'ALT-DRC-R2', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou','include_results': False, 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+
+    ('ALT-DRC-R3', {'ref_source': 'ALT-DRC-CE-HLSI3', 'init': 'DRC-R', 'init_weights': 'None', 'transition_w': 'ou', 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+    ('ALT-DRC-CE-HLSI4', {'ref_source': 'ALT-DRC-R3', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
+
 ])
 
 dashboard = DashboardPDF(
@@ -861,6 +914,7 @@ reference_key = pipeline['reference_key']
 reference_title = pipeline['reference_title']
 
 summarize_sampler_run(sampler_run_info)
+_sync_sampling_run_results_context()
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 metrics = compute_latent_metrics(samples, reference_key, alpha_true_np, prior_model, lik_model, posterior_score_fn, display_names=display_names)
 
@@ -1031,6 +1085,7 @@ for label in mean_fields:
 
 plot_normalizer_key = resolve_plot_normalizer(PLOT_NORMALIZER, list(mean_fields.keys()), display_names=display_names, metrics_dict=metrics, fallback=reference_key, best_metric_keys=('RelL2_field', 'IC RelL2(%)', 'RelL2_q(%)'))
 plot_normalizer_title = display_names.get(plot_normalizer_key, plot_normalizer_key)
+_sync_sampling_run_results_context()
 plot_pca_histograms(samples, alpha_true_np, display_names=display_names, normalizer=plot_normalizer_key, metrics_dict=metrics, fallback_key=reference_key)
 
 results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(metrics, sampler_run_info, n_ref=N_REF, target_name='Helmholtz scattering', display_names=display_names, reference_name=reference_title)
@@ -1077,7 +1132,7 @@ def _overlay_field(ax):
     ax.contour(support_mask_np, levels=[0.5], colors='white', linewidths=1.0)
 
 
-plot_field_reconstruction_grid(
+fig_field, axes_field = plot_field_reconstruction_grid(
     samples,
     mean_fields,
     reconstruct_contrast_field,
@@ -1094,6 +1149,13 @@ plot_field_reconstruction_grid(
     suptitle=f'Nonlinear Helmholtz inverse scattering (d={ACTIVE_DIM}, k={HELMHOLTZ_K:g})',
     field_name='Contrast $q(x)$',
 )
+_sync_sampling_run_results_context()
+if DASHBOARD_SHOW_FIGURES:
+    plt.show()
+else:
+    _save_open_figures_to_current_helmholtz_run()
+plt.close(fig_field)
+
 print('\nVisualizing complex wavefields for source 0...')
 methods_to_plot = [label for label in samples.keys() if label in mean_fields]
 n_cols = len(methods_to_plot) + 1
@@ -1136,7 +1198,7 @@ for i, label in enumerate(methods_to_plot):
     axes2[1, col].axis('off')
 plt.tight_layout()
 try:
-    sampling._save_all_open_figures_to_run_results()
+    _save_open_figures_to_current_helmholtz_run()
 except Exception:
     pass
 if DASHBOARD_SHOW_FIGURES:
@@ -1230,7 +1292,7 @@ fig3.legend(legend_map.values(), legend_map.keys(), loc='upper center', ncol=min
 fig3.suptitle('Source-0 scattered-field boundary traces', fontsize=16, y=1.08)
 plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
 try:
-    sampling._save_all_open_figures_to_run_results()
+    _save_open_figures_to_current_helmholtz_run()
 except Exception:
     pass
 if DASHBOARD_SHOW_FIGURES:
@@ -1256,13 +1318,14 @@ ax4.grid(True, which='both', alpha=0.25)
 ax4.legend(fontsize=9)
 plt.tight_layout()
 try:
-    sampling._save_all_open_figures_to_run_results()
+    _save_open_figures_to_current_helmholtz_run()
 except Exception:
     pass
 if DASHBOARD_SHOW_FIGURES:
     plt.show()
 plt.close(fig4)
 
+_save_open_figures_to_current_helmholtz_run()
 dashboard.add_run_results_png_figures(run_results_info['run_results_dir'])
 dashboard.close()
 # The dashboard already lives in the active run-results directory, so zip_run_results_dir()
