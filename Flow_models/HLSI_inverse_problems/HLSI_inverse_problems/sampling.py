@@ -416,7 +416,7 @@ def _batched_log_likelihood_only(lik_model, x, batch_size=256):
 
 def sample_gaussian_from_precision(mean, precision, n_samples, eps=1e-10):
     """Sample x ~ N(mean, precision^{-1}) for dense SPD precision."""
-    evals, evecs = torch.linalg.eigh(precision)
+    evals, evecs = _safe_batch_symmetric_eigh(precision, label='sample Gaussian precision')
     evals = torch.clamp(evals, min=eps)
     transform = evecs * torch.rsqrt(evals).unsqueeze(0)
     z = torch.randn(n_samples, mean.numel(), device=mean.device, dtype=mean.dtype)
@@ -687,6 +687,141 @@ def _compute_log_pou_denom_and_grad_at_points(points, X_ref, eigvecs, prec_eig, 
     return log_denom, grad_log_denom
 
 
+def _eigh_entry_clamp_value():
+    """Finite entry clamp used before robust symmetric eigendecompositions."""
+    try:
+        base = max(abs(float(HESS_MIN)), abs(float(HESS_MAX)), 1.0)
+    except Exception:
+        base = 1e8
+    # Anything far above the spectral gate is going to be treated as too-stiff
+    # anyway. Keeping entries finite prevents LAPACK/cuSOLVER non-convergence on
+    # pathological PDE Hessian batches without weakening the gate itself.
+    return float(min(max(1e4 * base, 1e12), 1e16))
+
+
+def _sanitize_symmetric_matrix_batch(A, label='matrix', entry_clamp=None):
+    """Symmetrize and remove NaN/Inf entries before an eigendecomposition."""
+    if entry_clamp is None:
+        entry_clamp = _eigh_entry_clamp_value()
+    A = 0.5 * (A + A.transpose(-1, -2))
+    if not torch.isfinite(A).all():
+        n_bad = int((~torch.isfinite(A)).sum().detach().cpu().item())
+        warnings.warn(
+            f"[{label}] replacing {n_bad} non-finite Hessian/precision entries before eigh.",
+            RuntimeWarning,
+        )
+        A = torch.nan_to_num(A, nan=0.0, posinf=entry_clamp, neginf=-entry_clamp)
+    A = torch.clamp(A, min=-entry_clamp, max=entry_clamp)
+    A = 0.5 * (A + A.transpose(-1, -2))
+    return A
+
+
+def _safe_single_symmetric_eigh(M, label='matrix', index=None, entry_clamp=None):
+    """Robust eigh for one symmetric matrix, with jitter and CPU fallback."""
+    if entry_clamp is None:
+        entry_clamp = _eigh_entry_clamp_value()
+    M = _sanitize_symmetric_matrix_batch(M, label=label, entry_clamp=entry_clamp)
+    d = M.shape[-1]
+    eye = torch.eye(d, device=M.device, dtype=M.dtype)
+    try:
+        return torch.linalg.eigh(M)
+    except Exception:
+        pass
+
+    scale = torch.max(torch.abs(M)).detach()
+    scale = torch.clamp(scale, min=torch.tensor(1.0, device=M.device, dtype=M.dtype)).item()
+    for jitter_factor in (1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2):
+        jitter = float(jitter_factor * scale)
+        try:
+            evals, evecs = torch.linalg.eigh(M + jitter * eye)
+            return evals - jitter, evecs
+        except Exception:
+            continue
+
+    # CPU NumPy/LAPACK fallback for the rare pathological element. This keeps the
+    # expensive HLSI reference-bank build alive without turning the whole batch
+    # into a slow CPU operation.
+    M_np = M.detach().cpu().numpy()
+    M_np = 0.5 * (M_np + M_np.T)
+    M_np = np.nan_to_num(M_np, nan=0.0, posinf=entry_clamp, neginf=-entry_clamp)
+    M_np = np.clip(M_np, -entry_clamp, entry_clamp)
+    scale_np = max(float(np.max(np.abs(M_np))), 1.0)
+    eye_np = np.eye(d, dtype=M_np.dtype)
+    last_err = None
+    for jitter_factor in (0.0, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2):
+        jitter = float(jitter_factor * scale_np)
+        try:
+            evals_np, evecs_np = np.linalg.eigh(M_np + jitter * eye_np)
+            evals_np = evals_np - jitter
+            evals = torch.as_tensor(evals_np, device=M.device, dtype=M.dtype)
+            evecs = torch.as_tensor(evecs_np, device=M.device, dtype=M.dtype)
+            return evals, evecs
+        except Exception as err:
+            last_err = err
+            continue
+
+    idx_msg = '' if index is None else f' at flattened batch index {index}'
+    warnings.warn(
+        f"[{label}] eigh failed{idx_msg} after all fallbacks ({last_err}); "
+        "using zero eigenvalues and identity eigenvectors for this element.",
+        RuntimeWarning,
+    )
+    return torch.zeros(d, device=M.device, dtype=M.dtype), eye
+
+
+def _safe_batch_symmetric_eigh(A, label='matrix', chunk_size=256):
+    """Robust batched symmetric eigendecomposition.
+
+    Fast path: sanitize/symmetrize the whole batch and call torch.linalg.eigh.
+    Fallback: isolate failing chunks/elements, add tiny diagonal jitter, and only
+    use CPU NumPy for genuinely pathological matrices. This is intended for
+    stiff inverse-problem Hessian banks where a single bad particle should not
+    crash the entire sampler comparison.
+    """
+    A = _sanitize_symmetric_matrix_batch(A, label=label)
+    orig_shape = A.shape[:-2]
+    d = A.shape[-1]
+    if A.ndim == 2:
+        return _safe_single_symmetric_eigh(A, label=label)
+    try:
+        return torch.linalg.eigh(A)
+    except Exception as err:
+        warnings.warn(
+            f"[{label}] batched torch.linalg.eigh failed ({err}); isolating bad chunks.",
+            RuntimeWarning,
+        )
+
+    flat = A.reshape(-1, d, d)
+    vals_out = torch.empty((flat.shape[0], d), device=A.device, dtype=A.dtype)
+    vecs_out = torch.empty((flat.shape[0], d, d), device=A.device, dtype=A.dtype)
+    bad_elements = 0
+
+    for start in range(0, flat.shape[0], chunk_size):
+        end = min(start + chunk_size, flat.shape[0])
+        block = flat[start:end]
+        try:
+            vals, vecs = torch.linalg.eigh(block)
+            vals_out[start:end] = vals
+            vecs_out[start:end] = vecs
+            continue
+        except Exception:
+            pass
+
+        for local_i in range(block.shape[0]):
+            idx = start + local_i
+            vals, vecs = _safe_single_symmetric_eigh(block[local_i], label=label, index=idx)
+            vals_out[idx] = vals
+            vecs_out[idx] = vecs
+            bad_elements += 1
+
+    if bad_elements:
+        warnings.warn(
+            f"[{label}] robust eigh repaired {bad_elements} matrix/matrices out of {flat.shape[0]}.",
+            RuntimeWarning,
+        )
+    return vals_out.reshape(*orig_shape, d), vecs_out.reshape(*orig_shape, d, d)
+
+
 def _build_leaf_repaired_local_bank(X_ref, s_local, P_raw_local, log_base_mass, I,
                                     label='base', bank_name='base'):
     """
@@ -700,7 +835,7 @@ def _build_leaf_repaired_local_bank(X_ref, s_local, P_raw_local, log_base_mass, 
     resulting PSD precision is then used in the same downstream HLSI / CE-HLSI
     machinery so we can test whether leaf rescue changes PoU behavior.
     """
-    eigvals_leaf_raw, eigvecs_leaf = torch.linalg.eigh(P_raw_local)
+    eigvals_leaf_raw, eigvecs_leaf = _safe_batch_symmetric_eigh(P_raw_local, label=f'{label}:{bank_name}:leaf')
     neg_mask = eigvals_leaf_raw < -HESS_MIN
     trusted_pos = (eigvals_leaf_raw >= HESS_MIN) & (eigvals_leaf_raw <= HESS_MAX)
     trusted_leaf = trusted_pos | neg_mask
@@ -808,7 +943,7 @@ def precompute_reference_bank(X_ref, prior_model, lik_model, label='base',
         P_raw = 0.5 * (P_raw + P_raw.transpose(-1, -2))
 
         print(f"  [{label}] Spectral band gating: [{HESS_MIN:.1e}, {HESS_MAX:.1e}]")
-        eigvals, eigvecs = torch.linalg.eigh(P_raw)
+        eigvals, eigvecs = _safe_batch_symmetric_eigh(P_raw, label=f'{label}:base')
         trusted = (eigvals >= HESS_MIN) & (eigvals <= HESS_MAX)
 
         n_below = (eigvals < HESS_MIN).float().sum(dim=1).mean().item()
@@ -871,7 +1006,7 @@ def precompute_reference_bank(X_ref, prior_model, lik_model, label='base',
             P_pou_raw = P_raw + P_window_ref + hess_log_pou_denom_ref
             P_pou_raw = 0.5 * (P_pou_raw + P_pou_raw.transpose(-1, -2))
 
-            eigvals_pou, eigvecs_pou = torch.linalg.eigh(P_pou_raw)
+            eigvals_pou, eigvecs_pou = _safe_batch_symmetric_eigh(P_pou_raw, label=f'{label}:PoU')
             trusted_pou = (eigvals_pou >= HESS_MIN) & (eigvals_pou <= HESS_MAX)
             prec_eig_pou = torch.where(trusted_pou, eigvals_pou, torch.zeros_like(eigvals_pou))
             P_pou_ref = torch.einsum('nij,nj,nkj->nik', eigvecs_pou, prec_eig_pou, eigvecs_pou) + 1e-6 * I
@@ -1257,7 +1392,7 @@ def _get_ce_hlsi_gate_eigenbasis(P_bar, et2, var_t):
 
         A_k = e^{-2t} / (e^{-2t} + v_t * lam_k).
     """
-    lam, V = torch.linalg.eigh(P_bar)
+    lam, V = _safe_batch_symmetric_eigh(P_bar, label='CE-HLSI gate P_bar')
     lam = lam.clamp(min=1e-6)
     gate_eig = et2 / (et2 + var_t * lam)
     return gate_eig, V
@@ -1373,7 +1508,7 @@ def _materialize_hlsi_gate_from_gated(gated_chunk, et2, var_t):
 
 
 def _materialize_hlsi_gate_from_precision(P_chunk, et2, var_t):
-    lam, V = torch.linalg.eigh(0.5 * (P_chunk + P_chunk.transpose(-1, -2)))
+    lam, V = _safe_batch_symmetric_eigh(0.5 * (P_chunk + P_chunk.transpose(-1, -2)), label='materialize HLSI gate')
     lam = torch.clamp(lam, min=0.0)
     gate_eig = et2 / torch.clamp(et2 + var_t * lam, min=1e-30)
     return torch.einsum('...ij,...j,...kj->...ik', V, gate_eig, V)
