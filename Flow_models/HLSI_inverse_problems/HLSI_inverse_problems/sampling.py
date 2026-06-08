@@ -1808,27 +1808,49 @@ def _global_log_weight_ess(logw_cpu):
     return float((z1 * z1 / z2).item())
 
 
-def _make_frozen_hlsi_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None):
-    """Snapshot exactly the score field used by a pure HLSI-family init stage."""
+def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None):
+    """Snapshot the score field used by a density-evaluation / DRC-R node.
+
+    This is the generic version of the older HLSI-only frozen spec.  It supports
+    the score families used in the paper-level density benchmark:
+
+      * Tweedie: mode='tweedie'
+      * scalar blend: mode='blend_posterior'
+      * HLSI / CE-HLSI / leaf / TL variants
+
+    Only fields needed by the chosen score are required.  HLSI-family scores need
+    P_ref/mu_ref; Tweedie and scalar blend only need X_ref, s0_post_ref, and the
+    selected log_weights.  The frozen spec deliberately lives on CPU so the PF
+    density evaluator can stream reference chunks without retaining large GPU
+    tensors between calls.
+    """
     if local_bank is None or init_log_weights is None:
         return None
-    if cfg.get('init') not in {
-        'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
-    }:
+    mode = canonicalize_init_name(cfg.get('init'))
+    supported = {
+        'tweedie', 'blend_posterior',
+        'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
+        'gnl_hlsi', 'gnl_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
+    }
+    if mode not in supported:
         return None
-    return {
+    if 'X_ref' not in local_bank:
+        raise KeyError(f"Frozen density score spec for {label!r} requires local_bank['X_ref'].")
+    if 's0_post_ref' not in local_bank and mode != 'tweedie':
+        raise KeyError(f"Frozen density score spec for mode={mode!r} requires local_bank['s0_post_ref'].")
+
+    spec = {
         'label': str(label),
-        'mode': cfg['init'],
-        'init_weights': cfg['init_weights'],
+        'mode': mode,
+        'init_weights': canonicalize_init_weights(cfg.get('init_weights', 'L')),
         'transition_w': cfg.get('transition_w', 'ou'),
         'X_ref': local_bank['X_ref'].detach().cpu(),
-        's0_post_ref': local_bank['s0_post_ref'].detach().cpu(),
+        's0_post_ref': (
+            local_bank['s0_post_ref'].detach().cpu()
+            if 's0_post_ref' in local_bank and torch.is_tensor(local_bank['s0_post_ref'])
+            else None
+        ),
         'log_weights': init_log_weights.detach().cpu(),
-        'P_ref': local_bank['P_ref'].detach().cpu(),
-        'mu_ref': local_bank['mu_ref'].detach().cpu(),
-        'gated_info': {
-            k: v.detach().cpu() for k, v in local_bank['gated_info'].items()
-        } if local_bank.get('gated_info') is not None else None,
         'gate_rho': cfg.get('gate_rho'),
         'gate_beta': cfg.get('gate_beta'),
         'gate_kappa': cfg.get('gate_kappa'),
@@ -1840,15 +1862,45 @@ def _make_frozen_hlsi_score_spec(label, cfg, local_bank, init_log_weights, final
         'law_matches_final_samples': int(cfg.get('mala_steps', 0)) <= 0,
         'n_ref_score': int(local_bank['X_ref'].shape[0]),
         'n_samples_final': int(final_samples.shape[0]) if torch.is_tensor(final_samples) else None,
+        'bank_name': local_bank.get('bank_name', 'unknown'),
     }
+    if 'P_ref' in local_bank and torch.is_tensor(local_bank['P_ref']):
+        spec['P_ref'] = local_bank['P_ref'].detach().cpu()
+    if 'mu_ref' in local_bank and torch.is_tensor(local_bank['mu_ref']):
+        spec['mu_ref'] = local_bank['mu_ref'].detach().cpu()
+    if local_bank.get('gated_info') is not None:
+        spec['gated_info'] = {
+            k: v.detach().cpu() for k, v in local_bank['gated_info'].items()
+        }
+    else:
+        spec['gated_info'] = None
+
+    hlsi_family = {
+        'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
+        'gnl_hlsi', 'gnl_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
+    }
+    if mode in hlsi_family:
+        missing = [k for k in ('P_ref', 'mu_ref') if k not in spec or spec[k] is None]
+        if missing:
+            raise KeyError(
+                f"Frozen density score spec for HLSI-family mode={mode!r} is missing {missing}. "
+                f"Available local_bank keys: {sorted(local_bank.keys())}"
+            )
+    return spec
+
+
+# Backwards-compatible name used by older script paths.
+def _make_frozen_hlsi_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None):
+    return _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights,
+                                           final_samples=final_samples)
 
 
 def _eval_score_from_frozen_spec(y, t, spec):
     return get_score_wrapper(
         y, t,
         spec['mode'],
-        spec['X_ref'], spec['s0_post_ref'], spec['log_weights'],
-        P_ref=spec['P_ref'], mu_ref=spec['mu_ref'], gated_info=spec.get('gated_info'),
+        spec['X_ref'], spec.get('s0_post_ref'), spec['log_weights'],
+        P_ref=spec.get('P_ref'), mu_ref=spec.get('mu_ref'), gated_info=spec.get('gated_info'),
         init_weights=spec.get('init_weights', 'L'),
         transition_w=spec.get('transition_w', 'ou'),
         gate_rho=spec.get('gate_rho'), gate_beta=spec.get('gate_beta'),
@@ -1886,7 +1938,32 @@ def _hutchinson_divergence_score(y, t, spec, n_probe=1, fd_eps=1e-3):
     return div / float(n_probe)
 
 
-_ANALYTIC_DRC_DIVERGENCE_MODES = {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi'}
+def _coordinate_fd_divergence_score(y, t, spec, fd_eps=1e-3):
+    """Deterministic coordinate finite-difference divergence of a frozen score field.
+
+    This is slower than Hutchinson by a factor of about 2*d score evaluations, but
+    it is useful for scalar-blend density benchmarks where an analytic divergence
+    is not yet implemented and stochastic Hutchinson noise would pollute the
+    energy-correlation diagnostic.
+    """
+    y_base = y.detach()
+    m, d = y_base.shape
+    div = torch.zeros(m, device=y_base.device, dtype=y_base.dtype)
+    state_scale = torch.clamp(torch.linalg.norm(y_base, dim=1, keepdim=True) / math.sqrt(float(max(d, 1))), min=1.0)
+    radius = float(fd_eps) * state_scale
+
+    with torch.no_grad():
+        for j in range(d):
+            step = torch.zeros_like(y_base)
+            step[:, j:j + 1] = radius
+            s_plus = _eval_score_from_frozen_spec(y_base + step, t, spec)
+            s_minus = _eval_score_from_frozen_spec(y_base - step, t, spec)
+            div = div + (s_plus[:, j] - s_minus[:, j]) / (2.0 * radius[:, 0])
+            del step, s_plus, s_minus
+    return div
+
+
+_ANALYTIC_CE_HLSI_DRC_DIVERGENCE_MODES = {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi'}
 
 
 def canonicalize_drc_divergence_mode(name):
@@ -1905,6 +1982,14 @@ def canonicalize_drc_divergence_mode(name):
         'fd': 'hutchinson',
         'finite_difference': 'hutchinson',
         'finite_diff': 'hutchinson',
+        'coordinate_fd': 'coordinate_fd',
+        'coordinate-fd': 'coordinate_fd',
+        'coord_fd': 'coordinate_fd',
+        'coord-fd': 'coordinate_fd',
+        'full_fd': 'coordinate_fd',
+        'full-fd': 'coordinate_fd',
+        'deterministic_fd': 'coordinate_fd',
+        'deterministic-fd': 'coordinate_fd',
         'zero': 'zero',
         'none': 'zero',
         'off': 'zero',
@@ -1912,16 +1997,23 @@ def canonicalize_drc_divergence_mode(name):
     if key not in aliases:
         raise ValueError(
             f"Unknown drc_divergence mode {name!r}. Expected one of: "
-            "auto, analytic, hutchinson, zero."
+            "auto, analytic, hutchinson, coordinate_fd, zero."
         )
     return aliases[key]
+
+
+def _config_bool(value):
+    """Parse config booleans robustly, including env-style strings."""
+    if isinstance(value, str):
+        return value.strip().lower() not in {'0', 'false', 'no', 'off', 'none', ''}
+    return bool(value)
 
 
 def _frozen_spec_supports_analytic_divergence(spec):
     """Closed-form divergence is implemented for CE-HLSI-family OU weights."""
     mode = canonicalize_init_name(spec.get('mode'))
     transition_w = canonicalize_transition_w(spec.get('transition_w', 'ou'))
-    return mode in _ANALYTIC_DRC_DIVERGENCE_MODES and transition_w == 'ou'
+    return mode in _ANALYTIC_CE_HLSI_DRC_DIVERGENCE_MODES and transition_w == 'ou'
 
 
 def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREAM_BATCH):
@@ -1940,7 +2032,7 @@ def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREA
     b-residuals sum to zero, T is accumulated as sum_i w_i db_i P_i.
     """
     mode = canonicalize_init_name(spec.get('mode'))
-    if mode not in _ANALYTIC_DRC_DIVERGENCE_MODES:
+    if mode not in _ANALYTIC_CE_HLSI_DRC_DIVERGENCE_MODES:
         raise ValueError(f"Analytic CE-HLSI divergence is not implemented for mode={mode!r}.")
     transition_w = canonicalize_transition_w(spec.get('transition_w', 'ou'))
     if transition_w != 'ou':
@@ -2030,26 +2122,93 @@ def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREA
     return score, div_score
 
 
+
+def _frozen_spec_supports_tweedie_analytic_divergence(spec):
+    """Closed-form Tweedie divergence for OU kernel responsibilities."""
+    mode = canonicalize_init_name(spec.get('mode'))
+    transition_w = canonicalize_transition_w(spec.get('transition_w', 'ou'))
+    return mode == 'tweedie' and transition_w == 'ou'
+
+
+def _eval_tweedie_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREAM_BATCH):
+    """Evaluate Tweedie score and exact finite-bank divergence.
+
+    For OU weights, the Tweedie score is bbar = E[b_i | y] with
+        b_i = -(y - exp(-t) x_i) / gamma_t.
+    Since grad_y log w_i = b_i and grad_y b_i = -gamma_t^{-1} I,
+        div bbar = tr Cov_w(b_i) - d / gamma_t.
+    """
+    transition_w = canonicalize_transition_w(spec.get('transition_w', 'ou'))
+    if transition_w != 'ou':
+        raise ValueError("Analytic Tweedie divergence currently requires transition_w='ou'.")
+
+    X_ref_cpu = spec['X_ref']
+    log_w_ref_cpu = spec['log_weights']
+    t_val = _canonicalize_time(t)
+    et = math.exp(-t_val)
+    gamma = 1.0 - math.exp(-2.0 * t_val)
+    inv_gamma = 1.0 / gamma
+
+    w = get_posterior_snis_weights(
+        y, t_val, X_ref_cpu, log_w_ref_cpu, batch_size=batch_size,
+        transition_w='ou')
+
+    m_query, d = y.shape
+    b_bar = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_gamma
+        b_bar += torch.einsum('mb,mbd->md', w_batch, b_batch)
+        del w_batch, X_batch, b_batch
+
+    Cbb = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_gamma
+        db = b_batch - b_bar.unsqueeze(1)
+        Cbb += torch.einsum('mb,mbu,mba->mua', w_batch, db, db)
+        del w_batch, X_batch, b_batch, db
+
+    div_score = torch.diagonal(Cbb, dim1=-2, dim2=-1).sum(dim=-1) - float(d) * inv_gamma
+    del w, Cbb
+    return b_bar, div_score
+
 def _eval_score_and_divergence_from_frozen_spec(y, t, spec, divergence_mode='auto',
                                                 n_probe=1, fd_eps=1e-3):
-    """Evaluate frozen score and divergence using analytic CE path when available."""
+    """Evaluate frozen score and divergence with score-family-specific dispatch."""
     mode = canonicalize_drc_divergence_mode(divergence_mode)
     if mode == 'zero':
         score = _eval_score_from_frozen_spec(y, t, spec)
         div = torch.zeros(y.shape[0], device=y.device, dtype=y.dtype)
         return score, div, 'zero'
 
-    analytic_ok = _frozen_spec_supports_analytic_divergence(spec)
-    if mode in {'auto', 'analytic'} and analytic_ok:
-        score, div = _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec)
-        return score, div, 'analytic'
+    tweedie_analytic_ok = _frozen_spec_supports_tweedie_analytic_divergence(spec)
+    ce_analytic_ok = _frozen_spec_supports_analytic_divergence(spec)
 
-    if mode == 'analytic' and not analytic_ok:
+    if mode in {'auto', 'analytic'} and tweedie_analytic_ok:
+        score, div = _eval_tweedie_score_and_divergence_analytic(y, t, spec)
+        return score, div, 'analytic_tweedie'
+
+    if mode in {'auto', 'analytic'} and ce_analytic_ok:
+        score, div = _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec)
+        return score, div, 'analytic_ce_hlsi'
+
+    if mode == 'analytic' and not (tweedie_analytic_ok or ce_analytic_ok):
         raise ValueError(
             "Requested drc_divergence='analytic', but the frozen score spec does not "
-            "support analytic divergence. Currently supported: CE-HLSI-family modes "
-            "with transition_w='ou'."
+            "support an analytic divergence. Currently supported: Tweedie and "
+            "CE-HLSI-family modes with transition_w='ou'. For scalar blend, use "
+            "drc_divergence='coordinate_fd' or 'hutchinson'."
         )
+
+    if mode == 'coordinate_fd':
+        score = _eval_score_from_frozen_spec(y, t, spec)
+        div = _coordinate_fd_divergence_score(y, t, spec, fd_eps=fd_eps)
+        return score, div, 'coordinate_fd'
 
     # Auto fallback or explicit hutchinson mode.
     score = _eval_score_from_frozen_spec(y, t, spec)
@@ -2169,14 +2328,121 @@ def _safe_spearman_corr_torch(x, y):
     return _safe_pearson_corr_torch(_rankdata_average_torch(x[mask]), _rankdata_average_torch(y[mask]))
 
 
+def _robust_interval_np(values, lo=1.0, hi=99.0, pad_frac=0.04):
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    lo_v, hi_v = np.percentile(arr, [float(lo), float(hi)])
+    if not np.isfinite(lo_v) or not np.isfinite(hi_v):
+        return None
+    if hi_v <= lo_v:
+        center = 0.5 * (hi_v + lo_v)
+        half = max(abs(center) * 1e-3, 1e-6)
+        return center - half, center + half
+    pad = float(pad_frac) * (hi_v - lo_v)
+    return lo_v - pad, hi_v + pad
+
+
+def _signed_log1p_np(values):
+    arr = np.asarray(values, dtype=np.float64)
+    return np.sign(arr) * np.log1p(np.abs(arr))
+
+
+def _positive_log10_np(values):
+    arr = np.asarray(values, dtype=np.float64)
+    pos = arr[np.isfinite(arr) & (arr > 0)]
+    floor = max(float(np.min(pos)) * 1e-3, 1e-300) if pos.size else 1e-300
+    return np.log10(np.maximum(arr, floor))
+
+
+def _plot_drc_scatter(ax, x, y, xlabel, ylabel, title, axis_mode='robust',
+                      robust_percentiles=(1.0, 99.0), point_size=10, alpha=0.45):
+    """Scatter helper for DRC density-energy diagnostics.
+
+    axis_mode options:
+      * 'raw': original axes, no clipping.
+      * 'robust': raw coordinates with quantile-limited axes.
+      * 'loglog': log10 axes for positive quantities, with robust limits.
+      * 'signed_log': signed log1p transform, useful for residual plots.
+    """
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    mode = str(axis_mode or 'robust').strip().lower().replace('-', '_')
+    lo, hi = robust_percentiles
+
+    if mode in {'loglog', 'log_log', 'log'}:
+        pos_mask = (x > 0) & (y > 0)
+        xp = _positive_log10_np(x[pos_mask])
+        yp = _positive_log10_np(y[pos_mask])
+        ax.scatter(xp, yp, s=point_size, alpha=alpha)
+        ax.set_xlabel('log10 ' + xlabel)
+        ax.set_ylabel('log10 ' + ylabel)
+        ax.set_title(title + f' (log-log, n={int(pos_mask.sum())}/{x.size})')
+        if xp.size:
+            xlim = _robust_interval_np(xp, lo, hi)
+            ylim = _robust_interval_np(yp, lo, hi)
+            if xlim is not None:
+                ax.set_xlim(*xlim)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+        ax.grid(True, alpha=0.25)
+        return
+
+    if mode in {'signed_log', 'symlog', 'log1p'}:
+        xp = _signed_log1p_np(x)
+        yp = _signed_log1p_np(y)
+        ax.scatter(xp, yp, s=point_size, alpha=alpha)
+        ax.set_xlabel('sign(x) log1p(|x|): ' + xlabel)
+        ax.set_ylabel('sign(y) log1p(|y|): ' + ylabel)
+        ax.set_title(title + ' (signed log1p)')
+        xlim = _robust_interval_np(xp, lo, hi)
+        ylim = _robust_interval_np(yp, lo, hi)
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.grid(True, alpha=0.25)
+        return
+
+    ax.scatter(x, y, s=point_size, alpha=alpha)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    suffix = ''
+    if mode in {'robust', 'quantile', 'trimmed'}:
+        xlim = _robust_interval_np(x, lo, hi)
+        ylim = _robust_interval_np(y, lo, hi)
+        if xlim is not None:
+            ax.set_xlim(*xlim)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        suffix = f' ({lo:g}-{hi:g}% axes)'
+    ax.set_title(title + suffix)
+    ax.grid(True, alpha=0.25)
+
+
 def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=None,
-                                              run_stem=None, make_plots=True):
+                                              run_stem=None, make_plots=True,
+                                              plot_axis_mode='robust',
+                                              residual_axis_mode='signed_log',
+                                              robust_percentiles=(1.0, 99.0),
+                                              also_save_raw_plots=False,
+                                              also_save_loglog_plots=False,
+                                              save_legacy_alias=True):
     """Compute density/energy diagnostics from stored DRC probability-flow details.
 
     The primary density diagnostic is correlation between true unnormalized energy
     -log pi(x) and estimated energy -log q(x).  The DRC ratio log pi-log q is
     treated as a residual: for a good self-consistent density it should be nearly
     constant, not strongly energy-correlated.
+
+    Plot axes default to robust quantile limits because inverse-problem pilot
+    banks often contain a few extremely high-energy transients that otherwise
+    dominate the figure.  Raw and log-log companion figures are optional and disabled by default
+    so dashboards can focus on the robust central view.
     """
     X = details.get('X_ref')
     logq = details['logq'].detach().double().cpu().reshape(-1)
@@ -2206,6 +2472,19 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
     residual_std = torch.std(raw_logw_c, unbiased=False)
     residual_mean_abs = torch.mean(torch.abs(raw_logw_c))
 
+    # Robust/central metrics are reported alongside global metrics. They are not
+    # replacements for the full-sample correlations; they are meant to diagnose
+    # whether a few transient outliers are dominating a plot or metric.
+    finite_mask = torch.isfinite(energy) & torch.isfinite(neglogq) & torch.isfinite(raw_logw)
+    if int(finite_mask.sum().item()) >= 3:
+        e_np = energy[finite_mask].numpy()
+        lo, hi = robust_percentiles
+        qlo, qhi = np.percentile(e_np, [float(lo), float(hi)])
+        central_mask = finite_mask & (energy >= float(qlo)) & (energy <= float(qhi))
+    else:
+        qlo, qhi = float('nan'), float('nan')
+        central_mask = finite_mask
+
     metrics = OrderedDict([
         ('label', str(label)),
         ('n_eval', int(logq.numel())),
@@ -2225,6 +2504,16 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
         ('raw_logratio_energy_spearman', _safe_spearman_corr_torch(energy, raw_logw)),
         ('processed_logw_ess', _global_log_weight_ess(logw)),
         ('raw_logw_ess', _global_log_weight_ess(raw_logw)),
+        ('plot_axis_mode', str(plot_axis_mode)),
+        ('residual_axis_mode', str(residual_axis_mode)),
+        ('robust_axis_lo_pct', float(robust_percentiles[0])),
+        ('robust_axis_hi_pct', float(robust_percentiles[1])),
+        ('central_energy_lo', float(qlo)),
+        ('central_energy_hi', float(qhi)),
+        ('central_n_eval', int(central_mask.sum().item())),
+        ('central_energy_neglogq_pearson', _safe_pearson_corr_torch(energy[central_mask], neglogq[central_mask]) if int(central_mask.sum().item()) >= 3 else float('nan')),
+        ('central_energy_neglogq_spearman', _safe_spearman_corr_torch(energy[central_mask], neglogq[central_mask]) if int(central_mask.sum().item()) >= 3 else float('nan')),
+        ('central_raw_logratio_energy_pearson', _safe_pearson_corr_torch(energy[central_mask], raw_logw[central_mask]) if int(central_mask.sum().item()) >= 3 else float('nan')),
     ])
 
     df = pd.DataFrame([metrics])
@@ -2250,28 +2539,57 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
         print(f'Saved DRC energy benchmark arrays to {npz_path}')
 
         if make_plots:
-            fig, ax = plt.subplots(figsize=(6.2, 5.0))
-            ax.scatter(energy.numpy(), neglogq.numpy(), s=10, alpha=0.45)
-            ax.set_xlabel('true energy  -log pi(x)')
-            ax.set_ylabel('estimated energy  -log q(x)')
-            ax.set_title(f'DRC density-energy correlation: {label}')
-            ax.grid(True, alpha=0.25)
-            fig.tight_layout()
-            fig_path = os.path.join(save_dir, f'{stem}_drc_energy_scatter_{safe_label}.png')
-            fig.savefig(fig_path, dpi=240, bbox_inches='tight')
-            print(f'Saved DRC energy scatter to {fig_path}')
+            energy_np = energy.numpy()
+            neglogq_np = neglogq.numpy()
+            raw_resid_np = raw_logw_c.numpy()
 
-            fig2, ax2 = plt.subplots(figsize=(6.2, 5.0))
-            ax2.scatter(energy.numpy(), raw_logw_c.numpy(), s=10, alpha=0.45)
-            ax2.axhline(0.0, linewidth=1.0, alpha=0.5)
-            ax2.set_xlabel('true energy  -log pi(x)')
-            ax2.set_ylabel('centered residual  log pi(x) - log q(x)')
-            ax2.set_title(f'DRC residual vs energy: {label}')
-            ax2.grid(True, alpha=0.25)
-            fig2.tight_layout()
-            fig2_path = os.path.join(save_dir, f'{stem}_drc_residual_scatter_{safe_label}.png')
-            fig2.savefig(fig2_path, dpi=240, bbox_inches='tight')
-            print(f'Saved DRC residual scatter to {fig2_path}')
+            def _save_energy_plot(mode, suffix):
+                fig, ax = plt.subplots(figsize=(6.2, 5.0))
+                _plot_drc_scatter(
+                    ax, energy_np, neglogq_np,
+                    'true energy  -log pi(x)', 'estimated energy  -log q(x)',
+                    f'DRC density-energy correlation: {label}',
+                    axis_mode=mode, robust_percentiles=robust_percentiles,
+                )
+                fig.tight_layout()
+                fig_path = os.path.join(save_dir, f'{stem}_drc_energy_scatter_{safe_label}_{suffix}.png')
+                fig.savefig(fig_path, dpi=240, bbox_inches='tight')
+                print(f'Saved DRC energy scatter ({mode}) to {fig_path}')
+                # Backwards-compatible legacy filename for the primary plotted view.
+                if save_legacy_alias and suffix == _sanitize_run_results_name(str(plot_axis_mode)):
+                    legacy_path = os.path.join(save_dir, f'{stem}_drc_energy_scatter_{safe_label}.png')
+                    fig.savefig(legacy_path, dpi=240, bbox_inches='tight')
+                    print(f'Saved DRC energy scatter legacy alias to {legacy_path}')
+
+            def _save_residual_plot(mode, suffix):
+                fig2, ax2 = plt.subplots(figsize=(6.2, 5.0))
+                _plot_drc_scatter(
+                    ax2, energy_np, raw_resid_np,
+                    'true energy  -log pi(x)', 'centered residual  log pi(x) - log q(x)',
+                    f'DRC residual vs energy: {label}',
+                    axis_mode=mode, robust_percentiles=robust_percentiles,
+                )
+                if str(mode).lower().replace('-', '_') not in {'signed_log', 'symlog', 'log1p', 'loglog', 'log_log', 'log'}:
+                    ax2.axhline(0.0, linewidth=1.0, alpha=0.5)
+                fig2.tight_layout()
+                fig2_path = os.path.join(save_dir, f'{stem}_drc_residual_scatter_{safe_label}_{suffix}.png')
+                fig2.savefig(fig2_path, dpi=240, bbox_inches='tight')
+                print(f'Saved DRC residual scatter ({mode}) to {fig2_path}')
+                # Backwards-compatible legacy filename for the primary plotted view.
+                if save_legacy_alias and suffix == _sanitize_run_results_name(str(residual_axis_mode)):
+                    legacy_path = os.path.join(save_dir, f'{stem}_drc_residual_scatter_{safe_label}.png')
+                    fig2.savefig(legacy_path, dpi=240, bbox_inches='tight')
+                    print(f'Saved DRC residual scatter legacy alias to {legacy_path}')
+
+            _save_energy_plot(plot_axis_mode, _sanitize_run_results_name(plot_axis_mode))
+            _save_residual_plot(residual_axis_mode, _sanitize_run_results_name(residual_axis_mode))
+            if also_save_loglog_plots and str(plot_axis_mode).lower().replace('-', '_') not in {'loglog', 'log_log', 'log'}:
+                _save_energy_plot('loglog', 'loglog')
+            if also_save_raw_plots:
+                if str(plot_axis_mode).lower().replace('-', '_') != 'raw':
+                    _save_energy_plot('raw', 'raw')
+                if str(residual_axis_mode).lower().replace('-', '_') != 'raw':
+                    _save_residual_plot('raw', 'raw')
 
     return df
 
@@ -2378,6 +2696,9 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
         details = {
             'label': str(label),
             'source_label': str(source_score_spec.get('label')),
+            'source_mode': str(source_score_spec.get('mode')),
+            'source_init_weights': str(source_score_spec.get('init_weights')),
+            'source_transition_w': str(source_score_spec.get('transition_w')),
             'X_ref': X_cpu.detach().cpu(),
             'log_prior': torch.cat(log_prior_chunks, dim=0).double(),
             'log_lik': torch.cat(log_lik_chunks, dim=0).double(),
@@ -3468,6 +3789,9 @@ INIT_ALIASES = {
     _normalize_sampler_key('tweedie'): 'tweedie',
     _normalize_sampler_key('blend'): 'blend_posterior',
     _normalize_sampler_key('blend_posterior'): 'blend_posterior',
+    _normalize_sampler_key('scalar-blend'): 'blend_posterior',
+    _normalize_sampler_key('scalar_blend'): 'blend_posterior',
+    _normalize_sampler_key('scalar blend'): 'blend_posterior',
     _normalize_sampler_key('ref-laplace'): 'ref_laplace',
     _normalize_sampler_key('ref_laplace'): 'ref_laplace',
     _normalize_sampler_key('ref laplace'): 'ref_laplace',
@@ -3476,6 +3800,10 @@ INIT_ALIASES = {
     _normalize_sampler_key('ce-hlsi'): 'ce_hlsi',
     _normalize_sampler_key('ce_hlsi'): 'ce_hlsi',
     _normalize_sampler_key('ce hlsi'): 'ce_hlsi',
+    _normalize_sampler_key('lfgi'): 'ce_hlsi',
+    _normalize_sampler_key('ce-lfgi'): 'ce_hlsi',
+    _normalize_sampler_key('ce_lfgi'): 'ce_hlsi',
+    _normalize_sampler_key('ce lfgi'): 'ce_hlsi',
     _normalize_sampler_key('drc-r'): 'drc_ratio_update',
     _normalize_sampler_key('drc_r'): 'drc_ratio_update',
     _normalize_sampler_key('drc r'): 'drc_ratio_update',
@@ -4009,9 +4337,18 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('drc_fd_eps', 1e-3)
     cfg['drc_fd_eps'] = float(cfg['drc_fd_eps'])
     cfg.setdefault('drc_store_details', False)
-    cfg['drc_store_details'] = bool(cfg['drc_store_details'])
+    cfg['drc_store_details'] = _config_bool(cfg['drc_store_details'])
     cfg.setdefault('drc_energy_benchmark', False)
-    cfg['drc_energy_benchmark'] = bool(cfg['drc_energy_benchmark'])
+    cfg['drc_energy_benchmark'] = _config_bool(cfg['drc_energy_benchmark'])
+    cfg.setdefault('drc_energy_plot_axis_mode', 'robust')
+    cfg.setdefault('drc_energy_residual_axis_mode', 'signed_log')
+    cfg.setdefault('drc_energy_robust_percentiles', (1.0, 99.0))
+    cfg.setdefault('drc_energy_save_raw_plots', False)
+    cfg['drc_energy_save_raw_plots'] = _config_bool(cfg['drc_energy_save_raw_plots'])
+    cfg.setdefault('drc_energy_save_loglog_plots', False)
+    cfg['drc_energy_save_loglog_plots'] = _config_bool(cfg['drc_energy_save_loglog_plots'])
+    cfg.setdefault('drc_energy_save_legacy_alias', True)
+    cfg['drc_energy_save_legacy_alias'] = _config_bool(cfg['drc_energy_save_legacy_alias'])
     cfg.setdefault('drc_tmin', cfg.get('init_tmin', 10 ** (-2.5)))
     cfg.setdefault('drc_tmax', cfg.get('init_tmax', 10.0))
     cfg['drc_tmin'] = float(cfg['drc_tmin'])
@@ -4293,21 +4630,30 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
             RuntimeWarning,
         )
 
-    # The proposal whose density is estimated is always a CE-HLSI-family field
-    # over the current reference bank.  cfg['init_weights'] controls whether this
-    # proposal is unweighted ('None', standard alternating invariant) or weighted
-    # ('DRC', advanced schedules with carried weights).
-    local_bank = select_local_bank(ref_bank, 'ce_hlsi', cfg['init_weights'])
-    init_log_weights = get_sampler_log_weights('ce_hlsi', cfg['init_weights'], ref_bank)
+    # The proposal/density model estimated by this DRC-R node is configurable.
+    # Backwards-compatible default: CE-HLSI with cfg['init_weights'], which matches
+    # the original alternating DRC implementation.  For density benchmarks, set
+    # e.g. drc_score_init='tweedie' or 'blend_posterior' and usually
+    # drc_score_init_weights='None' when ref_source is already a MALA posterior bank.
+    score_init = canonicalize_init_name(cfg.get('drc_score_init', 'ce_hlsi'))
+    score_weights = canonicalize_init_weights(
+        cfg.get('drc_score_init_weights', cfg.get('init_weights', 'None'))
+    )
+    local_bank = select_local_bank(ref_bank, score_init, score_weights)
+    init_log_weights = get_sampler_log_weights(score_init, score_weights, ref_bank)
     score_cfg = dict(cfg)
-    score_cfg['init'] = 'ce_hlsi'
+    score_cfg['init'] = score_init
+    score_cfg['init_weights'] = score_weights
     score_cfg['mala_steps'] = 0
     score_cfg['mala_burnin'] = 0
-    source_score_spec = _make_frozen_hlsi_score_spec(
+    source_score_spec = _make_frozen_density_score_spec(
         label, score_cfg, local_bank, init_log_weights, final_samples=local_bank['X_ref'],
     )
     if source_score_spec is None:
-        raise RuntimeError(f"Could not build frozen CE-HLSI proposal spec for DRC-R sampler '{label}'.")
+        raise RuntimeError(
+            f"Could not build frozen density proposal spec for DRC-R sampler {label!r} "
+            f"with drc_score_init={score_init!r}, drc_score_init_weights={score_weights!r}."
+        )
 
     t0 = time.time()
     want_drc_details = bool(cfg.get('drc_store_details', False) or cfg.get('drc_energy_benchmark', False))
@@ -4324,7 +4670,9 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     drc_diag = dict(drc_diag)
     drc_diag['drc_ratio_update_elapsed_seconds'] = float(time.time() - t0)
     drc_diag['drc_ratio_update_only'] = True
-    drc_diag['drc_proposal_weight_tensor'] = get_sampler_log_weight_name('ce_hlsi', cfg['init_weights'])
+    drc_diag['drc_score_init'] = score_init
+    drc_diag['drc_score_init_weights'] = score_weights
+    drc_diag['drc_proposal_weight_tensor'] = get_sampler_log_weight_name(score_init, score_weights)
 
     # Option B: keep reference coordinates fixed and pass rho forward as global
     # reference weights for the next CE-HLSI stage.
@@ -4335,11 +4683,21 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
         precomp.setdefault('drc_details', {})[label] = drc_details
         if bool(cfg.get('drc_energy_benchmark', False)):
             try:
+                robust_percentiles = cfg.get('drc_energy_robust_percentiles', (1.0, 99.0))
+                if isinstance(robust_percentiles, str):
+                    parts = [float(x.strip()) for x in robust_percentiles.replace(';', ',').split(',') if x.strip()]
+                    robust_percentiles = tuple(parts[:2]) if len(parts) >= 2 else (1.0, 99.0)
                 precomp.setdefault('drc_energy_benchmarks', {})[label] = compute_drc_energy_benchmark_from_details(
                     drc_details, label=label,
                     save_dir=RUN_RESULTS_DIR,
                     run_stem=RUN_RESULTS_STEM,
-                    make_plots=bool(cfg.get('drc_energy_plots', True)),
+                    make_plots=_config_bool(cfg.get('drc_energy_plots', True)),
+                    plot_axis_mode=cfg.get('drc_energy_plot_axis_mode', 'robust'),
+                    residual_axis_mode=cfg.get('drc_energy_residual_axis_mode', 'signed_log'),
+                    robust_percentiles=robust_percentiles,
+                    also_save_raw_plots=_config_bool(cfg.get('drc_energy_save_raw_plots', False)),
+                    also_save_loglog_plots=_config_bool(cfg.get('drc_energy_save_loglog_plots', False)),
+                    save_legacy_alias=_config_bool(cfg.get('drc_energy_save_legacy_alias', True)),
                 )
             except Exception as exc:
                 warnings.warn(
@@ -4354,14 +4712,19 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     run_info['init_reference_bank'] = ref_bank_source
     run_info['n_ref'] = int(n_ref_used) if n_ref_used else int(final_samples.shape[0])
     run_info['init_bank'] = local_bank['bank_name']
-    run_info['init_log_weights'] = get_sampler_log_weight_name('ce_hlsi', cfg['init_weights'])
+    run_info['init_log_weights'] = get_sampler_log_weight_name(score_init, score_weights)
+    run_info['drc_score_init'] = score_init
+    run_info['drc_score_init_weights'] = score_weights
     run_info['output_log_weights'] = 'carried_log_ref_weights/log_drc_ref'
     run_info['transition_w'] = cfg.get('transition_w', 'ou')
-    run_info['gate_family'] = resolve_hlsi_gate_law(
-        'ce_hlsi',
-        gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'), gate_kappa=cfg.get('gate_kappa'),
-        gate_topk=cfg.get('gate_topk', 64), gate_metric_source=cfg.get('gate_metric_source', 'mu'),
-    ).family
+    if score_init in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi'}:
+        run_info['gate_family'] = resolve_hlsi_gate_law(
+            score_init,
+            gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'), gate_kappa=cfg.get('gate_kappa'),
+            gate_topk=cfg.get('gate_topk', 64), gate_metric_source=cfg.get('gate_metric_source', 'mu'),
+        ).family
+    else:
+        run_info['gate_family'] = score_init
     run_info['score_spec_available'] = True
     run_info['score_spec_law_matches_final_samples'] = True
     run_info['ratio_update_only'] = True
