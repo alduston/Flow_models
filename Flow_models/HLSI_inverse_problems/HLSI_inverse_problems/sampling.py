@@ -1858,14 +1858,11 @@ def _eval_score_from_frozen_spec(y, t, spec):
 
 
 def _hutchinson_divergence_score(y, t, spec, n_probe=1, fd_eps=1e-3):
-    """Estimate div_x s(x,t) for a frozen HLSI-family score field.
+    """Fallback finite-difference Hutchinson estimate of div_x s(x,t).
 
-    We deliberately use a symmetric finite-difference Hutchinson estimator rather
-    than PyTorch autograd through the CE eigensolve. Autograd can return NaNs
-    when the CE-averaged Hessian has repeated or nearly repeated eigenvalues,
-    which is common for isotropic/regularized inverse-problem banks. The finite
-    difference estimator is slower but much more robust and requires no changes
-    to the HLSI score evaluator.
+    This path is retained for backwards compatibility and for score fields whose
+    analytic Jacobian/divergence has not been implemented.  CE-HLSI/LFGI DRC
+    probability-flow likelihoods should use the closed-form divergence below.
     """
     if int(n_probe) <= 0:
         # Cheap but biased fallback: useful only for smoke tests / ablations.
@@ -1889,8 +1886,180 @@ def _hutchinson_divergence_score(y, t, spec, n_probe=1, fd_eps=1e-3):
     return div / float(n_probe)
 
 
+_ANALYTIC_DRC_DIVERGENCE_MODES = {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi'}
+
+
+def canonicalize_drc_divergence_mode(name):
+    """Normalize DRC probability-flow divergence mode names."""
+    if name is None:
+        return 'auto'
+    key = str(name).strip().lower().replace('-', '_').replace(' ', '_')
+    aliases = {
+        'auto': 'auto',
+        'analytic': 'analytic',
+        'closed_form': 'analytic',
+        'closedform': 'analytic',
+        'exact': 'analytic',
+        'hutchinson': 'hutchinson',
+        'hutch': 'hutchinson',
+        'fd': 'hutchinson',
+        'finite_difference': 'hutchinson',
+        'finite_diff': 'hutchinson',
+        'zero': 'zero',
+        'none': 'zero',
+        'off': 'zero',
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown drc_divergence mode {name!r}. Expected one of: "
+            "auto, analytic, hutchinson, zero."
+        )
+    return aliases[key]
+
+
+def _frozen_spec_supports_analytic_divergence(spec):
+    """Closed-form divergence is implemented for CE-HLSI-family OU weights."""
+    mode = canonicalize_init_name(spec.get('mode'))
+    transition_w = canonicalize_transition_w(spec.get('transition_w', 'ou'))
+    return mode in _ANALYTIC_DRC_DIVERGENCE_MODES and transition_w == 'ou'
+
+
+def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREAM_BATCH):
+    """Evaluate CE-HLSI/LFGI score and its closed-form spatial divergence.
+
+    For OU responsibilities, let
+        b_i = grad_y log K_t(y|x_i),
+        c_i = exp(t) s_0(x_i),
+        H_i = P_i,
+    and form weighted averages bbar, cbar, Hbar under the same SNIS weights used
+    by the CE-HLSI score.  The returned divergence implements
+        div s = tr(J_b) + <G, J_r^T>_F
+                - (gamma/alpha^2) sum_{a,u,v} G_{a u} T_{a u v} (G r)_v,
+    with J_b=C_bb-gamma^{-1}I, J_c=C_cb, J_r=J_c-J_b, and
+    T_{a u v}=sum_i w_i (b_i-bbar)_a (P_i-Hbar)_{uv}.  Since the centered
+    b-residuals sum to zero, T is accumulated as sum_i w_i db_i P_i.
+    """
+    mode = canonicalize_init_name(spec.get('mode'))
+    if mode not in _ANALYTIC_DRC_DIVERGENCE_MODES:
+        raise ValueError(f"Analytic CE-HLSI divergence is not implemented for mode={mode!r}.")
+    transition_w = canonicalize_transition_w(spec.get('transition_w', 'ou'))
+    if transition_w != 'ou':
+        raise ValueError("Analytic CE-HLSI divergence currently requires transition_w='ou'.")
+
+    X_ref_cpu = spec['X_ref']
+    s0_post_ref_cpu = spec['s0_post_ref']
+    log_w_ref_cpu = spec['log_weights']
+    P_ref_cpu = spec['P_ref']
+
+    t_val = _canonicalize_time(t)
+    et = math.exp(-t_val)
+    et2 = et * et
+    gamma = 1.0 - math.exp(-2.0 * t_val)
+    inv_gamma = 1.0 / gamma
+
+    # Reuse the same stable two-pass SNIS weights as the existing CE-HLSI score.
+    w = get_posterior_snis_weights(
+        y, t_val, X_ref_cpu, log_w_ref_cpu, batch_size=batch_size,
+        transition_w='ou', P_ref_cpu=spec.get('P_ref'),
+        mu_ref_cpu=spec.get('mu_ref'), gated_info=spec.get('gated_info'))
+
+    m_query, d = y.shape
+    b_bar = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    c_bar = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    H_bar = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
+
+    # First pass: weighted means bbar, cbar, Hbar.
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        P_batch = P_ref_cpu[sl].to(y.device, non_blocking=True)
+
+        b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_gamma
+        c_batch = s0_batch / et
+        b_bar += torch.einsum('mb,mbd->md', w_batch, b_batch)
+        c_bar += torch.einsum('mb,bd->md', w_batch, c_batch)
+        H_bar += torch.einsum('mb,bij->mij', w_batch, P_batch)
+
+        del w_batch, X_batch, s0_batch, P_batch, b_batch, c_batch
+
+    # Gate exactly matches the existing CE-HLSI score path up to roundoff.
+    gate_eig, V = _get_ce_hlsi_gate_eigenbasis(H_bar, et2, gamma)
+    G = torch.einsum('mij,mj,mkj->mik', V, gate_eig, V)
+    r = c_bar - b_bar
+    Gr = torch.einsum('muv,mv->mu', G, r)
+    score = b_bar + Gr
+
+    Cbb = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
+    Ccb = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
+    T = torch.zeros((m_query, d, d, d), device=y.device, dtype=y.dtype)
+
+    # Second pass: derivative moments C_bb, C_cb, and T=d_y Hbar.
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        P_batch = P_ref_cpu[sl].to(y.device, non_blocking=True)
+
+        b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_gamma
+        c_batch = s0_batch / et
+        db = b_batch - b_bar.unsqueeze(1)
+        dc = c_batch.unsqueeze(0) - c_bar.unsqueeze(1)
+
+        Cbb += torch.einsum('mb,mbu,mba->mua', w_batch, db, db)
+        Ccb += torch.einsum('mb,mbu,mba->mua', w_batch, dc, db)
+        # T_{a u v}=sum_i w_i db_{i,a} P_{i,u,v}; centering by Hbar is unnecessary
+        # because sum_i w_i db_i=0 exactly up to floating point error.
+        T += torch.einsum('mb,mba,buv->mauv', w_batch, db, P_batch)
+
+        del w_batch, X_batch, s0_batch, P_batch, b_batch, c_batch, db, dc
+
+    I = torch.eye(d, device=y.device, dtype=y.dtype).unsqueeze(0)
+    Jb = Cbb - inv_gamma * I
+    Jc = Ccb
+    Jr = Jc - Jb
+
+    tr_Jb = torch.diagonal(Jb, dim1=-2, dim2=-1).sum(dim=-1)
+    tr_GJr = torch.einsum('mau,mua->m', G, Jr)
+    third = torch.einsum('mau,mauv,mv->m', G, T, Gr)
+    div_score = tr_Jb + tr_GJr - (gamma / max(et2, 1e-300)) * third
+
+    del w, b_bar, c_bar, H_bar, gate_eig, V, G, r, Gr, Cbb, Ccb, T, I, Jb, Jc, Jr
+    return score, div_score
+
+
+def _eval_score_and_divergence_from_frozen_spec(y, t, spec, divergence_mode='auto',
+                                                n_probe=1, fd_eps=1e-3):
+    """Evaluate frozen score and divergence using analytic CE path when available."""
+    mode = canonicalize_drc_divergence_mode(divergence_mode)
+    if mode == 'zero':
+        score = _eval_score_from_frozen_spec(y, t, spec)
+        div = torch.zeros(y.shape[0], device=y.device, dtype=y.dtype)
+        return score, div, 'zero'
+
+    analytic_ok = _frozen_spec_supports_analytic_divergence(spec)
+    if mode in {'auto', 'analytic'} and analytic_ok:
+        score, div = _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec)
+        return score, div, 'analytic'
+
+    if mode == 'analytic' and not analytic_ok:
+        raise ValueError(
+            "Requested drc_divergence='analytic', but the frozen score spec does not "
+            "support analytic divergence. Currently supported: CE-HLSI-family modes "
+            "with transition_w='ou'."
+        )
+
+    # Auto fallback or explicit hutchinson mode.
+    score = _eval_score_from_frozen_spec(y, t, spec)
+    div = _hutchinson_divergence_score(y, t, spec, n_probe=n_probe, fd_eps=fd_eps)
+    return score, div, 'hutchinson'
+
+
 def estimate_logq_probability_flow(X0, source_score_spec, t_min=None, t_max=None,
-                                   n_steps=32, n_div_probes=1, fd_eps=1e-3):
+                                   n_steps=32, n_div_probes=1, fd_eps=1e-3,
+                                   divergence_mode='auto', return_diagnostics=False):
     """Estimate log q_source(x0) by OU probability-flow continuation to noise.
 
     The reverse sampler in this module uses the OU reverse-SDE score convention
@@ -1918,22 +2087,26 @@ def estimate_logq_probability_flow(X0, source_score_spec, t_min=None, t_max=None
     ts = torch.logspace(math.log10(t0), math.log10(t1), int(n_steps) + 1,
                         device=device, dtype=torch.float64)
     div_accum = torch.zeros(y.shape[0], device=device, dtype=torch.float64)
+    divergence_mode = canonicalize_drc_divergence_mode(divergence_mode)
+    effective_divergence_modes = set()
 
     for i in range(int(n_steps)):
         t_cur = ts[i]
         t_next = ts[i + 1]
         dt = t_next - t_cur
 
-        s_cur = _eval_score_from_frozen_spec(y, t_cur, source_score_spec)
-        div_s_cur = _hutchinson_divergence_score(
-            y, t_cur, source_score_spec, n_probe=n_div_probes, fd_eps=fd_eps)
+        s_cur, div_s_cur, div_kind_cur = _eval_score_and_divergence_from_frozen_spec(
+            y, t_cur, source_score_spec, divergence_mode=divergence_mode,
+            n_probe=n_div_probes, fd_eps=fd_eps)
+        effective_divergence_modes.add(div_kind_cur)
         f_cur = -(y + s_cur)
         div_f_cur = -float(d) - div_s_cur
 
         y_hat = y + dt * f_cur
-        s_next = _eval_score_from_frozen_spec(y_hat, t_next, source_score_spec)
-        div_s_next = _hutchinson_divergence_score(
-            y_hat, t_next, source_score_spec, n_probe=n_div_probes, fd_eps=fd_eps)
+        s_next, div_s_next, div_kind_next = _eval_score_and_divergence_from_frozen_spec(
+            y_hat, t_next, source_score_spec, divergence_mode=divergence_mode,
+            n_probe=n_div_probes, fd_eps=fd_eps)
+        effective_divergence_modes.add(div_kind_next)
         f_next = -(y_hat + s_next)
         div_f_next = -float(d) - div_s_next
 
@@ -1945,11 +2118,166 @@ def estimate_logq_probability_flow(X0, source_score_spec, t_min=None, t_max=None
             torch.cuda.empty_cache()
 
     log_q_terminal = -0.5 * torch.sum(y * y, dim=1) - 0.5 * float(d) * math.log(2.0 * math.pi)
-    return log_q_terminal + div_accum
+    logq = log_q_terminal + div_accum
+    if return_diagnostics:
+        return logq, {
+            'drc_divergence_requested': divergence_mode,
+            'drc_divergence_effective': '+'.join(sorted(effective_divergence_modes)) if effective_divergence_modes else 'none',
+        }
+    return logq
+
+
+def _safe_pearson_corr_torch(x, y, eps=1e-30):
+    x = x.detach().double().cpu().reshape(-1)
+    y = y.detach().double().cpu().reshape(-1)
+    mask = torch.isfinite(x) & torch.isfinite(y)
+    if int(mask.sum().item()) < 3:
+        return float('nan')
+    x = x[mask]
+    y = y[mask]
+    xc = x - torch.mean(x)
+    yc = y - torch.mean(y)
+    denom = torch.sqrt(torch.sum(xc * xc) * torch.sum(yc * yc))
+    if denom.item() <= eps:
+        return float('nan')
+    return float((torch.sum(xc * yc) / denom).item())
+
+
+def _rankdata_average_torch(x):
+    """Average-tie ranks, 1-indexed, for modest diagnostic vectors."""
+    x = x.detach().double().cpu().reshape(-1)
+    order = torch.argsort(x, stable=True)
+    ranks = torch.empty_like(x)
+    n = int(x.numel())
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and x[order[j]].item() == x[order[i]].item():
+            j += 1
+        avg_rank = 0.5 * (i + 1 + j)  # 1-indexed average of i+1,...,j
+        ranks[order[i:j]] = avg_rank
+        i = j
+    return ranks
+
+
+def _safe_spearman_corr_torch(x, y):
+    x = x.detach().double().cpu().reshape(-1)
+    y = y.detach().double().cpu().reshape(-1)
+    mask = torch.isfinite(x) & torch.isfinite(y)
+    if int(mask.sum().item()) < 3:
+        return float('nan')
+    return _safe_pearson_corr_torch(_rankdata_average_torch(x[mask]), _rankdata_average_torch(y[mask]))
+
+
+def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=None,
+                                              run_stem=None, make_plots=True):
+    """Compute density/energy diagnostics from stored DRC probability-flow details.
+
+    The primary density diagnostic is correlation between true unnormalized energy
+    -log pi(x) and estimated energy -log q(x).  The DRC ratio log pi-log q is
+    treated as a residual: for a good self-consistent density it should be nearly
+    constant, not strongly energy-correlated.
+    """
+    X = details.get('X_ref')
+    logq = details['logq'].detach().double().cpu().reshape(-1)
+    log_target = details['log_target'].detach().double().cpu().reshape(-1)
+    raw_logw = details.get('raw_logw', log_target - logq).detach().double().cpu().reshape(-1)
+    logw = details.get('logw', raw_logw - torch.mean(raw_logw)).detach().double().cpu().reshape(-1)
+
+    energy = -log_target
+    neglogq = -logq
+    energy_c = energy - torch.mean(energy)
+    neglogq_c = neglogq - torch.mean(neglogq)
+    raw_logw_c = raw_logw - torch.mean(raw_logw)
+
+    denom = torch.sum(energy_c * energy_c)
+    if denom.item() > 1e-30:
+        slope = torch.sum(energy_c * neglogq_c) / denom
+        intercept = torch.mean(neglogq) - slope * torch.mean(energy)
+        neglogq_affine = intercept + slope * energy
+        affine_resid = neglogq - neglogq_affine
+        affine_rmse = torch.sqrt(torch.mean(affine_resid * affine_resid))
+    else:
+        slope = torch.tensor(float('nan'))
+        intercept = torch.tensor(float('nan'))
+        affine_rmse = torch.tensor(float('nan'))
+
+    centered_rmse = torch.sqrt(torch.mean((neglogq_c - energy_c) ** 2))
+    residual_std = torch.std(raw_logw_c, unbiased=False)
+    residual_mean_abs = torch.mean(torch.abs(raw_logw_c))
+
+    metrics = OrderedDict([
+        ('label', str(label)),
+        ('n_eval', int(logq.numel())),
+        ('energy_mean', float(torch.mean(energy).item())),
+        ('energy_std', float(torch.std(energy, unbiased=False).item())),
+        ('neglogq_mean', float(torch.mean(neglogq).item())),
+        ('neglogq_std', float(torch.std(neglogq, unbiased=False).item())),
+        ('energy_neglogq_pearson', _safe_pearson_corr_torch(energy, neglogq)),
+        ('energy_neglogq_spearman', _safe_spearman_corr_torch(energy, neglogq)),
+        ('centered_energy_rmse', float(centered_rmse.item())),
+        ('affine_energy_slope', float(slope.item())),
+        ('affine_energy_intercept', float(intercept.item())),
+        ('affine_energy_rmse', float(affine_rmse.item())),
+        ('raw_logratio_std', float(residual_std.item())),
+        ('raw_logratio_mean_abs_centered', float(residual_mean_abs.item())),
+        ('raw_logratio_energy_pearson', _safe_pearson_corr_torch(energy, raw_logw)),
+        ('raw_logratio_energy_spearman', _safe_spearman_corr_torch(energy, raw_logw)),
+        ('processed_logw_ess', _global_log_weight_ess(logw)),
+        ('raw_logw_ess', _global_log_weight_ess(raw_logw)),
+    ])
+
+    df = pd.DataFrame([metrics])
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        stem = run_stem or RUN_RESULTS_STEM or 'drc_energy_benchmark'
+        safe_label = _sanitize_run_results_name(label)
+        csv_path = os.path.join(save_dir, f'{stem}_drc_energy_{safe_label}.csv')
+        npz_path = os.path.join(save_dir, f'{stem}_drc_energy_{safe_label}.npz')
+        df.to_csv(csv_path, index=False)
+        np.savez(
+            npz_path,
+            X_ref=X.detach().cpu().numpy() if torch.is_tensor(X) else np.asarray(X) if X is not None else np.array([]),
+            logq=logq.numpy(),
+            log_target=log_target.numpy(),
+            energy=energy.numpy(),
+            neglogq=neglogq.numpy(),
+            raw_logw=raw_logw.numpy(),
+            logw=logw.numpy(),
+        )
+        print(f'Saved DRC energy benchmark CSV to {csv_path}')
+        print(f'Saved DRC energy benchmark arrays to {npz_path}')
+
+        if make_plots:
+            fig, ax = plt.subplots(figsize=(6.2, 5.0))
+            ax.scatter(energy.numpy(), neglogq.numpy(), s=10, alpha=0.45)
+            ax.set_xlabel('true energy  -log pi(x)')
+            ax.set_ylabel('estimated energy  -log q(x)')
+            ax.set_title(f'DRC density-energy correlation: {label}')
+            ax.grid(True, alpha=0.25)
+            fig.tight_layout()
+            fig_path = os.path.join(save_dir, f'{stem}_drc_energy_scatter_{safe_label}.png')
+            fig.savefig(fig_path, dpi=240, bbox_inches='tight')
+            print(f'Saved DRC energy scatter to {fig_path}')
+
+            fig2, ax2 = plt.subplots(figsize=(6.2, 5.0))
+            ax2.scatter(energy.numpy(), raw_logw_c.numpy(), s=10, alpha=0.45)
+            ax2.axhline(0.0, linewidth=1.0, alpha=0.5)
+            ax2.set_xlabel('true energy  -log pi(x)')
+            ax2.set_ylabel('centered residual  log pi(x) - log q(x)')
+            ax2.set_title(f'DRC residual vs energy: {label}')
+            ax2.grid(True, alpha=0.25)
+            fig2.tight_layout()
+            fig2_path = os.path.join(save_dir, f'{stem}_drc_residual_scatter_{safe_label}.png')
+            fig2.savefig(fig2_path, dpi=240, bbox_inches='tight')
+            print(f'Saved DRC residual scatter to {fig2_path}')
+
+    return df
 
 
 def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_spec,
-                                     cfg, label='DRC'):
+                                     cfg, label='DRC', return_details=False):
     """Attach the DRC mass law log pi_tilde(x_i) - log q_source(x_i) to a bank."""
     if source_score_spec is None:
         raise ValueError("DRC weights require a frozen source_score_spec. Did the ref_source run first?")
@@ -1959,11 +2287,16 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
     batch_size = int(cfg.get('drc_eval_batch_size', 64))
     logw_chunks = []
     logq_chunks = []
+    log_prior_chunks = []
+    log_lik_chunks = []
+    log_target_chunks = []
+    pf_effective_modes = set()
 
+    divergence_mode = canonicalize_drc_divergence_mode(cfg.get('drc_divergence', 'auto'))
     print(
         f"  [{label}] Computing DRC log weights from source={source_score_spec.get('label')!r} "
         f"with n={n}, batch_size={batch_size}, pf_steps={cfg.get('drc_pf_steps')}, "
-        f"div_probes={cfg.get('drc_div_probes')}"
+        f"divergence={divergence_mode}, div_probes={cfg.get('drc_div_probes')}"
     )
     t0_wall = time.time()
 
@@ -1974,7 +2307,7 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
             log_prior = prior_model.log_prob(X)
             log_lik = bank['log_lik_ref'][start:stop].to(device=device, dtype=torch.float64)
             log_target = log_prior + log_lik
-        log_q = estimate_logq_probability_flow(
+        log_q, pf_diag = estimate_logq_probability_flow(
             X,
             source_score_spec,
             t_min=cfg.get('drc_tmin', source_score_spec.get('t_min')),
@@ -1982,10 +2315,17 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
             n_steps=cfg.get('drc_pf_steps', 32),
             n_div_probes=cfg.get('drc_div_probes', 1),
             fd_eps=cfg.get('drc_fd_eps', 1e-3),
+            divergence_mode=divergence_mode,
+            return_diagnostics=True,
         )
+        pf_effective_modes.add(pf_diag.get('drc_divergence_effective', 'unknown'))
         logw = log_target - log_q
         logw_chunks.append(logw.detach().cpu())
         logq_chunks.append(log_q.detach().cpu())
+        if return_details:
+            log_prior_chunks.append(log_prior.detach().cpu())
+            log_lik_chunks.append(log_lik.detach().cpu())
+            log_target_chunks.append(log_target.detach().cpu())
         del X, log_prior, log_lik, log_target, log_q, logw
         gc.collect()
         if torch.cuda.is_available():
@@ -2007,6 +2347,7 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
         logw = torch.clamp(logw, med - clip, med + clip)
     logw = logw - torch.mean(logw)
 
+    effective_mode = '+'.join(sorted(pf_effective_modes)) if pf_effective_modes else 'unknown'
     diag = {
         'drc_source': str(source_score_spec.get('label')),
         'drc_logq_mean': float(torch.mean(logq).item()),
@@ -2019,6 +2360,8 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
         'drc_logw_max': float(torch.max(logw).item()),
         'drc_global_ess': _global_log_weight_ess(logw),
         'drc_pf_steps': int(cfg.get('drc_pf_steps', 32)),
+        'drc_divergence': divergence_mode,
+        'drc_divergence_effective': effective_mode,
         'drc_div_probes': int(cfg.get('drc_div_probes', 1)),
         'drc_fd_eps': float(cfg.get('drc_fd_eps', 1e-3)),
         'drc_eval_batch_size': int(batch_size),
@@ -2027,8 +2370,26 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
     print(
         f"  [{label}] DRC stats: std={diag['drc_logw_std']:.4g}, "
         f"range=[{diag['drc_logw_min']:.4g}, {diag['drc_logw_max']:.4g}], "
-        f"ESS={diag['drc_global_ess']:.1f}/{n}, time={diag['drc_runtime_seconds']:.2f}s"
+        f"ESS={diag['drc_global_ess']:.1f}/{n}, div={effective_mode}, "
+        f"time={diag['drc_runtime_seconds']:.2f}s"
     )
+
+    if return_details:
+        details = {
+            'label': str(label),
+            'source_label': str(source_score_spec.get('label')),
+            'X_ref': X_cpu.detach().cpu(),
+            'log_prior': torch.cat(log_prior_chunks, dim=0).double(),
+            'log_lik': torch.cat(log_lik_chunks, dim=0).double(),
+            'log_target': torch.cat(log_target_chunks, dim=0).double(),
+            'energy': -torch.cat(log_target_chunks, dim=0).double(),
+            'logq': logq.detach().cpu(),
+            'raw_logw': raw_logw.detach().cpu(),
+            'logw': logw.detach().cpu(),
+            'diagnostics': dict(diag),
+        }
+        return logw.detach().cpu(), diag, details
+
     return logw.detach().cpu(), diag
 
 
@@ -3641,10 +4002,16 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     # reference bank for a DRC-consuming sampler is selected.
     cfg.setdefault('drc_pf_steps', 32)
     cfg['drc_pf_steps'] = int(max(1, cfg['drc_pf_steps']))
+    cfg.setdefault('drc_divergence', 'auto')
+    cfg['drc_divergence'] = canonicalize_drc_divergence_mode(cfg['drc_divergence'])
     cfg.setdefault('drc_div_probes', 1)
     cfg['drc_div_probes'] = int(max(0, cfg['drc_div_probes']))
     cfg.setdefault('drc_fd_eps', 1e-3)
     cfg['drc_fd_eps'] = float(cfg['drc_fd_eps'])
+    cfg.setdefault('drc_store_details', False)
+    cfg['drc_store_details'] = bool(cfg['drc_store_details'])
+    cfg.setdefault('drc_energy_benchmark', False)
+    cfg['drc_energy_benchmark'] = bool(cfg['drc_energy_benchmark'])
     cfg.setdefault('drc_tmin', cfg.get('init_tmin', 10 ** (-2.5)))
     cfg.setdefault('drc_tmax', cfg.get('init_tmax', 10.0))
     cfg['drc_tmin'] = float(cfg['drc_tmin'])
@@ -3943,9 +4310,17 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
         raise RuntimeError(f"Could not build frozen CE-HLSI proposal spec for DRC-R sampler '{label}'.")
 
     t0 = time.time()
-    log_drc, drc_diag = compute_drc_log_weights_for_bank(
-        ref_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
-    )
+    want_drc_details = bool(cfg.get('drc_store_details', False) or cfg.get('drc_energy_benchmark', False))
+    if want_drc_details:
+        log_drc, drc_diag, drc_details = compute_drc_log_weights_for_bank(
+            ref_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
+            return_details=True,
+        )
+    else:
+        log_drc, drc_diag = compute_drc_log_weights_for_bank(
+            ref_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
+        )
+        drc_details = None
     drc_diag = dict(drc_diag)
     drc_diag['drc_ratio_update_elapsed_seconds'] = float(time.time() - t0)
     drc_diag['drc_ratio_update_only'] = True
@@ -3956,6 +4331,21 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     precomp.setdefault('carried_log_ref_weights', {})[label] = log_drc.detach().cpu()
     precomp.setdefault('drc_diagnostics', {})[label] = drc_diag
     precomp.setdefault('score_specs', {})[label] = source_score_spec
+    if drc_details is not None:
+        precomp.setdefault('drc_details', {})[label] = drc_details
+        if bool(cfg.get('drc_energy_benchmark', False)):
+            try:
+                precomp.setdefault('drc_energy_benchmarks', {})[label] = compute_drc_energy_benchmark_from_details(
+                    drc_details, label=label,
+                    save_dir=RUN_RESULTS_DIR,
+                    run_stem=RUN_RESULTS_STEM,
+                    make_plots=bool(cfg.get('drc_energy_plots', True)),
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"DRC energy benchmark failed for sampler {label!r}: {exc}",
+                    RuntimeWarning,
+                )
 
     final_samples = local_bank['X_ref'].detach().cpu()
     run_info = dict(cfg)
