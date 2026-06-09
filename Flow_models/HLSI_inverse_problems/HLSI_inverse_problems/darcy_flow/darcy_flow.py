@@ -1029,7 +1029,7 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
     }
 
-
+'''
 # MALA reference bank for density benchmark
 DENSITY_REF_SOURCE = 'MALA'
 
@@ -1070,9 +1070,9 @@ SAMPLER_CONFIGS = OrderedDict([
         'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
     )),
 ])
-
-
 '''
+
+
 SAMPLER_CONFIGS = OrderedDict([
     # Bootstrap reference construction: two alternating DRC-LFGI rounds.
     # Round 0 builds an initial LFGI proposal from the prior/reference bank.
@@ -1139,7 +1139,7 @@ SAMPLER_CONFIGS = OrderedDict([
         'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
     )),
 ])
-'''
+
 
 
 pipeline = run_standard_sampler_pipeline(
