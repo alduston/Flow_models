@@ -6,10 +6,11 @@ Darcy density benchmark: build a MALA posterior reference bank, evaluate
 Tweedie / scalar blend / CE-HLSI probability-flow normalized density surrogates
 on that same bank, and save one publication-style 3x2 density-energy grid.
 
-Typical Colab run, using the versioned sampling helper in the same directory:
+Typical repository/Slurm run:
 
-    !cp sampling_density_grid_v0.py /content/sampling_density_grid_v0.py
-    !python navier_stokes_density_eval_v0.py
+    # Place this file at navier_stokes/navier_stokes.py.
+    # Place the updated shared module at <repo-root>/sampling.py.
+    sbatch --export=ALL,PROB=navier_stokes run_one.slurm
 
 Useful overrides:
 
@@ -72,19 +73,11 @@ linecache.clearcache()
 if "sampling" in sys.modules:
     del sys.modules["sampling"]
 
-# Prefer the versioned sampling module that contains the publication-style
-# DRC density-energy comparison grid.  Set HLSI_SAMPLING_MODULE=sampling to
-# force use of a local unsuffixed sampling.py.
-SAMPLING_MODULE_NAME = os.environ.get("HLSI_SAMPLING_MODULE", "sampling_density_grid_v0")
-try:
-    sampling = importlib.import_module(SAMPLING_MODULE_NAME)
-except ModuleNotFoundError:
-    if SAMPLING_MODULE_NAME != "sampling":
-        print(f"WARNING: {SAMPLING_MODULE_NAME!r} not found; falling back to unsuffixed 'sampling'.")
-        SAMPLING_MODULE_NAME = "sampling"
-        sampling = importlib.import_module(SAMPLING_MODULE_NAME)
-    else:
-        raise
+# Slurm/repository default: import the shared module as <repo-root>/sampling.py.
+# A suffixed module can still be selected explicitly with HLSI_SAMPLING_MODULE,
+# but no suffixed helper is required for normal GitHub/Slurm use.
+SAMPLING_MODULE_NAME = os.environ.get("HLSI_SAMPLING_MODULE", "sampling")
+sampling = importlib.import_module(SAMPLING_MODULE_NAME)
 importlib.reload(sampling)
 # Preserve the historical module name for downstream `from sampling import ...`.
 sys.modules["sampling"] = sampling
@@ -844,7 +837,7 @@ DENSITY_DRC_GRID_MAX_POINTS = _env_int('IP_DENSITY_DRC_GRID_MAX_POINTS', 5000)
 DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
 
 # Divergence defaults matching the Darcy density script.  CE-HLSI and Tweedie
-# dispatch to analytic implementations in sampling_density_grid_v0; scalar blend
+# dispatch to analytic implementations in sampling.py; scalar blend
 # uses Hutchinson by default for speed.
 DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'auto')
 DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE', 'hutchinson')
@@ -985,11 +978,10 @@ SAMPLER_CONFIGS = OrderedDict([
 ])
 
 RUN_COMMAND_HINT = (
-    'HLSI_SAMPLING_MODULE=sampling_density_grid_v0 '
     'IP_DENSITY_N_REF={n_ref} IP_DENSITY_MALA_N_SAMPLES={mala_n} '
     'IP_DENSITY_MALA_STEPS={mala_steps} IP_DENSITY_MALA_BURNIN={burnin} '
     'IP_DENSITY_MALA_DT={dt:g} IP_DENSITY_DRC_PF_STEPS={pf_steps} '
-    'IP_DENSITY_DRC_PLOT_LAYOUT={layout} python navier_stokes_density_eval_v0.py'
+    'IP_DENSITY_DRC_PLOT_LAYOUT={layout} python navier_stokes.py'
 ).format(
     n_ref=N_REF,
     mala_n=MALA_N_SAMPLES,
@@ -1375,4 +1367,4 @@ run_results_zip_path = zip_run_results_dir()
 print(f"Run-results directory: {run_ctx['run_results_dir']}")
 print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
-print('\n=== Moderately hard anisotropic Navier-Stokes HLSI pipeline complete ===') 
+print('\n=== Moderately hard anisotropic Navier-Stokes HLSI pipeline complete ===')
