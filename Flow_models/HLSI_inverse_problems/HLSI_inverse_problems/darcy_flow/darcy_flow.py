@@ -52,8 +52,22 @@ linecache.clearcache()
 if "sampling" in sys.modules:
     del sys.modules["sampling"]
 
-import sampling
+# Prefer the versioned sampling module returned with this script.
+# Set HLSI_SAMPLING_MODULE=sampling to use a local unsuffixed sampling.py instead.
+SAMPLING_MODULE_NAME = os.environ.get("HLSI_SAMPLING_MODULE", "sampling_density_grid_v0")
+try:
+    sampling = importlib.import_module(SAMPLING_MODULE_NAME)
+except ModuleNotFoundError:
+    if SAMPLING_MODULE_NAME != "sampling":
+        print(f"WARNING: {SAMPLING_MODULE_NAME!r} not found; falling back to unsuffixed 'sampling'.")
+        SAMPLING_MODULE_NAME = "sampling"
+        sampling = importlib.import_module(SAMPLING_MODULE_NAME)
+    else:
+        raise
 importlib.reload(sampling)
+# Make the chosen module visible as 'sampling' so any downstream code using the
+# historical import name keeps working.
+sys.modules["sampling"] = sampling
 
 print("Using:", sampling.__file__)
 print("DRC test:", sampling.canonicalize_init_weights("DRC"))
@@ -849,6 +863,13 @@ DENSITY_DRC_SAVE_RAW_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_RAW_PLOTS', False)
 DENSITY_DRC_SAVE_LOGLOG_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_LOGLOG_PLOTS', False)
 DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS', False)
 DENSITY_DRC_SAVE_LEGACY_ALIAS = _env_bool('IP_DENSITY_DRC_SAVE_LEGACY_ALIAS', True)
+# New paper-facing density-energy plot layout.
+#   comparison_grid: one row per method and two columns (affine-normalized energy, residual).
+#   individual: legacy one-figure-per-method behavior.
+#   both: save both layouts.
+DENSITY_DRC_PLOT_LAYOUT = os.environ.get('IP_DENSITY_DRC_PLOT_LAYOUT', 'comparison_grid')
+DENSITY_DRC_GRID_MAX_POINTS = _env_int('IP_DENSITY_DRC_GRID_MAX_POINTS', 5000)
+DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
 
 # Divergence defaults by score family. Tweedie and CE-HLSI/LFGI use analytic
 # divergence through sampling_v1.py; scalar blend gets deterministic coordinate
@@ -944,6 +965,9 @@ dashboard.add_text_page(
         f'DENSITY_DRC_SAVE_RAW_PLOTS = {DENSITY_DRC_SAVE_RAW_PLOTS}',
         f'DENSITY_DRC_SAVE_LOGLOG_PLOTS = {DENSITY_DRC_SAVE_LOGLOG_PLOTS}',
         f'DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS = {DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS}',
+        f'DENSITY_DRC_PLOT_LAYOUT = {DENSITY_DRC_PLOT_LAYOUT}',
+        f'DENSITY_DRC_GRID_MAX_POINTS = {DENSITY_DRC_GRID_MAX_POINTS}',
+        f'DENSITY_DRC_GRID_SAVE_PDF = {DENSITY_DRC_GRID_SAVE_PDF}',
         f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
         f'NOISE_STD = {NOISE_STD}',
         f'N = {N}, num_observation = {num_observation}, num_holdout_observation = {num_holdout_observation}',
@@ -1027,6 +1051,11 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         'drc_energy_save_loglog_plots': DENSITY_DRC_SAVE_LOGLOG_PLOTS,
         'drc_energy_save_logratio_residual_plots': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
+        'drc_energy_plot_layout': DENSITY_DRC_PLOT_LAYOUT,
+        'drc_energy_grid_method_order': ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie'),
+        'drc_energy_grid_axis_reference': 'DENS-CE-HLSI',
+        'drc_energy_grid_max_points': DENSITY_DRC_GRID_MAX_POINTS,
+        'drc_energy_grid_save_pdf': DENSITY_DRC_GRID_SAVE_PDF,
     }
 
 
@@ -1167,10 +1196,10 @@ plot_mean_ess_logs(ess_logs, display_names=display_names)
 drc_energy_tables = precomp.get('drc_energy_benchmarks', {})
 if drc_energy_tables:
     drc_energy_df = pd.concat(list(drc_energy_tables.values()), ignore_index=True)
-    print('\n=== DRC density/energy benchmark on ALT-DRC-LFGI references ===')
+    print('\n=== DRC density/energy benchmark on density reference bank ===')
     print(drc_energy_df.to_string(index=False))
     dashboard.add_dataframe(
-        'DRC density/energy benchmark on ALT-DRC-LFGI references',
+        'DRC density/energy benchmark on density reference bank',
         drc_energy_df,
         max_rows=20,
         max_cols=8,
@@ -1332,6 +1361,9 @@ save_reproducibility_log(
         'DENSITY_DRC_SAVE_LOGLOG_PLOTS': DENSITY_DRC_SAVE_LOGLOG_PLOTS,
         'DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         'DENSITY_DRC_SAVE_LEGACY_ALIAS': DENSITY_DRC_SAVE_LEGACY_ALIAS,
+        'DENSITY_DRC_PLOT_LAYOUT': DENSITY_DRC_PLOT_LAYOUT,
+        'DENSITY_DRC_GRID_MAX_POINTS': DENSITY_DRC_GRID_MAX_POINTS,
+        'DENSITY_DRC_GRID_SAVE_PDF': DENSITY_DRC_GRID_SAVE_PDF,
         'DENSITY_TWEEDIE_DIVERGENCE': DENSITY_TWEEDIE_DIVERGENCE,
         'DENSITY_BLEND_DIVERGENCE': DENSITY_BLEND_DIVERGENCE,
         'DENSITY_LFGI_DIVERGENCE': DENSITY_LFGI_DIVERGENCE,
