@@ -1,4 +1,26 @@
 # -*- coding: utf-8 -*-
+"""Helmholtz inverse-scattering density-evaluation benchmark.
+
+Refactor of the Helmholtz HLSI script to match the Darcy/Navier-Stokes
+density benchmark: build a MALA posterior reference bank, evaluate Tweedie /
+scalar blend / CE-HLSI probability-flow normalized-density surrogates on that
+same bank, and save one publication-style 3x2 density-energy grid.
+
+Typical repository/Slurm run:
+
+    # Place this file at helmholtz/helmholtz.py.
+    # Place the updated shared module at <repo-root>/sampling.py.
+    sbatch --export=ALL,PROB=helmholtz run_one.slurm
+
+Useful overrides:
+
+    export IP_DENSITY_N_REF=250
+    export IP_DENSITY_MALA_STEPS=600
+    export IP_DENSITY_MALA_BURNIN=150
+    export IP_DENSITY_MALA_DT=4e-5
+    export IP_DENSITY_DRC_PF_STEPS=32
+    export IP_DENSITY_DRC_PLOT_LAYOUT=comparison_grid
+"""
 import gc
 import os
 import sys
@@ -7,8 +29,10 @@ from collections import OrderedDict
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
-THIS_DIR = os.getcwd() # if on collab
-#THIS_DIR = os.path.dirname(os.path.abspath(__file__)) # if not on collab
+try:
+    THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:  # notebook / pasted-cell fallback
+    THIS_DIR = os.getcwd()
 
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
@@ -44,7 +68,7 @@ import matplotlib.image as mpimg
 
 import sys, importlib, linecache, os
 
-# Make sure /content itself is before parent dirs.
+# Make sure the problem directory and repo root are import-visible.
 if os.getcwd() not in sys.path:
     sys.path.insert(0, os.getcwd())
 
@@ -53,8 +77,14 @@ linecache.clearcache()
 if "sampling" in sys.modules:
     del sys.modules["sampling"]
 
-import sampling
+# Slurm/repository default: import the shared module as <repo-root>/sampling.py.
+# A suffixed module can still be selected explicitly with HLSI_SAMPLING_MODULE,
+# but no suffixed helper is required for normal GitHub/Slurm use.
+SAMPLING_MODULE_NAME = os.environ.get("HLSI_SAMPLING_MODULE", "sampling")
+sampling = importlib.import_module(SAMPLING_MODULE_NAME)
 importlib.reload(sampling)
+# Preserve the historical module name for downstream `from sampling import ...`.
+sys.modules["sampling"] = sampling
 
 print("Using:", sampling.__file__)
 print("DRC test:", sampling.canonicalize_init_weights("DRC"))
@@ -755,7 +785,7 @@ def solve_single_total_field(alpha, pattern_idx):
     return u_total.reshape(N, N)
 
 # ==========================================
-# Shared sampling config
+# Shared sampling / density-benchmark config
 # ==========================================
 ACTIVE_DIM = num_truncated_series
 PLOT_NORMALIZER = 'best'
@@ -763,9 +793,97 @@ HESS_MIN = 1e-6
 HESS_MAX = 1e8
 GNL_PILOT_N = 512
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
-DEFAULT_N_GEN = 2000
-N_REF = 250
+GNL_USE_DOMINANT_PARTICLE_NEWTON = True
 BUILD_GNL_BANKS = False
+
+
+def _env_int(name, default):
+    return int(os.environ.get(name, str(default)))
+
+
+def _env_float(name, default):
+    return float(os.environ.get(name, str(default)))
+
+
+def _env_float_or_none(name, default):
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return default
+    raw = str(raw).strip().lower()
+    if raw in {'none', 'null', 'nan', ''}:
+        return None
+    return float(raw)
+
+
+def _env_bool(name, default):
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() not in {'0', 'false', 'no', 'off', 'none', ''}
+
+
+def _env_percentile_pair(name, default):
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return default
+    parts = [float(x.strip()) for x in str(raw).replace(';', ',').split(',') if x.strip()]
+    if len(parts) < 2:
+        return default
+    lo, hi = parts[:2]
+    if not (0.0 <= lo < hi <= 100.0):
+        raise ValueError(f'{name} must be two percentiles 0 <= lo < hi <= 100; got {raw!r}')
+    return (lo, hi)
+
+
+# Keep Helmholtz defaults modest enough to run, while exposing the same
+# density/MALA knobs as the Darcy/Navier-Stokes density scripts.  Increase
+# IP_DENSITY_N_REF for paper-scale runs.
+N_REF = _env_int('IP_DENSITY_N_REF', 250)
+DEFAULT_N_GEN = _env_int('IP_DENSITY_DEFAULT_N_GEN', N_REF)
+
+# Density-evaluation correction-factor benchmark on the MALA posterior bank.
+DENSITY_REF_SOURCE = os.environ.get('IP_DENSITY_REF_SOURCE', 'MALA')
+DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 32)
+DENSITY_DRC_EVAL_BATCH_SIZE = _env_int('IP_DENSITY_DRC_EVAL_BATCH_SIZE', 32)
+DENSITY_DRC_TMIN = _env_float('IP_DENSITY_DRC_TMIN', 10 ** (-2.5))
+DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 10.0)
+DENSITY_DRC_CLIP = _env_float_or_none('IP_DENSITY_DRC_CLIP', None)
+DENSITY_DRC_TEMPERATURE = _env_float('IP_DENSITY_DRC_TEMPERATURE', 1.0)
+DENSITY_DRC_ENERGY_PLOTS = _env_bool('IP_DENSITY_DRC_ENERGY_PLOTS', True)
+DENSITY_DRC_PLOT_AXIS_MODE = os.environ.get('IP_DENSITY_DRC_PLOT_AXIS_MODE', 'robust')
+DENSITY_DRC_RESIDUAL_AXIS_MODE = os.environ.get('IP_DENSITY_DRC_RESIDUAL_AXIS_MODE', 'robust')
+DENSITY_DRC_RESIDUAL_KIND = os.environ.get('IP_DENSITY_DRC_RESIDUAL_KIND', 'affine_normalized')
+DENSITY_DRC_AFFINE_FIT_SCOPE = os.environ.get('IP_DENSITY_DRC_AFFINE_FIT_SCOPE', 'central')
+DENSITY_DRC_ROBUST_PERCENTILES = _env_percentile_pair('IP_DENSITY_DRC_ROBUST_PERCENTILES', (1.0, 99.0))
+DENSITY_DRC_SAVE_RAW_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_RAW_PLOTS', False)
+DENSITY_DRC_SAVE_LOGLOG_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_LOGLOG_PLOTS', False)
+DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS', False)
+DENSITY_DRC_SAVE_LEGACY_ALIAS = _env_bool('IP_DENSITY_DRC_SAVE_LEGACY_ALIAS', True)
+DENSITY_DRC_PLOT_LAYOUT = os.environ.get('IP_DENSITY_DRC_PLOT_LAYOUT', 'comparison_grid')
+DENSITY_DRC_GRID_MAX_POINTS = _env_int('IP_DENSITY_DRC_GRID_MAX_POINTS', 5000)
+DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
+
+# Divergence defaults matching the Darcy density script. CE-HLSI and Tweedie
+# dispatch to analytic implementations in sampling.py; scalar blend uses
+# Hutchinson by default for speed.
+DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'auto')
+DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE', 'hutchinson')
+DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE', 'auto')
+DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
+
+# Same MALA reference-bank configuration style/defaults as the other density scripts.
+MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', N_REF)
+MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
+MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 4.0e-5)
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior')
+HELDOUT_BATCH_SIZE = _env_int('IP_DENSITY_HELDOUT_BATCH_SIZE', 1)
+
+if MALA_N_SAMPLES < N_REF:
+    raise ValueError(
+        f'MALA_N_SAMPLES={MALA_N_SAMPLES} must be >= N_REF={N_REF}, '
+        'because density-eval nodes use the reference bank selected from MALA.'
+    )
 
 configure_sampling(
     active_dim=ACTIVE_DIM,
@@ -777,13 +895,13 @@ configure_sampling(
     leaf_abs_scale=1.0,
     gnl_pilot_n=GNL_PILOT_N,
     gnl_stiff_lambda_cut=GNL_STIFF_LAMBDA_CUT,
-    gnl_use_dominant_particle_newton=True,
+    gnl_use_dominant_particle_newton=GNL_USE_DOMINANT_PARTICLE_NEWTON,
 )
 # Use the module-qualified call and then explicitly synchronize sampling.py's
-# run-results globals.  In long notebook sessions, stale matplotlib show hooks
+# run-results globals. In long notebook sessions, stale matplotlib show hooks
 # from a previous experiment can otherwise keep writing late diagnostics into
-# the previous run directory (for example Allen--Cahn).
-run_results_info = sampling.init_run_results('helmholtz_scattering_hlsi')
+# the previous run directory.
+run_results_info = sampling.init_run_results('helmholtz_density_eval_bench')
 DASHBOARD_PDF_PATH = os.path.join(
     run_results_info['run_results_dir'],
     f"{run_results_info['run_results_stem']}_summary_dashboard.pdf",
@@ -791,20 +909,11 @@ DASHBOARD_PDF_PATH = os.path.join(
 
 
 def _sync_sampling_run_results_context():
-    """Force sampling.py's figure-save hook to target this Helmholtz run.
-
-    This script imports/reloads sampling.py, but in Colab/IPython it is still
-    possible to have a stale ``plt.show`` hook or stale module globals from the
-    previous experiment.  Keep this local guard before every plot save/show so
-    complex-field, boundary-trace, and curvature figures land in the active
-    Helmholtz run-results directory and are picked up by the dashboard.
-    """
+    """Force sampling.py's figure-save hook to target this Helmholtz run."""
     sampling.RUN_TIMESTAMP = run_results_info['run_timestamp']
     sampling.RUN_RESULTS_ROOT = run_results_info['run_results_root']
     sampling.RUN_RESULTS_DIR = run_results_info['run_results_dir']
     sampling.RUN_RESULTS_STEM = run_results_info['run_results_stem']
-    # Reinstall the current sampling module's patched show hook if an older
-    # imported module left a different one attached to matplotlib.
     try:
         if plt.show is not sampling._patched_show:
             plt.show = sampling._patched_show
@@ -836,7 +945,6 @@ y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
 y_clean_holdout = solve_forward_holdout(jnp.array(alpha_true_np))
 y_clean_holdout_np = np.array(y_clean_holdout)
 y_holdout_obs_np = y_clean_holdout_np + np.random.normal(0.0, NOISE_STD, size=y_clean_holdout_np.shape)
-HELDOUT_BATCH_SIZE = 1
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
 lik_model, lik_aux = make_physics_likelihood(
@@ -851,61 +959,154 @@ lik_model, lik_aux = make_physics_likelihood(
 posterior_score_fn = make_posterior_score_fn(lik_model)
 
 
+def _density_eval_config(ref_source, score_init, divergence, label, display_name):
+    return {
+        'display_name': display_name,
+        'ref_source': ref_source,
+        'init': 'DRC-R',
+        'init_weights': 'None',
+        'drc_score_init': score_init,
+        # The MALA bank is the empirical posterior/reference bank. Do not
+        # likelihood-reweight again when fitting each frozen score family.
+        'drc_score_init_weights': 'None',
+        'transition_w': 'ou',
+        'n_ref': N_REF,
+        'include_results': False,
+        'drc_pf_steps': DENSITY_DRC_PF_STEPS,
+        'drc_divergence': divergence,
+        'drc_div_probes': DENSITY_DIV_PROBES,
+        'drc_eval_batch_size': DENSITY_DRC_EVAL_BATCH_SIZE,
+        'drc_clip': DENSITY_DRC_CLIP,
+        'drc_temperature': DENSITY_DRC_TEMPERATURE,
+        'drc_fd_eps': 1e-3,
+        'drc_tmin': DENSITY_DRC_TMIN,
+        'drc_tmax': DENSITY_DRC_TMAX,
+        'drc_store_details': True,
+        'drc_energy_benchmark': True,
+        'drc_energy_plots': DENSITY_DRC_ENERGY_PLOTS,
+        'drc_energy_plot_axis_mode': DENSITY_DRC_PLOT_AXIS_MODE,
+        'drc_energy_residual_axis_mode': DENSITY_DRC_RESIDUAL_AXIS_MODE,
+        'drc_energy_residual_kind': DENSITY_DRC_RESIDUAL_KIND,
+        'drc_energy_affine_fit_scope': DENSITY_DRC_AFFINE_FIT_SCOPE,
+        'drc_energy_robust_percentiles': DENSITY_DRC_ROBUST_PERCENTILES,
+        'drc_energy_save_raw_plots': DENSITY_DRC_SAVE_RAW_PLOTS,
+        'drc_energy_save_loglog_plots': DENSITY_DRC_SAVE_LOGLOG_PLOTS,
+        'drc_energy_save_logratio_residual_plots': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
+        'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
+        'drc_energy_plot_layout': DENSITY_DRC_PLOT_LAYOUT,
+        'drc_energy_grid_method_order': ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie'),
+        'drc_energy_grid_axis_reference': 'DENS-CE-HLSI',
+        'drc_energy_grid_max_points': DENSITY_DRC_GRID_MAX_POINTS,
+        'drc_energy_grid_save_pdf': DENSITY_DRC_GRID_SAVE_PDF,
+    }
+
+
 SAMPLER_CONFIGS = OrderedDict([
-    ('CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('CE-HLSI2', {'ref_source': 'CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False}),
-    ('CE-HLSI3', {'ref_source': 'CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False}),
-    ('CE-HLSI4', {'ref_source': 'CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True }),
-
-
-    ('DRC-CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-    ('DRC-CE-HLSI2', {'ref_source': 'DRC-CE-HLSI1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('DRC-CE-HLSI3', {'ref_source': 'DRC-CE-HLSI2', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('DRC-CE-HLSI4', {'ref_source': 'DRC-CE-HLSI3', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    #('DRC-CE-HLSI5', {'ref_source': 'DRC-CE-HLSI4', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-
-     # S1: CE-HLSI projection
-    # R1: ratio-only DRC-R, no sampling, hidden from metrics
-    # S2: weighted CE-HLSI projection using R1 carried weights
-    # repeat
-    ('ALT-DRC-CE-HLSI1', {'init': 'CE-HLSI', 'init_weights': 'None', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True}),
-
-    ('ALT-DRC-R1', {'ref_source': 'ALT-DRC-CE-HLSI1', 'init': 'DRC-R', 'init_weights': 'None', 'transition_w': 'ou'  ,'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('ALT-DRC-CE-HLSI2', {'ref_source': 'ALT-DRC-R1', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou' ,'include_results': False, 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-
-    ('ALT-DRC-R2', {'ref_source': 'ALT-DRC-CE-HLSI2', 'init': 'DRC-R', 'init_weights': 'None', 'transition_w': 'ou', 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('ALT-DRC-CE-HLSI3', {'ref_source': 'ALT-DRC-R2', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou','include_results': False, 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-
-    ('ALT-DRC-R3', {'ref_source': 'ALT-DRC-CE-HLSI3', 'init': 'DRC-R', 'init_weights': 'None', 'transition_w': 'ou', 'include_results': False, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-    ('ALT-DRC-CE-HLSI4', {'ref_source': 'ALT-DRC-R3', 'init': 'CE-HLSI', 'init_weights': 'DRC', 'transition_w': 'ou', 'init_steps': 200, 'mala_steps': 0, 'mala_burnin': 0, 'log_mean_ess': True, 'drc_pf_steps': 32, 'drc_div_probes': 1, 'drc_eval_batch_size': 32, 'drc_clip': 20.0, 'drc_temperature': 1.0, 'drc_fd_eps': 1e-3}),
-
+    ('MALA', {
+        'display_name': 'MALA reference',
+        'init': MALA_INIT,
+        'init_weights': 'None',
+        'transition_w': 'ou',
+        'n_ref': N_REF,
+        'n_samples': MALA_N_SAMPLES,
+        'init_steps': 0,
+        'mala_steps': MALA_STEPS,
+        'mala_burnin': MALA_BURNIN,
+        'mala_dt': MALA_DT,
+        'log_mean_ess': False,
+        'include_results': True,
+        'is_reference': True,
+    }),
+    ('DENS-Tweedie', _density_eval_config(
+        DENSITY_REF_SOURCE, 'tweedie', DENSITY_TWEEDIE_DIVERGENCE,
+        'DENS-Tweedie', 'Density eval: Tweedie',
+    )),
+    ('DENS-ScalarBlend', _density_eval_config(
+        DENSITY_REF_SOURCE, 'scalar_blend', DENSITY_BLEND_DIVERGENCE,
+        'DENS-ScalarBlend', 'Density eval: scalar blend',
+    )),
+    ('DENS-CE-HLSI', _density_eval_config(
+        DENSITY_REF_SOURCE, 'ce_hlsi', DENSITY_LFGI_DIVERGENCE,
+        'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
+    )),
 ])
+
+RUN_COMMAND_HINT = (
+    'IP_DENSITY_N_REF={n_ref} IP_DENSITY_MALA_N_SAMPLES={mala_n} '
+    'IP_DENSITY_MALA_STEPS={mala_steps} IP_DENSITY_MALA_BURNIN={burnin} '
+    'IP_DENSITY_MALA_DT={dt:g} IP_DENSITY_DRC_PF_STEPS={pf_steps} '
+    'IP_DENSITY_DRC_PLOT_LAYOUT={layout} python helmholtz.py'
+).format(
+    n_ref=N_REF,
+    mala_n=MALA_N_SAMPLES,
+    mala_steps=MALA_STEPS,
+    burnin=MALA_BURNIN,
+    dt=MALA_DT,
+    pf_steps=DENSITY_DRC_PF_STEPS,
+    layout=DENSITY_DRC_PLOT_LAYOUT,
+)
+
 
 dashboard = DashboardPDF(
     DASHBOARD_PDF_PATH,
-    title="Helmholtz scattering HLSI dashboard",
+    title='Helmholtz density-evaluation dashboard',
 )
 dashboard.add_text_page(
-    "Helmholtz scattering HLSI dashboard",
+    'Helmholtz density-evaluation dashboard',
     [
         f"Created: {datetime.now().isoformat(timespec='seconds')}",
-        "This dashboard contains the two canonical saved-results tables plus every PNG diagnostic plot saved in the run directory.",
-        "Tables are intentionally limited to two pages: metrics plus a readable split run-info page.",
-        "Random progress output from precomputation / Hessian batching is intentionally excluded.",
+        'This dashboard matches the Darcy/Navier-Stokes density-evaluation benchmark: one MALA reference bank, then probability-flow normalized-density evaluation for Tweedie, scalar blend, and CE-HLSI/LFGI on that same bank.',
+        'Primary density diagnostic: true posterior energy -log pi(x) versus probability-flow estimated energy -log q(x), plus affine-calibrated residuals in one publication-style comparison grid.',
+        'The comparison-grid plot uses CE-HLSI robust axes to align all rows.',
         f"run_results_dir = {run_results_info['run_results_dir']}",
-        "",
-        f"seed = {seed}",
-        f"ACTIVE_DIM = {ACTIVE_DIM}",
-        f"N_REF = {N_REF}",
-        f"DEFAULT_N_GEN = {DEFAULT_N_GEN}",
-        f"NOISE_STD = {NOISE_STD}",
-        f"HELMHOLTZ_K = {HELMHOLTZ_K}",
-        f"N = {N}, N_SOURCES = {N_SOURCES}, N_RECEIVERS = {N_RECEIVERS}, N_HOLDOUT_RECEIVERS = {N_HOLDOUT_RECEIVERS}",
-        f"HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}",
-        f"PLOT_NORMALIZER = {PLOT_NORMALIZER}",
+        '',
+        f'run command = {RUN_COMMAND_HINT}',
+        '',
+        f'seed = {seed}',
+        f'ACTIVE_DIM = {ACTIVE_DIM}',
+        f'N_REF = {N_REF}',
+        f'MALA_N_SAMPLES = {MALA_N_SAMPLES}',
+        f'MALA_STEPS = {MALA_STEPS}',
+        f'MALA_BURNIN = {MALA_BURNIN}',
+        f'MALA_DT = {MALA_DT}',
+        f'MALA_INIT = {MALA_INIT}',
+        f'DENSITY_REF_SOURCE = {DENSITY_REF_SOURCE}',
+        f'DENSITY_DRC_PF_STEPS = {DENSITY_DRC_PF_STEPS}',
+        f'DENSITY_TWEEDIE_DIVERGENCE = {DENSITY_TWEEDIE_DIVERGENCE}',
+        f'DENSITY_BLEND_DIVERGENCE = {DENSITY_BLEND_DIVERGENCE}',
+        f'DENSITY_LFGI_DIVERGENCE = {DENSITY_LFGI_DIVERGENCE}',
+        f'DENSITY_DRC_EVAL_BATCH_SIZE = {DENSITY_DRC_EVAL_BATCH_SIZE}',
+        f'DENSITY_DRC_TMIN = {DENSITY_DRC_TMIN}',
+        f'DENSITY_DRC_TMAX = {DENSITY_DRC_TMAX}',
+        f'DENSITY_DRC_CLIP = {DENSITY_DRC_CLIP}',
+        f'DENSITY_DRC_PLOT_AXIS_MODE = {DENSITY_DRC_PLOT_AXIS_MODE}',
+        f'DENSITY_DRC_RESIDUAL_AXIS_MODE = {DENSITY_DRC_RESIDUAL_AXIS_MODE}',
+        f'DENSITY_DRC_RESIDUAL_KIND = {DENSITY_DRC_RESIDUAL_KIND}',
+        f'DENSITY_DRC_AFFINE_FIT_SCOPE = {DENSITY_DRC_AFFINE_FIT_SCOPE}',
+        f'DENSITY_DRC_ROBUST_PERCENTILES = {DENSITY_DRC_ROBUST_PERCENTILES}',
+        f'DENSITY_DRC_PLOT_LAYOUT = {DENSITY_DRC_PLOT_LAYOUT}',
+        f'DENSITY_DRC_GRID_MAX_POINTS = {DENSITY_DRC_GRID_MAX_POINTS}',
+        f'DENSITY_DRC_GRID_SAVE_PDF = {DENSITY_DRC_GRID_SAVE_PDF}',
+        f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
+        f'NOISE_STD = {NOISE_STD}',
+        f'HELMHOLTZ_K = {HELMHOLTZ_K}',
+        f'HELMHOLTZ_DAMPING = {HELMHOLTZ_DAMPING}',
+        f'N = {N}, N_SOURCES = {N_SOURCES}, N_RECEIVERS = {N_RECEIVERS}, N_HOLDOUT_RECEIVERS = {N_HOLDOUT_RECEIVERS}',
+        f'HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}',
+        f'BUILD_GNL_BANKS = {BUILD_GNL_BANKS}',
+        f'PLOT_NORMALIZER = {PLOT_NORMALIZER}',
     ],
 )
-pipeline = run_standard_sampler_pipeline(prior_model, lik_model, SAMPLER_CONFIGS, n_ref=N_REF, build_gnl_banks=BUILD_GNL_BANKS, compute_pou=True)
+
+pipeline = run_standard_sampler_pipeline(
+    prior_model,
+    lik_model,
+    SAMPLER_CONFIGS,
+    n_ref=N_REF,
+    build_gnl_banks=BUILD_GNL_BANKS,
+    compute_pou=True,
+)
+precomp = pipeline['precomp']
 samples = pipeline['samples']
 ess_logs = pipeline['ess_logs']
 sampler_run_info = pipeline['sampler_run_info']
@@ -916,7 +1117,33 @@ reference_title = pipeline['reference_title']
 summarize_sampler_run(sampler_run_info)
 _sync_sampling_run_results_context()
 plot_mean_ess_logs(ess_logs, display_names=display_names)
-metrics = compute_latent_metrics(samples, reference_key, alpha_true_np, prior_model, lik_model, posterior_score_fn, display_names=display_names)
+
+# Surface the DRC density/energy benchmark produced by the ratio-only nodes.
+drc_energy_tables = precomp.get('drc_energy_benchmarks', {})
+if drc_energy_tables:
+    drc_energy_df = pd.concat(list(drc_energy_tables.values()), ignore_index=True)
+    print('\n=== DRC density/energy benchmark on MALA reference bank ===')
+    print(drc_energy_df.to_string(index=False))
+    dashboard.add_dataframe(
+        'DRC density/energy benchmark on MALA reference bank',
+        drc_energy_df,
+        max_rows=20,
+        max_cols=8,
+        include_index=False,
+    )
+else:
+    drc_energy_df = pd.DataFrame()
+    print("\nWARNING: no DRC density/energy benchmark was found in precomp['drc_energy_benchmarks'].")
+
+metrics = compute_latent_metrics(
+    samples,
+    reference_key,
+    alpha_true_np,
+    prior_model,
+    lik_model,
+    posterior_score_fn,
+    display_names=display_names,
+)
 
 gc.collect()
 if torch.cuda.is_available():
@@ -1088,12 +1315,12 @@ plot_normalizer_title = display_names.get(plot_normalizer_key, plot_normalizer_k
 _sync_sampling_run_results_context()
 plot_pca_histograms(samples, alpha_true_np, display_names=display_names, normalizer=plot_normalizer_key, metrics_dict=metrics, fallback_key=reference_key)
 
-results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(metrics, sampler_run_info, n_ref=N_REF, target_name='Helmholtz scattering', display_names=display_names, reference_name=reference_title)
+results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(metrics, sampler_run_info, n_ref=N_REF, target_name='Helmholtz scattering density evaluation', display_names=display_names, reference_name=reference_title)
 
 dashboard.add_results_tables(results_df, results_runinfo_df)
 
 save_reproducibility_log(
-    title='Helmholtz scattering HLSI run reproducibility log',
+    title='Helmholtz scattering density-evaluation reproducibility log',
     config={
         'seed': seed,
         'ACTIVE_DIM': ACTIVE_DIM,
@@ -1102,6 +1329,35 @@ save_reproducibility_log(
         'HESS_MIN': HESS_MIN,
         'HESS_MAX': HESS_MAX,
         'NOISE_STD': NOISE_STD,
+        'MALA_N_SAMPLES': MALA_N_SAMPLES,
+        'MALA_STEPS': MALA_STEPS,
+        'MALA_BURNIN': MALA_BURNIN,
+        'MALA_DT': MALA_DT,
+        'MALA_INIT': MALA_INIT,
+        'DENSITY_REF_SOURCE': DENSITY_REF_SOURCE,
+        'DENSITY_DRC_PF_STEPS': DENSITY_DRC_PF_STEPS,
+        'DENSITY_DRC_EVAL_BATCH_SIZE': DENSITY_DRC_EVAL_BATCH_SIZE,
+        'DENSITY_DRC_TMIN': DENSITY_DRC_TMIN,
+        'DENSITY_DRC_TMAX': DENSITY_DRC_TMAX,
+        'DENSITY_DRC_CLIP': DENSITY_DRC_CLIP,
+        'DENSITY_DRC_TEMPERATURE': DENSITY_DRC_TEMPERATURE,
+        'DENSITY_DRC_PLOT_AXIS_MODE': DENSITY_DRC_PLOT_AXIS_MODE,
+        'DENSITY_DRC_RESIDUAL_AXIS_MODE': DENSITY_DRC_RESIDUAL_AXIS_MODE,
+        'DENSITY_DRC_RESIDUAL_KIND': DENSITY_DRC_RESIDUAL_KIND,
+        'DENSITY_DRC_AFFINE_FIT_SCOPE': DENSITY_DRC_AFFINE_FIT_SCOPE,
+        'DENSITY_DRC_ROBUST_PERCENTILES': DENSITY_DRC_ROBUST_PERCENTILES,
+        'DENSITY_DRC_SAVE_RAW_PLOTS': DENSITY_DRC_SAVE_RAW_PLOTS,
+        'DENSITY_DRC_SAVE_LOGLOG_PLOTS': DENSITY_DRC_SAVE_LOGLOG_PLOTS,
+        'DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
+        'DENSITY_DRC_SAVE_LEGACY_ALIAS': DENSITY_DRC_SAVE_LEGACY_ALIAS,
+        'DENSITY_DRC_PLOT_LAYOUT': DENSITY_DRC_PLOT_LAYOUT,
+        'DENSITY_DRC_GRID_MAX_POINTS': DENSITY_DRC_GRID_MAX_POINTS,
+        'DENSITY_DRC_GRID_SAVE_PDF': DENSITY_DRC_GRID_SAVE_PDF,
+        'DENSITY_TWEEDIE_DIVERGENCE': DENSITY_TWEEDIE_DIVERGENCE,
+        'DENSITY_BLEND_DIVERGENCE': DENSITY_BLEND_DIVERGENCE,
+        'DENSITY_LFGI_DIVERGENCE': DENSITY_LFGI_DIVERGENCE,
+        'DENSITY_DIV_PROBES': DENSITY_DIV_PROBES,
+        'RUN_COMMAND_HINT': RUN_COMMAND_HINT,
         'HELDOUT_BATCH_SIZE': HELDOUT_BATCH_SIZE,
         'num_holdout_observation': num_holdout_observation,
         'N_HOLDOUT_RECEIVERS': N_HOLDOUT_RECEIVERS,
@@ -1112,6 +1368,9 @@ save_reproducibility_log(
     },
     extra_sections={
         'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path, 'dashboard_pdf': DASHBOARD_PDF_PATH},
+        'drc_density_energy_benchmark': (
+            drc_energy_df.to_dict('records') if isinstance(drc_energy_df, pd.DataFrame) and not drc_energy_df.empty else []
+        ),
         'summary_stats': {
             'reference_key': reference_key,
             'reference_title': reference_title,
@@ -1333,3 +1592,4 @@ dashboard.close()
 run_results_zip_path = zip_run_results_dir()
 print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
+print('\n=== Helmholtz density-evaluation pipeline complete ===')
