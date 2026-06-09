@@ -2424,6 +2424,403 @@ def _plot_drc_scatter(ax, x, y, xlabel, ylabel, title, axis_mode='robust',
     ax.grid(True, alpha=0.25)
 
 
+# -----------------------------------------------------------------------------
+# Publication-style comparison grid for DRC density-energy diagnostics
+# -----------------------------------------------------------------------------
+
+def _parse_label_sequence(value):
+    """Parse a label/order config that may be a tuple/list or comma string."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [x.strip() for x in value.replace(';', ',').split(',') if x.strip()]
+    try:
+        return [str(x).strip() for x in value if str(x).strip()]
+    except TypeError:
+        return [str(value).strip()] if str(value).strip() else []
+
+
+def _drc_method_pretty_name(label, cfg=None):
+    """Compact row label used in density-energy comparison figures."""
+    label_str = str(label)
+    init = None
+    if isinstance(cfg, dict):
+        init = canonicalize_init_name(cfg.get('drc_score_init', cfg.get('init', '')))
+    low = label_str.lower()
+    if init in {'ce_hlsi', 'hlsi_posterior', 'leaf_ce_hlsi', 'gnl_ce_hlsi'} or 'ce-hlsi' in low or 'hlsi' in low or 'lfgi' in low:
+        return 'CE-HLSI'
+    if init in {'scalar_blend', 'blend_posterior'} or 'blend' in low:
+        return 'Blend'
+    if init == 'tweedie' or 'tweedie' in low:
+        return 'Tweedie'
+    if isinstance(cfg, dict) and cfg.get('display_name'):
+        name = str(cfg.get('display_name'))
+        return name.replace('Density eval:', '').strip() or label_str
+    return label_str
+
+
+def _drc_method_order_key(label, cfg=None):
+    """Prefer the paper-facing row order CE-HLSI, Blend, Tweedie."""
+    name = _drc_method_pretty_name(label, cfg).lower()
+    if 'ce-hlsi' in name or 'hlsi' in name or 'lfgi' in name:
+        return (0, str(label))
+    if 'blend' in name:
+        return (1, str(label))
+    if 'tweedie' in name:
+        return (2, str(label))
+    return (10, str(label))
+
+
+def _affine_fit_np(x, y, mask=None):
+    """NumPy companion to the torch fit used in compute_drc_energy_benchmark_from_details."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if mask is None:
+        mask = finite
+    else:
+        mask = np.asarray(mask, dtype=bool).reshape(-1) & finite
+    if int(np.sum(mask)) < 3:
+        nan_arr = np.full_like(y, np.nan, dtype=np.float64)
+        return {
+            'slope': np.nan,
+            'intercept': np.nan,
+            'rmse_y': np.nan,
+            'rmse_energy_units': np.nan,
+            'r2': np.nan,
+            'resid_y': nan_arr.copy(),
+            'normalized_energy': nan_arr.copy(),
+            'normalized_resid_energy': nan_arr.copy(),
+            'fit_mask': mask,
+        }
+    xm = x[mask]
+    ym = y[mask]
+    xc = xm - np.mean(xm)
+    yc = ym - np.mean(ym)
+    denom = float(np.sum(xc * xc))
+    if not np.isfinite(denom) or denom <= 1e-30:
+        nan_arr = np.full_like(y, np.nan, dtype=np.float64)
+        return {
+            'slope': np.nan,
+            'intercept': np.nan,
+            'rmse_y': np.nan,
+            'rmse_energy_units': np.nan,
+            'r2': np.nan,
+            'resid_y': nan_arr.copy(),
+            'normalized_energy': nan_arr.copy(),
+            'normalized_resid_energy': nan_arr.copy(),
+            'fit_mask': mask,
+        }
+    a = float(np.sum(xc * yc) / denom)
+    b = float(np.mean(ym) - a * np.mean(xm))
+    yhat = b + a * x
+    resid = y - yhat
+    resid_m = y[mask] - (b + a * x[mask])
+    rmse_y = float(np.sqrt(np.mean(resid_m * resid_m)))
+    var_y = float(np.mean((ym - np.mean(ym)) ** 2))
+    r2 = float(1.0 - np.mean(resid_m * resid_m) / var_y) if var_y > 1e-30 else np.nan
+    if np.isfinite(a) and abs(a) > 1e-30:
+        normalized_energy = (y - b) / a
+        normalized_resid = normalized_energy - x
+        rmse_energy_units = float(np.sqrt(np.mean(normalized_resid[mask] ** 2)))
+    else:
+        normalized_energy = np.full_like(y, np.nan, dtype=np.float64)
+        normalized_resid = np.full_like(y, np.nan, dtype=np.float64)
+        rmse_energy_units = np.nan
+    return {
+        'slope': a,
+        'intercept': b,
+        'rmse_y': rmse_y,
+        'rmse_energy_units': rmse_energy_units,
+        'r2': r2,
+        'resid_y': resid,
+        'normalized_energy': normalized_energy,
+        'normalized_resid_energy': normalized_resid,
+        'fit_mask': mask,
+    }
+
+
+def _drc_energy_plot_payload_from_details(details, robust_percentiles=(1.0, 99.0),
+                                          affine_fit_scope='central'):
+    """Build arrays used by the publication-style DRC density-energy grid."""
+    logq = details['logq'].detach().double().cpu().numpy().reshape(-1)
+    log_target = details['log_target'].detach().double().cpu().numpy().reshape(-1)
+    energy = -log_target
+    neglogq = -logq
+    finite = np.isfinite(energy) & np.isfinite(neglogq)
+    if int(np.sum(finite)) >= 3:
+        lo, hi = robust_percentiles
+        qlo, qhi = np.percentile(energy[finite], [float(lo), float(hi)])
+        central_mask = finite & (energy >= float(qlo)) & (energy <= float(qhi))
+    else:
+        qlo, qhi = np.nan, np.nan
+        central_mask = finite
+    full_fit = _affine_fit_np(energy, neglogq, finite)
+    fit_scope = str(affine_fit_scope or 'central').strip().lower().replace('-', '_')
+    fit = _affine_fit_np(energy, neglogq, central_mask) if fit_scope in {'central', 'robust', 'trimmed'} else full_fit
+    return {
+        'energy': energy,
+        'neglogq': neglogq,
+        'finite_mask': finite,
+        'central_mask': central_mask,
+        'central_energy_lo': float(qlo),
+        'central_energy_hi': float(qhi),
+        'fit': fit,
+        'full_fit': full_fit,
+        'normalized_energy': fit['normalized_energy'],
+        'normalized_residual': fit['normalized_resid_energy'],
+    }
+
+
+def _drc_axis_limits_from_payload(payload, y_key, robust_percentiles=(1.0, 99.0),
+                                  pad_frac=0.04, force_include_zero=False):
+    x = np.asarray(payload['energy'], dtype=np.float64).reshape(-1)
+    y = np.asarray(payload[y_key], dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if int(np.sum(finite)) == 0:
+        return None, None
+    lo, hi = robust_percentiles
+    xlim = _robust_interval_np(x[finite], lo, hi, pad_frac=pad_frac)
+    ylim = _robust_interval_np(y[finite], lo, hi, pad_frac=pad_frac)
+    if ylim is not None and force_include_zero:
+        ylim = (min(float(ylim[0]), 0.0), max(float(ylim[1]), 0.0))
+        if ylim[1] <= ylim[0]:
+            ylim = (ylim[0] - 1.0, ylim[1] + 1.0)
+    return xlim, ylim
+
+
+def _thin_for_scatter(x, y, max_points=5000, seed=0):
+    """Deterministically thin very large clouds for plotting while preserving metrics."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    n = int(x.size)
+    max_points = int(max_points or 0)
+    if max_points > 0 and n > max_points:
+        rng = np.random.default_rng(int(seed))
+        idx = np.sort(rng.choice(n, size=max_points, replace=False))
+        x = x[idx]
+        y = y[idx]
+    return x, y
+
+
+def save_drc_energy_comparison_grid(details_by_label, cfg_by_label=None, save_dir=None,
+                                    run_stem=None, method_order=None,
+                                    axis_reference_label=None,
+                                    plot_axis_mode='robust', residual_axis_mode='robust',
+                                    robust_percentiles=(1.0, 99.0),
+                                    affine_fit_scope='central', residual_kind='affine_normalized',
+                                    max_points=5000, save_pdf=True):
+    """Save a paper-style array of DRC density-energy diagnostics.
+
+    Rows are methods and columns are: (1) affine-normalized estimated energy
+    against true energy, and (2) affine-normalized residual against true energy.
+    The default row ordering is CE-HLSI, Blend, Tweedie.  Axes are shared across
+    rows and are set by the CE-HLSI/reference-label arrays, matching the intended
+    paper comparison rather than allowing each method to choose its own window.
+    """
+    if not details_by_label:
+        return None
+    cfg_by_label = cfg_by_label or {}
+    available = [lab for lab in details_by_label.keys()]
+
+    requested_order = _parse_label_sequence(method_order)
+    labels = [lab for lab in requested_order if lab in details_by_label]
+    if not labels:
+        labels = sorted(available, key=lambda lab: _drc_method_order_key(lab, cfg_by_label.get(lab)))
+    else:
+        labels += [lab for lab in sorted(available, key=lambda lab: _drc_method_order_key(lab, cfg_by_label.get(lab))) if lab not in labels]
+
+    # A comparison plot is useful for one or more methods; one method simply gives a 1x2 panel.
+    if len(labels) == 0:
+        return None
+
+    payloads = OrderedDict()
+    for lab in labels:
+        payloads[lab] = _drc_energy_plot_payload_from_details(
+            details_by_label[lab], robust_percentiles=robust_percentiles,
+            affine_fit_scope=affine_fit_scope,
+        )
+
+    if axis_reference_label is None or axis_reference_label not in payloads:
+        ce_candidates = [lab for lab in labels if _drc_method_order_key(lab, cfg_by_label.get(lab))[0] == 0]
+        axis_reference_label = ce_candidates[0] if ce_candidates else labels[0]
+    ref_payload = payloads[axis_reference_label]
+    xlim_reg, ylim_reg = _drc_axis_limits_from_payload(
+        ref_payload, 'normalized_energy', robust_percentiles=robust_percentiles,
+        pad_frac=0.035, force_include_zero=False,
+    )
+    xlim_resid, ylim_resid = _drc_axis_limits_from_payload(
+        ref_payload, 'normalized_residual', robust_percentiles=robust_percentiles,
+        pad_frac=0.06, force_include_zero=True,
+    )
+    # Keep the same true-energy x-axis in both columns.
+    if xlim_reg is not None:
+        xlim_resid = xlim_reg
+    if xlim_reg is None:
+        xlim_reg = xlim_resid
+
+    n_rows = len(labels)
+    fig_h = max(2.15 * n_rows + 0.75, 3.2)
+    fig_w = 7.25
+    # Match the manuscript's clean black/white article style: no seaborn, no color cycle dependence,
+    # compact sans labels, light grid, rasterized dense point clouds.
+    rc = {
+        'font.family': 'sans-serif',
+        'font.size': 8.5,
+        'axes.titlesize': 9.5,
+        'axes.labelsize': 8.8,
+        'xtick.labelsize': 7.8,
+        'ytick.labelsize': 7.8,
+        'legend.fontsize': 7.2,
+        'axes.linewidth': 0.8,
+        'figure.dpi': 150,
+        'savefig.dpi': 300,
+    }
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(
+            n_rows, 2, figsize=(fig_w, fig_h), squeeze=False,
+            sharex='col', constrained_layout=True,
+        )
+        fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, hspace=0.045, wspace=0.045)
+        axes[0, 0].set_title('Affine-normalized density energy')
+        axes[0, 1].set_title('Affine residual')
+
+        for row, lab in enumerate(labels):
+            cfg = cfg_by_label.get(lab, {})
+            pretty = _drc_method_pretty_name(lab, cfg)
+            payload = payloads[lab]
+            fit = payload['fit']
+            energy = payload['energy']
+            q_aff = payload['normalized_energy']
+            resid = payload['normalized_residual']
+            seed = sum((i + 1) * ord(ch) for i, ch in enumerate(str(lab))) % (2 ** 32)
+
+            ax = axes[row, 0]
+            xs, ys = _thin_for_scatter(energy, q_aff, max_points=max_points, seed=seed)
+            ax.scatter(xs, ys, s=5.0, alpha=0.32, linewidths=0.0, rasterized=True)
+            if xlim_reg is not None:
+                ax.set_xlim(*xlim_reg)
+            if ylim_reg is not None:
+                ax.set_ylim(*ylim_reg)
+            if xlim_reg is not None and ylim_reg is not None:
+                lo_line = max(min(xlim_reg), min(ylim_reg))
+                hi_line = min(max(xlim_reg), max(ylim_reg))
+                if np.isfinite(lo_line) and np.isfinite(hi_line) and hi_line > lo_line:
+                    ax.plot([lo_line, hi_line], [lo_line, hi_line], color='0.15', linewidth=0.9, alpha=0.85)
+            ax.grid(True, color='0.85', linewidth=0.45, alpha=0.55)
+            ax.tick_params(direction='out', length=2.5, width=0.7)
+            ax.text(
+                0.02, 0.97,
+                f"{pretty}\n$a$={fit['slope']:.3g}, $b$={fit['intercept']:.3g}\n$R^2$={fit['r2']:.3f}",
+                transform=ax.transAxes, ha='left', va='top', fontsize=7.4,
+                bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.72', alpha=0.88),
+            )
+
+            axr = axes[row, 1]
+            xs_r, ys_r = _thin_for_scatter(energy, resid, max_points=max_points, seed=seed + 17)
+            axr.scatter(xs_r, ys_r, s=5.0, alpha=0.32, linewidths=0.0, rasterized=True)
+            axr.axhline(0.0, color='0.15', linewidth=0.85, alpha=0.85)
+            if xlim_resid is not None:
+                axr.set_xlim(*xlim_resid)
+            if ylim_resid is not None:
+                axr.set_ylim(*ylim_resid)
+            axr.grid(True, color='0.85', linewidth=0.45, alpha=0.55)
+            axr.tick_params(direction='out', length=2.5, width=0.7)
+            axr.text(
+                0.02, 0.97,
+                f"{pretty}\nRMSE={fit['rmse_energy_units']:.3g}",
+                transform=axr.transAxes, ha='left', va='top', fontsize=7.4,
+                bbox=dict(boxstyle='round,pad=0.22', facecolor='white', edgecolor='0.72', alpha=0.88),
+            )
+
+            if row == n_rows - 1:
+                ax.set_xlabel(r'True energy $E(x)=-\log\tilde\pi(x)$')
+                axr.set_xlabel(r'True energy $E(x)=-\log\tilde\pi(x)$')
+            ax.set_ylabel(r'$Q_{\rm aff}(x)=(-\log q(x)-b)/a$')
+            axr.set_ylabel(r'$Q_{\rm aff}(x)-E(x)$')
+
+        # Keep the figure itself caption-ready; the axis-reference convention is
+        # encoded in the saved filename and can be described in the manuscript caption.
+
+    if save_dir is None:
+        return fig
+    os.makedirs(save_dir, exist_ok=True)
+    stem = run_stem or RUN_RESULTS_STEM or 'drc_energy_benchmark'
+    axis_safe = _sanitize_run_results_name(axis_reference_label)
+    pct_safe = f'{float(robust_percentiles[0]):g}-{float(robust_percentiles[1]):g}'.replace('.', 'p')
+    path_base = os.path.join(save_dir, f'{stem}_drc_density_energy_comparison_grid_{axis_safe}_{pct_safe}_axes')
+    png_path = path_base + '.png'
+    fig.savefig(png_path, dpi=300, bbox_inches='tight', pad_inches=0.02)
+    print(f'Saved DRC density-energy comparison grid to {png_path}')
+    pdf_path = None
+    if save_pdf:
+        pdf_path = path_base + '.pdf'
+        fig.savefig(pdf_path, bbox_inches='tight', pad_inches=0.02)
+        print(f'Saved DRC density-energy comparison grid PDF to {pdf_path}')
+    # Prevent the patched plt.show() hook from saving the same grid a second time.
+    fig._run_results_saved = True
+    return {'png': png_path, 'pdf': pdf_path, 'figure': fig, 'labels': labels, 'axis_reference_label': axis_reference_label}
+
+
+def finalize_drc_energy_benchmark_plots(precomp, normalized_configs):
+    """Create the comparison-grid DRC density plot after all DRC-R nodes have run."""
+    details_all = precomp.get('drc_details', {}) if isinstance(precomp, dict) else {}
+    if not details_all:
+        return None
+
+    eligible = []
+    for label, cfg in normalized_configs.items():
+        if label not in details_all:
+            continue
+        if not _config_bool(cfg.get('drc_energy_benchmark', False)):
+            continue
+        if not _config_bool(cfg.get('drc_energy_plots', True)):
+            continue
+        layout = str(cfg.get('drc_energy_plot_layout', 'comparison_grid')).strip().lower().replace('-', '_')
+        if layout in {'comparison_grid', 'grid', 'array', 'publication', 'paper', 'both'}:
+            eligible.append(label)
+    if not eligible:
+        return None
+
+    # Use the first eligible config as the global plotting config; the benchmark scripts set these uniformly.
+    base_cfg = normalized_configs[eligible[0]]
+    robust_percentiles = base_cfg.get('drc_energy_robust_percentiles', (1.0, 99.0))
+    if isinstance(robust_percentiles, str):
+        parts = [float(x.strip()) for x in robust_percentiles.replace(';', ',').split(',') if x.strip()]
+        robust_percentiles = tuple(parts[:2]) if len(parts) >= 2 else (1.0, 99.0)
+    method_order = base_cfg.get('drc_energy_grid_method_order', None)
+    axis_ref = base_cfg.get('drc_energy_grid_axis_reference', None)
+    if axis_ref is None:
+        axis_ref = base_cfg.get('drc_energy_axis_reference_label', None)
+
+    details_by_label = OrderedDict((label, details_all[label]) for label in eligible)
+    cfg_by_label = {label: normalized_configs.get(label, {}) for label in eligible}
+    try:
+        out = save_drc_energy_comparison_grid(
+            details_by_label,
+            cfg_by_label=cfg_by_label,
+            save_dir=RUN_RESULTS_DIR,
+            run_stem=RUN_RESULTS_STEM,
+            method_order=method_order,
+            axis_reference_label=axis_ref,
+            plot_axis_mode=base_cfg.get('drc_energy_plot_axis_mode', 'robust'),
+            residual_axis_mode=base_cfg.get('drc_energy_residual_axis_mode', 'robust'),
+            robust_percentiles=robust_percentiles,
+            affine_fit_scope=base_cfg.get('drc_energy_affine_fit_scope', 'central'),
+            residual_kind=base_cfg.get('drc_energy_residual_kind', 'affine_normalized'),
+            max_points=int(base_cfg.get('drc_energy_grid_max_points', 5000)),
+            save_pdf=_config_bool(base_cfg.get('drc_energy_grid_save_pdf', True)),
+        )
+        precomp['drc_energy_comparison_grid'] = out
+        return out
+    except Exception as exc:
+        warnings.warn(f'DRC density-energy comparison grid failed: {exc}', RuntimeWarning)
+        return None
+
+
 def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=None,
                                               run_stem=None, make_plots=True,
                                               plot_axis_mode='robust',
@@ -4456,6 +4853,16 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg['drc_energy_save_loglog_plots'] = _config_bool(cfg['drc_energy_save_loglog_plots'])
     cfg.setdefault('drc_energy_save_legacy_alias', True)
     cfg['drc_energy_save_legacy_alias'] = _config_bool(cfg['drc_energy_save_legacy_alias'])
+    # Plot layout for density-energy diagnostics.  The paper-facing default is a
+    # single method-comparison grid; set to 'individual' for the legacy one-plot-per-method
+    # behavior or 'both' for both outputs.
+    cfg.setdefault('drc_energy_plot_layout', 'comparison_grid')
+    cfg.setdefault('drc_energy_grid_method_order', ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie'))
+    cfg.setdefault('drc_energy_grid_axis_reference', 'DENS-CE-HLSI')
+    cfg.setdefault('drc_energy_grid_max_points', 5000)
+    cfg['drc_energy_grid_max_points'] = int(max(100, cfg['drc_energy_grid_max_points']))
+    cfg.setdefault('drc_energy_grid_save_pdf', True)
+    cfg['drc_energy_grid_save_pdf'] = _config_bool(cfg['drc_energy_grid_save_pdf'])
     cfg.setdefault('drc_tmin', cfg.get('init_tmin', 10 ** (-2.5)))
     cfg.setdefault('drc_tmax', cfg.get('init_tmax', 10.0))
     cfg['drc_tmin'] = float(cfg['drc_tmin'])
@@ -4794,11 +5201,16 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
                 if isinstance(robust_percentiles, str):
                     parts = [float(x.strip()) for x in robust_percentiles.replace(';', ',').split(',') if x.strip()]
                     robust_percentiles = tuple(parts[:2]) if len(parts) >= 2 else (1.0, 99.0)
+                plot_layout = str(cfg.get('drc_energy_plot_layout', 'comparison_grid')).strip().lower().replace('-', '_')
+                individual_plots = (
+                    _config_bool(cfg.get('drc_energy_plots', True))
+                    and plot_layout in {'individual', 'legacy', 'single', 'separate', 'both'}
+                )
                 precomp.setdefault('drc_energy_benchmarks', {})[label] = compute_drc_energy_benchmark_from_details(
                     drc_details, label=label,
                     save_dir=RUN_RESULTS_DIR,
                     run_stem=RUN_RESULTS_STEM,
-                    make_plots=_config_bool(cfg.get('drc_energy_plots', True)),
+                    make_plots=individual_plots,
                     plot_axis_mode=cfg.get('drc_energy_plot_axis_mode', 'robust'),
                     residual_axis_mode=cfg.get('drc_energy_residual_axis_mode', 'signed_log'),
                     robust_percentiles=robust_percentiles,
@@ -5217,6 +5629,7 @@ def run_tree_sampler_suite(sampler_configs, prior_model, lik_model, n_ref=10000,
 
     precomp['included_result_labels'] = included_result_labels
     precomp['excluded_result_labels'] = excluded_result_labels
+    finalize_drc_energy_benchmark_plots(precomp, normalized)
     return samples, ess_logs, run_info, precomp
 
 
