@@ -860,9 +860,9 @@ DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE', 'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', N_REF)
-MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 400)
-MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 100)
-MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
+MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
+MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 4.0e-5)
 
 if MALA_N_SAMPLES < N_REF:
     raise ValueError(
@@ -1029,7 +1029,7 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
     }
 
-'''
+
 # MALA reference bank for density benchmark
 DENSITY_REF_SOURCE = 'MALA'
 
@@ -1070,9 +1070,11 @@ SAMPLER_CONFIGS = OrderedDict([
         'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
     )),
 ])
+
+
+
+
 '''
-
-
 SAMPLER_CONFIGS = OrderedDict([
     # Bootstrap reference construction: two alternating DRC-LFGI rounds.
     # Round 0 builds an initial LFGI proposal from the prior/reference bank.
@@ -1139,7 +1141,7 @@ SAMPLER_CONFIGS = OrderedDict([
         'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
     )),
 ])
-
+'''
 
 
 pipeline = run_standard_sampler_pipeline(
