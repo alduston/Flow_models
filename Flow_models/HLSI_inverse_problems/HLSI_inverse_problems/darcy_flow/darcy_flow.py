@@ -758,13 +758,13 @@ def solve_full_pressure(alpha):
 # ==========================================
 ACTIVE_DIM = num_truncated_series
 PLOT_NORMALIZER = 'best'
-HESS_MIN = 1e-8
+HESS_MIN = 1e-4
 HESS_MAX = 1e6
 GNL_PILOT_N = 1024
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
 GNL_USE_DOMINANT_PARTICLE_NEWTON = True
-DEFAULT_N_GEN = 4000
-N_REF = 4000
+DEFAULT_N_GEN = 2000
+N_REF = 2000
 BUILD_GNL_BANKS = False
 
 # ==========================================
@@ -831,20 +831,23 @@ BOOT_DRC_TEMPERATURE = _env_float('IP_DENSITY_BOOT_DRC_TEMPERATURE', 1.0)
 
 # Density-evaluation correction-factor benchmark on the final bootstrapped bank.
 DENSITY_REF_SOURCE = os.environ.get('IP_DENSITY_REF_SOURCE', 'ALT-DRC-LFGI3')
-DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 64)
+DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 32)
 DENSITY_DRC_EVAL_BATCH_SIZE = _env_int('IP_DENSITY_DRC_EVAL_BATCH_SIZE', 32)
 DENSITY_DRC_TMIN = _env_float('IP_DENSITY_DRC_TMIN', 10 ** (-2.5))
-DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 3.0)
+DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 10.0)
 DENSITY_DRC_CLIP = _env_float_or_none('IP_DENSITY_DRC_CLIP', None)
 DENSITY_DRC_TEMPERATURE = _env_float('IP_DENSITY_DRC_TEMPERATURE', 1.0)
 DENSITY_DRC_ENERGY_PLOTS = _env_bool('IP_DENSITY_DRC_ENERGY_PLOTS', True)
 DENSITY_DRC_PLOT_AXIS_MODE = os.environ.get('IP_DENSITY_DRC_PLOT_AXIS_MODE', 'robust')
 DENSITY_DRC_RESIDUAL_AXIS_MODE = os.environ.get('IP_DENSITY_DRC_RESIDUAL_AXIS_MODE', 'robust')
-DENSITY_DRC_ROBUST_PERCENTILES = _env_percentile_pair('IP_DENSITY_DRC_ROBUST_PERCENTILES', (2.0, 98.0))
+DENSITY_DRC_RESIDUAL_KIND = os.environ.get('IP_DENSITY_DRC_RESIDUAL_KIND', 'affine_normalized')
+DENSITY_DRC_AFFINE_FIT_SCOPE = os.environ.get('IP_DENSITY_DRC_AFFINE_FIT_SCOPE', 'central')
+DENSITY_DRC_ROBUST_PERCENTILES = _env_percentile_pair('IP_DENSITY_DRC_ROBUST_PERCENTILES', (1.0, 99.0))
 # Keep only the robust/truncated primary plots by default. Set these to 1 if you
 # want raw full-range or log-log companion figures for audit/debug runs.
 DENSITY_DRC_SAVE_RAW_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_RAW_PLOTS', False)
 DENSITY_DRC_SAVE_LOGLOG_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_LOGLOG_PLOTS', False)
+DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS', False)
 DENSITY_DRC_SAVE_LEGACY_ALIAS = _env_bool('IP_DENSITY_DRC_SAVE_LEGACY_ALIAS', True)
 
 # Divergence defaults by score family. Tweedie and CE-HLSI/LFGI use analytic
@@ -857,8 +860,8 @@ DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE', 'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', N_REF)
-MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 400)
-MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 100)
+MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 100)
+MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 25)
 MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
 
 if MALA_N_SAMPLES < N_REF:
@@ -935,9 +938,12 @@ dashboard.add_text_page(
         f'DENSITY_DRC_CLIP = {DENSITY_DRC_CLIP}',
         f'DENSITY_DRC_PLOT_AXIS_MODE = {DENSITY_DRC_PLOT_AXIS_MODE}',
         f'DENSITY_DRC_RESIDUAL_AXIS_MODE = {DENSITY_DRC_RESIDUAL_AXIS_MODE}',
+        f'DENSITY_DRC_RESIDUAL_KIND = {DENSITY_DRC_RESIDUAL_KIND}',
+        f'DENSITY_DRC_AFFINE_FIT_SCOPE = {DENSITY_DRC_AFFINE_FIT_SCOPE}',
         f'DENSITY_DRC_ROBUST_PERCENTILES = {DENSITY_DRC_ROBUST_PERCENTILES}',
         f'DENSITY_DRC_SAVE_RAW_PLOTS = {DENSITY_DRC_SAVE_RAW_PLOTS}',
         f'DENSITY_DRC_SAVE_LOGLOG_PLOTS = {DENSITY_DRC_SAVE_LOGLOG_PLOTS}',
+        f'DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS = {DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS}',
         f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
         f'NOISE_STD = {NOISE_STD}',
         f'N = {N}, num_observation = {num_observation}, num_holdout_observation = {num_holdout_observation}',
@@ -1014,12 +1020,14 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         'drc_energy_plots': DENSITY_DRC_ENERGY_PLOTS,
         'drc_energy_plot_axis_mode': DENSITY_DRC_PLOT_AXIS_MODE,
         'drc_energy_residual_axis_mode': DENSITY_DRC_RESIDUAL_AXIS_MODE,
+        'drc_energy_residual_kind': DENSITY_DRC_RESIDUAL_KIND,
+        'drc_energy_affine_fit_scope': DENSITY_DRC_AFFINE_FIT_SCOPE,
         'drc_energy_robust_percentiles': DENSITY_DRC_ROBUST_PERCENTILES,
         'drc_energy_save_raw_plots': DENSITY_DRC_SAVE_RAW_PLOTS,
         'drc_energy_save_loglog_plots': DENSITY_DRC_SAVE_LOGLOG_PLOTS,
+        'drc_energy_save_logratio_residual_plots': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
     }
-
 
 
 # MALA reference bank for density benchmark
@@ -1062,7 +1070,6 @@ SAMPLER_CONFIGS = OrderedDict([
         'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
     )),
 ])
-
 
 
 '''
@@ -1316,9 +1323,12 @@ save_reproducibility_log(
         'DENSITY_DRC_TEMPERATURE': DENSITY_DRC_TEMPERATURE,
         'DENSITY_DRC_PLOT_AXIS_MODE': DENSITY_DRC_PLOT_AXIS_MODE,
         'DENSITY_DRC_RESIDUAL_AXIS_MODE': DENSITY_DRC_RESIDUAL_AXIS_MODE,
+        'DENSITY_DRC_RESIDUAL_KIND': DENSITY_DRC_RESIDUAL_KIND,
+        'DENSITY_DRC_AFFINE_FIT_SCOPE': DENSITY_DRC_AFFINE_FIT_SCOPE,
         'DENSITY_DRC_ROBUST_PERCENTILES': DENSITY_DRC_ROBUST_PERCENTILES,
         'DENSITY_DRC_SAVE_RAW_PLOTS': DENSITY_DRC_SAVE_RAW_PLOTS,
         'DENSITY_DRC_SAVE_LOGLOG_PLOTS': DENSITY_DRC_SAVE_LOGLOG_PLOTS,
+        'DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         'DENSITY_DRC_SAVE_LEGACY_ALIAS': DENSITY_DRC_SAVE_LEGACY_ALIAS,
         'DENSITY_TWEEDIE_DIVERGENCE': DENSITY_TWEEDIE_DIVERGENCE,
         'DENSITY_BLEND_DIVERGENCE': DENSITY_BLEND_DIVERGENCE,
