@@ -876,9 +876,9 @@ DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
 # Same MALA reference-bank configuration style/defaults as the other density scripts.
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', N_REF)
-MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 500)
-MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 100)
-MALA_DT = _env_float('IP_DENSITY_MALA_DT', 3.0e-5)
+MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
+MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 6.0e-5)
 # Default to a target-side MAP/Laplace proxy initialization for MALA.  This is
 # distinct from the older reference-bank `ref_laplace` mode: `map_laplace` first
 # optimizes the posterior and samples N(map, observed_info(map)^{-1}).
