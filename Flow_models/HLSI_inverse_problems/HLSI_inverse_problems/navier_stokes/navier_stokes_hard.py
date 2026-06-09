@@ -839,9 +839,9 @@ DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
 # Divergence defaults matching the Darcy density script.  CE-HLSI and Tweedie
 # dispatch to analytic implementations in sampling.py; scalar blend
 # uses Hutchinson by default for speed.
-DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'auto')                #'auto')
-DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE',     'coordinate_fd')       #'auto')
-DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE',       'analytic')            #'auto')
+DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'hutchinson')            #'auto')
+DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE',     'hutchinson')            #'auto')
+DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE',       'hutchinson')            #'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
 # Same MALA reference-bank configuration style/defaults as Darcy.
