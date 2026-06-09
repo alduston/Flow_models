@@ -3550,6 +3550,192 @@ def sample_ref_laplace(n_samples, bank, log_weight_key='log_mass_ref'):
     return samples, info
 
 
+
+
+def _posterior_logprob_and_score(prior_model, lik_model, x):
+    """Evaluate log posterior and score for a batch of latent points."""
+    log_prior = prior_model.log_prob(x)
+    log_lik, grad_lik = lik_model.log_likelihood_and_grad(x)
+    score_prior = prior_model.score0(x)
+    return log_prior + log_lik, score_prior + grad_lik, log_lik
+
+
+def _stabilize_map_precision(P_raw, min_precision=None, max_precision=None, label='map_laplace'):
+    """Symmetrize and spectrally clamp an observed-information matrix."""
+    if min_precision is None:
+        min_precision = max(float(HESS_MIN), 1e-8)
+    if max_precision is None:
+        max_precision = float(HESS_MAX) if np.isfinite(float(HESS_MAX)) else 1e12
+    P_raw = 0.5 * (P_raw + P_raw.T)
+    evals, evecs = _safe_single_symmetric_eigh(P_raw, label=label)
+    evals_clamped = torch.clamp(evals, min=float(min_precision), max=float(max_precision))
+    P = (evecs * evals_clamped.unsqueeze(0)) @ evecs.T
+    P = 0.5 * (P + P.T)
+    return P, evals, evals_clamped, evecs
+
+
+def build_map_laplace_component(prior_model, lik_model, n_starts=128, max_iter=25,
+                                tol=1e-5, ridge=1e-6, max_step_norm=2.0,
+                                backtrack_steps=8, verbose=True):
+    """Build a MAP-centered Gaussian Laplace approximation to the posterior.
+
+    This is a true target-side MAP/Laplace proxy, independent of a reference bank.
+    It first chooses the best point from a small prior pilot cloud, then performs
+    damped Newton/Gauss-Newton ascent using the posterior score and observed
+    information P(x) = I - Hessian(log likelihood)(x).  The returned precision is
+    the spectrally stabilized observed information at the final MAP estimate.
+    """
+    n_starts = int(max(1, n_starts))
+    max_iter = int(max(0, max_iter))
+    backtrack_steps = int(max(0, backtrack_steps))
+    d = int(prior_model.dim)
+    I = torch.eye(d, device=device, dtype=torch.float64)
+
+    with torch.no_grad():
+        # Include the prior mean as one candidate, since it is often a safer
+        # starting point than a pure random cloud in very small-noise inverse problems.
+        n_random = max(0, n_starts - 1)
+        starts = prior_model.sample(n_random) if n_random > 0 else torch.empty((0, d), device=device, dtype=torch.float64)
+        starts = torch.cat([torch.zeros((1, d), device=device, dtype=torch.float64), starts], dim=0)
+        logp_starts, _, loglik_starts = _posterior_logprob_and_score(prior_model, lik_model, starts)
+        best_idx = int(torch.argmax(logp_starts).item())
+        x = starts[best_idx:best_idx + 1].clone()
+        cur_logp = logp_starts[best_idx:best_idx + 1].clone()
+        cur_loglik = loglik_starts[best_idx:best_idx + 1].clone()
+        if verbose:
+            print(
+                f"[MAP-Laplace] pilot starts={n_starts}, best_idx={best_idx}, "
+                f"logpost={float(cur_logp.item()):.6g}, loglik={float(cur_loglik.item()):.6g}, "
+                f"||x||={float(torch.linalg.vector_norm(x[0]).item()):.4g}"
+            )
+
+        n_accept = 0
+        last_step_norm = float('nan')
+        last_grad_norm = float('nan')
+        last_alpha = 0.0
+        for it in range(max_iter):
+            logp, score, loglik = _posterior_logprob_and_score(prior_model, lik_model, x)
+            hess_lik = lik_model.hess_log_likelihood(x)[0]
+            P_raw = I - 0.5 * (hess_lik + hess_lik.T)
+            P, raw_eigs, clamped_eigs, _ = _stabilize_map_precision(
+                P_raw + float(ridge) * I,
+                min_precision=max(float(HESS_MIN), float(ridge), 1e-10),
+                max_precision=float(HESS_MAX),
+                label='map_laplace:newton_precision',
+            )
+            step = torch.linalg.solve(P, score[0])
+            step_norm = float(torch.linalg.vector_norm(step).item())
+            grad_norm = float(torch.linalg.vector_norm(score[0]).item())
+            last_step_norm = step_norm
+            last_grad_norm = grad_norm
+            if step_norm > float(max_step_norm) > 0.0:
+                step = step * (float(max_step_norm) / max(step_norm, 1e-300))
+                step_norm = float(max_step_norm)
+
+            accepted = False
+            alpha = 1.0
+            best_x = x
+            best_logp = logp
+            best_loglik = loglik
+            for bt in range(backtrack_steps + 1):
+                x_prop = x + alpha * step.unsqueeze(0)
+                prop_logp, _, prop_loglik = _posterior_logprob_and_score(prior_model, lik_model, x_prop)
+                if torch.isfinite(prop_logp).all() and float(prop_logp.item()) >= float(logp.item()) - 1e-10:
+                    best_x, best_logp, best_loglik = x_prop, prop_logp, prop_loglik
+                    accepted = True
+                    break
+                alpha *= 0.5
+            last_alpha = alpha if accepted else 0.0
+            if not accepted:
+                if verbose:
+                    print(f"[MAP-Laplace] iter={it:02d}: no ascent step accepted; stopping")
+                cur_logp = logp
+                cur_loglik = loglik
+                break
+
+            x = best_x.detach().clone()
+            cur_logp = best_logp.detach().clone()
+            cur_loglik = best_loglik.detach().clone()
+            n_accept += 1
+            if verbose:
+                print(
+                    f"[MAP-Laplace] iter={it:02d}: logpost={float(cur_logp.item()):.6g}, "
+                    f"loglik={float(cur_loglik.item()):.6g}, ||score||={grad_norm:.3g}, "
+                    f"step={step_norm:.3g}, alpha={last_alpha:.3g}"
+                )
+            if step_norm * max(last_alpha, 0.0) < float(tol):
+                break
+
+        # Final precision at the accepted MAP point.
+        final_logp, final_score, final_loglik = _posterior_logprob_and_score(prior_model, lik_model, x)
+        hess_lik = lik_model.hess_log_likelihood(x)[0]
+        P_raw = I - 0.5 * (hess_lik + hess_lik.T)
+        P, raw_eigs, clamped_eigs, _ = _stabilize_map_precision(
+            P_raw + float(ridge) * I,
+            min_precision=max(float(HESS_MIN), float(ridge), 1e-10),
+            max_precision=float(HESS_MAX),
+            label='map_laplace:final_precision',
+        )
+        map_x = x[0].detach().clone()
+        component = {
+            'selected_ref_index': -1,
+            'selected_log_mass': float(final_logp.item()),
+            'x_map': map_x,
+            'mean': map_x,
+            'precision': P.detach().clone(),
+            'raw_precision_eigs': raw_eigs.detach().clone(),
+            'precision_eigs': clamped_eigs.detach().clone(),
+            'map_logpost': float(final_logp.item()),
+            'map_loglik': float(final_loglik.item()),
+            'map_score_norm': float(torch.linalg.vector_norm(final_score[0]).item()),
+            'pilot_best_index': int(best_idx),
+            'n_starts': int(n_starts),
+            'n_newton_accept': int(n_accept),
+            'last_step_norm': float(last_step_norm),
+            'last_grad_norm': float(last_grad_norm),
+            'last_alpha': float(last_alpha),
+        }
+    return component
+
+
+def sample_map_laplace(n_samples, prior_model, lik_model, n_starts=128, max_iter=25,
+                       tol=1e-5, ridge=1e-6, max_step_norm=2.0,
+                       backtrack_steps=8, verbose=True, return_component=False):
+    """Draw samples from a MAP-centered Gaussian Laplace approximation."""
+    component = build_map_laplace_component(
+        prior_model, lik_model,
+        n_starts=n_starts, max_iter=max_iter, tol=tol, ridge=ridge,
+        max_step_norm=max_step_norm, backtrack_steps=backtrack_steps,
+        verbose=verbose,
+    )
+    samples = sample_gaussian_from_precision(component['mean'], component['precision'], int(n_samples), eps=max(float(ridge), 1e-10))
+    cov_eigs = torch.clamp(component['precision_eigs'], min=max(float(ridge), 1e-10))
+    info = {
+        'map_logpost': float(component['map_logpost']),
+        'map_loglik': float(component['map_loglik']),
+        'map_energy': float(-component['map_logpost']),
+        'map_score_norm': float(component['map_score_norm']),
+        'map_norm': float(torch.linalg.vector_norm(component['x_map']).item()),
+        'n_starts': int(component['n_starts']),
+        'newton_accept': int(component['n_newton_accept']),
+        'last_step_norm': float(component['last_step_norm']),
+        'last_grad_norm': float(component['last_grad_norm']),
+        'last_alpha': float(component['last_alpha']),
+        'precision_min_eig_raw': float(torch.min(component['raw_precision_eigs']).item()),
+        'precision_max_eig_raw': float(torch.max(component['raw_precision_eigs']).item()),
+        'precision_min_eig': float(torch.min(component['precision_eigs']).item()),
+        'precision_max_eig': float(torch.max(component['precision_eigs']).item()),
+        'component_cov_trace': float(torch.sum(torch.reciprocal(cov_eigs)).item()),
+        'score_norm_initial': float('nan'),
+        'score_norm_mean': float('nan'),
+        'score_norm_final': float('nan'),
+        'score_norm_max': float('nan'),
+        'score_norm_num_steps': 0,
+    }
+    if return_component:
+        return samples, info, component
+    return samples, info
+
 def _make_frozen_mala_preconditioner(component, ridge=1e-10):
     """
     Build a fixed global MALA preconditioner from the same dominant reference
@@ -4295,6 +4481,12 @@ INIT_ALIASES = {
     _normalize_sampler_key('ref-laplace'): 'ref_laplace',
     _normalize_sampler_key('ref_laplace'): 'ref_laplace',
     _normalize_sampler_key('ref laplace'): 'ref_laplace',
+    _normalize_sampler_key('map-laplace'): 'map_laplace',
+    _normalize_sampler_key('map_laplace'): 'map_laplace',
+    _normalize_sampler_key('map laplace'): 'map_laplace',
+    _normalize_sampler_key('map-laplace-proxy'): 'map_laplace',
+    _normalize_sampler_key('map_laplace_proxy'): 'map_laplace',
+    _normalize_sampler_key('laplace-map'): 'map_laplace',
     _normalize_sampler_key('hlsi'): 'hlsi_posterior',
     _normalize_sampler_key('hlsi_posterior'): 'hlsi_posterior',
     _normalize_sampler_key('ce-hlsi'): 'ce_hlsi',
@@ -4349,6 +4541,7 @@ INIT_DISPLAY_NAMES = {
     'tweedie': 'Tweedie',
     'blend_posterior': 'Blend',
     'ref_laplace': 'Ref_Laplace',
+    'map_laplace': 'MAP_Laplace',
     'hlsi_posterior': 'HLSI',
     'ce_hlsi': 'CE-HLSI',
     'drc_ratio_update': 'DRC-R',
@@ -4777,6 +4970,8 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
         cfg['init_weights'] = canonicalize_init_weights(
             cfg.get('init_weights', implied_weights if implied_weights is not None else 'WC')
         )
+    elif cfg['init'] == 'map_laplace':
+        cfg['init_weights'] = 'None'
     elif cfg['init'] == 'drc_ratio_update':
         # DRC-R is a ratio-only R-step.  By default it estimates q from an
         # unweighted CE-HLSI proposal on the current references; advanced
@@ -4797,10 +4992,10 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('display_name', str(label))
     cfg.setdefault('canonical_display_name', format_sampler_display_name(
         cfg['init'], 'L' if cfg['init'] == 'prior' else cfg['init_weights']))
-    cfg.setdefault('init_steps', 0 if cfg['init'] in {'prior', 'ref_laplace', 'drc_ratio_update'} else 200)
+    cfg.setdefault('init_steps', 0 if cfg['init'] in {'prior', 'ref_laplace', 'map_laplace', 'drc_ratio_update'} else 200)
     cfg.setdefault('init_tmax', 10.0)
     cfg.setdefault('init_tmin', 10 ** (-2.5))
-    cfg.setdefault('log_mean_ess', cfg['init'] not in {'prior', 'ref_laplace', 'drc_ratio_update'})
+    cfg.setdefault('log_mean_ess', cfg['init'] not in {'prior', 'ref_laplace', 'map_laplace', 'drc_ratio_update'})
     cfg.setdefault('n_samples', default_n_samples)
     cfg['n_samples'] = int(cfg['n_samples'])
     cfg.setdefault('n_ref', None)
@@ -4812,6 +5007,18 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('mala_dt', 5e-4)
     cfg.setdefault('precond_mala', False)
     cfg['precond_mala'] = bool(cfg['precond_mala'])
+    cfg.setdefault('map_laplace_starts', 128)
+    cfg['map_laplace_starts'] = int(max(1, cfg['map_laplace_starts']))
+    cfg.setdefault('map_laplace_max_iter', 25)
+    cfg['map_laplace_max_iter'] = int(max(0, cfg['map_laplace_max_iter']))
+    cfg.setdefault('map_laplace_tol', 1e-5)
+    cfg['map_laplace_tol'] = float(cfg['map_laplace_tol'])
+    cfg.setdefault('map_laplace_ridge', 1e-6)
+    cfg['map_laplace_ridge'] = float(cfg['map_laplace_ridge'])
+    cfg.setdefault('map_laplace_max_step_norm', 2.0)
+    cfg['map_laplace_max_step_norm'] = float(cfg['map_laplace_max_step_norm'])
+    cfg.setdefault('map_laplace_backtrack_steps', 8)
+    cfg['map_laplace_backtrack_steps'] = int(max(0, cfg['map_laplace_backtrack_steps']))
     cfg.setdefault('is_reference', False)
     cfg.setdefault('include_results', True)
     cfg['include_results'] = sampler_config_includes_results(cfg)
@@ -4890,7 +5097,7 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('gate_metric_source', 'mu')
     cfg['gate_metric_source'] = canonicalize_gate_metric_source(cfg['gate_metric_source'])
 
-    if cfg['init'] in {'prior', 'ref_laplace', 'drc_ratio_update'} and cfg['init_steps'] != 0:
+    if cfg['init'] in {'prior', 'ref_laplace', 'map_laplace', 'drc_ratio_update'} and cfg['init_steps'] != 0:
         print(f"[normalize_sampler_config] '{label}': init='{cfg['init']}' ignores "
               f"init_steps={cfg['init_steps']}; setting to 0.")
         cfg['init_steps'] = 0
@@ -5289,6 +5496,8 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
     init_stage_info = None
     init_log_weights = None
 
+    map_laplace_component = None
+
     if cfg['init'] == 'ref_laplace':
         bank = ref_bank if ref_bank is not None else get_sampler_precomp_bank(
             precomp, cfg['init'], mala_refs=cfg.get('mala_refs', False),
@@ -5299,6 +5508,18 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
             cfg['n_samples'],
             bank,
             log_weight_key='log_mass_ref',
+        )
+    elif cfg['init'] == 'map_laplace':
+        init_samples, init_stage_info, map_laplace_component = sample_map_laplace(
+            cfg['n_samples'], prior_model, lik_model,
+            n_starts=cfg.get('map_laplace_starts', 128),
+            max_iter=cfg.get('map_laplace_max_iter', 25),
+            tol=cfg.get('map_laplace_tol', 1e-5),
+            ridge=cfg.get('map_laplace_ridge', 1e-6),
+            max_step_norm=cfg.get('map_laplace_max_step_norm', 2.0),
+            backtrack_steps=cfg.get('map_laplace_backtrack_steps', 8),
+            verbose=True,
+            return_component=True,
         )
     elif cfg['init'] != 'prior' and cfg['init_steps'] > 0:
         bank = ref_bank if ref_bank is not None else get_sampler_precomp_bank(
@@ -5334,12 +5555,15 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
     if cfg['mala_steps'] > 0:
         mala_preconditioner = None
         if cfg.get('precond_mala', False):
-            ref_laplace_bank = get_sampler_precomp_bank(precomp, 'ref_laplace')
-            ref_laplace_component = _build_ref_laplace_component(
-                ref_laplace_bank,
-                log_weight_key='log_mass_ref',
-            )
-            mala_preconditioner = _make_frozen_mala_preconditioner(ref_laplace_component)
+            if cfg['init'] == 'map_laplace' and map_laplace_component is not None:
+                mala_preconditioner = _make_frozen_mala_preconditioner(map_laplace_component)
+            else:
+                ref_laplace_bank = get_sampler_precomp_bank(precomp, 'ref_laplace')
+                ref_laplace_component = _build_ref_laplace_component(
+                    ref_laplace_bank,
+                    log_weight_key='log_mass_ref',
+                )
+                mala_preconditioner = _make_frozen_mala_preconditioner(ref_laplace_component)
 
         final_samples, mala_info = run_mala_sampler(
             cfg['n_samples'], prior_model, lik_model,
@@ -5358,12 +5582,14 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
     run_info['init_bank'] = local_bank['bank_name'] if cfg['init'] != 'prior' and local_bank is not None else 'base'
     if cfg['init'] == 'ref_laplace':
         run_info['init_log_weights'] = 'log_mass_ref'
+    elif cfg['init'] == 'map_laplace':
+        run_info['init_log_weights'] = 'map_laplace_gaussian'
     else:
         run_info['init_log_weights'] = get_sampler_log_weight_name(cfg['init'], cfg['init_weights']) if cfg['init'] != 'prior' else 'prior'
     run_info['transition_w'] = cfg.get('transition_w', 'ou')
     if cfg['init'] != 'prior':
         run_info['gate_family'] = resolve_hlsi_gate_law(
-            cfg['init'],
+            cfg['init'], cfg['init_weights'],
             gate_rho=cfg.get('gate_rho'), gate_beta=cfg.get('gate_beta'), gate_kappa=cfg.get('gate_kappa'),
             gate_topk=cfg.get('gate_topk', 64), gate_metric_source=cfg.get('gate_metric_source', 'mu'),
         ).family if cfg['init'] in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi'} else cfg['init']
@@ -5671,7 +5897,7 @@ def summarize_sampler_run(sampler_run_info):
         init_weights = info.get('init_weights', 'prior')
         gate_family = info.get('gate_family', '-')
         gate_bits = ''
-        if init_mode not in {'prior', 'tweedie', 'blend_posterior', 'ref_laplace'}:
+        if init_mode not in {'prior', 'tweedie', 'blend_posterior', 'ref_laplace', 'map_laplace'}:
             gate_bits = (
                 f" | gate={gate_family}"
                 f" | rho={info.get('gate_rho', '-') }"
