@@ -2431,7 +2431,10 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
                                               robust_percentiles=(1.0, 99.0),
                                               also_save_raw_plots=False,
                                               also_save_loglog_plots=False,
-                                              save_legacy_alias=True):
+                                              save_legacy_alias=True,
+                                              residual_kind='affine_normalized',
+                                              affine_fit_scope='central',
+                                              also_save_logratio_residual_plots=False):
     """Compute density/energy diagnostics from stored DRC probability-flow details.
 
     The primary density diagnostic is correlation between true unnormalized energy
@@ -2456,17 +2459,59 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
     neglogq_c = neglogq - torch.mean(neglogq)
     raw_logw_c = raw_logw - torch.mean(raw_logw)
 
-    denom = torch.sum(energy_c * energy_c)
-    if denom.item() > 1e-30:
-        slope = torch.sum(energy_c * neglogq_c) / denom
-        intercept = torch.mean(neglogq) - slope * torch.mean(energy)
-        neglogq_affine = intercept + slope * energy
-        affine_resid = neglogq - neglogq_affine
-        affine_rmse = torch.sqrt(torch.mean(affine_resid * affine_resid))
-    else:
-        slope = torch.tensor(float('nan'))
-        intercept = torch.tensor(float('nan'))
-        affine_rmse = torch.tensor(float('nan'))
+    def _affine_fit_stats(x, y, mask=None):
+        if mask is None:
+            mask = torch.isfinite(x) & torch.isfinite(y)
+        else:
+            mask = mask & torch.isfinite(x) & torch.isfinite(y)
+        if int(mask.sum().item()) < 3:
+            nan = torch.tensor(float('nan'))
+            return {
+                'slope': nan, 'intercept': nan, 'rmse_y': nan, 'rmse_energy_units': nan,
+                'r2': float('nan'), 'resid_y': torch.full_like(y, float('nan')),
+                'normalized_energy': torch.full_like(y, float('nan')),
+                'normalized_resid_energy': torch.full_like(y, float('nan')),
+            }
+        xm = x[mask].double()
+        ym = y[mask].double()
+        xc = xm - torch.mean(xm)
+        yc = ym - torch.mean(ym)
+        denom = torch.sum(xc * xc)
+        if denom.item() <= 1e-30:
+            nan = torch.tensor(float('nan'))
+            return {
+                'slope': nan, 'intercept': nan, 'rmse_y': nan, 'rmse_energy_units': nan,
+                'r2': float('nan'), 'resid_y': torch.full_like(y, float('nan')),
+                'normalized_energy': torch.full_like(y, float('nan')),
+                'normalized_resid_energy': torch.full_like(y, float('nan')),
+            }
+        a = torch.sum(xc * yc) / denom
+        b = torch.mean(ym) - a * torch.mean(xm)
+        yhat_all = b + a * y.new_tensor(1.0).double() * x.double()
+        resid_all = y.double() - yhat_all
+        resid_m = y[mask].double() - (b + a * x[mask].double())
+        rmse_y = torch.sqrt(torch.mean(resid_m * resid_m))
+        var_y = torch.mean((ym - torch.mean(ym)) ** 2)
+        r2 = float((1.0 - torch.mean(resid_m * resid_m) / var_y).item()) if var_y.item() > 1e-30 else float('nan')
+        if torch.isfinite(a) and abs(float(a.item())) > 1e-30:
+            normalized_energy = (y.double() - b) / a
+            normalized_resid = normalized_energy - x.double()
+            rmse_energy_units = torch.sqrt(torch.mean((normalized_resid[mask]) ** 2))
+        else:
+            normalized_energy = torch.full_like(y.double(), float('nan'))
+            normalized_resid = torch.full_like(y.double(), float('nan'))
+            rmse_energy_units = torch.tensor(float('nan'))
+        return {
+            'slope': a, 'intercept': b, 'rmse_y': rmse_y, 'rmse_energy_units': rmse_energy_units,
+            'r2': r2, 'resid_y': resid_all, 'normalized_energy': normalized_energy,
+            'normalized_resid_energy': normalized_resid,
+        }
+
+    full_fit = _affine_fit_stats(energy, neglogq)
+    slope = full_fit['slope']
+    intercept = full_fit['intercept']
+    affine_resid = full_fit['resid_y']
+    affine_rmse = full_fit['rmse_y']
 
     centered_rmse = torch.sqrt(torch.mean((neglogq_c - energy_c) ** 2))
     residual_std = torch.std(raw_logw_c, unbiased=False)
@@ -2485,6 +2530,10 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
         qlo, qhi = float('nan'), float('nan')
         central_mask = finite_mask
 
+    central_fit = _affine_fit_stats(energy, neglogq, central_mask)
+    fit_scope = str(affine_fit_scope or 'central').strip().lower().replace('-', '_')
+    plot_fit = central_fit if fit_scope in {'central', 'robust', 'trimmed'} else full_fit
+
     metrics = OrderedDict([
         ('label', str(label)),
         ('n_eval', int(logq.numel())),
@@ -2498,6 +2547,8 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
         ('affine_energy_slope', float(slope.item())),
         ('affine_energy_intercept', float(intercept.item())),
         ('affine_energy_rmse', float(affine_rmse.item())),
+        ('affine_energy_r2', float(full_fit['r2'])),
+        ('slope_normalized_energy_rmse', float(full_fit['rmse_energy_units'].item())),
         ('raw_logratio_std', float(residual_std.item())),
         ('raw_logratio_mean_abs_centered', float(residual_mean_abs.item())),
         ('raw_logratio_energy_pearson', _safe_pearson_corr_torch(energy, raw_logw)),
@@ -2514,6 +2565,13 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
         ('central_energy_neglogq_pearson', _safe_pearson_corr_torch(energy[central_mask], neglogq[central_mask]) if int(central_mask.sum().item()) >= 3 else float('nan')),
         ('central_energy_neglogq_spearman', _safe_spearman_corr_torch(energy[central_mask], neglogq[central_mask]) if int(central_mask.sum().item()) >= 3 else float('nan')),
         ('central_raw_logratio_energy_pearson', _safe_pearson_corr_torch(energy[central_mask], raw_logw[central_mask]) if int(central_mask.sum().item()) >= 3 else float('nan')),
+        ('central_affine_energy_slope', float(central_fit['slope'].item())),
+        ('central_affine_energy_intercept', float(central_fit['intercept'].item())),
+        ('central_affine_energy_rmse', float(central_fit['rmse_y'].item())),
+        ('central_affine_energy_r2', float(central_fit['r2'])),
+        ('central_slope_normalized_energy_rmse', float(central_fit['rmse_energy_units'].item())),
+        ('affine_fit_scope', str(fit_scope)),
+        ('residual_kind', str(residual_kind)),
     ])
 
     df = pd.DataFrame([metrics])
@@ -2534,6 +2592,10 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
             neglogq=neglogq.numpy(),
             raw_logw=raw_logw.numpy(),
             logw=logw.numpy(),
+            full_affine_normalized_energy=full_fit['normalized_energy'].detach().cpu().numpy(),
+            full_affine_normalized_residual=full_fit['normalized_resid_energy'].detach().cpu().numpy(),
+            central_affine_normalized_energy=central_fit['normalized_energy'].detach().cpu().numpy(),
+            central_affine_normalized_residual=central_fit['normalized_resid_energy'].detach().cpu().numpy(),
         )
         print(f'Saved DRC energy benchmark CSV to {csv_path}')
         print(f'Saved DRC energy benchmark arrays to {npz_path}')
@@ -2542,6 +2604,11 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
             energy_np = energy.numpy()
             neglogq_np = neglogq.numpy()
             raw_resid_np = raw_logw_c.numpy()
+            calibrated_energy_np = plot_fit['normalized_energy'].detach().cpu().numpy()
+            calibrated_resid_np = plot_fit['normalized_resid_energy'].detach().cpu().numpy()
+            fit_a = float(plot_fit['slope'].item())
+            fit_b = float(plot_fit['intercept'].item())
+            fit_label = 'central affine' if fit_scope in {'central', 'robust', 'trimmed'} else 'global affine'
 
             def _save_energy_plot(mode, suffix):
                 fig, ax = plt.subplots(figsize=(6.2, 5.0))
@@ -2561,28 +2628,64 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
                     fig.savefig(legacy_path, dpi=240, bbox_inches='tight')
                     print(f'Saved DRC energy scatter legacy alias to {legacy_path}')
 
-            def _save_residual_plot(mode, suffix):
+            def _save_residual_plot(mode, suffix, kind=None, legacy=False):
+                kind_key = str(kind or residual_kind or 'affine_normalized').strip().lower().replace('-', '_')
+                if kind_key in {'raw', 'raw_logratio', 'logratio', 'importance'}:
+                    y_resid = raw_resid_np
+                    y_label = 'centered log-ratio residual  log pi(x) - log q(x)'
+                    title = f'DRC log-ratio residual vs energy: {label}'
+                    filename_mid = 'drc_logratio_residual_scatter'
+                else:
+                    y_resid = calibrated_resid_np
+                    y_label = f'{fit_label} residual  ((-log q)-b)/a - energy'
+                    title = f'DRC affine-calibrated residual vs energy: {label}'
+                    filename_mid = 'drc_calibrated_residual_scatter'
                 fig2, ax2 = plt.subplots(figsize=(6.2, 5.0))
                 _plot_drc_scatter(
-                    ax2, energy_np, raw_resid_np,
-                    'true energy  -log pi(x)', 'centered residual  log pi(x) - log q(x)',
-                    f'DRC residual vs energy: {label}',
+                    ax2, energy_np, y_resid,
+                    'true energy  -log pi(x)', y_label, title,
                     axis_mode=mode, robust_percentiles=robust_percentiles,
                 )
                 if str(mode).lower().replace('-', '_') not in {'signed_log', 'symlog', 'log1p', 'loglog', 'log_log', 'log'}:
                     ax2.axhline(0.0, linewidth=1.0, alpha=0.5)
                 fig2.tight_layout()
-                fig2_path = os.path.join(save_dir, f'{stem}_drc_residual_scatter_{safe_label}_{suffix}.png')
+                fig2_path = os.path.join(save_dir, f'{stem}_{filename_mid}_{safe_label}_{suffix}.png')
                 fig2.savefig(fig2_path, dpi=240, bbox_inches='tight')
-                print(f'Saved DRC residual scatter ({mode}) to {fig2_path}')
-                # Backwards-compatible legacy filename for the primary plotted view.
-                if save_legacy_alias and suffix == _sanitize_run_results_name(str(residual_axis_mode)):
+                print(f'Saved DRC {kind_key} residual scatter ({mode}) to {fig2_path}')
+                # Backwards-compatible legacy filename for the primary residual view.
+                if legacy and save_legacy_alias:
                     legacy_path = os.path.join(save_dir, f'{stem}_drc_residual_scatter_{safe_label}.png')
                     fig2.savefig(legacy_path, dpi=240, bbox_inches='tight')
                     print(f'Saved DRC residual scatter legacy alias to {legacy_path}')
 
+            def _save_calibrated_energy_plot(mode, suffix):
+                fig3, ax3 = plt.subplots(figsize=(6.2, 5.0))
+                _plot_drc_scatter(
+                    ax3, energy_np, calibrated_energy_np,
+                    'true energy  -log pi(x)', f'{fit_label} normalized estimated energy  ((-log q)-b)/a',
+                    f'DRC affine-normalized density-energy: {label}',
+                    axis_mode=mode, robust_percentiles=robust_percentiles,
+                )
+                if str(mode).lower().replace('-', '_') not in {'signed_log', 'symlog', 'log1p', 'loglog', 'log_log', 'log'}:
+                    xlim = ax3.get_xlim(); ylim = ax3.get_ylim()
+                    lo_line = max(min(xlim), min(ylim)); hi_line = min(max(xlim), max(ylim))
+                    if np.isfinite(lo_line) and np.isfinite(hi_line) and hi_line > lo_line:
+                        ax3.plot([lo_line, hi_line], [lo_line, hi_line], linewidth=1.0, alpha=0.6)
+                    ax3.set_xlim(*xlim); ax3.set_ylim(*ylim)
+                ax3.text(0.02, 0.98, f'a={fit_a:.4g}, b={fit_b:.4g}', transform=ax3.transAxes,
+                         va='top', ha='left', fontsize=8.5, alpha=0.75)
+                fig3.tight_layout()
+                fig3_path = os.path.join(save_dir, f'{stem}_drc_affine_energy_scatter_{safe_label}_{suffix}.png')
+                fig3.savefig(fig3_path, dpi=240, bbox_inches='tight')
+                print(f'Saved DRC affine-normalized energy scatter ({mode}) to {fig3_path}')
+
             _save_energy_plot(plot_axis_mode, _sanitize_run_results_name(plot_axis_mode))
-            _save_residual_plot(residual_axis_mode, _sanitize_run_results_name(residual_axis_mode))
+            _save_calibrated_energy_plot(plot_axis_mode, _sanitize_run_results_name(plot_axis_mode))
+            _save_residual_plot(residual_axis_mode, _sanitize_run_results_name(residual_axis_mode),
+                                kind=residual_kind, legacy=True)
+            if also_save_logratio_residual_plots and str(residual_kind).strip().lower().replace('-', '_') not in {'raw', 'raw_logratio', 'logratio', 'importance'}:
+                _save_residual_plot(residual_axis_mode, 'logratio_' + _sanitize_run_results_name(residual_axis_mode),
+                                    kind='raw_logratio', legacy=False)
             if also_save_loglog_plots and str(plot_axis_mode).lower().replace('-', '_') not in {'loglog', 'log_log', 'log'}:
                 _save_energy_plot('loglog', 'loglog')
             if also_save_raw_plots:
@@ -4341,7 +4444,11 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('drc_energy_benchmark', False)
     cfg['drc_energy_benchmark'] = _config_bool(cfg['drc_energy_benchmark'])
     cfg.setdefault('drc_energy_plot_axis_mode', 'robust')
-    cfg.setdefault('drc_energy_residual_axis_mode', 'signed_log')
+    cfg.setdefault('drc_energy_residual_axis_mode', 'robust')
+    cfg.setdefault('drc_energy_residual_kind', 'affine_normalized')
+    cfg.setdefault('drc_energy_affine_fit_scope', 'central')
+    cfg.setdefault('drc_energy_save_logratio_residual_plots', False)
+    cfg['drc_energy_save_logratio_residual_plots'] = _config_bool(cfg['drc_energy_save_logratio_residual_plots'])
     cfg.setdefault('drc_energy_robust_percentiles', (1.0, 99.0))
     cfg.setdefault('drc_energy_save_raw_plots', False)
     cfg['drc_energy_save_raw_plots'] = _config_bool(cfg['drc_energy_save_raw_plots'])
@@ -4698,6 +4805,9 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
                     also_save_raw_plots=_config_bool(cfg.get('drc_energy_save_raw_plots', False)),
                     also_save_loglog_plots=_config_bool(cfg.get('drc_energy_save_loglog_plots', False)),
                     save_legacy_alias=_config_bool(cfg.get('drc_energy_save_legacy_alias', True)),
+                    residual_kind=cfg.get('drc_energy_residual_kind', 'affine_normalized'),
+                    affine_fit_scope=cfg.get('drc_energy_affine_fit_scope', 'central'),
+                    also_save_logratio_residual_plots=_config_bool(cfg.get('drc_energy_save_logratio_residual_plots', False)),
                 )
             except Exception as exc:
                 warnings.warn(
