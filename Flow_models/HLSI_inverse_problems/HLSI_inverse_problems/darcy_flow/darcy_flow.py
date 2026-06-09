@@ -831,16 +831,16 @@ BOOT_DRC_TEMPERATURE = _env_float('IP_DENSITY_BOOT_DRC_TEMPERATURE', 1.0)
 
 # Density-evaluation correction-factor benchmark on the final bootstrapped bank.
 DENSITY_REF_SOURCE = os.environ.get('IP_DENSITY_REF_SOURCE', 'ALT-DRC-LFGI3')
-DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 32)
+DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 64)
 DENSITY_DRC_EVAL_BATCH_SIZE = _env_int('IP_DENSITY_DRC_EVAL_BATCH_SIZE', 32)
 DENSITY_DRC_TMIN = _env_float('IP_DENSITY_DRC_TMIN', 10 ** (-2.5))
-DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 10.0)
+DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 3.0)
 DENSITY_DRC_CLIP = _env_float_or_none('IP_DENSITY_DRC_CLIP', None)
 DENSITY_DRC_TEMPERATURE = _env_float('IP_DENSITY_DRC_TEMPERATURE', 1.0)
 DENSITY_DRC_ENERGY_PLOTS = _env_bool('IP_DENSITY_DRC_ENERGY_PLOTS', True)
 DENSITY_DRC_PLOT_AXIS_MODE = os.environ.get('IP_DENSITY_DRC_PLOT_AXIS_MODE', 'robust')
 DENSITY_DRC_RESIDUAL_AXIS_MODE = os.environ.get('IP_DENSITY_DRC_RESIDUAL_AXIS_MODE', 'robust')
-DENSITY_DRC_ROBUST_PERCENTILES = _env_percentile_pair('IP_DENSITY_DRC_ROBUST_PERCENTILES', (1.0, 99.0))
+DENSITY_DRC_ROBUST_PERCENTILES = _env_percentile_pair('IP_DENSITY_DRC_ROBUST_PERCENTILES', (2.0, 98.0))
 # Keep only the robust/truncated primary plots by default. Set these to 1 if you
 # want raw full-range or log-log companion figures for audit/debug runs.
 DENSITY_DRC_SAVE_RAW_PLOTS = _env_bool('IP_DENSITY_DRC_SAVE_RAW_PLOTS', False)
