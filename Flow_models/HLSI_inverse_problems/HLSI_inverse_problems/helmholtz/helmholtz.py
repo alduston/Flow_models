@@ -873,9 +873,9 @@ DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
 # Same MALA reference-bank configuration style/defaults as the other density scripts.
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', N_REF)
-MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
-MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
-MALA_DT = _env_float('IP_DENSITY_MALA_DT', 4.0e-5)
+MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 1500)
+MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 500)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 2.5e-5)
 MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior')
 HELDOUT_BATCH_SIZE = _env_int('IP_DENSITY_HELDOUT_BATCH_SIZE', 1)
 
