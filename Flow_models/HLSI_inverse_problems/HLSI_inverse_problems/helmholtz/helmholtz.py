@@ -17,7 +17,10 @@ Useful overrides:
     export IP_DENSITY_N_REF=250
     export IP_DENSITY_MALA_STEPS=600
     export IP_DENSITY_MALA_BURNIN=150
-    export IP_DENSITY_MALA_DT=4e-5
+    export IP_DENSITY_MALA_DT=2.5e-5
+    export IP_DENSITY_MALA_INIT=map_laplace
+    export IP_DENSITY_MAP_LAPLACE_STARTS=128
+    export IP_DENSITY_MAP_LAPLACE_MAX_ITER=25
     export IP_DENSITY_DRC_PF_STEPS=32
     export IP_DENSITY_DRC_PLOT_LAYOUT=comparison_grid
 """
@@ -876,7 +879,17 @@ MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', N_REF)
 MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 1500)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 500)
 MALA_DT = _env_float('IP_DENSITY_MALA_DT', 2.5e-5)
-MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior')
+# Default to a target-side MAP/Laplace proxy initialization for MALA.  This is
+# distinct from the older reference-bank `ref_laplace` mode: `map_laplace` first
+# optimizes the posterior and samples N(map, observed_info(map)^{-1}).
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
+MALA_PRECOND = _env_bool('IP_DENSITY_MALA_PRECOND', False)
+MAP_LAPLACE_STARTS = _env_int('IP_DENSITY_MAP_LAPLACE_STARTS', 128)
+MAP_LAPLACE_MAX_ITER = _env_int('IP_DENSITY_MAP_LAPLACE_MAX_ITER', 25)
+MAP_LAPLACE_TOL = _env_float('IP_DENSITY_MAP_LAPLACE_TOL', 1e-5)
+MAP_LAPLACE_RIDGE = _env_float('IP_DENSITY_MAP_LAPLACE_RIDGE', 1e-6)
+MAP_LAPLACE_MAX_STEP_NORM = _env_float('IP_DENSITY_MAP_LAPLACE_MAX_STEP_NORM', 2.0)
+MAP_LAPLACE_BACKTRACK_STEPS = _env_int('IP_DENSITY_MAP_LAPLACE_BACKTRACK_STEPS', 8)
 HELDOUT_BATCH_SIZE = _env_int('IP_DENSITY_HELDOUT_BATCH_SIZE', 1)
 
 if MALA_N_SAMPLES < N_REF:
@@ -1013,6 +1026,13 @@ SAMPLER_CONFIGS = OrderedDict([
         'mala_steps': MALA_STEPS,
         'mala_burnin': MALA_BURNIN,
         'mala_dt': MALA_DT,
+        'precond_mala': MALA_PRECOND,
+        'map_laplace_starts': MAP_LAPLACE_STARTS,
+        'map_laplace_max_iter': MAP_LAPLACE_MAX_ITER,
+        'map_laplace_tol': MAP_LAPLACE_TOL,
+        'map_laplace_ridge': MAP_LAPLACE_RIDGE,
+        'map_laplace_max_step_norm': MAP_LAPLACE_MAX_STEP_NORM,
+        'map_laplace_backtrack_steps': MAP_LAPLACE_BACKTRACK_STEPS,
         'log_mean_ess': False,
         'include_results': True,
         'is_reference': True,
@@ -1034,7 +1054,9 @@ SAMPLER_CONFIGS = OrderedDict([
 RUN_COMMAND_HINT = (
     'IP_DENSITY_N_REF={n_ref} IP_DENSITY_MALA_N_SAMPLES={mala_n} '
     'IP_DENSITY_MALA_STEPS={mala_steps} IP_DENSITY_MALA_BURNIN={burnin} '
-    'IP_DENSITY_MALA_DT={dt:g} IP_DENSITY_DRC_PF_STEPS={pf_steps} '
+    'IP_DENSITY_MALA_DT={dt:g} IP_DENSITY_MALA_INIT={mala_init} '
+    'IP_DENSITY_MAP_LAPLACE_STARTS={map_starts} IP_DENSITY_MAP_LAPLACE_MAX_ITER={map_iter} '
+    'IP_DENSITY_DRC_PF_STEPS={pf_steps} '
     'IP_DENSITY_DRC_PLOT_LAYOUT={layout} python helmholtz.py'
 ).format(
     n_ref=N_REF,
@@ -1042,6 +1064,9 @@ RUN_COMMAND_HINT = (
     mala_steps=MALA_STEPS,
     burnin=MALA_BURNIN,
     dt=MALA_DT,
+    mala_init=MALA_INIT,
+    map_starts=MAP_LAPLACE_STARTS,
+    map_iter=MAP_LAPLACE_MAX_ITER,
     pf_steps=DENSITY_DRC_PF_STEPS,
     layout=DENSITY_DRC_PLOT_LAYOUT,
 )
@@ -1070,6 +1095,13 @@ dashboard.add_text_page(
         f'MALA_BURNIN = {MALA_BURNIN}',
         f'MALA_DT = {MALA_DT}',
         f'MALA_INIT = {MALA_INIT}',
+        f'MALA_PRECOND = {MALA_PRECOND}',
+        f'MAP_LAPLACE_STARTS = {MAP_LAPLACE_STARTS}',
+        f'MAP_LAPLACE_MAX_ITER = {MAP_LAPLACE_MAX_ITER}',
+        f'MAP_LAPLACE_TOL = {MAP_LAPLACE_TOL}',
+        f'MAP_LAPLACE_RIDGE = {MAP_LAPLACE_RIDGE}',
+        f'MAP_LAPLACE_MAX_STEP_NORM = {MAP_LAPLACE_MAX_STEP_NORM}',
+        f'MAP_LAPLACE_BACKTRACK_STEPS = {MAP_LAPLACE_BACKTRACK_STEPS}',
         f'DENSITY_REF_SOURCE = {DENSITY_REF_SOURCE}',
         f'DENSITY_DRC_PF_STEPS = {DENSITY_DRC_PF_STEPS}',
         f'DENSITY_TWEEDIE_DIVERGENCE = {DENSITY_TWEEDIE_DIVERGENCE}',
@@ -1334,6 +1366,13 @@ save_reproducibility_log(
         'MALA_BURNIN': MALA_BURNIN,
         'MALA_DT': MALA_DT,
         'MALA_INIT': MALA_INIT,
+        'MALA_PRECOND': MALA_PRECOND,
+        'MAP_LAPLACE_STARTS': MAP_LAPLACE_STARTS,
+        'MAP_LAPLACE_MAX_ITER': MAP_LAPLACE_MAX_ITER,
+        'MAP_LAPLACE_TOL': MAP_LAPLACE_TOL,
+        'MAP_LAPLACE_RIDGE': MAP_LAPLACE_RIDGE,
+        'MAP_LAPLACE_MAX_STEP_NORM': MAP_LAPLACE_MAX_STEP_NORM,
+        'MAP_LAPLACE_BACKTRACK_STEPS': MAP_LAPLACE_BACKTRACK_STEPS,
         'DENSITY_REF_SOURCE': DENSITY_REF_SOURCE,
         'DENSITY_DRC_PF_STEPS': DENSITY_DRC_PF_STEPS,
         'DENSITY_DRC_EVAL_BATCH_SIZE': DENSITY_DRC_EVAL_BATCH_SIZE,
