@@ -866,7 +866,7 @@ def _env_percentile_pair(name, default):
 # setting: independent score-signal and gate banks with 5000 particles each.
 # Override IP_DENSITY_N_REF_SIGNAL/IP_DENSITY_N_REF_GATE/IP_DENSITY_N_REF_EVAL
 # for smaller smoke tests.
-N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', 5000))
+N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', 500))
 N_REF_GATE_ENV_SET = _env_is_set('IP_DENSITY_N_REF_GATE')
 N_REF_GATE = _env_int('IP_DENSITY_N_REF_GATE', N_REF_SIGNAL)
 N_REF_EVAL = _env_int('IP_DENSITY_N_REF_EVAL', N_REF_SIGNAL)
@@ -879,16 +879,16 @@ DEFAULT_N_GEN = _env_int('IP_DENSITY_DEFAULT_N_GEN', N_REF_SIGNAL)
 DENSITY_REF_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_REF_SOURCE', 'MALA'))
 DENSITY_BANK_COUPLING = _canonical_bank_coupling(os.environ.get(
     'IP_DENSITY_BANK_COUPLING',
-    os.environ.get('IP_DENSITY_GATE_BANK_COUPLING', 'shared') #'independent'),
+    os.environ.get('IP_DENSITY_GATE_BANK_COUPLING', 'independent') #'independent'),
 ))
 DENSITY_EVAL_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_EVAL_SOURCE', 'MALA-EVAL'))
 DENSITY_EVAL_BANK_COUPLING = _canonical_bank_coupling(
     os.environ.get('IP_DENSITY_EVAL_BANK_COUPLING', 'independent')
 )
-DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 32)
+DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 64)
 DENSITY_DRC_EVAL_BATCH_SIZE = _env_int('IP_DENSITY_DRC_EVAL_BATCH_SIZE', 32)
 DENSITY_DRC_TMIN = _env_float('IP_DENSITY_DRC_TMIN', 10 ** (-2.5))
-DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 10.0)
+DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 5.0)
 DENSITY_DRC_CLIP = _env_float_or_none('IP_DENSITY_DRC_CLIP', None)
 DENSITY_DRC_TEMPERATURE = _env_float('IP_DENSITY_DRC_TEMPERATURE', 1.0)
 DENSITY_DRC_ENERGY_PLOTS = _env_bool('IP_DENSITY_DRC_ENERGY_PLOTS', True)
@@ -918,10 +918,10 @@ DENSITY_SOURCE_REQUIRED_N = _required_source_bank_size(
     N_REF_SIGNAL, N_REF_GATE, DENSITY_BANK_COUPLING,
 )
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', DENSITY_SOURCE_REQUIRED_N)
-MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 400)
-MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 100)
+MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
+MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
 MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
-MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior')
 MALA_EVAL_N_SAMPLES = _env_int('IP_DENSITY_MALA_EVAL_N_SAMPLES', N_REF_EVAL)
 MALA_EVAL_STEPS = _env_int('IP_DENSITY_MALA_EVAL_STEPS', MALA_STEPS)
 MALA_EVAL_BURNIN = _env_int('IP_DENSITY_MALA_EVAL_BURNIN', MALA_BURNIN)
