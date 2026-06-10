@@ -959,7 +959,7 @@ MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
 MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
 # Default to target-side MAP/Laplace proxy initialization for MALA.
-MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior') #'map_laplace')
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
 MALA_PRECOND = _env_bool('IP_DENSITY_MALA_PRECOND', False)
 MALA_EVAL_N_SAMPLES = _env_int('IP_DENSITY_MALA_EVAL_N_SAMPLES', N_REF_EVAL)
 MALA_EVAL_STEPS = _env_int('IP_DENSITY_MALA_EVAL_STEPS', MALA_STEPS)
