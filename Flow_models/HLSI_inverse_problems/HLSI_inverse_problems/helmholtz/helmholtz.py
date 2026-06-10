@@ -953,13 +953,13 @@ DENSITY_SOURCE_REQUIRED_N = _required_source_bank_size(
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', DENSITY_SOURCE_REQUIRED_N)
 MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
-MALA_DT = _env_float('IP_DENSITY_MALA_DT', 7.0e-5)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 3.0e-5)
 
 # Default to a target-side MAP/Laplace proxy initialization for MALA.  This is
 # distinct from the older reference-bank `ref_laplace` mode: `map_laplace` first
 # optimizes the posterior and samples N(map, observed_info(map)^{-1}).
 
-MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior')
 MALA_PRECOND = _env_bool('IP_DENSITY_MALA_PRECOND', False)
 MALA_EVAL_N_SAMPLES = _env_int('IP_DENSITY_MALA_EVAL_N_SAMPLES', N_REF_EVAL)
 MALA_EVAL_STEPS = _env_int('IP_DENSITY_MALA_EVAL_STEPS', MALA_STEPS)
