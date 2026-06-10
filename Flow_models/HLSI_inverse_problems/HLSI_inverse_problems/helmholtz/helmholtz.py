@@ -14,11 +14,16 @@ Typical repository/Slurm run:
 
 Useful overrides:
 
-    export IP_DENSITY_N_REF=250
+    export IP_DENSITY_N_REF_SIGNAL=5000
+    export IP_DENSITY_N_REF_GATE=5000
+    export IP_DENSITY_N_REF_EVAL=5000
+    export IP_DENSITY_BANK_COUPLING=independent      # shared | prefix | independent
+    export IP_DENSITY_EVAL_SOURCE=MALA-EVAL          # use a disjoint density-eval bank
+    export IP_DENSITY_EVAL_BANK_COUPLING=independent
+    export IP_DENSITY_MALA_INIT=map_laplace
     export IP_DENSITY_MALA_STEPS=600
     export IP_DENSITY_MALA_BURNIN=150
     export IP_DENSITY_MALA_DT=2.5e-5
-    export IP_DENSITY_MALA_INIT=map_laplace
     export IP_DENSITY_MAP_LAPLACE_STARTS=128
     export IP_DENSITY_MAP_LAPLACE_MAX_ITER=25
     export IP_DENSITY_DRC_PF_STEPS=32
@@ -825,6 +830,55 @@ def _env_bool(name, default):
     return str(raw).strip().lower() not in {'0', 'false', 'no', 'off', 'none', ''}
 
 
+
+def _env_is_set(name):
+    return name in os.environ and str(os.environ.get(name, '')).strip() != ''
+
+
+def _canonical_bank_coupling(value):
+    raw = str(value).strip().lower().replace('-', '_')
+    aliases = {
+        'same': 'shared',
+        'same_bank': 'shared',
+        'reuse': 'shared',
+        'reused': 'shared',
+        'coupled': 'shared',
+        'shared': 'shared',
+        'prefix': 'prefix',
+        'nested': 'prefix',
+        'independent': 'independent',
+        'indep': 'independent',
+        'disjoint': 'independent',
+        'separate': 'independent',
+    }
+    if raw not in aliases:
+        raise ValueError(
+            f'Unsupported bank coupling {value!r}; expected shared, prefix, or independent.'
+        )
+    return aliases[raw]
+
+
+def _required_source_bank_size(n_signal, n_gate, score_gate_bank_coupling):
+    coupling = _canonical_bank_coupling(score_gate_bank_coupling)
+    if coupling == 'shared':
+        return int(n_signal)
+    if coupling == 'prefix':
+        return int(max(n_signal, n_gate))
+    return int(n_signal) + int(n_gate)
+
+
+def _canonical_source_label(value):
+    raw = str(value).strip()
+    low = raw.lower().replace('_', '-').replace(' ', '-')
+    if low in {'none', 'null', ''}:
+        return 'None'
+    if low == 'mala':
+        return 'MALA'
+    if low in {'mala-eval', 'malaeval'}:
+        return 'MALA-EVAL'
+    return raw
+
+
 def _env_percentile_pair(name, default):
     raw = os.environ.get(name, None)
     if raw is None:
@@ -838,18 +892,34 @@ def _env_percentile_pair(name, default):
     return (lo, hi)
 
 
-# Keep Helmholtz defaults modest enough to run, while exposing the same
-# density/MALA knobs as the Darcy/Navier-Stokes density scripts.  Increase
-# IP_DENSITY_N_REF for paper-scale runs.
-N_REF = _env_int('IP_DENSITY_N_REF', 250)
-DEFAULT_N_GEN = _env_int('IP_DENSITY_DEFAULT_N_GEN', N_REF)
+# Helmholtz keeps a modest legacy IP_DENSITY_N_REF fallback, but now uses the
+# same split-bank density controls as the Navier-Stokes benchmark.  The signal
+# bank feeds the score field; the gate bank feeds CE-HLSI gate estimation; the
+# density-eval bank is the held-out location bank for the PF/DRC correction.
+N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', 500))
+N_REF_GATE_ENV_SET = _env_is_set('IP_DENSITY_N_REF_GATE')
+N_REF_GATE = _env_int('IP_DENSITY_N_REF_GATE', N_REF_SIGNAL)
+N_REF_EVAL = _env_int('IP_DENSITY_N_REF_EVAL', N_REF_SIGNAL)
+N_REF = N_REF_SIGNAL  # Backward-compatible alias used by reporting helpers.
+DEFAULT_N_GEN = _env_int('IP_DENSITY_DEFAULT_N_GEN', N_REF_SIGNAL)
 
-# Density-evaluation correction-factor benchmark on the MALA posterior bank.
-DENSITY_REF_SOURCE = os.environ.get('IP_DENSITY_REF_SOURCE', 'MALA')
-DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 32)
+# Density-evaluation correction-factor benchmark.  By default, this follows the
+# current Navier-Stokes wiring: the frozen score field is fitted from MALA and
+# the eval-bank source/coupling is explicit, so you can use either an independent
+# slice from the same source or a distinct MALA-EVAL source bank.
+DENSITY_REF_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_REF_SOURCE', 'MALA'))
+DENSITY_BANK_COUPLING = _canonical_bank_coupling(os.environ.get(
+    'IP_DENSITY_BANK_COUPLING',
+    os.environ.get('IP_DENSITY_GATE_BANK_COUPLING', 'shared'),
+))
+DENSITY_EVAL_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_EVAL_SOURCE', 'MALA-EVAL'))
+DENSITY_EVAL_BANK_COUPLING = _canonical_bank_coupling(
+    os.environ.get('IP_DENSITY_EVAL_BANK_COUPLING', 'shared')
+)
+DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 64)
 DENSITY_DRC_EVAL_BATCH_SIZE = _env_int('IP_DENSITY_DRC_EVAL_BATCH_SIZE', 32)
 DENSITY_DRC_TMIN = _env_float('IP_DENSITY_DRC_TMIN', 10 ** (-2.5))
-DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 10.0)
+DENSITY_DRC_TMAX = _env_float('IP_DENSITY_DRC_TMAX', 5.0)
 DENSITY_DRC_CLIP = _env_float_or_none('IP_DENSITY_DRC_CLIP', None)
 DENSITY_DRC_TEMPERATURE = _env_float('IP_DENSITY_DRC_TEMPERATURE', 1.0)
 DENSITY_DRC_ENERGY_PLOTS = _env_bool('IP_DENSITY_DRC_ENERGY_PLOTS', True)
@@ -866,24 +936,37 @@ DENSITY_DRC_PLOT_LAYOUT = os.environ.get('IP_DENSITY_DRC_PLOT_LAYOUT', 'comparis
 DENSITY_DRC_GRID_MAX_POINTS = _env_int('IP_DENSITY_DRC_GRID_MAX_POINTS', 5000)
 DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
 
-# Divergence defaults matching the Darcy density script. CE-HLSI and Tweedie
-# dispatch to analytic implementations in sampling.py; scalar blend uses
-# Hutchinson by default for speed.
+# Divergence defaults matching the density scripts. CE-HLSI and Tweedie dispatch
+# to analytic implementations in sampling.py when available; scalar blend keeps
+# Hutchinson by default for speed unless explicitly overridden.
 DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'auto')
 DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE', 'hutchinson')
 DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE', 'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
-# Same MALA reference-bank configuration style/defaults as the other density scripts.
-MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', N_REF)
+# MALA source-bank configuration.  DENSITY_SOURCE_REQUIRED_N is the minimum
+# number of source particles needed to provide disjoint signal/gate slices from
+# DENSITY_REF_SOURCE under the selected score/gate coupling.
+DENSITY_SOURCE_REQUIRED_N = _required_source_bank_size(
+    N_REF_SIGNAL, N_REF_GATE, DENSITY_BANK_COUPLING,
+)
+MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', DENSITY_SOURCE_REQUIRED_N)
 MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
-MALA_DT = _env_float('IP_DENSITY_MALA_DT', 6.0e-5)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 7.0e-5)
+
 # Default to a target-side MAP/Laplace proxy initialization for MALA.  This is
 # distinct from the older reference-bank `ref_laplace` mode: `map_laplace` first
 # optimizes the posterior and samples N(map, observed_info(map)^{-1}).
+
 MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
 MALA_PRECOND = _env_bool('IP_DENSITY_MALA_PRECOND', False)
+MALA_EVAL_N_SAMPLES = _env_int('IP_DENSITY_MALA_EVAL_N_SAMPLES', N_REF_EVAL)
+MALA_EVAL_STEPS = _env_int('IP_DENSITY_MALA_EVAL_STEPS', MALA_STEPS)
+MALA_EVAL_BURNIN = _env_int('IP_DENSITY_MALA_EVAL_BURNIN', MALA_BURNIN)
+MALA_EVAL_DT = _env_float('IP_DENSITY_MALA_EVAL_DT', MALA_DT)
+MALA_EVAL_INIT = os.environ.get('IP_DENSITY_MALA_EVAL_INIT', MALA_INIT)
+MALA_EVAL_PRECOND = _env_bool('IP_DENSITY_MALA_EVAL_PRECOND', MALA_PRECOND)
 MAP_LAPLACE_STARTS = _env_int('IP_DENSITY_MAP_LAPLACE_STARTS', 128)
 MAP_LAPLACE_MAX_ITER = _env_int('IP_DENSITY_MAP_LAPLACE_MAX_ITER', 25)
 MAP_LAPLACE_TOL = _env_float('IP_DENSITY_MAP_LAPLACE_TOL', 1e-5)
@@ -892,10 +975,15 @@ MAP_LAPLACE_MAX_STEP_NORM = _env_float('IP_DENSITY_MAP_LAPLACE_MAX_STEP_NORM', 2
 MAP_LAPLACE_BACKTRACK_STEPS = _env_int('IP_DENSITY_MAP_LAPLACE_BACKTRACK_STEPS', 8)
 HELDOUT_BATCH_SIZE = _env_int('IP_DENSITY_HELDOUT_BATCH_SIZE', 1)
 
-if MALA_N_SAMPLES < N_REF:
+if MALA_N_SAMPLES < DENSITY_SOURCE_REQUIRED_N:
     raise ValueError(
-        f'MALA_N_SAMPLES={MALA_N_SAMPLES} must be >= N_REF={N_REF}, '
-        'because density-eval nodes use the reference bank selected from MALA.'
+        f'MALA_N_SAMPLES={MALA_N_SAMPLES} must be >= {DENSITY_SOURCE_REQUIRED_N} '
+        f'for N_REF_SIGNAL={N_REF_SIGNAL}, N_REF_GATE={N_REF_GATE}, '
+        f'and DENSITY_BANK_COUPLING={DENSITY_BANK_COUPLING!r}.'
+    )
+if DENSITY_EVAL_SOURCE == 'MALA-EVAL' and MALA_EVAL_N_SAMPLES < N_REF_EVAL:
+    raise ValueError(
+        f'MALA_EVAL_N_SAMPLES={MALA_EVAL_N_SAMPLES} must be >= N_REF_EVAL={N_REF_EVAL}.'
     )
 
 configure_sampling(
@@ -983,7 +1071,13 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         # likelihood-reweight again when fitting each frozen score family.
         'drc_score_init_weights': 'None',
         'transition_w': 'ou',
-        'n_ref': N_REF,
+        'n_ref': N_REF_SIGNAL,
+        'n_ref_signal': N_REF_SIGNAL,
+        'n_ref_gate': N_REF_GATE,
+        'score_gate_bank_coupling': DENSITY_BANK_COUPLING,
+        'drc_eval_source': DENSITY_EVAL_SOURCE,
+        'drc_eval_n_ref': N_REF_EVAL,
+        'drc_eval_bank_coupling': DENSITY_EVAL_BANK_COUPLING,
         'include_results': False,
         'drc_pf_steps': DENSITY_DRC_PF_STEPS,
         'drc_divergence': divergence,
@@ -1020,7 +1114,7 @@ SAMPLER_CONFIGS = OrderedDict([
         'init': MALA_INIT,
         'init_weights': 'None',
         'transition_w': 'ou',
-        'n_ref': N_REF,
+        'n_ref': DENSITY_SOURCE_REQUIRED_N,
         'n_samples': MALA_N_SAMPLES,
         'init_steps': 0,
         'mala_steps': MALA_STEPS,
@@ -1037,6 +1131,33 @@ SAMPLER_CONFIGS = OrderedDict([
         'include_results': True,
         'is_reference': True,
     }),
+])
+
+if DENSITY_EVAL_SOURCE == 'MALA-EVAL':
+    SAMPLER_CONFIGS['MALA-EVAL'] = {
+        'display_name': 'MALA density-eval bank',
+        'init': MALA_EVAL_INIT,
+        'init_weights': 'None',
+        'transition_w': 'ou',
+        'n_ref': N_REF_EVAL,
+        'n_samples': MALA_EVAL_N_SAMPLES,
+        'init_steps': 0,
+        'mala_steps': MALA_EVAL_STEPS,
+        'mala_burnin': MALA_EVAL_BURNIN,
+        'mala_dt': MALA_EVAL_DT,
+        'precond_mala': MALA_EVAL_PRECOND,
+        'map_laplace_starts': MAP_LAPLACE_STARTS,
+        'map_laplace_max_iter': MAP_LAPLACE_MAX_ITER,
+        'map_laplace_tol': MAP_LAPLACE_TOL,
+        'map_laplace_ridge': MAP_LAPLACE_RIDGE,
+        'map_laplace_max_step_norm': MAP_LAPLACE_MAX_STEP_NORM,
+        'map_laplace_backtrack_steps': MAP_LAPLACE_BACKTRACK_STEPS,
+        'log_mean_ess': False,
+        'include_results': False,
+        'is_reference': False,
+    }
+
+SAMPLER_CONFIGS.update(OrderedDict([
     ('DENS-Tweedie', _density_eval_config(
         DENSITY_REF_SOURCE, 'tweedie', DENSITY_TWEEDIE_DIVERGENCE,
         'DENS-Tweedie', 'Density eval: Tweedie',
@@ -1049,18 +1170,25 @@ SAMPLER_CONFIGS = OrderedDict([
         DENSITY_REF_SOURCE, 'ce_hlsi', DENSITY_LFGI_DIVERGENCE,
         'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
     )),
-])
+]))
 
 RUN_COMMAND_HINT = (
-    'IP_DENSITY_N_REF={n_ref} IP_DENSITY_MALA_N_SAMPLES={mala_n} '
-    'IP_DENSITY_MALA_STEPS={mala_steps} IP_DENSITY_MALA_BURNIN={burnin} '
-    'IP_DENSITY_MALA_DT={dt:g} IP_DENSITY_MALA_INIT={mala_init} '
-    'IP_DENSITY_MAP_LAPLACE_STARTS={map_starts} IP_DENSITY_MAP_LAPLACE_MAX_ITER={map_iter} '
-    'IP_DENSITY_DRC_PF_STEPS={pf_steps} '
+    'IP_DENSITY_N_REF_SIGNAL={n_signal} IP_DENSITY_N_REF_GATE={n_gate} '
+    'IP_DENSITY_N_REF_EVAL={n_eval} IP_DENSITY_BANK_COUPLING={bank_coupling} '
+    'IP_DENSITY_EVAL_SOURCE={eval_source} IP_DENSITY_MALA_N_SAMPLES={mala_n} '
+    'IP_DENSITY_MALA_EVAL_N_SAMPLES={mala_eval_n} IP_DENSITY_MALA_STEPS={mala_steps} '
+    'IP_DENSITY_MALA_BURNIN={burnin} IP_DENSITY_MALA_DT={dt:g} '
+    'IP_DENSITY_MALA_INIT={mala_init} IP_DENSITY_MAP_LAPLACE_STARTS={map_starts} '
+    'IP_DENSITY_MAP_LAPLACE_MAX_ITER={map_iter} IP_DENSITY_DRC_PF_STEPS={pf_steps} '
     'IP_DENSITY_DRC_PLOT_LAYOUT={layout} python helmholtz.py'
 ).format(
-    n_ref=N_REF,
+    n_signal=N_REF_SIGNAL,
+    n_gate=N_REF_GATE,
+    n_eval=N_REF_EVAL,
+    bank_coupling=DENSITY_BANK_COUPLING,
+    eval_source=DENSITY_EVAL_SOURCE,
     mala_n=MALA_N_SAMPLES,
+    mala_eval_n=MALA_EVAL_N_SAMPLES,
     mala_steps=MALA_STEPS,
     burnin=MALA_BURNIN,
     dt=MALA_DT,
@@ -1072,6 +1200,7 @@ RUN_COMMAND_HINT = (
 )
 
 
+
 dashboard = DashboardPDF(
     DASHBOARD_PDF_PATH,
     title='Helmholtz density-evaluation dashboard',
@@ -1080,7 +1209,7 @@ dashboard.add_text_page(
     'Helmholtz density-evaluation dashboard',
     [
         f"Created: {datetime.now().isoformat(timespec='seconds')}",
-        'This dashboard matches the Darcy/Navier-Stokes density-evaluation benchmark: one MALA reference bank, then probability-flow normalized-density evaluation for Tweedie, scalar blend, and CE-HLSI/LFGI on that same bank.',
+        'This dashboard matches the Darcy/Navier-Stokes density-evaluation benchmark, with configurable score-signal, gate, and held-out density-evaluation banks. By default, density values are evaluated on MALA-EVAL rather than on the score-reference bank.',
         'Primary density diagnostic: true posterior energy -log pi(x) versus probability-flow estimated energy -log q(x), plus affine-calibrated residuals in one publication-style comparison grid.',
         'The comparison-grid plot uses CE-HLSI robust axes to align all rows.',
         f"run_results_dir = {run_results_info['run_results_dir']}",
@@ -1089,8 +1218,14 @@ dashboard.add_text_page(
         '',
         f'seed = {seed}',
         f'ACTIVE_DIM = {ACTIVE_DIM}',
-        f'N_REF = {N_REF}',
+        f'N_REF_SIGNAL = {N_REF_SIGNAL}',
+        f'N_REF_GATE = {N_REF_GATE}',
+        f'N_REF_EVAL = {N_REF_EVAL}',
+        f'DENSITY_BANK_COUPLING = {DENSITY_BANK_COUPLING}',
+        f'DENSITY_EVAL_SOURCE = {DENSITY_EVAL_SOURCE}',
+        f'DENSITY_EVAL_BANK_COUPLING = {DENSITY_EVAL_BANK_COUPLING}',
         f'MALA_N_SAMPLES = {MALA_N_SAMPLES}',
+        f'MALA_EVAL_N_SAMPLES = {MALA_EVAL_N_SAMPLES}',
         f'MALA_STEPS = {MALA_STEPS}',
         f'MALA_BURNIN = {MALA_BURNIN}',
         f'MALA_DT = {MALA_DT}',
@@ -1134,7 +1269,7 @@ pipeline = run_standard_sampler_pipeline(
     prior_model,
     lik_model,
     SAMPLER_CONFIGS,
-    n_ref=N_REF,
+    n_ref=N_REF_SIGNAL,
     build_gnl_banks=BUILD_GNL_BANKS,
     compute_pou=True,
 )
@@ -1154,10 +1289,10 @@ plot_mean_ess_logs(ess_logs, display_names=display_names)
 drc_energy_tables = precomp.get('drc_energy_benchmarks', {})
 if drc_energy_tables:
     drc_energy_df = pd.concat(list(drc_energy_tables.values()), ignore_index=True)
-    print('\n=== DRC density/energy benchmark on MALA reference bank ===')
+    print('\n=== DRC density/energy benchmark on configured density-eval bank ===')
     print(drc_energy_df.to_string(index=False))
     dashboard.add_dataframe(
-        'DRC density/energy benchmark on MALA reference bank',
+        'DRC density/energy benchmark on configured density-eval bank',
         drc_energy_df,
         max_rows=20,
         max_cols=8,
@@ -1347,7 +1482,7 @@ plot_normalizer_title = display_names.get(plot_normalizer_key, plot_normalizer_k
 _sync_sampling_run_results_context()
 plot_pca_histograms(samples, alpha_true_np, display_names=display_names, normalizer=plot_normalizer_key, metrics_dict=metrics, fallback_key=reference_key)
 
-results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(metrics, sampler_run_info, n_ref=N_REF, target_name='Helmholtz scattering density evaluation', display_names=display_names, reference_name=reference_title)
+results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_results_tables(metrics, sampler_run_info, n_ref=N_REF_SIGNAL, target_name='Helmholtz scattering density evaluation', display_names=display_names, reference_name=reference_title)
 
 dashboard.add_results_tables(results_df, results_runinfo_df)
 
@@ -1356,12 +1491,23 @@ save_reproducibility_log(
     config={
         'seed': seed,
         'ACTIVE_DIM': ACTIVE_DIM,
-        'N_REF': N_REF,
+        'N_REF_SIGNAL': N_REF_SIGNAL,
+        'N_REF_GATE': N_REF_GATE,
+        'N_REF_EVAL': N_REF_EVAL,
+        'DENSITY_SOURCE_REQUIRED_N': DENSITY_SOURCE_REQUIRED_N,
+        'DENSITY_BANK_COUPLING': DENSITY_BANK_COUPLING,
+        'DENSITY_EVAL_SOURCE': DENSITY_EVAL_SOURCE,
+        'DENSITY_EVAL_BANK_COUPLING': DENSITY_EVAL_BANK_COUPLING,
         'PLOT_NORMALIZER': PLOT_NORMALIZER,
         'HESS_MIN': HESS_MIN,
         'HESS_MAX': HESS_MAX,
         'NOISE_STD': NOISE_STD,
         'MALA_N_SAMPLES': MALA_N_SAMPLES,
+        'MALA_EVAL_N_SAMPLES': MALA_EVAL_N_SAMPLES,
+        'MALA_EVAL_STEPS': MALA_EVAL_STEPS,
+        'MALA_EVAL_BURNIN': MALA_EVAL_BURNIN,
+        'MALA_EVAL_DT': MALA_EVAL_DT,
+        'MALA_EVAL_INIT': MALA_EVAL_INIT,
         'MALA_STEPS': MALA_STEPS,
         'MALA_BURNIN': MALA_BURNIN,
         'MALA_DT': MALA_DT,
