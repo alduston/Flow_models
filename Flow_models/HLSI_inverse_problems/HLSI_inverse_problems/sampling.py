@@ -1631,7 +1631,9 @@ def eval_modular_hlsi_posterior_score(y, t, mode, X_ref_cpu, log_lik_ref_cpu,
                                       gated_info=None, batch_size=REF_STREAM_BATCH,
                                       gate_rho=None, gate_beta=None, gate_kappa=None,
                                       gate_topk=64, gate_metric_source='mu',
-                                      transition_w='ou'):
+                                      transition_w='ou',
+                                      gate_X_ref=None, gate_log_lik_ref=None, gate_P_ref=None,
+                                      gate_mu_ref=None, gate_gated_info=None):
     gate_law = resolve_hlsi_gate_law(
         mode,
         gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
@@ -1650,6 +1652,9 @@ def eval_modular_hlsi_posterior_score(y, t, mode, X_ref_cpu, log_lik_ref_cpu,
             y, t, X_ref_cpu, log_lik_ref_cpu, P_ref_cpu, s0_post_ref_cpu,
             mu_ref_cpu=mu_ref_cpu, gated_info=gated_info, batch_size=batch_size,
             transition_w=transition_w,
+            gate_X_ref_cpu=gate_X_ref, gate_log_lik_ref_cpu=gate_log_lik_ref,
+            gate_P_ref_cpu=gate_P_ref, gate_mu_ref_cpu=gate_mu_ref,
+            gate_gated_info=gate_gated_info,
         )
 
     component_state = _build_hlsi_component_state(
@@ -1663,7 +1668,10 @@ def eval_modular_hlsi_posterior_score(y, t, mode, X_ref_cpu, log_lik_ref_cpu,
 def eval_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
                                  P_ref_cpu, s0_post_ref_cpu, mu_ref_cpu=None,
                                  gated_info=None, batch_size=REF_STREAM_BATCH,
-                                 apply_pou_correction=False, transition_w='ou'):
+                                 apply_pou_correction=False, transition_w='ou',
+                                 gate_X_ref_cpu=None, gate_log_lik_ref_cpu=None,
+                                 gate_P_ref_cpu=None, gate_mu_ref_cpu=None,
+                                 gate_gated_info=None):
     """
     Certainty-Equivalent HLSI with externally supplied SNIS weights.
 
@@ -1698,18 +1706,38 @@ def eval_ce_hlsi_posterior_score(y, t, X_ref_cpu, log_lik_ref_cpu,
     s_tsi_num = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
     P_bar = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
 
+    use_separate_gate_bank = gate_X_ref_cpu is not None
+    if not use_separate_gate_bank:
+        gate_X_ref_cpu = X_ref_cpu
+        gate_log_lik_ref_cpu = log_lik_ref_cpu
+        gate_P_ref_cpu = P_ref_cpu
+        gate_mu_ref_cpu = mu_ref_cpu
+        gate_gated_info = gated_info
+    if gate_log_lik_ref_cpu is None:
+        gate_log_lik_ref_cpu = log_lik_ref_cpu
+    if gate_P_ref_cpu is None:
+        raise ValueError('CE-HLSI gate evaluation requires gate_P_ref_cpu/P_ref_cpu.')
+
     for i in range(0, X_ref_cpu.shape[0], batch_size):
         sl = slice(i, i + batch_size)
         w_batch = w[:, sl]
         X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
         s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
-        P_batch = P_ref_cpu[sl].to(y.device, non_blocking=True)
-
         mu_x += torch.einsum('mb,bd->md', w_batch, X_batch)
         s_tsi_num += torch.einsum('mb,bd->md', w_batch, s0_batch)
-        P_bar += torch.einsum('mb,bij->mij', w_batch, P_batch)
 
-        del w_batch, X_batch, s0_batch, P_batch
+        del w_batch, X_batch, s0_batch
+
+    w_gate = w if not use_separate_gate_bank else get_posterior_snis_weights(
+        y, t_val, gate_X_ref_cpu, gate_log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=gate_P_ref_cpu,
+        mu_ref_cpu=gate_mu_ref_cpu, gated_info=gate_gated_info)
+    for i in range(0, gate_X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_gate_batch = w_gate[:, sl]
+        P_batch = gate_P_ref_cpu[sl].to(y.device, non_blocking=True)
+        P_bar += torch.einsum('mb,bij->mij', w_gate_batch, P_batch)
+        del w_gate_batch, P_batch
 
     s_twd = -(1.0 / var_t) * (y - et * mu_x)
     s_tsi = (1.0 / et) * s_tsi_num
@@ -1745,7 +1773,9 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
                       P_ref=None, mu_ref=None, gated_info=None, init_weights='L',
                       transition_w='ou', grad_log_pou_denom_ref=None,
                       gate_rho=None, gate_beta=None, gate_kappa=None,
-                      gate_topk=64, gate_metric_source='mu'):
+                      gate_topk=64, gate_metric_source='mu',
+                      gate_X_ref=None, gate_log_lik_ref=None, gate_P_ref=None,
+                      gate_mu_ref=None, gate_gated_info=None):
     """
     No-CFG wrapper: returns only the conditional/posterior score estimate.
 
@@ -1786,6 +1816,8 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
             gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
             gate_topk=gate_topk, gate_metric_source=gate_metric_source,
             transition_w=transition_w,
+            gate_X_ref=gate_X_ref, gate_log_lik_ref=gate_log_lik_ref,
+            gate_P_ref=gate_P_ref, gate_mu_ref=gate_mu_ref, gate_gated_info=gate_gated_info,
         )
 
     else:
@@ -1808,7 +1840,8 @@ def _global_log_weight_ess(logw_cpu):
     return float((z1 * z1 / z2).item())
 
 
-def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None):
+def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None,
+                                    gate_local_bank=None, gate_init_log_weights=None):
     """Snapshot the score field used by a density-evaluation / DRC-R node.
 
     This is the generic version of the older HLSI-only frozen spec.  It supports
@@ -1863,7 +1896,27 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
         'n_ref_score': int(local_bank['X_ref'].shape[0]),
         'n_samples_final': int(final_samples.shape[0]) if torch.is_tensor(final_samples) else None,
         'bank_name': local_bank.get('bank_name', 'unknown'),
+        'score_gate_bank_coupling': cfg.get('score_gate_bank_coupling', 'shared'),
     }
+    if gate_local_bank is not None:
+        if gate_init_log_weights is None:
+            gate_init_log_weights = init_log_weights
+        spec.update({
+            'gate_X_ref': gate_local_bank['X_ref'].detach().cpu(),
+            'gate_log_weights': gate_init_log_weights.detach().cpu(),
+            'gate_bank_name': gate_local_bank.get('bank_name', 'unknown'),
+            'n_ref_gate': int(gate_local_bank['X_ref'].shape[0]),
+        })
+        if 'P_ref' in gate_local_bank and torch.is_tensor(gate_local_bank['P_ref']):
+            spec['gate_P_ref'] = gate_local_bank['P_ref'].detach().cpu()
+        if 'mu_ref' in gate_local_bank and torch.is_tensor(gate_local_bank['mu_ref']):
+            spec['gate_mu_ref'] = gate_local_bank['mu_ref'].detach().cpu()
+        if gate_local_bank.get('gated_info') is not None:
+            spec['gate_gated_info'] = {
+                k: v.detach().cpu() for k, v in gate_local_bank['gated_info'].items()
+            }
+        else:
+            spec['gate_gated_info'] = None
     if 'P_ref' in local_bank and torch.is_tensor(local_bank['P_ref']):
         spec['P_ref'] = local_bank['P_ref'].detach().cpu()
     if 'mu_ref' in local_bank and torch.is_tensor(local_bank['mu_ref']):
@@ -1886,13 +1939,24 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
                 f"Frozen density score spec for HLSI-family mode={mode!r} is missing {missing}. "
                 f"Available local_bank keys: {sorted(local_bank.keys())}"
             )
+        if gate_local_bank is not None and mode in _ANALYTIC_CE_HLSI_DRC_DIVERGENCE_MODES:
+            gate_missing = [k for k in ('gate_X_ref', 'gate_log_weights', 'gate_P_ref')
+                            if k not in spec or spec[k] is None]
+            if gate_missing:
+                raise KeyError(
+                    f"Frozen density score spec for separate-gate mode={mode!r} is missing {gate_missing}. "
+                    f"Available gate bank keys: {sorted(gate_local_bank.keys())}"
+                )
     return spec
 
 
 # Backwards-compatible name used by older script paths.
-def _make_frozen_hlsi_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None):
-    return _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights,
-                                           final_samples=final_samples)
+def _make_frozen_hlsi_score_spec(label, cfg, local_bank, init_log_weights, final_samples=None,
+                                 gate_local_bank=None, gate_init_log_weights=None):
+    return _make_frozen_density_score_spec(
+        label, cfg, local_bank, init_log_weights, final_samples=final_samples,
+        gate_local_bank=gate_local_bank, gate_init_log_weights=gate_init_log_weights,
+    )
 
 
 def _eval_score_from_frozen_spec(y, t, spec):
@@ -1903,6 +1967,11 @@ def _eval_score_from_frozen_spec(y, t, spec):
         P_ref=spec.get('P_ref'), mu_ref=spec.get('mu_ref'), gated_info=spec.get('gated_info'),
         init_weights=spec.get('init_weights', 'L'),
         transition_w=spec.get('transition_w', 'ou'),
+        gate_X_ref=spec.get('gate_X_ref'),
+        gate_log_lik_ref=spec.get('gate_log_weights'),
+        gate_P_ref=spec.get('gate_P_ref'),
+        gate_mu_ref=spec.get('gate_mu_ref'),
+        gate_gated_info=spec.get('gate_gated_info'),
         gate_rho=spec.get('gate_rho'), gate_beta=spec.get('gate_beta'),
         gate_kappa=spec.get('gate_kappa'), gate_topk=spec.get('gate_topk', 64),
         gate_metric_source=spec.get('gate_metric_source', 'mu'),
@@ -2042,6 +2111,12 @@ def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREA
     s0_post_ref_cpu = spec['s0_post_ref']
     log_w_ref_cpu = spec['log_weights']
     P_ref_cpu = spec['P_ref']
+    gate_X_ref_cpu = spec.get('gate_X_ref', X_ref_cpu)
+    gate_log_w_ref_cpu = spec.get('gate_log_weights', log_w_ref_cpu)
+    gate_P_ref_cpu = spec.get('gate_P_ref', P_ref_cpu)
+    gate_mu_ref_cpu = spec.get('gate_mu_ref', spec.get('mu_ref'))
+    gate_gated_info = spec.get('gate_gated_info', spec.get('gated_info'))
+    use_separate_gate_bank = gate_X_ref_cpu is not X_ref_cpu
 
     t_val = _canonicalize_time(t)
     et = math.exp(-t_val)
@@ -2060,21 +2135,32 @@ def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREA
     c_bar = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
     H_bar = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
 
-    # First pass: weighted means bbar, cbar, Hbar.
+    # First pass: signal-bank weighted means bbar and cbar.
     for i in range(0, X_ref_cpu.shape[0], batch_size):
         sl = slice(i, i + batch_size)
         w_batch = w[:, sl]
         X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
         s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
-        P_batch = P_ref_cpu[sl].to(y.device, non_blocking=True)
 
         b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_gamma
         c_batch = s0_batch / et
         b_bar += torch.einsum('mb,mbd->md', w_batch, b_batch)
         c_bar += torch.einsum('mb,bd->md', w_batch, c_batch)
-        H_bar += torch.einsum('mb,bij->mij', w_batch, P_batch)
 
-        del w_batch, X_batch, s0_batch, P_batch, b_batch, c_batch
+        del w_batch, X_batch, s0_batch, b_batch, c_batch
+
+    w_gate = w if not use_separate_gate_bank else get_posterior_snis_weights(
+        y, t_val, gate_X_ref_cpu, gate_log_w_ref_cpu, batch_size=batch_size,
+        transition_w='ou', P_ref_cpu=gate_P_ref_cpu,
+        mu_ref_cpu=gate_mu_ref_cpu, gated_info=gate_gated_info)
+
+    # Gate-bank weighted Hessian mean Hbar.
+    for i in range(0, gate_X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        wg_batch = w_gate[:, sl]
+        P_batch = gate_P_ref_cpu[sl].to(y.device, non_blocking=True)
+        H_bar += torch.einsum('mb,bij->mij', wg_batch, P_batch)
+        del wg_batch, P_batch
 
     # Gate exactly matches the existing CE-HLSI score path up to roundoff.
     gate_eig, V = _get_ce_hlsi_gate_eigenbasis(H_bar, et2, gamma)
@@ -2087,13 +2173,12 @@ def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREA
     Ccb = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
     T = torch.zeros((m_query, d, d, d), device=y.device, dtype=y.dtype)
 
-    # Second pass: derivative moments C_bb, C_cb, and T=d_y Hbar.
+    # Second pass over the signal bank: derivative moments C_bb and C_cb.
     for i in range(0, X_ref_cpu.shape[0], batch_size):
         sl = slice(i, i + batch_size)
         w_batch = w[:, sl]
         X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
         s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
-        P_batch = P_ref_cpu[sl].to(y.device, non_blocking=True)
 
         b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_gamma
         c_batch = s0_batch / et
@@ -2102,11 +2187,27 @@ def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREA
 
         Cbb += torch.einsum('mb,mbu,mba->mua', w_batch, db, db)
         Ccb += torch.einsum('mb,mbu,mba->mua', w_batch, dc, db)
-        # T_{a u v}=sum_i w_i db_{i,a} P_{i,u,v}; centering by Hbar is unnecessary
-        # because sum_i w_i db_i=0 exactly up to floating point error.
-        T += torch.einsum('mb,mba,buv->mauv', w_batch, db, P_batch)
 
-        del w_batch, X_batch, s0_batch, P_batch, b_batch, c_batch, db, dc
+        del w_batch, X_batch, s0_batch, b_batch, c_batch, db, dc
+
+    # Third-order derivative of Hbar from the gate bank.
+    b_gate_bar = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    for i in range(0, gate_X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        wg_batch = w_gate[:, sl]
+        Xg_batch = gate_X_ref_cpu[sl].to(y.device, non_blocking=True)
+        bg_batch = -(y.unsqueeze(1) - et * Xg_batch.unsqueeze(0)) * inv_gamma
+        b_gate_bar += torch.einsum('mb,mbd->md', wg_batch, bg_batch)
+        del wg_batch, Xg_batch, bg_batch
+    for i in range(0, gate_X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        wg_batch = w_gate[:, sl]
+        Xg_batch = gate_X_ref_cpu[sl].to(y.device, non_blocking=True)
+        P_batch = gate_P_ref_cpu[sl].to(y.device, non_blocking=True)
+        bg_batch = -(y.unsqueeze(1) - et * Xg_batch.unsqueeze(0)) * inv_gamma
+        dbg = bg_batch - b_gate_bar.unsqueeze(1)
+        T += torch.einsum('mb,mba,buv->mauv', wg_batch, dbg, P_batch)
+        del wg_batch, Xg_batch, P_batch, bg_batch, dbg
 
     I = torch.eye(d, device=y.device, dtype=y.dtype).unsqueeze(0)
     Jb = Cbb - inv_gamma * I
@@ -2118,7 +2219,7 @@ def _eval_ce_hlsi_score_and_divergence_analytic(y, t, spec, batch_size=REF_STREA
     third = torch.einsum('mau,mauv,mv->m', G, T, Gr)
     div_score = tr_Jb + tr_GJr - (gamma / max(et2, 1e-300)) * third
 
-    del w, b_bar, c_bar, H_bar, gate_eig, V, G, r, Gr, Cbb, Ccb, T, I, Jb, Jc, Jr
+    del w, w_gate, b_bar, c_bar, H_bar, gate_eig, V, G, r, Gr, Cbb, Ccb, T, I, Jb, Jc, Jr, b_gate_bar
     return score, div_score
 
 
@@ -3183,6 +3284,13 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
         'drc_div_probes': int(cfg.get('drc_div_probes', 1)),
         'drc_fd_eps': float(cfg.get('drc_fd_eps', 1e-3)),
         'drc_eval_batch_size': int(batch_size),
+        'drc_n_ref_score': int(source_score_spec.get('n_ref_score', source_score_spec.get('X_ref').shape[0])),
+        'drc_n_ref_gate': int(source_score_spec.get('n_ref_gate', source_score_spec.get('n_ref_score', source_score_spec.get('X_ref').shape[0]))),
+        'drc_n_ref_eval': int(n),
+        'drc_score_bank': str(source_score_spec.get('bank_name', 'unknown')),
+        'drc_gate_bank': str(source_score_spec.get('gate_bank_name', source_score_spec.get('bank_name', 'unknown'))),
+        'drc_eval_bank': str(bank.get('bank_name', 'unknown')),
+        'drc_score_gate_bank_coupling': str(source_score_spec.get('score_gate_bank_coupling', 'shared')),
         'drc_runtime_seconds': float(time.time() - t0_wall),
     }
     print(
@@ -3200,6 +3308,9 @@ def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_
             'source_init_weights': str(source_score_spec.get('init_weights')),
             'source_transition_w': str(source_score_spec.get('transition_w')),
             'X_ref': X_cpu.detach().cpu(),
+            'eval_bank_name': str(bank.get('bank_name', 'unknown')),
+            'score_bank_name': str(source_score_spec.get('bank_name', 'unknown')),
+            'gate_bank_name': str(source_score_spec.get('gate_bank_name', source_score_spec.get('bank_name', 'unknown'))),
             'log_prior': torch.cat(log_prior_chunks, dim=0).double(),
             'log_lik': torch.cat(log_lik_chunks, dim=0).double(),
             'log_target': torch.cat(log_target_chunks, dim=0).double(),
@@ -3231,13 +3342,14 @@ def _attach_drc_weights_if_requested(bank, cfg, precomp, prior_model, lik_model,
     carried = precomp.get('carried_log_ref_weights', {})
     if ref_source in carried:
         n = int(bank['X_ref'].shape[0])
+        start = int(bank.get('source_offset', 0) or 0)
         logw = carried[ref_source].detach().cpu().double().reshape(-1)
-        if logw.numel() < n:
+        if logw.numel() < start + n:
             raise ValueError(
-                f"Sampler '{label}' requested {n} DRC-R carried weights from ref_source={ref_source!r}, "
-                f"but only {logw.numel()} are available."
+                f"Sampler '{label}' requested {n} DRC-R carried weights from ref_source={ref_source!r} "
+                f"at source_offset={start}, requiring {start + n} weights, but only {logw.numel()} are available."
             )
-        out_bank['log_drc_ref'] = logw[:n].contiguous()
+        out_bank['log_drc_ref'] = logw[start:start + n].contiguous()
         diag = {
             'drc_source': str(ref_source),
             'drc_source_kind': 'alternating_ratio_update_carried_weights',
@@ -3397,6 +3509,8 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                      grad_log_pou_denom_ref=None, transition_w='ou',
                      gate_rho=None, gate_beta=None, gate_kappa=None,
                      gate_topk=64, gate_metric_source='mu',
+                     gate_X_ref=None, gate_log_lik_ref=None, gate_P_ref=None,
+                     gate_mu_ref=None, gate_gated_info=None,
                      return_info=False):
     if x_init is None:
         y = torch.randn(n_samples, dim, device=device, dtype=torch.float64)
@@ -3453,7 +3567,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                   grad_log_pou_denom_ref=grad_log_pou_denom_ref,
                                   gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
                                   gate_topk=gate_topk, gate_metric_source=gate_metric_source,
-                                  transition_w=transition_w)
+                                  transition_w=transition_w,
+                                  gate_X_ref=gate_X_ref, gate_log_lik_ref=gate_log_lik_ref,
+                                  gate_P_ref=gate_P_ref, gate_mu_ref=gate_mu_ref,
+                                  gate_gated_info=gate_gated_info)
         cur_norm = _mean_vector_norm(s_cur)
         if i == 0:
             info['score_norm_initial'] = cur_norm
@@ -3470,7 +3587,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                    grad_log_pou_denom_ref=grad_log_pou_denom_ref,
                                    gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
                                    gate_topk=gate_topk, gate_metric_source=gate_metric_source,
-                                   transition_w=transition_w)
+                                   transition_w=transition_w,
+                                  gate_X_ref=gate_X_ref, gate_log_lik_ref=gate_log_lik_ref,
+                                  gate_P_ref=gate_P_ref, gate_mu_ref=gate_mu_ref,
+                                  gate_gated_info=gate_gated_info)
         d_next = y_hat + 2.0 * s_next
 
         y = y + 0.5 * (d_cur + d_next) * dt + math.sqrt(2.0 * dt.item()) * z
@@ -3488,7 +3608,10 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                     grad_log_pou_denom_ref=grad_log_pou_denom_ref,
                                     gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
                                     gate_topk=gate_topk, gate_metric_source=gate_metric_source,
-                                    transition_w=transition_w)
+                                    transition_w=transition_w,
+                                  gate_X_ref=gate_X_ref, gate_log_lik_ref=gate_log_lik_ref,
+                                  gate_P_ref=gate_P_ref, gate_mu_ref=gate_mu_ref,
+                                  gate_gated_info=gate_gated_info)
     info['score_norm_mean'] = score_norm_sum / float(max(1, steps))
     info['score_norm_final'] = _mean_vector_norm(final_score)
     info['score_norm_max'] = max(score_norm_max, info['score_norm_final'])
@@ -4782,6 +4905,36 @@ def canonicalize_ref_source(value):
     return text
 
 
+def canonical_bank_coupling(value):
+    """Normalize score/gate/evaluation bank coupling mode names.
+
+    Modes mirror the benchmark-sweep harness:
+      * shared:      exact same finite bank.
+      * prefix:      gate bank includes the signal bank as its leading prefix.
+      * independent: disjoint finite banks drawn from the same source when possible.
+    """
+    key = str(value or 'shared').strip().lower().replace('_', '-').replace(' ', '-')
+    aliases = {
+        'shared': 'shared', 'same': 'shared', 'same-bank': 'shared',
+        'prefix': 'prefix', 'coupled': 'prefix', 'prefix-coupled': 'prefix',
+        'prefix-coupling': 'prefix', 'inclusive': 'prefix', 'include': 'prefix',
+        'independent': 'independent', 'indep': 'independent',
+        'indpendent': 'independent', 'disjoint': 'independent',
+        'separate': 'independent', 'decoupled': 'independent',
+    }
+    if key not in aliases:
+        raise ValueError(f"Unknown bank coupling mode {value!r}; use shared, prefix, or independent")
+    return aliases[key]
+
+
+def _optional_int(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, str) and value.strip() == '':
+        return default
+    return int(value)
+
+
 def get_sampler_bank_key(init_mode=None, mala_refs=False, ref_source=None, n_ref=None):
     ref_source = canonicalize_ref_source(ref_source)
     if ref_source is not None:
@@ -5001,6 +5154,36 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     cfg.setdefault('n_ref', None)
     if cfg['n_ref'] is not None:
         cfg['n_ref'] = int(cfg['n_ref'])
+
+    # Finite-bank controls. ``n_ref`` remains the backwards-compatible signal
+    # bank size. ``n_ref_signal``/``n_ref_gate`` and
+    # ``score_gate_bank_coupling`` expose the benchmark-sweep split-bank
+    # semantics inside the tree sampler.
+    raw_n_ref_signal = cfg.get('n_ref_signal', cfg.get('n_ref_score', cfg.get('n_ref')))
+    raw_n_ref_gate = cfg.get('n_ref_gate', cfg.get('n_gate', None))
+    cfg['n_ref_signal'] = _optional_int(raw_n_ref_signal, None)
+    cfg['n_ref_gate'] = _optional_int(raw_n_ref_gate, None)
+    bank_coupling_raw = cfg.get(
+        'score_gate_bank_coupling',
+        cfg.get('gate_bank_coupling', cfg.get('bank_coupling', None)),
+    )
+    cfg['score_gate_bank_coupling'] = canonical_bank_coupling(
+        ('prefix' if raw_n_ref_gate is not None and bank_coupling_raw is None else bank_coupling_raw)
+        or 'shared'
+    )
+    cfg['gate_bank_coupling'] = cfg['score_gate_bank_coupling']
+
+    cfg['drc_eval_source'] = canonicalize_ref_source(
+        cfg.get('drc_eval_source', cfg.get('eval_source', None))
+    )
+    raw_n_ref_eval = cfg.get('drc_eval_n_ref', cfg.get('n_ref_eval', cfg.get('eval_n_ref', cfg.get('n_ref'))))
+    cfg['drc_eval_n_ref'] = _optional_int(raw_n_ref_eval, None)
+    cfg['n_ref_eval'] = cfg['drc_eval_n_ref']
+    cfg['drc_eval_bank_coupling'] = canonical_bank_coupling(
+        cfg.get('drc_eval_bank_coupling', cfg.get('eval_bank_coupling', 'shared'))
+    )
+    cfg['eval_bank_coupling'] = cfg['drc_eval_bank_coupling']
+
     cfg.setdefault('dim', default_dim)
     cfg.setdefault('mala_steps', 0)
     cfg.setdefault('mala_burnin', 0)
@@ -5206,19 +5389,26 @@ def _finite_reference_samples(samples_cpu, source_label):
 
 
 
-def _take_reference_subset(samples_cpu, n_ref, source_label, consumer_label):
+def _take_reference_subset(samples_cpu, n_ref, source_label, consumer_label, offset=0):
     samples_cpu = _finite_reference_samples(samples_cpu, source_label)
     available = int(samples_cpu.shape[0])
+    offset = int(max(0, offset or 0))
+    if offset > available:
+        raise ValueError(
+            f"Sampler '{consumer_label}' requested ref_source='{source_label}' with offset={offset}, "
+            f"but only {available} finite samples are available."
+        )
     if n_ref is None:
-        n_take = available
+        n_take = available - offset
     else:
         n_take = int(n_ref)
-        if n_take > available:
+        if offset + n_take > available:
             raise ValueError(
-                f"Sampler '{consumer_label}' requested n_ref={n_take} from ref_source='{source_label}', "
-                f"but only {available} finite samples are available."
+                f"Sampler '{consumer_label}' requested n_ref={n_take} from ref_source='{source_label}' "
+                f"at offset={offset}, requiring {offset + n_take} finite samples, "
+                f"but only {available} are available."
             )
-    return samples_cpu[:n_take].contiguous(), n_take
+    return samples_cpu[offset:offset + n_take].contiguous(), n_take
 
 
 
@@ -5228,6 +5418,30 @@ def _precompute_bank_from_reference_samples(x_ref_cpu, prior_model, lik_model, l
         x_ref, prior_model, lik_model, label=label, compute_pou=bool(compute_pou),
     )
     del x_ref
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return bank
+
+
+def _precompute_eval_bank_from_reference_samples(x_ref_cpu, prior_model, lik_model, label,
+                                                 log_batch_size=50):
+    """Precompute only the fields needed for held-out DRC density evaluation."""
+    print(f"Precomputing {label} density-eval bank with {x_ref_cpu.shape[0]} particles (log-likelihood only)...")
+    x_ref = x_ref_cpu.to(device=device, dtype=torch.float64)
+    log_lik_chunks = []
+    with torch.no_grad():
+        for i in range(0, x_ref.shape[0], int(log_batch_size)):
+            log_lik_chunks.append(lik_model.log_likelihood(x_ref[i:i + int(log_batch_size)]))
+    log_lik = torch.cat(log_lik_chunks, dim=0)
+    bank = {
+        'X_ref': x_ref.detach().cpu(),
+        'log_lik_ref': log_lik.detach().cpu(),
+        'log_none_ref': torch.zeros_like(log_lik).detach().cpu(),
+        'bank_name': str(label),
+        'eval_only': True,
+    }
+    del x_ref, log_lik, log_lik_chunks
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -5268,22 +5482,97 @@ def _get_or_build_prior_bank(precomp, prior_model, lik_model, n_ref, compute_pou
 
 
 
-def _get_or_build_source_bank(precomp, samples, source_label, consumer_label, prior_model, lik_model, n_ref, compute_pou):
+def _get_or_build_source_bank(precomp, samples, source_label, consumer_label, prior_model, lik_model,
+                              n_ref, compute_pou, offset=0, role='signal'):
     source_samples = samples[source_label]
     x_ref_cpu, n_ref_actual = _take_reference_subset(
-        source_samples, n_ref, source_label=source_label, consumer_label=consumer_label,
+        source_samples, n_ref, source_label=source_label, consumer_label=consumer_label, offset=offset,
     )
-    key = ('source', source_label, n_ref_actual, bool(compute_pou))
-    superset_key = ('source', source_label, n_ref_actual, True)
+    offset = int(max(0, offset or 0))
+    key = ('source', source_label, offset, n_ref_actual, bool(compute_pou), str(role))
+    legacy_key = ('source', source_label, n_ref_actual, bool(compute_pou)) if offset == 0 and role == 'signal' else None
+    superset_key = ('source', source_label, offset, n_ref_actual, True, str(role))
     precomp.setdefault('bank_cache', {})
+    if legacy_key is not None and legacy_key in precomp['bank_cache']:
+        return precomp['bank_cache'][legacy_key], n_ref_actual
     if not compute_pou and superset_key in precomp['bank_cache']:
         return precomp['bank_cache'][superset_key], n_ref_actual
     if key not in precomp['bank_cache']:
-        bank_label = f'{consumer_label}_ref_from_{source_label}_n{n_ref_actual}'
-        precomp['bank_cache'][key] = _precompute_bank_from_reference_samples(
+        span = f'{offset}_{offset + n_ref_actual}' if offset else f'n{n_ref_actual}'
+        bank_label = f'{consumer_label}_{role}_from_{source_label}_{span}'
+        bank = _precompute_bank_from_reference_samples(
             x_ref_cpu, prior_model, lik_model, label=bank_label, compute_pou=compute_pou,
         )
+        bank['source_label'] = source_label
+        bank['source_offset'] = int(offset)
+        bank['source_n_ref'] = int(n_ref_actual)
+        bank['bank_role'] = str(role)
+        precomp['bank_cache'][key] = bank
+        if legacy_key is not None:
+            precomp['bank_cache'][legacy_key] = bank
     return precomp['bank_cache'][key], n_ref_actual
+
+
+def _get_or_build_source_eval_bank(precomp, samples, source_label, consumer_label, prior_model, lik_model,
+                                   n_ref, offset=0, role='eval'):
+    source_samples = samples[source_label]
+    x_ref_cpu, n_ref_actual = _take_reference_subset(
+        source_samples, n_ref, source_label=source_label, consumer_label=consumer_label, offset=offset,
+    )
+    offset = int(max(0, offset or 0))
+    key = ('source_eval', source_label, offset, n_ref_actual, str(role))
+    precomp.setdefault('bank_cache', {})
+    if key not in precomp['bank_cache']:
+        span = f'{offset}_{offset + n_ref_actual}' if offset else f'n{n_ref_actual}'
+        bank_label = f'{consumer_label}_{role}_from_{source_label}_{span}'
+        bank = _precompute_eval_bank_from_reference_samples(
+            x_ref_cpu, prior_model, lik_model, label=bank_label,
+        )
+        bank['source_label'] = source_label
+        bank['source_offset'] = int(offset)
+        bank['source_n_ref'] = int(n_ref_actual)
+        bank['bank_role'] = str(role)
+        precomp['bank_cache'][key] = bank
+    return precomp['bank_cache'][key], n_ref_actual
+
+
+def _resolve_signal_gate_counts(cfg, default_n_ref):
+    n_signal = int(default_n_ref if cfg.get('n_ref_signal') is None else cfg['n_ref_signal'])
+    if cfg.get('n_ref_gate') is None:
+        n_gate = n_signal
+        gate_was_set = False
+    else:
+        n_gate = int(cfg['n_ref_gate'])
+        gate_was_set = True
+    coupling = canonical_bank_coupling(cfg.get('score_gate_bank_coupling', 'shared'))
+    if coupling == 'shared':
+        if gate_was_set and n_gate != n_signal:
+            print(
+                f"[bank-coupling] shared mode uses gate=signal exactly; "
+                f"ignoring n_ref_gate={n_gate} and setting it to n_ref_signal={n_signal}."
+            )
+        n_gate = n_signal
+    elif coupling == 'prefix' and n_gate < n_signal:
+        raise ValueError(
+            f"score_gate_bank_coupling=prefix requires n_ref_gate={n_gate} >= n_ref_signal={n_signal}. "
+            "Use score_gate_bank_coupling=independent for disjoint banks."
+        )
+    if n_signal <= 0 or n_gate <= 0:
+        raise ValueError(f'n_ref_signal and n_ref_gate must be positive, got {n_signal}, {n_gate}.')
+    return n_signal, n_gate, coupling
+
+
+def _gate_bank_is_separate(n_signal, n_gate, coupling):
+    return coupling == 'independent' or (coupling == 'prefix' and int(n_gate) != int(n_signal))
+
+
+def _config_uses_ce_gate_bank(cfg):
+    mode = cfg.get('drc_score_init') if canonicalize_init_name(cfg.get('init')) == 'drc_ratio_update' else cfg.get('init')
+    try:
+        mode = canonicalize_init_name(mode)
+    except Exception:
+        return False
+    return mode in {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi'}
 
 
 
@@ -5294,34 +5583,99 @@ def _select_reference_bank_for_config(label, cfg, samples, precomp, prior_model,
     ref_source = cfg.get('ref_source')
     needs_pou = _config_requires_pou_bank(cfg)
     precomp.setdefault('drc_diagnostics', {})
-    # For ordinary prior banks, preserve the historical compute_pou flag. For
-    # named source banks, only build PoU objects when the consumer actually needs
-    # them; descendants build their own banks from the resulting samples later.
+
+    n_signal, n_gate, coupling = _resolve_signal_gate_counts(cfg, default_n_ref)
+    gate_separate = _gate_bank_is_separate(n_signal, n_gate, coupling) and _config_uses_ce_gate_bank(cfg)
+
     if ref_source is None:
-        n_ref_used = int(default_n_ref if cfg.get('n_ref') is None else cfg['n_ref'])
-        bank = _get_or_build_prior_bank(
-            precomp, prior_model, lik_model, n_ref=n_ref_used,
+        signal_bank = _get_or_build_prior_bank(
+            precomp, prior_model, lik_model, n_ref=n_signal,
             compute_pou=bool(compute_pou_default or needs_pou),
         )
+        ref_bank_source = 'None'
+        n_ref_used = n_signal
+
+        if gate_separate:
+            gate_key = ('prior_gate', label, n_gate, bool(compute_pou_default or needs_pou), coupling)
+            precomp.setdefault('bank_cache', {})
+            if gate_key not in precomp['bank_cache']:
+                precomp['bank_cache'][gate_key] = _build_prior_reference_bank(
+                    prior_model, lik_model, n_gate,
+                    compute_pou=bool(compute_pou_default or needs_pou),
+                    label=f'{label}_gate_prior_n{n_gate}',
+                )
+            precomp.setdefault('gate_banks', {})[label] = precomp['bank_cache'][gate_key]
+            precomp.setdefault('gate_bank_info', {})[label] = dict(
+                n_ref_signal=n_signal, n_ref_gate=n_gate, coupling=coupling,
+                ref_source='None', gate_offset=0, gate_bank_separate=True,
+            )
+
         bank, drc_diag = _attach_drc_weights_if_requested(
-            bank, cfg, precomp, prior_model, lik_model, ref_source=None, label=label,
+            signal_bank, cfg, precomp, prior_model, lik_model, ref_source=None, label=label,
         )
         if drc_diag:
             precomp['drc_diagnostics'][label] = drc_diag
-        return bank, 'None', n_ref_used
+    else:
+        signal_bank, n_ref_used = _get_or_build_source_bank(
+            precomp, samples, ref_source, label, prior_model, lik_model,
+            n_ref=n_signal, compute_pou=needs_pou, offset=0, role='signal',
+        )
+        ref_bank_source = ref_source
 
-    source_n_ref = int(default_n_ref if cfg.get('n_ref') is None else cfg['n_ref'])
-    bank, n_ref_used = _get_or_build_source_bank(
-        precomp, samples, ref_source, label, prior_model, lik_model,
-        n_ref=source_n_ref, compute_pou=needs_pou,
-    )
-    bank, drc_diag = _attach_drc_weights_if_requested(
-        bank, cfg, precomp, prior_model, lik_model, ref_source=ref_source, label=label,
-    )
-    if drc_diag:
-        precomp['drc_diagnostics'][label] = drc_diag
-    return bank, ref_source, n_ref_used
+        if gate_separate:
+            gate_offset = n_signal if coupling == 'independent' else 0
+            gate_bank, n_gate_used = _get_or_build_source_bank(
+                precomp, samples, ref_source, label, prior_model, lik_model,
+                n_ref=n_gate, compute_pou=needs_pou, offset=gate_offset, role='gate',
+            )
+            if canonicalize_init_weights(cfg.get('init_weights', 'L')) == 'DRC':
+                gate_bank, _ = _attach_drc_weights_if_requested(
+                    gate_bank, cfg, precomp, prior_model, lik_model, ref_source=ref_source, label=label,
+                )
+            precomp.setdefault('gate_banks', {})[label] = gate_bank
+            precomp.setdefault('gate_bank_info', {})[label] = dict(
+                n_ref_signal=n_signal, n_ref_gate=n_gate_used, coupling=coupling,
+                ref_source=ref_source, gate_offset=gate_offset, gate_bank_separate=True,
+            )
 
+        bank, drc_diag = _attach_drc_weights_if_requested(
+            signal_bank, cfg, precomp, prior_model, lik_model, ref_source=ref_source, label=label,
+        )
+        if drc_diag:
+            precomp['drc_diagnostics'][label] = drc_diag
+
+    if canonicalize_init_name(cfg.get('init')) == 'drc_ratio_update':
+        eval_source = cfg.get('drc_eval_source')
+        n_eval = int(n_signal if cfg.get('drc_eval_n_ref') is None else cfg['drc_eval_n_ref'])
+        if eval_source is not None:
+            if eval_source not in samples:
+                raise KeyError(
+                    f"Sampler '{label}' declares drc_eval_source={eval_source!r}, but that source has not run. "
+                    f"Available samples: {list(samples.keys())}"
+                )
+            eval_offset = 0
+            eval_bank, n_eval_used = _get_or_build_source_eval_bank(
+                precomp, samples, eval_source, label, prior_model, lik_model,
+                n_ref=n_eval, offset=eval_offset, role='eval',
+            )
+            precomp.setdefault('eval_banks', {})[label] = eval_bank
+            precomp.setdefault('eval_bank_info', {})[label] = dict(
+                eval_source=eval_source, n_ref_eval=n_eval_used, eval_offset=eval_offset,
+                eval_bank_separate=True,
+            )
+        elif str(cfg.get('drc_eval_bank_coupling', 'shared')) == 'independent' and ref_source is not None:
+            eval_offset = n_signal + (n_gate if coupling == 'independent' and gate_separate else 0)
+            eval_bank, n_eval_used = _get_or_build_source_eval_bank(
+                precomp, samples, ref_source, label, prior_model, lik_model,
+                n_ref=n_eval, offset=eval_offset, role='eval',
+            )
+            precomp.setdefault('eval_banks', {})[label] = eval_bank
+            precomp.setdefault('eval_bank_info', {})[label] = dict(
+                eval_source=ref_source, n_ref_eval=n_eval_used, eval_offset=eval_offset,
+                eval_bank_separate=True,
+            )
+
+    return bank, ref_bank_source, n_ref_used
 
 
 
@@ -5362,6 +5716,23 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     )
     local_bank = select_local_bank(ref_bank, score_init, score_weights)
     init_log_weights = get_sampler_log_weights(score_init, score_weights, ref_bank)
+    gate_bank = precomp.get('gate_banks', {}).get(label)
+    gate_local_bank = None
+    gate_log_weights = None
+    if gate_bank is not None and score_init in _ANALYTIC_CE_HLSI_DRC_DIVERGENCE_MODES:
+        gate_local_bank = select_local_bank(gate_bank, score_init, score_weights)
+        gate_log_weights = get_sampler_log_weights(score_init, score_weights, gate_bank)
+        print(
+            f"  [{label}] frozen score uses split banks: "
+            f"signal={tuple(local_bank['X_ref'].shape)}, gate={tuple(gate_local_bank['X_ref'].shape)}, "
+            f"coupling={cfg.get('score_gate_bank_coupling')}"
+        )
+    eval_bank = precomp.get('eval_banks', {}).get(label, ref_bank)
+    if eval_bank is not ref_bank:
+        print(
+            f"  [{label}] DRC density evaluation uses held-out eval bank "
+            f"{eval_bank.get('bank_name', 'eval')} with n={int(eval_bank['X_ref'].shape[0])}"
+        )
     score_cfg = dict(cfg)
     score_cfg['init'] = score_init
     score_cfg['init_weights'] = score_weights
@@ -5369,6 +5740,7 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     score_cfg['mala_burnin'] = 0
     source_score_spec = _make_frozen_density_score_spec(
         label, score_cfg, local_bank, init_log_weights, final_samples=local_bank['X_ref'],
+        gate_local_bank=gate_local_bank, gate_init_log_weights=gate_log_weights,
     )
     if source_score_spec is None:
         raise RuntimeError(
@@ -5380,12 +5752,12 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     want_drc_details = bool(cfg.get('drc_store_details', False) or cfg.get('drc_energy_benchmark', False))
     if want_drc_details:
         log_drc, drc_diag, drc_details = compute_drc_log_weights_for_bank(
-            ref_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
+            eval_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
             return_details=True,
         )
     else:
         log_drc, drc_diag = compute_drc_log_weights_for_bank(
-            ref_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
+            eval_bank, prior_model, lik_model, source_score_spec, cfg, label=label,
         )
         drc_details = None
     drc_diag = dict(drc_diag)
@@ -5434,12 +5806,17 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
                     RuntimeWarning,
                 )
 
-    final_samples = local_bank['X_ref'].detach().cpu()
+    final_samples = eval_bank['X_ref'].detach().cpu()
     run_info = dict(cfg)
     run_info.update(drc_diag)
     run_info['ref_source'] = ref_bank_source
     run_info['init_reference_bank'] = ref_bank_source
-    run_info['n_ref'] = int(n_ref_used) if n_ref_used else int(final_samples.shape[0])
+    run_info['n_ref'] = int(n_ref_used) if n_ref_used else int(local_bank['X_ref'].shape[0])
+    run_info['n_ref_signal'] = int(local_bank['X_ref'].shape[0])
+    run_info['n_ref_gate'] = int(gate_local_bank['X_ref'].shape[0]) if gate_local_bank is not None else int(local_bank['X_ref'].shape[0])
+    run_info['n_ref_eval'] = int(eval_bank['X_ref'].shape[0])
+    run_info['gate_bank'] = gate_local_bank.get('bank_name') if gate_local_bank is not None else local_bank.get('bank_name')
+    run_info['eval_bank'] = eval_bank.get('bank_name', 'unknown')
     run_info['init_bank'] = local_bank['bank_name']
     run_info['init_log_weights'] = get_sampler_log_weight_name(score_init, score_weights)
     run_info['drc_score_init'] = score_init
@@ -5498,6 +5875,10 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
 
     map_laplace_component = None
 
+    gate_bank = precomp.get('gate_banks', {}).get(label) if isinstance(precomp, dict) else None
+    gate_local_bank = None
+    gate_log_weights = None
+
     if cfg['init'] == 'ref_laplace':
         bank = ref_bank if ref_bank is not None else get_sampler_precomp_bank(
             precomp, cfg['init'], mala_refs=cfg.get('mala_refs', False),
@@ -5528,6 +5909,14 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
         )
         local_bank = select_local_bank(bank, cfg['init'], cfg['init_weights'])
         init_log_weights = get_sampler_log_weights(cfg['init'], cfg['init_weights'], bank)
+        if gate_bank is not None and _config_uses_ce_gate_bank(cfg):
+            gate_local_bank = select_local_bank(gate_bank, cfg['init'], cfg['init_weights'])
+            gate_log_weights = get_sampler_log_weights(cfg['init'], cfg['init_weights'], gate_bank)
+            print(
+                f"  separate gate bank: signal={tuple(local_bank['X_ref'].shape)}, "
+                f"gate={tuple(gate_local_bank['X_ref'].shape)}, "
+                f"mode={cfg.get('score_gate_bank_coupling')}"
+            )
         init_out = run_sampler_heun(
             cfg['n_samples'], cfg['init'],
             local_bank['X_ref'], local_bank['s0_post_ref'], init_log_weights,
@@ -5541,6 +5930,11 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
             gate_kappa=cfg.get('gate_kappa'), gate_topk=cfg.get('gate_topk', 64),
             gate_metric_source=cfg.get('gate_metric_source', 'mu'),
             transition_w=cfg.get('transition_w', 'ou'),
+            gate_X_ref=gate_local_bank['X_ref'] if gate_local_bank is not None else None,
+            gate_log_lik_ref=gate_log_weights,
+            gate_P_ref=gate_local_bank['P_ref'] if gate_local_bank is not None else None,
+            gate_mu_ref=gate_local_bank['mu_ref'] if gate_local_bank is not None else None,
+            gate_gated_info=gate_local_bank['gated_info'] if gate_local_bank is not None else None,
             return_info=True,
         )
         if cfg['log_mean_ess']:
@@ -5622,6 +6016,7 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
 
     score_spec = _make_frozen_hlsi_score_spec(
         label, cfg, local_bank, init_log_weights, final_samples=final_samples,
+        gate_local_bank=gate_local_bank, gate_init_log_weights=gate_log_weights,
     )
     if score_spec is not None:
         precomp.setdefault('score_specs', {})[label] = score_spec
