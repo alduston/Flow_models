@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-PROBLEMS=(
+ALL_PROBLEMS=(
   "advect_diff"
   "allen_cahn"
   "darcy_flow"
@@ -19,7 +19,8 @@ PROBLEMS=(
   "helmholtz_alt"
 )
 
-SUB_PROBLEMS=(
+PROBLEMS=(
+"navier_stokes"
 )
 
 for p in "${PROBLEMS[@]}"; do
