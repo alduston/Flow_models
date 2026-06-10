@@ -902,11 +902,11 @@ DEFAULT_N_GEN = _env_int('IP_DENSITY_DEFAULT_N_GEN', N_REF_SIGNAL)
 DENSITY_REF_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_REF_SOURCE', 'MALA'))
 DENSITY_BANK_COUPLING = _canonical_bank_coupling(os.environ.get(
     'IP_DENSITY_BANK_COUPLING',
-    os.environ.get('IP_DENSITY_GATE_BANK_COUPLING', 'shared'), #'independent'),
+    os.environ.get('IP_DENSITY_GATE_BANK_COUPLING', 'independent'), #'independent'),
 ))
 DENSITY_EVAL_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_EVAL_SOURCE', 'MALA')) #'MALA-EVAL'))
 DENSITY_EVAL_BANK_COUPLING = _canonical_bank_coupling(
-    os.environ.get('IP_DENSITY_EVAL_BANK_COUPLING', 'shared') #'independent')
+    os.environ.get('IP_DENSITY_EVAL_BANK_COUPLING', 'independent') #'independent')
 )
 DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 64)
 DENSITY_DRC_EVAL_BATCH_SIZE = _env_int('IP_DENSITY_DRC_EVAL_BATCH_SIZE', 32)
@@ -932,7 +932,7 @@ DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
 # to analytic implementations in sampling.py when available; scalar blend keeps
 # Hutchinson by default for speed unless explicitly overridden.
 DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'auto')
-DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE', 'hutchinson')
+DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE', 'auto')
 DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE', 'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
@@ -959,7 +959,7 @@ MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
 MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
 # Default to target-side MAP/Laplace proxy initialization for MALA.
-MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior') #'map_laplace')
 MALA_PRECOND = _env_bool('IP_DENSITY_MALA_PRECOND', False)
 MALA_EVAL_N_SAMPLES = _env_int('IP_DENSITY_MALA_EVAL_N_SAMPLES', N_REF_EVAL)
 MALA_EVAL_STEPS = _env_int('IP_DENSITY_MALA_EVAL_STEPS', MALA_STEPS)
