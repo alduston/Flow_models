@@ -2387,6 +2387,26 @@ def estimate_logq_probability_flow(X0, source_score_spec, t_min=None, t_max=None
     return logq
 
 
+def _metric_safe_scalar(value):
+    if value is None:
+        return True
+    if isinstance(value, (str, bool, int, float)):
+        return True
+    if isinstance(value, np.generic):
+        return True
+    if torch.is_tensor(value) and value.numel() == 1:
+        return True
+    return False
+
+
+def _metric_scalar_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value) and value.numel() == 1:
+        return float(value.detach().cpu().item())
+    return value
+
+
 def _safe_pearson_corr_torch(x, y, eps=1e-30):
     x = x.detach().double().cpu().reshape(-1)
     y = y.detach().double().cpu().reshape(-1)
@@ -2932,7 +2952,12 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
                                               save_legacy_alias=True,
                                               residual_kind='affine_normalized',
                                               affine_fit_scope='central',
-                                              also_save_logratio_residual_plots=False):
+                                              also_save_logratio_residual_plots=False,
+                                              known_logZ=None,
+                                              estimated_logZ=None,
+                                              method_family=None,
+                                              runtime_seconds=None,
+                                              extra_metrics=None):
     """Compute density/energy diagnostics from stored DRC probability-flow details.
 
     The primary density diagnostic is correlation between true unnormalized energy
@@ -3072,6 +3097,63 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
         ('residual_kind', str(residual_kind)),
     ])
 
+    # Manuscript-facing aliases.  These duplicate a few historical metric names
+    # without changing existing CSV consumers.  The density-evaluation tables in
+    # the manuscript use these short names.
+    metrics['pointwise_nll'] = metrics['neglogq_mean']
+    metrics['pointwise_nll_std'] = metrics['neglogq_std']
+    metrics['ess'] = metrics['raw_logw_ess']
+    metrics['central_pearson'] = metrics['central_energy_neglogq_pearson']
+    metrics['affine_slope'] = metrics['affine_energy_slope']
+    metrics['affine_rmse'] = metrics['affine_energy_rmse']
+    metrics['affine_r2'] = metrics['affine_energy_r2']
+    metrics['slope_normalized_rmse'] = metrics['slope_normalized_energy_rmse']
+
+    if method_family is not None:
+        metrics['method_family'] = str(method_family)
+    if runtime_seconds is not None:
+        try:
+            metrics['runtime_seconds'] = float(runtime_seconds)
+        except Exception:
+            metrics['runtime_seconds'] = float('nan')
+
+    if known_logZ is None:
+        known_logZ = details.get('known_logZ', None)
+    if estimated_logZ is None:
+        estimated_logZ = details.get('estimated_logZ', None)
+    if known_logZ is not None:
+        known_logZ_t = torch.as_tensor(float(known_logZ), dtype=torch.float64)
+        true_logp = log_target - known_logZ_t
+        logq_error = logq - true_logp
+        mean_residual_logZ_est = torch.mean(raw_logw)
+        median_residual_logZ_est = torch.median(raw_logw)
+        metrics['known_logZ'] = float(known_logZ_t.item())
+        metrics['pointwise_logq_bias'] = float(torch.mean(logq_error).item())
+        metrics['pointwise_logq_rmse'] = float(torch.sqrt(torch.mean(logq_error ** 2)).item())
+        metrics['pointwise_logq_mae'] = float(torch.mean(torch.abs(logq_error)).item())
+        metrics['mean_residual_logZ_estimate'] = float(mean_residual_logZ_est.item())
+        metrics['median_residual_logZ_estimate'] = float(median_residual_logZ_est.item())
+        metrics['known_logZ_mean_residual_error'] = float((mean_residual_logZ_est - known_logZ_t).item())
+        metrics['known_logZ_median_residual_error'] = float((median_residual_logZ_est - known_logZ_t).item())
+        metrics['known_logZ_abs_error'] = abs(metrics['known_logZ_mean_residual_error'])
+        metrics['known_logZ_median_abs_error'] = abs(metrics['known_logZ_median_residual_error'])
+        # Backward/placeholder-friendly alias: this is the mean residual estimate
+        # error, not a bridge/SMC evidence estimator.  Use it only on known-Z
+        # calibration targets where pointwise normalized-density error is defined.
+        metrics['knownZ_evidence_error'] = metrics['known_logZ_mean_residual_error']
+    if estimated_logZ is not None:
+        metrics['estimated_logZ'] = float(estimated_logZ)
+        if known_logZ is not None:
+            metrics['estimated_logZ_error'] = float(estimated_logZ) - float(known_logZ)
+            metrics['estimated_logZ_abs_error'] = abs(metrics['estimated_logZ_error'])
+
+    if extra_metrics:
+        for k, v in dict(extra_metrics).items():
+            if _metric_safe_scalar(v):
+                metrics[str(k)] = _metric_scalar_value(v)
+            else:
+                metrics[str(k)] = str(type(v).__name__)
+
     df = pd.DataFrame([metrics])
 
     if save_dir is not None:
@@ -3193,6 +3275,437 @@ def compute_drc_energy_benchmark_from_details(details, label='DRC', save_dir=Non
                     _save_residual_plot('raw', 'raw')
 
     return df
+
+def _log_gaussian_precision_density(X, mean, precision, precision_eigs=None, eps=1e-12):
+    """Evaluate log N(mean, precision^{-1}) at X for a dense precision matrix."""
+    X = X.to(device=device, dtype=torch.float64)
+    mean = mean.to(device=X.device, dtype=torch.float64).reshape(1, -1)
+    precision = 0.5 * (precision.to(device=X.device, dtype=torch.float64) + precision.to(device=X.device, dtype=torch.float64).T)
+    d = int(X.shape[1])
+    if precision_eigs is None:
+        evals, _ = _safe_single_symmetric_eigh(precision, label='gaussian_density_precision')
+    else:
+        evals = torch.as_tensor(precision_eigs, device=X.device, dtype=torch.float64).reshape(-1)
+    evals = torch.clamp(evals, min=float(eps))
+    logdet_precision = torch.sum(torch.log(evals))
+    diff = X - mean
+    quad = torch.sum((diff @ precision) * diff, dim=1)
+    return 0.5 * logdet_precision - 0.5 * d * math.log(2.0 * math.pi) - 0.5 * quad
+
+
+def _bank_log_target_chunks(bank, prior_model, lik_model=None, batch_size=256):
+    """Return X, log_prior, log_lik, log_target for a precomputed or eval-only bank."""
+    X_cpu = bank['X_ref'].detach().cpu().double()
+    n = int(X_cpu.shape[0])
+    batch_size = int(max(1, batch_size))
+    log_prior_chunks = []
+    log_lik_chunks = []
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            stop = min(start + batch_size, n)
+            X = X_cpu[start:stop].to(device=device, dtype=torch.float64)
+            log_prior = prior_model.log_prob(X).detach().cpu().double()
+            if 'log_lik_ref' in bank and bank['log_lik_ref'] is not None:
+                log_lik = bank['log_lik_ref'][start:stop].detach().cpu().double()
+            elif lik_model is not None:
+                log_lik = lik_model.log_likelihood(X).detach().cpu().double()
+            else:
+                raise KeyError("bank is missing 'log_lik_ref' and no lik_model was provided.")
+            log_prior_chunks.append(log_prior)
+            log_lik_chunks.append(log_lik)
+            del X, log_prior, log_lik
+    log_prior = torch.cat(log_prior_chunks, dim=0).double()
+    log_lik = torch.cat(log_lik_chunks, dim=0).double()
+    return X_cpu, log_prior, log_lik, (log_prior + log_lik)
+
+
+def compute_density_energy_benchmark_from_logq(
+    X,
+    logq,
+    log_target,
+    label='density-model',
+    log_prior=None,
+    log_lik=None,
+    save_dir=None,
+    run_stem=None,
+    make_plots=False,
+    plot_axis_mode='robust',
+    residual_axis_mode='robust',
+    robust_percentiles=(1.0, 99.0),
+    also_save_raw_plots=False,
+    also_save_loglog_plots=False,
+    save_legacy_alias=True,
+    residual_kind='affine_normalized',
+    affine_fit_scope='central',
+    also_save_logratio_residual_plots=False,
+    known_logZ=None,
+    estimated_logZ=None,
+    method_family=None,
+    runtime_seconds=None,
+    extra_metrics=None,
+):
+    """Generic density-energy metric wrapper for any normalized logq evaluator.
+
+    This is the modular entry point for manuscript density tables.  It accepts
+    pointwise normalized surrogate log densities `logq` and unnormalized target
+    log densities `log_target` at the same evaluation locations, then reuses the
+    DRC metric/plot machinery.  It works for PF-ODE densities, closed-form
+    Gaussian/Laplace baselines, and known-Z calibration targets.
+    """
+    X_cpu = X.detach().cpu().double() if torch.is_tensor(X) else torch.as_tensor(np.asarray(X), dtype=torch.float64)
+    logq_cpu = logq.detach().cpu().double().reshape(-1) if torch.is_tensor(logq) else torch.as_tensor(np.asarray(logq), dtype=torch.float64).reshape(-1)
+    log_target_cpu = log_target.detach().cpu().double().reshape(-1) if torch.is_tensor(log_target) else torch.as_tensor(np.asarray(log_target), dtype=torch.float64).reshape(-1)
+    if logq_cpu.numel() != log_target_cpu.numel():
+        raise ValueError(f'logq and log_target sizes differ: {logq_cpu.numel()} vs {log_target_cpu.numel()}')
+    if X_cpu.shape[0] != logq_cpu.numel():
+        raise ValueError(f'X and logq sizes differ: {X_cpu.shape[0]} vs {logq_cpu.numel()}')
+    if log_prior is None:
+        log_prior_cpu = torch.full_like(logq_cpu, float('nan'))
+    else:
+        log_prior_cpu = log_prior.detach().cpu().double().reshape(-1) if torch.is_tensor(log_prior) else torch.as_tensor(np.asarray(log_prior), dtype=torch.float64).reshape(-1)
+    if log_lik is None:
+        log_lik_cpu = torch.full_like(logq_cpu, float('nan'))
+    else:
+        log_lik_cpu = log_lik.detach().cpu().double().reshape(-1) if torch.is_tensor(log_lik) else torch.as_tensor(np.asarray(log_lik), dtype=torch.float64).reshape(-1)
+    raw_logw = log_target_cpu - logq_cpu
+    details = {
+        'label': str(label),
+        'source_label': str(label),
+        'source_mode': str(method_family or 'external_logq'),
+        'source_init_weights': 'normalized_logq',
+        'source_transition_w': 'n/a',
+        'X_ref': X_cpu,
+        'eval_bank_name': 'external_eval',
+        'score_bank_name': 'external_or_closed_form',
+        'gate_bank_name': 'external_or_closed_form',
+        'log_prior': log_prior_cpu,
+        'log_lik': log_lik_cpu,
+        'log_target': log_target_cpu,
+        'energy': -log_target_cpu,
+        'logq': logq_cpu,
+        'raw_logw': raw_logw,
+        'logw': raw_logw - torch.mean(raw_logw),
+        'diagnostics': dict(extra_metrics or {}),
+    }
+    if known_logZ is not None:
+        details['known_logZ'] = float(known_logZ)
+    if estimated_logZ is not None:
+        details['estimated_logZ'] = float(estimated_logZ)
+    return compute_drc_energy_benchmark_from_details(
+        details, label=label, save_dir=save_dir, run_stem=run_stem,
+        make_plots=make_plots, plot_axis_mode=plot_axis_mode,
+        residual_axis_mode=residual_axis_mode, robust_percentiles=robust_percentiles,
+        also_save_raw_plots=also_save_raw_plots,
+        also_save_loglog_plots=also_save_loglog_plots,
+        save_legacy_alias=save_legacy_alias,
+        residual_kind=residual_kind,
+        affine_fit_scope=affine_fit_scope,
+        also_save_logratio_residual_plots=also_save_logratio_residual_plots,
+        known_logZ=known_logZ,
+        estimated_logZ=estimated_logZ,
+        method_family=method_family,
+        runtime_seconds=runtime_seconds,
+        extra_metrics=extra_metrics,
+    ), details
+
+
+def evaluate_gaussian_precision_density_baseline(
+    eval_bank,
+    prior_model,
+    lik_model,
+    mean,
+    precision,
+    label='DENS-Gaussian',
+    precision_eigs=None,
+    batch_size=256,
+    save_dir=None,
+    run_stem=None,
+    make_plots=False,
+    known_logZ=None,
+    method_family='gaussian_precision',
+    extra_metrics=None,
+    **metric_kwargs,
+):
+    """Evaluate a closed-form Gaussian density baseline on an existing eval bank."""
+    t0 = time.time()
+    X_cpu, log_prior, log_lik, log_target = _bank_log_target_chunks(
+        eval_bank, prior_model, lik_model=lik_model, batch_size=batch_size,
+    )
+    logq_chunks = []
+    with torch.no_grad():
+        for start in range(0, int(X_cpu.shape[0]), int(max(1, batch_size))):
+            stop = min(start + int(batch_size), int(X_cpu.shape[0]))
+            X = X_cpu[start:stop].to(device=device, dtype=torch.float64)
+            logq_chunks.append(
+                _log_gaussian_precision_density(X, mean, precision, precision_eigs=precision_eigs).detach().cpu()
+            )
+            del X
+    logq = torch.cat(logq_chunks, dim=0).double()
+    runtime = float(time.time() - t0)
+    extra = dict(extra_metrics or {})
+    extra.update({
+        'eval_bank_name': str(eval_bank.get('bank_name', 'unknown')),
+        'baseline_runtime_seconds': runtime,
+    })
+    df, details = compute_density_energy_benchmark_from_logq(
+        X_cpu, logq, log_target, label=label, log_prior=log_prior, log_lik=log_lik,
+        save_dir=save_dir, run_stem=run_stem, make_plots=make_plots,
+        known_logZ=known_logZ, method_family=method_family,
+        runtime_seconds=runtime, extra_metrics=extra, **metric_kwargs,
+    )
+    details['eval_bank_name'] = str(eval_bank.get('bank_name', 'unknown'))
+    details['diagnostics'] = dict(extra)
+    return df, details
+
+
+def compute_map_laplace_density_baseline(
+    eval_bank,
+    prior_model,
+    lik_model,
+    label='DENS-MAP-Laplace',
+    n_starts=128,
+    max_iter=25,
+    tol=1e-5,
+    ridge=1e-6,
+    max_step_norm=2.0,
+    backtrack_steps=8,
+    batch_size=256,
+    save_dir=None,
+    run_stem=None,
+    make_plots=False,
+    precomp=None,
+    known_logZ=None,
+    verbose=True,
+    **metric_kwargs,
+):
+    """Build/evaluate a MAP-Laplace Gaussian baseline on the density eval bank.
+
+    The returned row is directly comparable to the PF-ODE density rows because it
+    is evaluated at the same bank locations and passed through the same metric
+    code.  If `precomp` is supplied, the row and details are inserted into
+    `precomp['drc_energy_benchmarks']` and `precomp['drc_details']` for dashboard
+    and table aggregation.
+    """
+    component = build_map_laplace_component(
+        prior_model, lik_model, n_starts=n_starts, max_iter=max_iter,
+        tol=tol, ridge=ridge, max_step_norm=max_step_norm,
+        backtrack_steps=backtrack_steps, verbose=verbose,
+    )
+    extra = {
+        'map_logpost': float(component.get('map_logpost', float('nan'))),
+        'map_loglik': float(component.get('map_loglik', float('nan'))),
+        'map_score_norm': float(component.get('map_score_norm', float('nan'))),
+        'map_laplace_n_starts': int(component.get('n_starts', n_starts)),
+        'map_laplace_newton_accept': int(component.get('n_newton_accept', 0)),
+        'map_precision_min_eig': float(torch.min(component['precision_eigs']).item()),
+        'map_precision_max_eig': float(torch.max(component['precision_eigs']).item()),
+    }
+    df, details = evaluate_gaussian_precision_density_baseline(
+        eval_bank, prior_model, lik_model,
+        mean=component['mean'], precision=component['precision'], precision_eigs=component.get('precision_eigs'),
+        label=label, batch_size=batch_size, save_dir=save_dir, run_stem=run_stem,
+        make_plots=make_plots, known_logZ=known_logZ,
+        method_family='map_laplace_gaussian', extra_metrics=extra, **metric_kwargs,
+    )
+    details['map_laplace_component'] = {k: v for k, v in component.items() if not torch.is_tensor(v)}
+    if precomp is not None:
+        precomp.setdefault('drc_energy_benchmarks', {})[label] = df
+        precomp.setdefault('drc_details', {})[label] = details
+        precomp.setdefault('density_baseline_components', {})[label] = component
+    return df, details, component
+
+
+def make_density_manuscript_table(density_tables, display_names=None, method_order=None,
+                                  include_known_z=False):
+    """Compact table matching the manuscript density-evaluation placeholders."""
+    if isinstance(density_tables, pd.DataFrame):
+        df = density_tables.copy()
+    elif isinstance(density_tables, dict):
+        frames = [v for v in density_tables.values() if isinstance(v, pd.DataFrame) and not v.empty]
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        frames = [v for v in density_tables if isinstance(v, pd.DataFrame) and not v.empty]
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if df.empty:
+        return df
+    display_names = display_names or {}
+    if 'label' in df.columns:
+        df['Method'] = df['label'].map(lambda x: display_names.get(str(x), str(x)))
+    elif 'Method' not in df.columns:
+        df['Method'] = [display_names.get(str(i), str(i)) for i in range(len(df))]
+
+    column_map = OrderedDict([
+        ('Method', 'Method'),
+        ('n_eval', '$n_{eval}$'),
+        ('energy_neglogq_pearson', 'Pearson'),
+        ('energy_neglogq_spearman', 'Spearman'),
+        ('central_energy_neglogq_pearson', 'Central Pearson'),
+        ('affine_energy_slope', 'Affine slope'),
+        ('affine_energy_r2', 'Affine $R^2$'),
+        ('affine_energy_rmse', 'Affine RMSE'),
+        ('slope_normalized_energy_rmse', 'Slope-normalized RMSE'),
+        ('raw_logw_ess', 'ESS'),
+        ('pointwise_nll', 'Pointwise NLL'),
+    ])
+    if include_known_z:
+        column_map.update(OrderedDict([
+            ('pointwise_logq_bias', 'Pointwise logq bias'),
+            ('pointwise_logq_rmse', 'Pointwise logq RMSE'),
+            ('knownZ_evidence_error', 'Known-$Z$ evidence error'),
+        ]))
+    cols = [c for c in column_map if c in df.columns]
+    out = df[cols].rename(columns={c: column_map[c] for c in cols})
+    if method_order and 'Method' in out.columns:
+        order_labels = [display_names.get(str(x), str(x)) for x in method_order]
+        order_map = {lab: i for i, lab in enumerate(order_labels)}
+        out['_order'] = out['Method'].map(lambda x: order_map.get(str(x), len(order_map) + 100))
+        out = out.sort_values('_order').drop(columns=['_order']).reset_index(drop=True)
+    return out
+
+
+def _parse_int_list(value, default):
+    if value is None:
+        return tuple(int(x) for x in default)
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(';', ',').split(',') if p.strip()]
+        return tuple(int(float(p)) for p in parts) if parts else tuple(int(x) for x in default)
+    return tuple(int(x) for x in value)
+
+
+def _parse_float_list(value, default):
+    if value is None:
+        return tuple(float(x) for x in default)
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(';', ',').split(',') if p.strip()]
+        return tuple(float(p) for p in parts) if parts else tuple(float(x) for x in default)
+    return tuple(float(x) for x in value)
+
+
+def run_drc_pf_sensitivity_benchmark(
+    precomp,
+    cfg_by_label,
+    prior_model,
+    lik_model,
+    labels=('DENS-CE-HLSI', 'DENS-Tweedie'),
+    pf_steps_list=(32, 64, 128),
+    tmin_list=None,
+    save_dir=None,
+    run_stem=None,
+    batch_size=None,
+    robust_percentiles=(1.0, 99.0),
+    affine_fit_scope='central',
+    known_logZ=None,
+    make_plot=True,
+):
+    """Rerun PF logq evaluation over a tiny discretization grid.
+
+    This uses the frozen score specs and eval banks already stored by DRC-R
+    density nodes, so it does not rebuild reference/gate banks.  It is meant for
+    the manuscript's small PF-discretization sanity check, not a full sweep.
+    """
+    if precomp is None or 'score_specs' not in precomp:
+        raise ValueError("precomp must contain score_specs from prior DRC-R density runs.")
+    labels = tuple(labels or ())
+    pf_steps_list = _parse_int_list(pf_steps_list, (32, 64, 128))
+    if tmin_list is None:
+        # Use the configured tmin per method if no grid is requested.
+        tmin_list = (None,)
+    else:
+        tmin_list = _parse_float_list(tmin_list, (10 ** (-2.5),))
+    rows = []
+    detail_grid = {}
+    t0_all = time.time()
+    for label in labels:
+        if label not in precomp.get('score_specs', {}):
+            warnings.warn(f'PF sensitivity skipped missing score spec for {label!r}.', RuntimeWarning)
+            continue
+        base_cfg = dict(cfg_by_label.get(label, {})) if isinstance(cfg_by_label, dict) else {}
+        source_score_spec = precomp['score_specs'][label]
+        eval_bank = precomp.get('eval_banks', {}).get(label)
+        if eval_bank is None:
+            details0 = precomp.get('drc_details', {}).get(label)
+            if details0 is not None:
+                eval_bank = {'X_ref': details0['X_ref'], 'log_lik_ref': details0['log_lik'], 'bank_name': details0.get('eval_bank_name', 'details_eval')}
+            else:
+                warnings.warn(f'PF sensitivity skipped {label!r}: no eval bank or details available.', RuntimeWarning)
+                continue
+        for pf_steps in pf_steps_list:
+            for tmin in tmin_list:
+                cfg = dict(base_cfg)
+                cfg['drc_pf_steps'] = int(pf_steps)
+                if tmin is not None:
+                    cfg['drc_tmin'] = float(tmin)
+                if batch_size is not None:
+                    cfg['drc_eval_batch_size'] = int(batch_size)
+                cfg.setdefault('drc_divergence', base_cfg.get('drc_divergence', 'auto'))
+                cfg.setdefault('drc_div_probes', base_cfg.get('drc_div_probes', 1))
+                cfg.setdefault('drc_fd_eps', base_cfg.get('drc_fd_eps', 1e-3))
+                cfg.setdefault('drc_temperature', 1.0)
+                t0 = time.time()
+                _, diag, details = compute_drc_log_weights_for_bank(
+                    eval_bank, prior_model, lik_model, source_score_spec, cfg,
+                    label=f'{label}-pf{pf_steps}-tmin{cfg.get("drc_tmin", source_score_spec.get("t_min"))}',
+                    return_details=True,
+                )
+                df = compute_drc_energy_benchmark_from_details(
+                    details,
+                    label=label,
+                    save_dir=None,
+                    make_plots=False,
+                    robust_percentiles=robust_percentiles,
+                    affine_fit_scope=affine_fit_scope,
+                    known_logZ=known_logZ,
+                    runtime_seconds=float(time.time() - t0),
+                    extra_metrics=diag,
+                )
+                row = df.iloc[0].to_dict()
+                row['method'] = label
+                row['pf_steps'] = int(pf_steps)
+                row['t_min'] = float(cfg.get('drc_tmin', source_score_spec.get('t_min')))
+                row['t_max'] = float(cfg.get('drc_tmax', source_score_spec.get('t_max')))
+                rows.append(row)
+                detail_grid[(label, int(pf_steps), row['t_min'])] = details
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out, None
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        stem = run_stem or RUN_RESULTS_STEM or 'density_pf_sensitivity'
+        csv_path = os.path.join(save_dir, f'{stem}_density_pf_sensitivity.csv')
+        out.to_csv(csv_path, index=False)
+        print(f'Saved density PF sensitivity CSV to {csv_path}')
+    else:
+        csv_path = None
+    fig_path = None
+    if make_plot and save_dir is not None:
+        stem = run_stem or RUN_RESULTS_STEM or 'density_pf_sensitivity'
+        fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
+        for label in sorted(out['method'].unique()):
+            sub0 = out[out['method'] == label]
+            for tmin in sorted(sub0['t_min'].unique()):
+                sub = sub0[sub0['t_min'] == tmin].sort_values('pf_steps')
+                curve_label = str(label) if len(out['t_min'].unique()) == 1 else f'{label}, tmin={tmin:g}'
+                axes[0].plot(sub['pf_steps'], sub['affine_energy_rmse'], marker='o', label=curve_label)
+                axes[1].plot(sub['pf_steps'], sub['slope_normalized_energy_rmse'], marker='o', label=curve_label)
+        axes[0].set_xlabel('PF steps')
+        axes[0].set_ylabel('Affine RMSE')
+        axes[0].set_title('PF sensitivity: affine RMSE')
+        axes[1].set_xlabel('PF steps')
+        axes[1].set_ylabel('Slope-normalized RMSE')
+        axes[1].set_title('PF sensitivity: energy-units RMSE')
+        for ax in axes:
+            ax.grid(True, alpha=0.25)
+        axes[1].legend(fontsize=8, loc='best')
+        fig.suptitle('Density PF discretization sensitivity', fontsize=14)
+        fig.tight_layout()
+        fig_path = os.path.join(save_dir, f'{stem}_density_pf_sensitivity.png')
+        fig.savefig(fig_path, dpi=260, bbox_inches='tight')
+        print(f'Saved density PF sensitivity figure to {fig_path}')
+    precomp.setdefault('density_pf_sensitivity', {})['table'] = out
+    precomp.setdefault('density_pf_sensitivity', {})['csv_path'] = csv_path
+    precomp.setdefault('density_pf_sensitivity', {})['figure_path'] = fig_path
+    precomp.setdefault('density_pf_sensitivity', {})['runtime_seconds'] = float(time.time() - t0_all)
+    return out, fig_path
 
 
 def compute_drc_log_weights_for_bank(bank, prior_model, lik_model, source_score_spec,
