@@ -896,7 +896,7 @@ def _env_percentile_pair(name, default):
 # same split-bank density controls as the Navier-Stokes benchmark.  The signal
 # bank feeds the score field; the gate bank feeds CE-HLSI gate estimation; the
 # density-eval bank is the held-out location bank for the PF/DRC correction.
-N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', 500))
+N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', 1000))
 N_REF_GATE_ENV_SET = _env_is_set('IP_DENSITY_N_REF_GATE')
 N_REF_GATE = _env_int('IP_DENSITY_N_REF_GATE', N_REF_SIGNAL)
 N_REF_EVAL = _env_int('IP_DENSITY_N_REF_EVAL', N_REF_SIGNAL)
