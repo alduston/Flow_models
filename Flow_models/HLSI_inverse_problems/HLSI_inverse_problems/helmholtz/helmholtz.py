@@ -953,7 +953,7 @@ DENSITY_SOURCE_REQUIRED_N = _required_source_bank_size(
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', DENSITY_SOURCE_REQUIRED_N)
 MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
-MALA_DT = _env_float('IP_DENSITY_MALA_DT', 3.0e-5)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
 
 # Default to a target-side MAP/Laplace proxy initialization for MALA.  This is
 # distinct from the older reference-bank `ref_laplace` mode: `map_laplace` first
