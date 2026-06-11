@@ -98,6 +98,9 @@ from sampling import (
     compute_latent_metrics,
     configure_sampling,
     get_valid_samples,
+    compute_map_laplace_density_baseline,
+    make_density_manuscript_table,
+    run_drc_pf_sensitivity_benchmark,
     init_run_results,
     make_physics_likelihood,
     make_posterior_score_fn,
@@ -862,6 +865,28 @@ def _env_percentile_pair(name, default):
     return (lo, hi)
 
 
+def _env_csv(name, default):
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return tuple(default)
+    parts = [x.strip() for x in str(raw).replace(';', ',').split(',') if x.strip()]
+    return tuple(parts) if parts else tuple(default)
+
+
+def _env_int_tuple(name, default):
+    return tuple(int(float(x)) for x in _env_csv(name, default))
+
+
+def _env_float_tuple_or_none(name, default=None):
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return default
+    parts = [x.strip() for x in str(raw).replace(';', ',').split(',') if x.strip()]
+    if not parts or any(x.lower() in {'none', 'null'} for x in parts):
+        return default
+    return tuple(float(x) for x in parts)
+
+
 # Navier-Stokes density benchmark defaults mirror the large-bank paper-style
 # setting: independent score-signal and gate banks with 5000 particles each.
 # Override IP_DENSITY_N_REF_SIGNAL/IP_DENSITY_N_REF_GATE/IP_DENSITY_N_REF_EVAL
@@ -913,6 +938,22 @@ DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE',     'au
 DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE',       'auto')            #'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
+# Manuscript-table extras.  These are intentionally thin wrappers around helper
+# functions in sampling.py so other inverse-problem scripts can reuse the same
+# density metrics, MAP-Laplace baseline, and PF sensitivity plot.
+DENSITY_BASELINES = _env_csv('IP_DENSITY_BASELINES', ('map_laplace',))
+DENSITY_MAP_LAPLACE_STARTS = _env_int('IP_DENSITY_MAP_LAPLACE_STARTS', 128)
+DENSITY_MAP_LAPLACE_MAX_ITER = _env_int('IP_DENSITY_MAP_LAPLACE_MAX_ITER', 25)
+DENSITY_MAP_LAPLACE_TOL = _env_float('IP_DENSITY_MAP_LAPLACE_TOL', 1e-5)
+DENSITY_MAP_LAPLACE_RIDGE = _env_float('IP_DENSITY_MAP_LAPLACE_RIDGE', 1e-6)
+DENSITY_MAP_LAPLACE_MAX_STEP_NORM = _env_float('IP_DENSITY_MAP_LAPLACE_MAX_STEP_NORM', 2.0)
+DENSITY_MAP_LAPLACE_BACKTRACK_STEPS = _env_int('IP_DENSITY_MAP_LAPLACE_BACKTRACK_STEPS', 8)
+DENSITY_KNOWN_LOGZ = _env_float_or_none('IP_DENSITY_KNOWN_LOGZ', None)
+DENSITY_RUN_PF_SENSITIVITY = _env_bool('IP_DENSITY_RUN_PF_SENSITIVITY', False)
+DENSITY_PF_SENSITIVITY_LABELS = _env_csv('IP_DENSITY_PF_SENSITIVITY_LABELS', ('DENS-CE-HLSI', 'DENS-Tweedie'))
+DENSITY_PF_SENSITIVITY_STEPS = _env_int_tuple('IP_DENSITY_PF_SENSITIVITY_STEPS', (32, 64, 128))
+DENSITY_PF_SENSITIVITY_TMINS = _env_float_tuple_or_none('IP_DENSITY_PF_SENSITIVITY_TMINS', None)
+
 # Same MALA reference-bank configuration style/defaults as Darcy.
 DENSITY_SOURCE_REQUIRED_N = _required_source_bank_size(
     N_REF_SIGNAL, N_REF_GATE, DENSITY_BANK_COUPLING,
@@ -921,7 +962,7 @@ MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', DENSITY_SOURCE_REQUIRED_N
 MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
 MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
-MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior')
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
 MALA_EVAL_N_SAMPLES = _env_int('IP_DENSITY_MALA_EVAL_N_SAMPLES', N_REF_EVAL)
 MALA_EVAL_STEPS = _env_int('IP_DENSITY_MALA_EVAL_STEPS', MALA_STEPS)
 MALA_EVAL_BURNIN = _env_int('IP_DENSITY_MALA_EVAL_BURNIN', MALA_BURNIN)
@@ -1073,15 +1114,15 @@ if DENSITY_EVAL_SOURCE == 'MALA-EVAL':
 SAMPLER_CONFIGS.update(OrderedDict([
     ('DENS-Tweedie', _density_eval_config(
         DENSITY_REF_SOURCE, 'tweedie', DENSITY_TWEEDIE_DIVERGENCE,
-        'DENS-Tweedie', 'Density eval: Tweedie',
+        'DENS-Tweedie', 'Tweedie PF',
     )),
     ('DENS-ScalarBlend', _density_eval_config(
         DENSITY_REF_SOURCE, 'scalar_blend', DENSITY_BLEND_DIVERGENCE,
-        'DENS-ScalarBlend', 'Density eval: scalar blend',
+        'DENS-ScalarBlend', 'Scalar blend PF',
     )),
     ('DENS-CE-HLSI', _density_eval_config(
         DENSITY_REF_SOURCE, 'ce_hlsi', DENSITY_LFGI_DIVERGENCE,
-        'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
+        'DENS-CE-HLSI', 'CE-HLSI/LFGI, GN precision',
     )),
 ]))
 
@@ -1092,6 +1133,7 @@ RUN_COMMAND_HINT = (
     'IP_DENSITY_MALA_EVAL_N_SAMPLES={mala_eval_n} IP_DENSITY_MALA_STEPS={mala_steps} '
     'IP_DENSITY_MALA_BURNIN={burnin} IP_DENSITY_MALA_DT={dt:g} '
     'IP_DENSITY_DRC_PF_STEPS={pf_steps} IP_DENSITY_DRC_PLOT_LAYOUT={layout} '
+    'IP_DENSITY_BASELINES={baselines} IP_DENSITY_RUN_PF_SENSITIVITY={pf_sens} '
     'python navier_stokes.py'
 ).format(
     n_signal=N_REF_SIGNAL,
@@ -1106,6 +1148,8 @@ RUN_COMMAND_HINT = (
     dt=MALA_DT,
     pf_steps=DENSITY_DRC_PF_STEPS,
     layout=DENSITY_DRC_PLOT_LAYOUT,
+    baselines=','.join(DENSITY_BASELINES),
+    pf_sens=int(bool(DENSITY_RUN_PF_SENSITIVITY)),
 )
 
 
@@ -1143,6 +1187,11 @@ dashboard.add_text_page(
         f'DENSITY_TWEEDIE_DIVERGENCE = {DENSITY_TWEEDIE_DIVERGENCE}',
         f'DENSITY_BLEND_DIVERGENCE = {DENSITY_BLEND_DIVERGENCE}',
         f'DENSITY_LFGI_DIVERGENCE = {DENSITY_LFGI_DIVERGENCE}',
+        f'DENSITY_BASELINES = {DENSITY_BASELINES}',
+        f'DENSITY_KNOWN_LOGZ = {DENSITY_KNOWN_LOGZ}',
+        f'DENSITY_RUN_PF_SENSITIVITY = {DENSITY_RUN_PF_SENSITIVITY}',
+        f'DENSITY_PF_SENSITIVITY_STEPS = {DENSITY_PF_SENSITIVITY_STEPS}',
+        f'DENSITY_PF_SENSITIVITY_TMINS = {DENSITY_PF_SENSITIVITY_TMINS}',
         f'DENSITY_DRC_EVAL_BATCH_SIZE = {DENSITY_DRC_EVAL_BATCH_SIZE}',
         f'DENSITY_DRC_TMIN = {DENSITY_DRC_TMIN}',
         f'DENSITY_DRC_TMAX = {DENSITY_DRC_TMAX}',
@@ -1185,22 +1234,129 @@ reference_title = pipeline['reference_title']
 summarize_sampler_run(sampler_run_info)
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 
-# Surface the DRC density/energy benchmark produced by the ratio-only nodes.
+# Add closed-form density baselines on the same held-out density-eval bank.
+# Keep this tiny: for the manuscript table we only need MAP-Laplace unless an
+# experiment explicitly requests more baselines later.
+def _first_density_eval_bank(precomp_dict):
+    for lab in ('DENS-CE-HLSI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+        bank = precomp_dict.get('eval_banks', {}).get(lab)
+        if bank is not None:
+            return bank
+    for lab in ('DENS-CE-HLSI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+        det = precomp_dict.get('drc_details', {}).get(lab)
+        if det is not None:
+            return {
+                'X_ref': det['X_ref'],
+                'log_lik_ref': det['log_lik'],
+                'bank_name': det.get('eval_bank_name', f'{lab}_details_eval'),
+                'eval_only': True,
+            }
+    return None
+
+baseline_eval_bank = _first_density_eval_bank(precomp)
+if baseline_eval_bank is not None and any(str(b).lower().replace('-', '_') in {'map_laplace', 'laplace_map', 'map'} for b in DENSITY_BASELINES):
+    try:
+        map_df, map_details, map_component = compute_map_laplace_density_baseline(
+            baseline_eval_bank,
+            prior_model,
+            lik_model,
+            label='DENS-MAP-Laplace',
+            n_starts=DENSITY_MAP_LAPLACE_STARTS,
+            max_iter=DENSITY_MAP_LAPLACE_MAX_ITER,
+            tol=DENSITY_MAP_LAPLACE_TOL,
+            ridge=DENSITY_MAP_LAPLACE_RIDGE,
+            max_step_norm=DENSITY_MAP_LAPLACE_MAX_STEP_NORM,
+            backtrack_steps=DENSITY_MAP_LAPLACE_BACKTRACK_STEPS,
+            batch_size=max(1, DENSITY_DRC_EVAL_BATCH_SIZE),
+            save_dir=run_ctx['run_results_dir'],
+            run_stem=run_ctx['run_results_stem'],
+            make_plots=False,
+            precomp=precomp,
+            known_logZ=DENSITY_KNOWN_LOGZ,
+            plot_axis_mode=DENSITY_DRC_PLOT_AXIS_MODE,
+            residual_axis_mode=DENSITY_DRC_RESIDUAL_AXIS_MODE,
+            robust_percentiles=DENSITY_DRC_ROBUST_PERCENTILES,
+            residual_kind=DENSITY_DRC_RESIDUAL_KIND,
+            affine_fit_scope=DENSITY_DRC_AFFINE_FIT_SCOPE,
+            verbose=True,
+        )
+        display_names['DENS-MAP-Laplace'] = 'MAP-Laplace Gaussian'
+        print('\n=== Added MAP-Laplace Gaussian density baseline ===')
+        print(map_df.to_string(index=False))
+    except Exception as exc:
+        print(f"WARNING: MAP-Laplace density baseline failed and will be skipped: {exc}")
+elif baseline_eval_bank is None:
+    print('WARNING: no density eval bank found; MAP-Laplace density baseline skipped.')
+
+# Optional tiny PF-discretization sensitivity plot for the manuscript sanity
+# check. This reuses frozen score specs and held-out eval banks; it does not
+# rebuild score/gate banks.
+pf_sensitivity_df = pd.DataFrame()
+pf_sensitivity_fig_path = None
+if DENSITY_RUN_PF_SENSITIVITY:
+    try:
+        pf_sensitivity_df, pf_sensitivity_fig_path = run_drc_pf_sensitivity_benchmark(
+            precomp,
+            SAMPLER_CONFIGS,
+            prior_model,
+            lik_model,
+            labels=DENSITY_PF_SENSITIVITY_LABELS,
+            pf_steps_list=DENSITY_PF_SENSITIVITY_STEPS,
+            tmin_list=DENSITY_PF_SENSITIVITY_TMINS,
+            save_dir=run_ctx['run_results_dir'],
+            run_stem=run_ctx['run_results_stem'],
+            batch_size=max(1, DENSITY_DRC_EVAL_BATCH_SIZE),
+            robust_percentiles=DENSITY_DRC_ROBUST_PERCENTILES,
+            affine_fit_scope=DENSITY_DRC_AFFINE_FIT_SCOPE,
+            known_logZ=DENSITY_KNOWN_LOGZ,
+            make_plot=True,
+        )
+        if not pf_sensitivity_df.empty:
+            dashboard.add_dataframe(
+                'Density PF discretization sensitivity',
+                pf_sensitivity_df[['method', 'pf_steps', 't_min', 'affine_energy_rmse', 'slope_normalized_energy_rmse', 'raw_logw_ess', 'pointwise_nll']],
+                max_rows=30,
+                max_cols=7,
+                include_index=False,
+            )
+            if pf_sensitivity_fig_path:
+                dashboard.add_image_page(pf_sensitivity_fig_path)
+    except Exception as exc:
+        print(f'WARNING: density PF sensitivity benchmark failed and will be skipped: {exc}')
+
+# Surface the density/energy benchmark produced by ratio-only nodes plus any
+# closed-form baseline rows added above.
 drc_energy_tables = precomp.get('drc_energy_benchmarks', {})
 if drc_energy_tables:
     drc_energy_df = pd.concat(list(drc_energy_tables.values()), ignore_index=True)
-    print('\n=== DRC density/energy benchmark on density-eval bank ===')
-    print(drc_energy_df.to_string(index=False))
-    dashboard.add_dataframe(
-        'DRC density/energy benchmark on density-eval bank',
+    manuscript_density_df = make_density_manuscript_table(
         drc_energy_df,
+        display_names=display_names,
+        method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-CE-HLSI', 'DENS-MAP-Laplace'),
+        include_known_z=DENSITY_KNOWN_LOGZ is not None,
+    )
+    print('\n=== Density/energy benchmark on density-eval bank ===')
+    print(drc_energy_df.to_string(index=False))
+    print('\n=== Manuscript density table ===')
+    print(manuscript_density_df.to_string(index=False))
+    dashboard.add_dataframe(
+        'Manuscript density table',
+        manuscript_density_df,
         max_rows=20,
+        max_cols=8,
+        include_index=False,
+    )
+    dashboard.add_dataframe(
+        'Full density/energy benchmark on density-eval bank',
+        drc_energy_df,
+        max_rows=24,
         max_cols=8,
         include_index=False,
     )
 else:
     drc_energy_df = pd.DataFrame()
-    print("\nWARNING: no DRC density/energy benchmark was found in precomp['drc_energy_benchmarks'].")
+    manuscript_density_df = pd.DataFrame()
+    print("\nWARNING: no density/energy benchmark was found in precomp['drc_energy_benchmarks'].")
 
 metrics = compute_latent_metrics(
     samples,
@@ -1357,6 +1513,18 @@ save_reproducibility_log(
         'DENSITY_BLEND_DIVERGENCE': DENSITY_BLEND_DIVERGENCE,
         'DENSITY_LFGI_DIVERGENCE': DENSITY_LFGI_DIVERGENCE,
         'DENSITY_DIV_PROBES': DENSITY_DIV_PROBES,
+        'DENSITY_BASELINES': DENSITY_BASELINES,
+        'DENSITY_MAP_LAPLACE_STARTS': DENSITY_MAP_LAPLACE_STARTS,
+        'DENSITY_MAP_LAPLACE_MAX_ITER': DENSITY_MAP_LAPLACE_MAX_ITER,
+        'DENSITY_MAP_LAPLACE_TOL': DENSITY_MAP_LAPLACE_TOL,
+        'DENSITY_MAP_LAPLACE_RIDGE': DENSITY_MAP_LAPLACE_RIDGE,
+        'DENSITY_MAP_LAPLACE_MAX_STEP_NORM': DENSITY_MAP_LAPLACE_MAX_STEP_NORM,
+        'DENSITY_MAP_LAPLACE_BACKTRACK_STEPS': DENSITY_MAP_LAPLACE_BACKTRACK_STEPS,
+        'DENSITY_KNOWN_LOGZ': DENSITY_KNOWN_LOGZ,
+        'DENSITY_RUN_PF_SENSITIVITY': DENSITY_RUN_PF_SENSITIVITY,
+        'DENSITY_PF_SENSITIVITY_LABELS': DENSITY_PF_SENSITIVITY_LABELS,
+        'DENSITY_PF_SENSITIVITY_STEPS': DENSITY_PF_SENSITIVITY_STEPS,
+        'DENSITY_PF_SENSITIVITY_TMINS': DENSITY_PF_SENSITIVITY_TMINS,
         'RUN_COMMAND_HINT': RUN_COMMAND_HINT,
         'num_holdout_observation': num_holdout_observation,
         'HESS_MIN': HESS_MIN,
@@ -1383,6 +1551,12 @@ save_reproducibility_log(
         },
         'drc_density_energy_benchmark': (
             drc_energy_df.to_dict('records') if isinstance(drc_energy_df, pd.DataFrame) and not drc_energy_df.empty else []
+        ),
+        'manuscript_density_table': (
+            manuscript_density_df.to_dict('records') if isinstance(manuscript_density_df, pd.DataFrame) and not manuscript_density_df.empty else []
+        ),
+        'density_pf_sensitivity': (
+            pf_sensitivity_df.to_dict('records') if isinstance(pf_sensitivity_df, pd.DataFrame) and not pf_sensitivity_df.empty else []
         ),
         'summary_stats': {
             'reference_key': reference_key,
