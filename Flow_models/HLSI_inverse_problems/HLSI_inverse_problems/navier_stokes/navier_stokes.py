@@ -866,7 +866,7 @@ def _env_percentile_pair(name, default):
 # setting: independent score-signal and gate banks with 5000 particles each.
 # Override IP_DENSITY_N_REF_SIGNAL/IP_DENSITY_N_REF_GATE/IP_DENSITY_N_REF_EVAL
 # for smaller smoke tests.
-N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', 500))
+N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', 1000))
 N_REF_GATE_ENV_SET = _env_is_set('IP_DENSITY_N_REF_GATE')
 N_REF_GATE = _env_int('IP_DENSITY_N_REF_GATE', N_REF_SIGNAL)
 N_REF_EVAL = _env_int('IP_DENSITY_N_REF_EVAL', N_REF_SIGNAL)
