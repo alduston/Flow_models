@@ -86,6 +86,9 @@ from sampling import (
     compute_latent_metrics,
     configure_sampling,
     get_valid_samples,
+    compute_map_laplace_density_baseline,
+    make_density_manuscript_table,
+    run_drc_pf_sensitivity_benchmark,
     init_run_results,
     make_physics_likelihood,
     make_posterior_score_fn,
@@ -884,6 +887,28 @@ def _env_percentile_pair(name, default):
     return (lo, hi)
 
 
+def _env_csv(name, default):
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return tuple(default)
+    parts = [x.strip() for x in str(raw).replace(';', ',').split(',') if x.strip()]
+    return tuple(parts) if parts else tuple(default)
+
+
+def _env_int_tuple(name, default):
+    return tuple(int(float(x)) for x in _env_csv(name, default))
+
+
+def _env_float_tuple_or_none(name, default=None):
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return default
+    parts = [x.strip() for x in str(raw).replace(';', ',').split(',') if x.strip()]
+    if not parts or any(x.lower() in {'none', 'null'} for x in parts):
+        return default
+    return tuple(float(x) for x in parts)
+
+
 # Darcy keeps its legacy IP_DENSITY_N_REF fallback, but now uses the same split
 # bank controls as Navier-Stokes and Helmholtz. The score-signal bank feeds the
 # frozen score field; the gate bank feeds CE-HLSI gate estimation; the eval bank
@@ -904,9 +929,9 @@ DENSITY_BANK_COUPLING = _canonical_bank_coupling(os.environ.get(
     'IP_DENSITY_BANK_COUPLING',
     os.environ.get('IP_DENSITY_GATE_BANK_COUPLING', 'independent'), #'independent'),
 ))
-DENSITY_EVAL_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_EVAL_SOURCE', 'MALA')) #'MALA-EVAL'))
+DENSITY_EVAL_SOURCE = _canonical_source_label(os.environ.get('IP_DENSITY_EVAL_SOURCE', 'MALA-EVAL'))
 DENSITY_EVAL_BANK_COUPLING = _canonical_bank_coupling(
-    os.environ.get('IP_DENSITY_EVAL_BANK_COUPLING', 'independent') #'independent')
+    os.environ.get('IP_DENSITY_EVAL_BANK_COUPLING', 'independent')
 )
 DENSITY_DRC_PF_STEPS = _env_int('IP_DENSITY_DRC_PF_STEPS', 64)
 DENSITY_DRC_EVAL_BATCH_SIZE = _env_int('IP_DENSITY_DRC_EVAL_BATCH_SIZE', 32)
@@ -936,6 +961,18 @@ DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE', 'auto')
 DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE', 'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
+# Manuscript-table extras. These are intentionally thin wrappers around helper
+# functions in sampling.py so Darcy produces the same paper metrics as the
+# Navier-Stokes and Helmholtz density benchmarks: PF density rows, a MAP-Laplace
+# Gaussian baseline row, optional known-Z columns, and an optional PF sensitivity
+# plot/table.
+DENSITY_BASELINES = _env_csv('IP_DENSITY_BASELINES', ('map_laplace',))
+DENSITY_KNOWN_LOGZ = _env_float_or_none('IP_DENSITY_KNOWN_LOGZ', None)
+DENSITY_RUN_PF_SENSITIVITY = _env_bool('IP_DENSITY_RUN_PF_SENSITIVITY', False)
+DENSITY_PF_SENSITIVITY_LABELS = _env_csv('IP_DENSITY_PF_SENSITIVITY_LABELS', ('DENS-CE-HLSI', 'DENS-Tweedie'))
+DENSITY_PF_SENSITIVITY_STEPS = _env_int_tuple('IP_DENSITY_PF_SENSITIVITY_STEPS', (32, 64, 128))
+DENSITY_PF_SENSITIVITY_TMINS = _env_float_tuple_or_none('IP_DENSITY_PF_SENSITIVITY_TMINS', None)
+
 # Legacy ALT-DRC bootstrap settings are retained for manual experiments, but the
 # active paper-facing density benchmark below uses MALA / MALA-EVAL by default.
 BOOT_N_REF = _env_int('IP_DENSITY_BOOT_N_REF', N_REF_SIGNAL)
@@ -959,7 +996,7 @@ MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
 MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
 MALA_DT = _env_float('IP_DENSITY_MALA_DT', 5.0e-5)
 # Default to target-side MAP/Laplace proxy initialization for MALA.
-MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior') #'map_laplace')
+MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'map_laplace')
 MALA_PRECOND = _env_bool('IP_DENSITY_MALA_PRECOND', False)
 MALA_EVAL_N_SAMPLES = _env_int('IP_DENSITY_MALA_EVAL_N_SAMPLES', N_REF_EVAL)
 MALA_EVAL_STEPS = _env_int('IP_DENSITY_MALA_EVAL_STEPS', MALA_STEPS)
@@ -1012,7 +1049,8 @@ RUN_COMMAND_HINT = (
     'IP_DENSITY_MALA_BURNIN={burnin} IP_DENSITY_MALA_DT={dt:g} '
     'IP_DENSITY_MALA_INIT={mala_init} IP_DENSITY_MAP_LAPLACE_STARTS={map_starts} '
     'IP_DENSITY_MAP_LAPLACE_MAX_ITER={map_iter} IP_DENSITY_DRC_PF_STEPS={pf_steps} '
-    'IP_DENSITY_DRC_PLOT_LAYOUT={layout} python darcy_flow.py'
+    'IP_DENSITY_DRC_PLOT_LAYOUT={layout} IP_DENSITY_BASELINES={baselines} '
+    'IP_DENSITY_RUN_PF_SENSITIVITY={pf_sens} python darcy_flow.py'
 ).format(
     n_signal=N_REF_SIGNAL,
     n_gate=N_REF_GATE,
@@ -1029,6 +1067,8 @@ RUN_COMMAND_HINT = (
     map_iter=MAP_LAPLACE_MAX_ITER,
     pf_steps=DENSITY_DRC_PF_STEPS,
     layout=DENSITY_DRC_PLOT_LAYOUT,
+    baselines=','.join(DENSITY_BASELINES),
+    pf_sens=int(bool(DENSITY_RUN_PF_SENSITIVITY)),
 )
 
 # ==========================================
@@ -1090,6 +1130,11 @@ dashboard.add_text_page(
         f'DENSITY_TWEEDIE_DIVERGENCE = {DENSITY_TWEEDIE_DIVERGENCE}',
         f'DENSITY_BLEND_DIVERGENCE = {DENSITY_BLEND_DIVERGENCE}',
         f'DENSITY_LFGI_DIVERGENCE = {DENSITY_LFGI_DIVERGENCE}',
+        f'DENSITY_BASELINES = {DENSITY_BASELINES}',
+        f'DENSITY_KNOWN_LOGZ = {DENSITY_KNOWN_LOGZ}',
+        f'DENSITY_RUN_PF_SENSITIVITY = {DENSITY_RUN_PF_SENSITIVITY}',
+        f'DENSITY_PF_SENSITIVITY_STEPS = {DENSITY_PF_SENSITIVITY_STEPS}',
+        f'DENSITY_PF_SENSITIVITY_TMINS = {DENSITY_PF_SENSITIVITY_TMINS}',
         f'DENSITY_DRC_EVAL_BATCH_SIZE = {DENSITY_DRC_EVAL_BATCH_SIZE}',
         f'DENSITY_DRC_TMIN = {DENSITY_DRC_TMIN}',
         f'DENSITY_DRC_TMAX = {DENSITY_DRC_TMAX}',
@@ -1252,15 +1297,15 @@ if DENSITY_EVAL_SOURCE == 'MALA-EVAL':
 SAMPLER_CONFIGS.update(OrderedDict([
     ('DENS-Tweedie', _density_eval_config(
         DENSITY_REF_SOURCE, 'tweedie', DENSITY_TWEEDIE_DIVERGENCE,
-        'DENS-Tweedie', 'Density eval: Tweedie',
+        'DENS-Tweedie', 'Tweedie PF',
     )),
     ('DENS-ScalarBlend', _density_eval_config(
         DENSITY_REF_SOURCE, 'scalar_blend', DENSITY_BLEND_DIVERGENCE,
-        'DENS-ScalarBlend', 'Density eval: scalar blend',
+        'DENS-ScalarBlend', 'Scalar blend PF',
     )),
     ('DENS-CE-HLSI', _density_eval_config(
         DENSITY_REF_SOURCE, 'ce_hlsi', DENSITY_LFGI_DIVERGENCE,
-        'DENS-CE-HLSI', 'Density eval: CE-HLSI/LFGI',
+        'DENS-CE-HLSI', 'CE-HLSI/LFGI, GN precision',
     )),
 ]))
 
@@ -1272,7 +1317,8 @@ RUN_COMMAND_HINT = (
     'IP_DENSITY_MALA_BURNIN={burnin} IP_DENSITY_MALA_DT={dt:g} '
     'IP_DENSITY_MALA_INIT={mala_init} IP_DENSITY_MAP_LAPLACE_STARTS={map_starts} '
     'IP_DENSITY_MAP_LAPLACE_MAX_ITER={map_iter} IP_DENSITY_DRC_PF_STEPS={pf_steps} '
-    'IP_DENSITY_DRC_PLOT_LAYOUT={layout} python darcy_flow.py'
+    'IP_DENSITY_DRC_PLOT_LAYOUT={layout} IP_DENSITY_BASELINES={baselines} '
+    'IP_DENSITY_RUN_PF_SENSITIVITY={pf_sens} python darcy_flow.py'
 ).format(
     n_signal=N_REF_SIGNAL,
     n_gate=N_REF_GATE,
@@ -1289,6 +1335,8 @@ RUN_COMMAND_HINT = (
     map_iter=MAP_LAPLACE_MAX_ITER,
     pf_steps=DENSITY_DRC_PF_STEPS,
     layout=DENSITY_DRC_PLOT_LAYOUT,
+    baselines=','.join(DENSITY_BASELINES),
+    pf_sens=int(bool(DENSITY_RUN_PF_SENSITIVITY)),
 )
 
 
@@ -1315,22 +1363,139 @@ reference_title = pipeline['reference_title']
 summarize_sampler_run(sampler_run_info)
 plot_mean_ess_logs(ess_logs, display_names=display_names)
 
-# Surface the DRC density/energy benchmark produced by the ratio-only node.
+# Add closed-form density baselines on the same held-out density-eval bank.
+# Keep this deliberately small: for the manuscript comparison we need the
+# MAP-Laplace Gaussian row to test whether Darcy nonlinearity separates CE-HLSI
+# from a local Gaussian approximation.
+def _first_density_eval_bank(precomp_dict):
+    for lab in ('DENS-CE-HLSI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+        bank = precomp_dict.get('eval_banks', {}).get(lab)
+        if bank is not None:
+            return bank
+    for lab in ('DENS-CE-HLSI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+        det = precomp_dict.get('drc_details', {}).get(lab)
+        if det is not None:
+            return {
+                'X_ref': det['X_ref'],
+                'log_lik_ref': det['log_lik'],
+                'bank_name': det.get('eval_bank_name', f'{lab}_details_eval'),
+                'eval_only': True,
+            }
+    return None
+
+baseline_eval_bank = _first_density_eval_bank(precomp)
+if baseline_eval_bank is not None and any(str(b).lower().replace('-', '_') in {'map_laplace', 'laplace_map', 'map'} for b in DENSITY_BASELINES):
+    try:
+        map_df, map_details, map_component = compute_map_laplace_density_baseline(
+            baseline_eval_bank,
+            prior_model,
+            lik_model,
+            label='DENS-MAP-Laplace',
+            n_starts=MAP_LAPLACE_STARTS,
+            max_iter=MAP_LAPLACE_MAX_ITER,
+            tol=MAP_LAPLACE_TOL,
+            ridge=MAP_LAPLACE_RIDGE,
+            max_step_norm=MAP_LAPLACE_MAX_STEP_NORM,
+            backtrack_steps=MAP_LAPLACE_BACKTRACK_STEPS,
+            batch_size=max(1, DENSITY_DRC_EVAL_BATCH_SIZE),
+            save_dir=run_ctx['run_results_dir'],
+            run_stem=run_ctx['run_results_stem'],
+            make_plots=False,
+            precomp=precomp,
+            known_logZ=DENSITY_KNOWN_LOGZ,
+            plot_axis_mode=DENSITY_DRC_PLOT_AXIS_MODE,
+            residual_axis_mode=DENSITY_DRC_RESIDUAL_AXIS_MODE,
+            robust_percentiles=DENSITY_DRC_ROBUST_PERCENTILES,
+            residual_kind=DENSITY_DRC_RESIDUAL_KIND,
+            affine_fit_scope=DENSITY_DRC_AFFINE_FIT_SCOPE,
+            verbose=True,
+        )
+        display_names['DENS-MAP-Laplace'] = 'MAP-Laplace Gaussian'
+        print('\n=== Added MAP-Laplace Gaussian density baseline ===')
+        print(map_df.to_string(index=False))
+    except Exception as exc:
+        print(f"WARNING: MAP-Laplace density baseline failed and will be skipped: {exc}")
+elif baseline_eval_bank is None:
+    print('WARNING: no density eval bank found; MAP-Laplace density baseline skipped.')
+
+# Optional tiny PF-discretization sensitivity plot for the manuscript sanity
+# check. This reuses frozen score specs and held-out eval banks; it does not
+# rebuild score/gate banks.
+pf_sensitivity_df = pd.DataFrame()
+pf_sensitivity_fig_path = None
+if DENSITY_RUN_PF_SENSITIVITY:
+    try:
+        pf_sensitivity_df, pf_sensitivity_fig_path = run_drc_pf_sensitivity_benchmark(
+            precomp,
+            SAMPLER_CONFIGS,
+            prior_model,
+            lik_model,
+            labels=DENSITY_PF_SENSITIVITY_LABELS,
+            pf_steps_list=DENSITY_PF_SENSITIVITY_STEPS,
+            tmin_list=DENSITY_PF_SENSITIVITY_TMINS,
+            save_dir=run_ctx['run_results_dir'],
+            run_stem=run_ctx['run_results_stem'],
+            batch_size=max(1, DENSITY_DRC_EVAL_BATCH_SIZE),
+            robust_percentiles=DENSITY_DRC_ROBUST_PERCENTILES,
+            affine_fit_scope=DENSITY_DRC_AFFINE_FIT_SCOPE,
+            known_logZ=DENSITY_KNOWN_LOGZ,
+            make_plot=True,
+        )
+        if not pf_sensitivity_df.empty:
+            pf_cols = ['method', 'pf_steps', 't_min', 'affine_energy_rmse', 'slope_normalized_energy_rmse', 'raw_logw_ess', 'pointwise_nll']
+            pf_cols = [c for c in pf_cols if c in pf_sensitivity_df.columns]
+            dashboard.add_dataframe(
+                'Density PF discretization sensitivity',
+                pf_sensitivity_df[pf_cols],
+                max_rows=30,
+                max_cols=7,
+                include_index=False,
+            )
+            if pf_sensitivity_fig_path:
+                dashboard.add_image_page(pf_sensitivity_fig_path)
+    except Exception as exc:
+        print(f'WARNING: density PF sensitivity benchmark failed and will be skipped: {exc}')
+
+# Surface the density/energy benchmark produced by ratio-only nodes plus any
+# closed-form baseline rows added above.
 drc_energy_tables = precomp.get('drc_energy_benchmarks', {})
 if drc_energy_tables:
     drc_energy_df = pd.concat(list(drc_energy_tables.values()), ignore_index=True)
-    print('\n=== DRC density/energy benchmark on configured density-eval bank ===')
-    print(drc_energy_df.to_string(index=False))
-    dashboard.add_dataframe(
-        'DRC density/energy benchmark on configured density-eval bank',
+    manuscript_density_df = make_density_manuscript_table(
         drc_energy_df,
+        display_names=display_names,
+        method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-CE-HLSI', 'DENS-MAP-Laplace'),
+        include_known_z=DENSITY_KNOWN_LOGZ is not None,
+    )
+    print('\n=== Density/energy benchmark on configured density-eval bank ===')
+    print(drc_energy_df.to_string(index=False))
+    print('\n=== Manuscript density table ===')
+    print(manuscript_density_df.to_string(index=False))
+    manuscript_density_df_path = os.path.join(
+        run_ctx['run_results_dir'],
+        f"{run_ctx['run_results_stem']}_manuscript_density_table.csv",
+    )
+    manuscript_density_df.to_csv(manuscript_density_df_path, index=False)
+    print(f'Saved manuscript density table to {manuscript_density_df_path}')
+    dashboard.add_dataframe(
+        'Manuscript density table',
+        manuscript_density_df,
         max_rows=20,
+        max_cols=8,
+        include_index=False,
+    )
+    dashboard.add_dataframe(
+        'Full density/energy benchmark on configured density-eval bank',
+        drc_energy_df,
+        max_rows=24,
         max_cols=8,
         include_index=False,
     )
 else:
     drc_energy_df = pd.DataFrame()
-    print("\nWARNING: no DRC density/energy benchmark was found in precomp['drc_energy_benchmarks'].")
+    manuscript_density_df = pd.DataFrame()
+    manuscript_density_df_path = None
+    print("\nWARNING: no density/energy benchmark was found in precomp['drc_energy_benchmarks'].")
 
 metrics = compute_latent_metrics(
     samples,
@@ -1514,6 +1679,12 @@ save_reproducibility_log(
         'DENSITY_BLEND_DIVERGENCE': DENSITY_BLEND_DIVERGENCE,
         'DENSITY_LFGI_DIVERGENCE': DENSITY_LFGI_DIVERGENCE,
         'DENSITY_DIV_PROBES': DENSITY_DIV_PROBES,
+        'DENSITY_BASELINES': DENSITY_BASELINES,
+        'DENSITY_KNOWN_LOGZ': DENSITY_KNOWN_LOGZ,
+        'DENSITY_RUN_PF_SENSITIVITY': DENSITY_RUN_PF_SENSITIVITY,
+        'DENSITY_PF_SENSITIVITY_LABELS': DENSITY_PF_SENSITIVITY_LABELS,
+        'DENSITY_PF_SENSITIVITY_STEPS': DENSITY_PF_SENSITIVITY_STEPS,
+        'DENSITY_PF_SENSITIVITY_TMINS': DENSITY_PF_SENSITIVITY_TMINS,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
         'USE_GAUSS_NEWTON_HESSIAN': True,
         'X': X,
@@ -1545,9 +1716,17 @@ save_reproducibility_log(
             'metrics_csv': results_df_path,
             'runinfo_csv': results_runinfo_df_path,
             'dashboard_pdf': DASHBOARD_PDF_PATH,
+            'manuscript_density_table_csv': manuscript_density_df_path,
+            'pf_sensitivity_figure': pf_sensitivity_fig_path,
         },
         'drc_density_energy_benchmark': (
             drc_energy_df.to_dict('records') if isinstance(drc_energy_df, pd.DataFrame) and not drc_energy_df.empty else []
+        ),
+        'manuscript_density_table': (
+            manuscript_density_df.to_dict('records') if isinstance(manuscript_density_df, pd.DataFrame) and not manuscript_density_df.empty else []
+        ),
+        'density_pf_sensitivity': (
+            pf_sensitivity_df.to_dict('records') if isinstance(pf_sensitivity_df, pd.DataFrame) and not pf_sensitivity_df.empty else []
         ),
     },
 )
@@ -1690,13 +1869,22 @@ plt.suptitle(f'Inverse Darcy flow (d={ACTIVE_DIM}): permeability field', fontsiz
 plt.tight_layout()
 plt.show()
 
+try:
+    sampling._save_all_open_figures_to_run_results()
+except Exception as exc:
+    print(f'WARNING: final open-figure save before dashboard failed: {exc}')
+
 if DASHBOARD_SHOW_FIGURES:
     dashboard.add_run_results_png_figures(run_ctx['run_results_dir'])
 dashboard.close()
 plt.close('all')
-# The dashboard lives in the active run-results directory, so zip_run_results_dir()
-# includes it alongside the PNGs, CSVs, and reproducibility log.
-run_results_zip_path = zip_run_results_dir()
+# sampling.py now accepts extra_paths in the artifact-complete zip helper. The
+# fallback keeps this script runnable with older helper versions, but complete
+# artifact zipping requires the updated sampling.py from the Navier-Stokes patch.
+try:
+    run_results_zip_path = zip_run_results_dir(extra_paths=[DASHBOARD_PDF_PATH])
+except TypeError:
+    run_results_zip_path = zip_run_results_dir()
 print(f"Run-results directory: {run_ctx['run_results_dir']}")
 print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
