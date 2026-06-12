@@ -27,6 +27,7 @@ Useful overrides:
     export IP_DENSITY_MALA_DT=4e-5
     export IP_DENSITY_MAP_LAPLACE_STARTS=128
     export IP_DENSITY_MAP_LAPLACE_MAX_ITER=25
+    export IP_DENSITY_BASELINES=map_laplace
     export IP_DENSITY_DRC_PF_STEPS=32
     export IP_DENSITY_DRC_PLOT_LAYOUT=comparison_grid
 """
@@ -782,13 +783,13 @@ def solve_full_pressure(alpha):
 # ==========================================
 ACTIVE_DIM = num_truncated_series
 PLOT_NORMALIZER = 'best'
-HESS_MIN = 1e-4
+HESS_MIN = 1e-6
 HESS_MAX = 1e6
 GNL_PILOT_N = 1024
 GNL_STIFF_LAMBDA_CUT = HESS_MAX
 GNL_USE_DOMINANT_PARTICLE_NEWTON = True
-DEFAULT_N_GEN = 1500
-N_REF = 1500
+DEFAULT_N_GEN = 2000
+N_REF = 2000
 BUILD_GNL_BANKS = False
 
 # ==========================================
@@ -992,9 +993,9 @@ DENSITY_SOURCE_REQUIRED_N = _required_source_bank_size(
     N_REF_SIGNAL, N_REF_GATE, DENSITY_BANK_COUPLING,
 )
 MALA_N_SAMPLES = _env_int('IP_DENSITY_MALA_N_SAMPLES', DENSITY_SOURCE_REQUIRED_N)
-MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 700)
-MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 200)
-MALA_DT = _env_float('IP_DENSITY_MALA_DT', 3.0e-5)
+MALA_STEPS = _env_int('IP_DENSITY_MALA_STEPS', 600)
+MALA_BURNIN = _env_int('IP_DENSITY_MALA_BURNIN', 150)
+MALA_DT = _env_float('IP_DENSITY_MALA_DT', 4.0e-5)
 # Default to target-side MAP/Laplace proxy initialization for MALA.
 MALA_INIT = os.environ.get('IP_DENSITY_MALA_INIT', 'prior')
 MALA_PRECOND = _env_bool('IP_DENSITY_MALA_PRECOND', False)
@@ -1238,7 +1239,7 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         'drc_energy_save_logratio_residual_plots': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
         'drc_energy_plot_layout': DENSITY_DRC_PLOT_LAYOUT,
-        'drc_energy_grid_method_order': ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie'),
+        'drc_energy_grid_method_order': ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'),
         'drc_energy_grid_axis_reference': 'DENS-CE-HLSI',
         'drc_energy_grid_max_points': DENSITY_DRC_GRID_MAX_POINTS,
         'drc_energy_grid_save_pdf': DENSITY_DRC_GRID_SAVE_PDF,
@@ -1417,6 +1418,38 @@ if baseline_eval_bank is not None and any(str(b).lower().replace('-', '_') in {'
         print(f"WARNING: MAP-Laplace density baseline failed and will be skipped: {exc}")
 elif baseline_eval_bank is None:
     print('WARNING: no density eval bank found; MAP-Laplace density baseline skipped.')
+
+# The standard DRC comparison grid is created inside run_standard_sampler_pipeline,
+# before the closed-form MAP-Laplace baseline row exists. Regenerate the grid here
+# after inserting DENS-MAP-Laplace so the figure matches the metric table.
+density_grid_method_order = ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace')
+if 'DENS-MAP-Laplace' in precomp.get('drc_details', {}):
+    try:
+        all_drc_details = precomp.get('drc_details', {})
+        grid_labels = [lab for lab in density_grid_method_order if lab in all_drc_details]
+        grid_labels += [lab for lab in all_drc_details.keys() if lab not in grid_labels and str(lab).startswith('DENS-')]
+        details_for_grid = OrderedDict((lab, all_drc_details[lab]) for lab in grid_labels)
+        cfg_for_grid = {lab: dict(SAMPLER_CONFIGS.get(lab, {})) for lab in grid_labels}
+        cfg_for_grid.setdefault('DENS-MAP-Laplace', {})['display_name'] = 'MAP-Laplace Gaussian'
+        refreshed_grid = sampling.save_drc_energy_comparison_grid(
+            details_for_grid,
+            cfg_by_label=cfg_for_grid,
+            save_dir=run_ctx['run_results_dir'],
+            run_stem=run_ctx['run_results_stem'],
+            method_order=density_grid_method_order,
+            axis_reference_label='DENS-CE-HLSI' if 'DENS-CE-HLSI' in details_for_grid else None,
+            plot_axis_mode=DENSITY_DRC_PLOT_AXIS_MODE,
+            residual_axis_mode=DENSITY_DRC_RESIDUAL_AXIS_MODE,
+            robust_percentiles=DENSITY_DRC_ROBUST_PERCENTILES,
+            affine_fit_scope=DENSITY_DRC_AFFINE_FIT_SCOPE,
+            residual_kind=DENSITY_DRC_RESIDUAL_KIND,
+            max_points=DENSITY_DRC_GRID_MAX_POINTS,
+            save_pdf=DENSITY_DRC_GRID_SAVE_PDF,
+        )
+        precomp['drc_energy_comparison_grid'] = refreshed_grid
+        print('Refreshed density-energy comparison grid with MAP-Laplace row.')
+    except Exception as exc:
+        print(f'WARNING: failed to refresh density-energy comparison grid with MAP-Laplace row: {exc}')
 
 # Optional tiny PF-discretization sensitivity plot for the manuscript sanity
 # check. This reuses frozen score specs and held-out eval banks; it does not
