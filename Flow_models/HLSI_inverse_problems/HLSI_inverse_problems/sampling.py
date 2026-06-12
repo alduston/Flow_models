@@ -16,6 +16,8 @@ import random
 import shutil
 import time
 import warnings
+import glob
+import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
@@ -247,17 +249,154 @@ def save_reproducibility_log(title='HLSI run reproducibility log', config=None, 
     return log_path
 
 
-def zip_run_results_dir():
+def _copy_orphan_run_artifact(path, run_dir_abs, copied):
+    """Copy a run artifact saved outside RUN_RESULTS_DIR back into the run dir."""
+    try:
+        if not path or not os.path.isfile(path):
+            return
+        src = os.path.abspath(path)
+        if src.startswith(run_dir_abs + os.sep):
+            return
+        if src.lower().endswith(('.zip', '.tmp')):
+            return
+        dst = os.path.join(run_dir_abs, os.path.basename(src))
+        if os.path.abspath(dst) == src:
+            return
+        # Preserve a newer destination if it already exists; otherwise copy.
+        if os.path.exists(dst):
+            try:
+                if os.path.getmtime(dst) >= os.path.getmtime(src) and os.path.getsize(dst) == os.path.getsize(src):
+                    return
+            except OSError:
+                pass
+        shutil.copy2(src, dst)
+        copied.append((src, dst))
+    except Exception as exc:
+        warnings.warn(f"Could not copy run artifact {path!r} into run-results directory: {exc}", RuntimeWarning)
+
+
+def _stage_orphan_run_artifacts(run_dir_abs, extra_paths=None, include_cwd_stem_artifacts=True):
+    """Best-effort catch for figures/tables accidentally saved outside run dir.
+
+    Most artifacts should already be written directly under RUN_RESULTS_DIR.  Some
+    ad-hoc benchmark code historically wrote prefix-matched PNG/PDF/CSV/TXT files
+    into the current working directory before the final zip step.  This helper
+    copies those files into RUN_RESULTS_DIR so the zip is a complete run snapshot.
+    """
+    copied = []
+    for path in (extra_paths or []):
+        _copy_orphan_run_artifact(path, run_dir_abs, copied)
+    if include_cwd_stem_artifacts and RUN_RESULTS_STEM:
+        artifact_exts = {
+            '.png', '.jpg', '.jpeg', '.pdf', '.csv', '.txt', '.json', '.tex',
+            '.npz', '.npy', '.pkl', '.pt', '.pth', '.html', '.md', '.log',
+        }
+        search_dirs = []
+        for d in (os.getcwd(), os.path.abspath(RUN_RESULTS_ROOT or '.'), os.path.dirname(run_dir_abs)):
+            if d and os.path.isdir(d) and d not in search_dirs:
+                search_dirs.append(d)
+        for d in search_dirs:
+            for path in glob.glob(os.path.join(d, f'{RUN_RESULTS_STEM}*')):
+                if os.path.isdir(path):
+                    continue
+                if os.path.splitext(path)[1].lower() not in artifact_exts:
+                    continue
+                _copy_orphan_run_artifact(path, run_dir_abs, copied)
+    if copied:
+        print(f'Staged {len(copied)} orphan run artifact(s) into {run_dir_abs}')
+    return copied
+
+
+def _write_run_results_manifest(run_dir_abs, copied_orphans=None):
+    """Write a manifest of every file that will be included in the run zip."""
+    if RUN_RESULTS_STEM:
+        manifest_path = os.path.join(run_dir_abs, f'{RUN_RESULTS_STEM}_artifact_manifest.txt')
+    else:
+        manifest_path = os.path.join(run_dir_abs, 'artifact_manifest.txt')
+    lines = [
+        'Run artifact manifest',
+        '=' * 72,
+        f'run_results_dir = {run_dir_abs}',
+        f'run_results_stem = {RUN_RESULTS_STEM}',
+        '',
+    ]
+    copied_orphans = copied_orphans or []
+    if copied_orphans:
+        lines.append('Orphan artifacts copied into run-results directory before zipping')
+        lines.append('-' * 72)
+        for src, dst in copied_orphans:
+            lines.append(f'{src} -> {dst}')
+        lines.append('')
+    rows = []
+    for root, _, files in os.walk(run_dir_abs):
+        for name in files:
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, run_dir_abs)
+            try:
+                stat = os.stat(path)
+                rows.append((rel, stat.st_size, stat.st_mtime))
+            except OSError:
+                rows.append((rel, -1, 0.0))
+    rows.sort(key=lambda r: r[0])
+    lines.append(f'Files included: {len(rows)}')
+    lines.append('-' * 72)
+    for rel, size, mtime in rows:
+        lines.append(f'{rel}\t{size} bytes\tmtime={mtime:.6f}')
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    return manifest_path
+
+
+def zip_run_results_dir(extra_paths=None, include_cwd_stem_artifacts=True, write_manifest=True):
+    """Create a complete zip snapshot of the current run-results directory.
+
+    This intentionally does not rely on `shutil.make_archive`, because a few
+    benchmark scripts save final diagnostics (for example density-energy grids,
+    per-method CSV/NPZ files, dashboard PDFs, or ad-hoc figures) at different
+    points in the shutdown sequence.  Before zipping we:
+      1. force-save all still-open matplotlib figures into RUN_RESULTS_DIR;
+      2. copy any prefix-matched artifacts accidentally written outside the run
+         directory back into RUN_RESULTS_DIR;
+      3. write an artifact manifest; and
+      4. zip every file currently under RUN_RESULTS_DIR recursively.
+    """
     if RUN_RESULTS_DIR is None:
         raise RuntimeError('init_run_results must be called before zip_run_results_dir.')
     _save_all_open_figures_to_run_results()
-    zip_path = shutil.make_archive(
-        RUN_RESULTS_DIR,
-        'zip',
-        root_dir=RUN_RESULTS_ROOT,
-        base_dir=os.path.basename(RUN_RESULTS_DIR),
+    run_dir_abs = os.path.abspath(RUN_RESULTS_DIR)
+    os.makedirs(run_dir_abs, exist_ok=True)
+    copied = _stage_orphan_run_artifacts(
+        run_dir_abs,
+        extra_paths=extra_paths,
+        include_cwd_stem_artifacts=include_cwd_stem_artifacts,
     )
-    print(f'Compressed run-results directory to {zip_path}')
+    if write_manifest:
+        manifest_path = _write_run_results_manifest(run_dir_abs, copied_orphans=copied)
+        print(f'Wrote run artifact manifest to {manifest_path}')
+
+    zip_path = run_dir_abs + '.zip'
+    tmp_zip_path = zip_path + '.tmp'
+    if os.path.exists(tmp_zip_path):
+        os.remove(tmp_zip_path)
+    base_arcdir = os.path.basename(run_dir_abs)
+    n_files = 0
+    with zipfile.ZipFile(tmp_zip_path, mode='w', compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for root, _, files in os.walk(run_dir_abs):
+            files = sorted(files)
+            for name in files:
+                path = os.path.join(root, name)
+                if not os.path.isfile(path):
+                    continue
+                # The zip is outside run_dir_abs by construction; this is an extra guard
+                # for manual calls where paths may be unusual.
+                if os.path.abspath(path) in {os.path.abspath(zip_path), os.path.abspath(tmp_zip_path)}:
+                    continue
+                rel = os.path.relpath(path, run_dir_abs)
+                arcname = os.path.join(base_arcdir, rel)
+                zf.write(path, arcname=arcname)
+                n_files += 1
+    os.replace(tmp_zip_path, zip_path)
+    print(f'Compressed run-results directory to {zip_path} ({n_files} files)')
     return zip_path
 
 
