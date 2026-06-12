@@ -1669,9 +1669,21 @@ try:
 except Exception:
     pass
 
+# Final artifact sweep: make sure figures created immediately before shutdown are
+# saved into run_results before the dashboard and zip are finalized.
+try:
+    sampling._save_all_open_figures_to_run_results()
+except Exception as exc:
+    print(f'WARNING: final open-figure save before dashboard failed: {exc}')
+
 dashboard.add_run_results_png_figures(run_ctx['run_results_dir'])
 dashboard.close()
-run_results_zip_path = zip_run_results_dir()
+
+# The sampling helper now recursively zips the full run-results directory and
+# stages any prefix-matched orphan artifacts before writing the archive.  Passing
+# the dashboard explicitly is harmless when it is already in the run directory
+# and protects against future path changes.
+run_results_zip_path = zip_run_results_dir(extra_paths=[DASHBOARD_PDF_PATH])
 print(f"Run-results directory: {run_ctx['run_results_dir']}")
 print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
