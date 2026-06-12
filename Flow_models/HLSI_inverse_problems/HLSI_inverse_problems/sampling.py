@@ -2705,7 +2705,12 @@ def _drc_method_pretty_name(label, cfg=None):
     label_str = str(label)
     init = None
     if isinstance(cfg, dict):
-        init = canonicalize_init_name(cfg.get('drc_score_init', cfg.get('init', '')))
+        init_raw = cfg.get('drc_score_init', cfg.get('init', None))
+        if init_raw not in (None, ''):
+            try:
+                init = canonicalize_init_name(init_raw)
+            except Exception:
+                init = None
     low = label_str.lower()
     if init in {'ce_hlsi', 'hlsi_posterior', 'leaf_ce_hlsi', 'gnl_ce_hlsi'} or 'ce-hlsi' in low or 'hlsi' in low or 'lfgi' in low:
         return 'CE-HLSI'
@@ -2713,6 +2718,8 @@ def _drc_method_pretty_name(label, cfg=None):
         return 'Blend'
     if init == 'tweedie' or 'tweedie' in low:
         return 'Tweedie'
+    if 'map-laplace' in low or 'map_laplace' in low or ('laplace' in low and 'map' in low):
+        return 'MAP-Laplace'
     if isinstance(cfg, dict) and cfg.get('display_name'):
         name = str(cfg.get('display_name'))
         return name.replace('Density eval:', '').strip() or label_str
@@ -2728,6 +2735,8 @@ def _drc_method_order_key(label, cfg=None):
         return (1, str(label))
     if 'tweedie' in name:
         return (2, str(label))
+    if 'map-laplace' in name or ('laplace' in name and 'map' in name):
+        return (3, str(label))
     return (10, str(label))
 
 
@@ -2877,7 +2886,7 @@ def save_drc_energy_comparison_grid(details_by_label, cfg_by_label=None, save_di
 
     Rows are methods and columns are: (1) affine-normalized estimated energy
     against true energy, and (2) affine-normalized residual against true energy.
-    The default row ordering is CE-HLSI, Blend, Tweedie.  Axes are shared across
+    The default row ordering is CE-HLSI, Blend, Tweedie, MAP-Laplace when present.  Axes are shared across
     rows and are set by the CE-HLSI/reference-label arrays, matching the intended
     paper comparison rather than allowing each method to choose its own window.
     """
@@ -5899,7 +5908,7 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     # single method-comparison grid; set to 'individual' for the legacy one-plot-per-method
     # behavior or 'both' for both outputs.
     cfg.setdefault('drc_energy_plot_layout', 'comparison_grid')
-    cfg.setdefault('drc_energy_grid_method_order', ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie'))
+    cfg.setdefault('drc_energy_grid_method_order', ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'))
     cfg.setdefault('drc_energy_grid_axis_reference', 'DENS-CE-HLSI')
     cfg.setdefault('drc_energy_grid_max_points', 5000)
     cfg['drc_energy_grid_max_points'] = int(max(100, cfg['drc_energy_grid_max_points']))
