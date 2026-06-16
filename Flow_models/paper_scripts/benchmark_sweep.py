@@ -57,6 +57,10 @@ Environment knobs:
   * LFGI_BENCH_SCORE_RMSE=0/1
   * LFGI_BENCH_AUX_METRICS=0/1
   * LFGI_BENCH_CURL=0/1
+  * LFGI_BENCH_POLE_AUDIT=auto|0|1
+    - auto enables the Section-8 pole-separation diagnostic for funnel targets.
+    - controls: LFGI_BENCH_POLE_AUDIT_N, N_HI, TIMES, ETA, ACTIVE_MASS_TOL,
+      CHUNK, HESSIAN_SOURCE.
   * LFGI_BENCH_CURL_N, LFGI_BENCH_CURL_TIME_GRID, LFGI_BENCH_CURL_PROBES
   * LFGI_BENCH_METRIC_MAX
   * LFGI_BENCH_DPSMC_BLEND_COV=snis|reference
@@ -5316,6 +5320,309 @@ def canonical_bank_coupling(value):
     return aliases[key]
 
 
+
+# ==============================================================
+# LFGI pole-separation / Section 8 safety-regime diagnostic
+# ==============================================================
+def _parse_float_list_env(name, default):
+    raw = os.environ.get(name, None)
+    if raw is None or str(raw).strip() == '':
+        return [float(x) for x in default]
+    vals = []
+    for tok in str(raw).replace(';', ',').split(','):
+        tok = tok.strip()
+        if tok:
+            vals.append(float(tok))
+    return vals
+
+
+def _quantile_finite(values, q):
+    arr = np.asarray([float(v) for v in values], dtype=float)
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return np.nan
+    # Nearest-order statistic avoids numpy interpolation warnings when the
+    # diagnostic correctly produces +inf for failed pole conditions.
+    arr = np.sort(arr)
+    idx = int(round(float(q) * (arr.size - 1)))
+    idx = max(0, min(arr.size - 1, idx))
+    return float(arr[idx])
+
+
+def _mean_bool(values):
+    vals = list(values)
+    if not vals:
+        return np.nan
+    return float(np.mean([1.0 if bool(v) else 0.0 for v in vals]))
+
+
+def _write_dict_rows_csv(path, rows, fieldnames=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rows = list(rows)
+    if fieldnames is None:
+        fieldnames = []
+        for row in rows:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, '') for k in fieldnames})
+    return path
+
+
+def _summarize_lfgi_pole_audit(rows):
+    rows = list(rows)
+    times = sorted({float(r['t']) for r in rows})
+    summary = []
+    for t in times:
+        group = [r for r in rows if float(r['t']) == t]
+        summary.append({
+            't': t,
+            'n': len(group),
+            'pass_rate': _mean_bool(r.get('strict_section8_pass', False) for r in group),
+            'active_pole_rate': _mean_bool(r.get('active_pole', False) for r in group),
+            'nonpos_A_rate': _mean_bool(float(r.get('lam_min_A', np.nan)) <= 0.0 for r in group),
+            'neff_med': _quantile_finite([r.get('neff', np.nan) for r in group], 0.50),
+            'neff_q05': _quantile_finite([r.get('neff', np.nan) for r in group], 0.05),
+            'lam_min_A_q01': _quantile_finite([r.get('lam_min_A', np.nan) for r in group], 0.01),
+            'lam_min_A_q05': _quantile_finite([r.get('lam_min_A', np.nan) for r in group], 0.05),
+            'lam_min_A_med': _quantile_finite([r.get('lam_min_A', np.nan) for r in group], 0.50),
+            'min_active_A_q05': _quantile_finite([r.get('min_active_A', np.nan) for r in group], 0.05),
+            'min_active_A_med': _quantile_finite([r.get('min_active_A', np.nan) for r in group], 0.50),
+            'epsH_med': _quantile_finite([r.get('epsH', np.nan) for r in group], 0.50),
+            'epsH_q90': _quantile_finite([r.get('epsH', np.nan) for r in group], 0.90),
+            'epsH_q95': _quantile_finite([r.get('epsH', np.nan) for r in group], 0.95),
+            'Lambda_pole_med': _quantile_finite([r.get('Lambda_pole', np.nan) for r in group], 0.50),
+            'Lambda_pole_q90': _quantile_finite([r.get('Lambda_pole', np.nan) for r in group], 0.90),
+            'DeltaR_med': _quantile_finite([r.get('DeltaR', np.nan) for r in group], 0.50),
+            'capture_ratio_med': _quantile_finite([r.get('capture_ratio', np.nan) for r in group], 0.50),
+            'capture_ratio_q90': _quantile_finite([r.get('capture_ratio', np.nan) for r in group], 0.90),
+            'capture_ratio_q95': _quantile_finite([r.get('capture_ratio', np.nan) for r in group], 0.95),
+        })
+    return summary
+
+
+def _print_lfgi_pole_audit_summary(summary):
+    if not summary:
+        print("    pole audit: no rows")
+        return
+    hdr = (
+        f"{'t':>8s} {'pass':>7s} {'actPole':>8s} {'nonposA':>8s} "
+        f"{'neff50':>9s} {'lamA05':>11s} {'actA05':>11s} "
+        f"{'eps90':>10s} {'Lam90':>10s} {'cap90':>10s}"
+    )
+    print("    " + hdr)
+    print("    " + "-" * len(hdr))
+    for r in summary:
+        print(
+            "    "
+            f"{float(r['t']):8.4g} {float(r['pass_rate']):7.3f} "
+            f"{float(r['active_pole_rate']):8.3f} {float(r['nonpos_A_rate']):8.3f} "
+            f"{float(r['neff_med']):9.2f} {float(r['lam_min_A_q05']):11.3e} "
+            f"{float(r['min_active_A_q05']):11.3e} {float(r['epsH_q90']):10.3e} "
+            f"{float(r['Lambda_pole_q90']):10.3e} {float(r['capture_ratio_q90']):10.3e}"
+        )
+
+
+def _resolve_pole_audit_enabled(mode, target):
+    """Default 'auto' audits funnel targets without slowing every benchmark."""
+    key = str(mode or 'auto').strip().lower()
+    if key in {'1', 'true', 'yes', 'on', 'always'}:
+        return True
+    if key in {'0', 'false', 'no', 'off', 'never'}:
+        return False
+    if key == 'auto':
+        vname = str(getattr(target, 'variant_name', '')).lower()
+        return ('funnel' in vname)
+    raise ValueError(
+        f"Unsupported LFGI_BENCH_POLE_AUDIT={mode!r}; use 0/1 or auto."
+    )
+
+
+def _sample_audit_bank(target, n, mala_kw=None):
+    mala_kw = dict(mala_kw or {})
+    if hasattr(target, 'sample_reference'):
+        try:
+            return target.sample_reference(n, device=DEVICE, **mala_kw).contiguous()
+        except TypeError:
+            # Some exact samplers do not accept MALA-specific keyword arguments.
+            return target.sample_reference(n, device=DEVICE).contiguous()
+    return target.sample_mala(n, device=DEVICE, **mala_kw).contiguous()
+
+
+def lfgi_pole_audit(
+    target,
+    finite_xg,
+    n_query=512,
+    n_hi=8192,
+    times=(0.01, 0.03, 0.1, 0.3, 1.0, 3.0),
+    eta=0.5,
+    active_mass_tol=1e-3,
+    hessian_source='true',
+    query_chunk=64,
+    mala_kw=None,
+):
+    """Audit whether the current target lies in the Section 8 pole-separated regime.
+
+    The high-reference bank estimates the population conditional Hessian average
+    H(y,t), disagreement covariance C_dd(y,t), and risk reduction Delta R*.  The
+    supplied finite gate bank finite_xg estimates Hhat_N(y,t).  A point passes the
+    strict sufficient-condition proxy only when A = alpha^2 I + gamma H is positive,
+    the relative Hessian error epsH is <= 1/2, no risk-active direction sees a pole,
+    and the finite-reference loss bound is below eta * Delta R*.
+    """
+    D = int(getattr(target, 'D', getattr(target, 'd', finite_xg.shape[1])))
+    query_chunk = max(1, int(query_chunk))
+    n_query = int(n_query)
+    n_hi = int(n_hi)
+    eta = float(eta)
+    active_mass_tol = float(active_mass_tol)
+    hessian_source = canonical_hessian_source(hessian_source)
+
+    eye = torch.eye(D, dtype=torch.get_default_dtype(), device=DEVICE)
+
+    xr_hi = _sample_audit_bank(target, n_hi, mala_kw=mala_kw)
+    xq = _sample_audit_bank(target, n_query, mala_kw=mala_kw)
+    finite_xg = finite_xg.to(device=DEVICE, dtype=torch.get_default_dtype()).contiguous()
+
+    print(
+        f"    pole audit banks: high={tuple(xr_hi.shape)}, finite_gate={tuple(finite_xg.shape)}, "
+        f"query={tuple(xq.shape)}, source={hessian_source}, chunk={query_chunk}"
+    )
+
+    t0 = time.time()
+    H_hi = target_hessian_proxy(target, xr_hi, hessian_source)
+    H_fin = target_hessian_proxy(target, finite_xg, hessian_source)
+    s_hi = target.score(xr_hi)
+    print(f"    pole audit precompute done ({time.time() - t0:.1f}s)")
+
+    records = []
+    for t_float in [float(x) for x in times]:
+        t = torch.tensor(t_float, dtype=torch.get_default_dtype(), device=DEVICE)
+        a = at(t)
+        v = vt(t)
+        a2 = a * a
+        sqrt_v = torch.sqrt(v)
+        t_start = time.time()
+
+        for lo in range(0, n_query, query_chunk):
+            hi = min(n_query, lo + query_chunk)
+            x0 = xq[lo:hi]
+            y = a * x0 + sqrt_v * torch.randn_like(x0)
+            B = y.shape[0]
+
+            with torch.no_grad():
+                w_hi = snis_w(y, t, xr_hi)
+                w_fin = snis_w(y, t, finite_xg)
+
+                Hbar = torch.einsum('bn,nij->bij', w_hi, H_hi)
+                Hhat = torch.einsum('bn,nij->bij', w_fin, H_fin)
+
+                b = (a * xr_hi.unsqueeze(0) - y.unsqueeze(1)) / v
+                c = s_hi.unsqueeze(0) / a
+                delta = c - b
+                Cdd = torch.einsum('bn,bni,bnj->bij', w_hi, delta, delta)
+                Cbd = torch.einsum('bn,bni,bnj->bij', w_hi, b, delta)
+                A = a2 * eye.unsqueeze(0) + v * Hbar
+                neff_fin = 1.0 / w_fin.square().sum(dim=1).clamp_min(1e-30)
+                neff_hi = 1.0 / w_hi.square().sum(dim=1).clamp_min(1e-30)
+
+            for j in range(B):
+                Ai = sym(A[j])
+                Ci = sym(Cdd[j])
+                eigA, Q = torch.linalg.eigh(Ai)
+                lam_min = float(eigA.min().detach().cpu().item())
+
+                trC = torch.trace(Ci).clamp_min(1e-30)
+                C_in_A_basis = Q.T @ Ci @ Q
+                risk_mass = torch.diag(C_in_A_basis).clamp_min(0.0) / trC
+                active = risk_mass > (active_mass_tol / max(D, 1))
+                if bool(active.any().detach().cpu().item()):
+                    min_active_A = float(eigA[active].min().detach().cpu().item())
+                    active_pole = bool((eigA[active] <= 0.0).any().detach().cpu().item())
+                    active_mass_negative = float(risk_mass[(eigA <= 0.0)].sum().detach().cpu().item())
+                    min_abs_active_A = float(eigA[active].abs().min().detach().cpu().item())
+                else:
+                    min_active_A = np.nan
+                    active_pole = False
+                    active_mass_negative = 0.0
+                    min_abs_active_A = np.nan
+
+                base_row = dict(
+                    t=t_float,
+                    query_index=lo + j,
+                    x1=float(x0[j, 0].detach().cpu().item()) if D >= 1 else np.nan,
+                    y1=float(y[j, 0].detach().cpu().item()) if D >= 1 else np.nan,
+                    neff=float(neff_fin[j].detach().cpu().item()),
+                    neff_hi=float(neff_hi[j].detach().cpu().item()),
+                    lam_min_A=lam_min,
+                    min_active_A=min_active_A,
+                    min_abs_active_A=min_abs_active_A,
+                    active_pole=active_pole,
+                    active_mass_negative=active_mass_negative,
+                    eta=eta,
+                    active_mass_tol=active_mass_tol,
+                )
+
+                if lam_min <= 0.0:
+                    row = dict(
+                        base_row,
+                        Lambda_pole=np.inf,
+                        epsH=np.inf,
+                        DeltaR=np.nan,
+                        capture_ratio=np.inf,
+                        strict_section8_pass=False,
+                    )
+                    records.append(row)
+                    continue
+
+                inv_eigs = 1.0 / eigA.clamp_min(1e-300)
+                Ainv = Q @ torch.diag(inv_eigs) @ Q.T
+                Lambda_pole = float((inv_eigs.max() * torch.trace(Ainv @ Ci)).detach().cpu().item())
+
+                Ais = Q @ torch.diag(torch.rsqrt(eigA.clamp_min(1e-300))) @ Q.T
+                E = sym(v * (Ais @ (Hhat[j] - Hbar[j]) @ Ais))
+                epsH = float(torch.linalg.eigvalsh(E).abs().max().detach().cpu().item())
+
+                # Delta R* = tr(C_{b delta} C_{delta delta}^+ C_{delta b}).
+                # A tiny scale-relative ridge makes the diagnostic stable when Cdd
+                # is numerically rank-deficient but does not rescue an A-pole.
+                ridge_scale = torch.trace(Ci).abs().clamp_min(1.0) / max(D, 1)
+                Cdd_inv = torch.linalg.pinv(Ci + 1e-10 * ridge_scale * eye)
+                DeltaR = float(torch.trace(Cbd[j] @ Cdd_inv @ Cbd[j].T).detach().cpu().item())
+
+                if epsH >= 1.0 or DeltaR <= 0.0 or not np.isfinite(DeltaR):
+                    capture_ratio = np.inf
+                else:
+                    capture_ratio = (
+                        float((a2 * a2).detach().cpu().item())
+                        * (epsH / max(1e-12, 1.0 - epsH)) ** 2
+                        * Lambda_pole
+                        / max(DeltaR, 1e-300)
+                    )
+
+                row = dict(
+                    base_row,
+                    Lambda_pole=Lambda_pole,
+                    epsH=epsH,
+                    DeltaR=DeltaR,
+                    capture_ratio=capture_ratio,
+                    strict_section8_pass=(
+                        lam_min > 0.0
+                        and epsH <= 0.5
+                        and capture_ratio <= eta
+                        and not active_pole
+                    ),
+                )
+                records.append(row)
+
+        print(f"    pole audit t={t_float:g}: {time.time() - t_start:.1f}s")
+
+    return records, _summarize_lfgi_pole_audit(records)
+
 def _env_bool(name, default=False):
     raw = os.environ.get(name, None)
     if raw is None:
@@ -5426,6 +5733,23 @@ def run(target, out_dir='outputs', methods=None):
     vdesc = getattr(target, 'variant_desc', '')
     label = f"{vname}" + (f" ({vdesc})" if vdesc else "")
 
+    POLE_AUDIT_MODE = os.environ.get('LFGI_BENCH_POLE_AUDIT', 'auto')
+    DO_POLE_AUDIT = _resolve_pole_audit_enabled(POLE_AUDIT_MODE, target)
+    POLE_AUDIT_N = int(os.environ.get('LFGI_BENCH_POLE_AUDIT_N', '512'))
+    POLE_AUDIT_N_HI = int(os.environ.get('LFGI_BENCH_POLE_AUDIT_N_HI', '8192'))
+    POLE_AUDIT_CHUNK = int(os.environ.get('LFGI_BENCH_POLE_AUDIT_CHUNK', '64'))
+    POLE_AUDIT_ETA = float(os.environ.get('LFGI_BENCH_POLE_AUDIT_ETA', '0.5'))
+    POLE_AUDIT_ACTIVE_MASS_TOL = float(os.environ.get('LFGI_BENCH_POLE_AUDIT_ACTIVE_MASS_TOL', '1e-3'))
+    POLE_AUDIT_TIMES = _parse_float_list_env(
+        'LFGI_BENCH_POLE_AUDIT_TIMES',
+        (0.01, 0.03, 0.1, 0.3, 1.0, 3.0),
+    )
+    POLE_AUDIT_HESSIAN_SOURCE = canonical_hessian_source(
+        os.environ.get('LFGI_BENCH_POLE_AUDIT_HESSIAN_SOURCE', 'true')
+    )
+    pole_audit_paths = {}
+    pole_audit_summary = []
+
     print("\n" + "=" * 80)
     print(f"LFGI benchmark  —  target: {label}")
     print(f"  dimension D={D}; headline metric={dpsmc_benchmark_metric_name(target)}")
@@ -5439,6 +5763,7 @@ def run(target, out_dir='outputs', methods=None):
         gate_bank_msg = str(BANK_COUPLING)
     print(f"  sizes: NR={NR}, NG={NG} ({gate_bank_msg}; bank_coupling={BANK_COUPLING}), NS={NS}, NT={NT}, NR_LARGE={NR_LARGE}, steps={N_STEPS}, time_schedule={TIME_SCHEDULE}, time_grid={N_TIME_GRID}")
     print(f"  metric flags: aux={DO_AUX_METRICS}, score_rmse={DO_SCORE_RMSE}, curl={DO_CURL}, copying={DO_COPYING}, metric_max={os.environ.get('LFGI_BENCH_METRIC_MAX', '4096')}")
+    print(f"  pole audit: mode={POLE_AUDIT_MODE}, enabled={DO_POLE_AUDIT}, n={POLE_AUDIT_N}, n_hi={POLE_AUDIT_N_HI}, eta={POLE_AUDIT_ETA:g}, times={POLE_AUDIT_TIMES}")
     if DO_CURL:
         print(f"  curl diagnostic: n={CURL_TRAJ_N}, time_grid={CURL_TIME_GRID}, probes={CURL_PROBES}, fd_eps={CURL_FD_EPS:g}, chunk={CURL_CHUNK}, t_min_filter={CURL_T_MIN:g}")
     if DO_MALA_STATIONARITY:
@@ -5839,6 +6164,34 @@ def run(target, out_dir='outputs', methods=None):
             raise ValueError(f"Unsupported HLSI sampler config for {method_name!r}: {cfg}")
         return fn
 
+    # ---- Section 8 pole-separated safety-regime diagnostic ----
+    if DO_POLE_AUDIT:
+        print("\n[2p] LFGI pole-separation audit …")
+        gpu_log('before LFGI pole audit', reset_peak=True)
+        t0 = time.time()
+        pole_rows, pole_audit_summary = lfgi_pole_audit(
+            target,
+            finite_xg=xg,
+            n_query=POLE_AUDIT_N,
+            n_hi=POLE_AUDIT_N_HI,
+            times=POLE_AUDIT_TIMES,
+            eta=POLE_AUDIT_ETA,
+            active_mass_tol=POLE_AUDIT_ACTIVE_MASS_TOL,
+            hessian_source=POLE_AUDIT_HESSIAN_SOURCE,
+            query_chunk=POLE_AUDIT_CHUNK,
+            mala_kw=mala_kw,
+        )
+        audit_path = os.path.join(out_dir, f'{_safe_name(vname)}_lfgi_pole_audit.csv')
+        summary_path = os.path.join(out_dir, f'{_safe_name(vname)}_lfgi_pole_audit_summary.csv')
+        _write_dict_rows_csv(audit_path, pole_rows)
+        _write_dict_rows_csv(summary_path, pole_audit_summary)
+        pole_audit_paths = {'audit_csv': audit_path, 'summary_csv': summary_path}
+        _print_lfgi_pole_audit_summary(pole_audit_summary)
+        print(f"    saved: {audit_path}")
+        print(f"    saved: {summary_path}")
+        print(f"    Done ({time.time() - t0:.1f}s)")
+        gpu_log('after LFGI pole audit')
+
     # ---- Sample + evaluate ----
     print("\n[3] Sampling and evaluating methods …")
     hdr = (f"{'Method':<26s} {'PaperMetric':>12} {'NLL':>10} {'ESS':>10} {'W2':>8}"
@@ -6087,6 +6440,16 @@ def run(target, out_dir='outputs', methods=None):
         gate_bank_separate=bool(GATE_BANK_SEPARATE),
         gate_bank_prefix_coupled=bool(BANK_COUPLING == 'prefix'),
         gate_bank_independent=bool(BANK_COUPLING == 'independent'),
+        pole_audit_mode=str(POLE_AUDIT_MODE),
+        pole_audit_enabled=bool(DO_POLE_AUDIT),
+        pole_audit_n=POLE_AUDIT_N,
+        pole_audit_n_hi=POLE_AUDIT_N_HI,
+        pole_audit_eta=POLE_AUDIT_ETA,
+        pole_audit_active_mass_tol=POLE_AUDIT_ACTIVE_MASS_TOL,
+        pole_audit_hessian_source=POLE_AUDIT_HESSIAN_SOURCE,
+        pole_audit_times=','.join(str(x) for x in POLE_AUDIT_TIMES),
+        pole_audit_csv=pole_audit_paths.get('audit_csv', ''),
+        pole_audit_summary_csv=pole_audit_paths.get('summary_csv', ''),
         NS=NS, NT=NT, NR_LARGE=NR_LARGE,
         N_STEPS=N_STEPS, T_MIN=T_MIN, T_MAX=T_MAX, TIME_SCHEDULE=TIME_SCHEDULE, N_TIME_GRID=N_TIME_GRID,
         ref_source=ref_source,
@@ -6149,6 +6512,17 @@ def run(target, out_dir='outputs', methods=None):
                         run_info[_prefix + key] = float(val)
                     except (TypeError, ValueError):
                         pass
+    if pole_audit_summary:
+        try:
+            run_info.update(
+                pole_audit_pass_rate_min=float(np.nanmin([r.get('pass_rate', np.nan) for r in pole_audit_summary])),
+                pole_audit_active_pole_rate_max=float(np.nanmax([r.get('active_pole_rate', np.nan) for r in pole_audit_summary])),
+                pole_audit_nonpos_A_rate_max=float(np.nanmax([r.get('nonpos_A_rate', np.nan) for r in pole_audit_summary])),
+                pole_audit_epsH_q90_max=float(np.nanmax([r.get('epsH_q90', np.nan) for r in pole_audit_summary])),
+                pole_audit_capture_ratio_q90_max=float(np.nanmax([r.get('capture_ratio_q90', np.nan) for r in pole_audit_summary])),
+            )
+        except Exception:
+            pass
     target._last_run_info = run_info
     target._last_sampler_configs = sampler_configs
     save_metrics_csv(results, method_names, target, out_dir=out_dir)
@@ -6206,6 +6580,14 @@ def save_metrics_csv(results, methods, target, out_dir='outputs'):
             'gate_bank_separate': run_info.get('gate_bank_separate', ''),
             'gate_bank_prefix_coupled': run_info.get('gate_bank_prefix_coupled', ''),
             'gate_bank_independent': run_info.get('gate_bank_independent', ''),
+
+            'pole_audit_enabled': run_info.get('pole_audit_enabled', ''),
+            'pole_audit_pass_rate_min': run_info.get('pole_audit_pass_rate_min', ''),
+            'pole_audit_active_pole_rate_max': run_info.get('pole_audit_active_pole_rate_max', ''),
+            'pole_audit_nonpos_A_rate_max': run_info.get('pole_audit_nonpos_A_rate_max', ''),
+            'pole_audit_epsH_q90_max': run_info.get('pole_audit_epsH_q90_max', ''),
+            'pole_audit_capture_ratio_q90_max': run_info.get('pole_audit_capture_ratio_q90_max', ''),
+            'pole_audit_summary_csv': run_info.get('pole_audit_summary_csv', ''),
         }
         for k in keys:
             row[k] = r.get(k, np.nan)
@@ -6288,6 +6670,12 @@ def result_metric_rows(results, methods, target, run_idx=0, seed=None):
             'gate_bank_separate': run_info.get('gate_bank_separate', ''),
             'gate_bank_prefix_coupled': run_info.get('gate_bank_prefix_coupled', ''),
             'gate_bank_independent': run_info.get('gate_bank_independent', ''),
+            'pole_audit_enabled': run_info.get('pole_audit_enabled', ''),
+            'pole_audit_pass_rate_min': run_info.get('pole_audit_pass_rate_min', ''),
+            'pole_audit_active_pole_rate_max': run_info.get('pole_audit_active_pole_rate_max', ''),
+            'pole_audit_nonpos_A_rate_max': run_info.get('pole_audit_nonpos_A_rate_max', ''),
+            'pole_audit_epsH_q90_max': run_info.get('pole_audit_epsH_q90_max', ''),
+            'pole_audit_capture_ratio_q90_max': run_info.get('pole_audit_capture_ratio_q90_max', ''),
             'n_samples_valid': int(r.get('samples', torch.empty(0)).shape[0]) if torch.is_tensor(r.get('samples', None)) else np.nan,
         }
         for key in AGGREGATE_METRIC_KEYS:
@@ -6365,7 +6753,15 @@ def save_aggregate_latex_table(summary_rows, out_dir, prefix='aggregate_metrics'
 def save_aggregate_metric_files(rows, out_dir, prefix='aggregate_metrics', metric_keys=None):
     metric_keys = list(metric_keys or AGGREGATE_METRIC_KEYS)
     os.makedirs(out_dir, exist_ok=True)
-    run_fields = ['run_idx', 'seed', 'variant', 'method', 'dpsmc_metric_name', 'NR', 'NG', 'bank_coupling', 'gate_bank_separate', 'gate_bank_prefix_coupled', 'gate_bank_independent', 'n_samples_valid'] + metric_keys
+    run_fields = [
+        'run_idx', 'seed', 'variant', 'method', 'dpsmc_metric_name',
+        'NR', 'NG', 'bank_coupling', 'gate_bank_separate',
+        'gate_bank_prefix_coupled', 'gate_bank_independent',
+        'pole_audit_enabled', 'pole_audit_pass_rate_min',
+        'pole_audit_active_pole_rate_max', 'pole_audit_nonpos_A_rate_max',
+        'pole_audit_epsH_q90_max', 'pole_audit_capture_ratio_q90_max',
+        'n_samples_valid',
+    ] + metric_keys
     runs_csv = _write_csv(os.path.join(out_dir, f'{prefix}_runs.csv'), rows, fieldnames=run_fields)
     summary_rows = summarize_metric_rows(rows, metric_keys=metric_keys)
     summary_csv = _write_csv(os.path.join(out_dir, f'{prefix}_summary.csv'), summary_rows, fieldnames=_aggregate_fieldnames(metric_keys))
@@ -6400,7 +6796,18 @@ def build_variant_summary_lines(results, methods, target, out_dir='outputs', met
     lines.append(f'Device: {DEVICE}; dtype: {torch.get_default_dtype()}')
     if metrics_csv:
         lines.append(f'Metrics CSV: {metrics_csv}')
-    for key in ['NR', 'NG', 'bank_coupling', 'gate_bank_separate', 'gate_bank_prefix_coupled', 'gate_bank_independent', 'NS', 'NT', 'NR_LARGE', 'N_STEPS', 'T_MIN', 'T_MAX', 'N_TIME_GRID', 'ref_source', 'headline_metric', 'do_score_rmse', 'do_aux_metrics', 'do_curl', 'curl_traj_n', 'curl_time_grid', 'curl_probes', 'curl_fd_eps', 'curl_t_min_filter']:
+    for key in [
+        'NR', 'NG', 'bank_coupling', 'gate_bank_separate',
+        'gate_bank_prefix_coupled', 'gate_bank_independent',
+        'NS', 'NT', 'NR_LARGE', 'N_STEPS', 'T_MIN', 'T_MAX', 'N_TIME_GRID',
+        'ref_source', 'headline_metric', 'do_score_rmse', 'do_aux_metrics',
+        'do_curl', 'curl_traj_n', 'curl_time_grid', 'curl_probes',
+        'curl_fd_eps', 'curl_t_min_filter',
+        'pole_audit_enabled', 'pole_audit_csv', 'pole_audit_summary_csv',
+        'pole_audit_pass_rate_min', 'pole_audit_active_pole_rate_max',
+        'pole_audit_nonpos_A_rate_max', 'pole_audit_epsH_q90_max',
+        'pole_audit_capture_ratio_q90_max',
+    ]:
         if key in run_info:
             lines.append(f'{key}={run_info[key]}')
     lines.append('Score-RMSE label: high-N SNIS-Tweedie reference from held-out MALA samples.')
