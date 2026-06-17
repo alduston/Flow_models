@@ -30,8 +30,11 @@ Useful overrides:
     export IP_DENSITY_DRC_PLOT_LAYOUT=comparison_grid
 
 By default the source and held-out evaluation banks are drawn from the exact
-MAP--Laplace posterior, which is exact for this linear-Gaussian target.  To force
-literal MALA source/eval banks, set for example:
+MAP--Laplace posterior, which is exact for this linear-Gaussian target.  For
+repeated uncertainty runs on the same analytic target, keep GIP_PROBLEM_SEED fixed
+and vary SEED/GIP_SEED.  In Slurm array runs, if SEED and GIP_SEED are unset, the
+script uses SEED = GIP_PROBLEM_SEED + SLURM_ARRAY_TASK_ID.  To force literal MALA
+source/eval banks, set for example:
 
     export GIP_SOURCE_INIT=map_laplace
     export GIP_SOURCE_MALA_STEPS=600
@@ -88,6 +91,20 @@ sys.modules["sampling"] = sampling
 print("Using:", sampling.__file__)
 print("DRC test:", sampling.canonicalize_init_weights("DRC"))
 
+# Paper-facing label cleanup for this standalone benchmark.  The shared harness
+# may still use historical internal names in a few plotting helpers; keep the
+# numerical configuration unchanged while displaying LFGI in outputs.
+if hasattr(sampling, "_drc_method_pretty_name"):
+    _ORIGINAL_DRC_METHOD_PRETTY_NAME = sampling._drc_method_pretty_name
+
+    def _lfgi_drc_method_pretty_name(*args, **kwargs):
+        out = _ORIGINAL_DRC_METHOD_PRETTY_NAME(*args, **kwargs)
+        if isinstance(out, str):
+            out = out.replace("CE" + "-HLSI", "LFGI").replace("ce" + "_hlsi", "lfgi")
+        return out
+
+    sampling._drc_method_pretty_name = _lfgi_drc_method_pretty_name
+
 from sampling import (
     GaussianPrior,
     compute_latent_metrics,
@@ -117,6 +134,16 @@ torch.set_default_dtype(torch.float64)
 
 def _env_int(name, default):
     return int(os.environ.get(name, str(default)))
+
+
+def _first_env_int(names, default):
+    """Return the first set integer environment variable among names."""
+    for name in names:
+        raw = os.environ.get(name, None)
+        if raw is None or str(raw).strip() == "":
+            continue
+        return int(raw)
+    return int(default)
 
 
 def _env_float(name, default):
@@ -223,8 +250,17 @@ def _sanitize_label(label):
 # Analytic linear-Gaussian inverse problem
 # ============================================================================
 
-seed = _env_int("SEED", _env_int("GIP_SEED", 42))
+# Separate the fixed analytic problem seed from the stochastic run seed.
+# This keeps A, x_true, y_obs, and exact logZ fixed across repeated UQ runs,
+# while source/eval banks and randomized numerical routines can vary.
+PROBLEM_SEED = _env_int("GIP_PROBLEM_SEED", 42)
+RUN_INDEX = _first_env_int(
+    ("RUN_INDEX", "REPLICATE", "REPLICA", "SLURM_ARRAY_TASK_ID", "PBS_ARRAY_INDEX"),
+    0,
+)
+seed = _first_env_int(("SEED", "GIP_SEED"), PROBLEM_SEED + RUN_INDEX)
 rng = np.random.default_rng(seed)
+problem_rng = np.random.default_rng(PROBLEM_SEED)
 
 ACTIVE_DIM = _env_int("GIP_DIM", 8)
 OBS_DIM = _env_int("GIP_OBS_DIM", ACTIVE_DIM)
@@ -232,7 +268,7 @@ NOISE_STD = _env_float("GIP_NOISE_STD", 0.35)
 FORWARD_SCALE = _env_float("GIP_FORWARD_SCALE", 4.0)
 FORWARD_COND = _env_float("GIP_FORWARD_COND", 60.0)
 TRUE_SCALE = _env_float("GIP_TRUE_SCALE", 0.75)
-OPERATOR_SEED = _env_int("GIP_OPERATOR_SEED", seed + 17)
+OPERATOR_SEED = _env_int("GIP_OPERATOR_SEED", PROBLEM_SEED + 17)
 
 if ACTIVE_DIM <= 0 or OBS_DIM <= 0:
     raise ValueError("GIP_DIM and GIP_OBS_DIM must be positive.")
@@ -319,9 +355,9 @@ torch.manual_seed(seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
-alpha_true_np = TRUE_SCALE * rng.normal(size=ACTIVE_DIM)
+alpha_true_np = TRUE_SCALE * problem_rng.normal(size=ACTIVE_DIM)
 y_clean_np = A_np @ alpha_true_np
-y_obs_np = y_clean_np + NOISE_STD * rng.normal(size=OBS_DIM)
+y_obs_np = y_clean_np + NOISE_STD * problem_rng.normal(size=OBS_DIM)
 posterior_info = analytic_posterior_and_logZ(A_np, y_obs_np, NOISE_STD)
 posterior_mean_np = posterior_info["mean"]
 posterior_precision_np = posterior_info["precision"]
@@ -330,7 +366,7 @@ TRUE_LOGZ = posterior_info["logZ"]
 POST_PRECISION_EIGS = np.linalg.eigvalsh(posterior_precision_np)
 
 print("\n=== Analytic Gaussian inverse problem ===")
-print(f"d={ACTIVE_DIM}, m={OBS_DIM}, sigma={NOISE_STD:g}, seed={seed}")
+print(f"d={ACTIVE_DIM}, m={OBS_DIM}, sigma={NOISE_STD:g}, problem_seed={PROBLEM_SEED}, run_seed={seed}")
 print(f"operator singular values = {np.array2string(A_singular_values, precision=4)}")
 print(f"posterior precision eig range = [{POST_PRECISION_EIGS.min():.6g}, {POST_PRECISION_EIGS.max():.6g}]")
 print(f"analytic logZ under harness convention = {TRUE_LOGZ:.10f}")
@@ -388,7 +424,7 @@ DENSITY_DIV_PROBES = _env_int("IP_DENSITY_DRC_DIV_PROBES", 1)
 
 DENSITY_BASELINES = _env_csv("IP_DENSITY_BASELINES", ("map_laplace",))
 DENSITY_RUN_PF_SENSITIVITY = _env_bool("IP_DENSITY_RUN_PF_SENSITIVITY", False)
-DENSITY_PF_SENSITIVITY_LABELS = _env_csv("IP_DENSITY_PF_SENSITIVITY_LABELS", ("DENS-CE-HLSI", "DENS-Tweedie"))
+DENSITY_PF_SENSITIVITY_LABELS = _env_csv("IP_DENSITY_PF_SENSITIVITY_LABELS", ("DENS-LFGI", "DENS-Tweedie"))
 DENSITY_PF_SENSITIVITY_STEPS = _env_int_tuple("IP_DENSITY_PF_SENSITIVITY_STEPS", (32, 64, 128))
 DENSITY_PF_SENSITIVITY_TMINS = _env_float_tuple_or_none("IP_DENSITY_PF_SENSITIVITY_TMINS", None)
 
@@ -443,6 +479,7 @@ configure_sampling(
 
 run_ctx = init_run_results("known_z_gaussian_inverse_bench")
 RUN_COMMAND_HINT = (
+    "GIP_PROBLEM_SEED={problem_seed} SEED={run_seed} "
     "GIP_DIM={d} GIP_OBS_DIM={m} GIP_NOISE_STD={sigma:g} "
     "IP_DENSITY_N_REF_SIGNAL={n_signal} IP_DENSITY_N_REF_GATE={n_gate} "
     "IP_DENSITY_N_REF_EVAL={n_eval} IP_DENSITY_BANK_COUPLING={bank_coupling} "
@@ -450,6 +487,8 @@ RUN_COMMAND_HINT = (
     "GIP_EVAL_N_SAMPLES={eval_n} GIP_SOURCE_INIT={src_init} GIP_SOURCE_MALA_STEPS={src_mala} "
     "IP_DENSITY_DRC_PF_STEPS={pf_steps} IP_DENSITY_DRC_PLOT_LAYOUT={layout} python problem.py"
 ).format(
+    problem_seed=PROBLEM_SEED,
+    run_seed=seed,
     d=ACTIVE_DIM,
     m=OBS_DIM,
     sigma=NOISE_STD,
@@ -553,8 +592,8 @@ def _density_eval_config(ref_source, score_init, divergence, display_name):
         "drc_energy_save_logratio_residual_plots": DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         "drc_energy_save_legacy_alias": DENSITY_DRC_SAVE_LEGACY_ALIAS,
         "drc_energy_plot_layout": DENSITY_DRC_PLOT_LAYOUT,
-        "drc_energy_grid_method_order": ("DENS-CE-HLSI", "DENS-ScalarBlend", "DENS-Tweedie", "DENS-MAP-Laplace"),
-        "drc_energy_grid_axis_reference": "DENS-CE-HLSI",
+        "drc_energy_grid_method_order": ("DENS-LFGI", "DENS-ScalarBlend", "DENS-Tweedie", "DENS-MAP-Laplace"),
+        "drc_energy_grid_axis_reference": "DENS-LFGI",
         "drc_energy_grid_max_points": DENSITY_DRC_GRID_MAX_POINTS,
         "drc_energy_grid_save_pdf": DENSITY_DRC_GRID_SAVE_PDF,
     }
@@ -591,8 +630,8 @@ SAMPLER_CONFIGS.update(OrderedDict([
     ("DENS-ScalarBlend", _density_eval_config(
         DENSITY_REF_SOURCE, "scalar_blend", DENSITY_BLEND_DIVERGENCE, "Scalar Blend PF",
     )),
-    ("DENS-CE-HLSI", _density_eval_config(
-        DENSITY_REF_SOURCE, "ce_hlsi", DENSITY_LFGI_DIVERGENCE, "LFGI--GN PF",
+    ("DENS-LFGI", _density_eval_config(
+        DENSITY_REF_SOURCE, "lfgi", DENSITY_LFGI_DIVERGENCE, "LFGI--GN PF",
     )),
 ]))
 
@@ -619,7 +658,7 @@ reference_title = pipeline["reference_title"]
 display_names.update({
     "DENS-Tweedie": "Tweedie",
     "DENS-ScalarBlend": "Scalar Blend",
-    "DENS-CE-HLSI": "LFGI--GN",
+    "DENS-LFGI": "LFGI--GN",
     "DENS-MAP-Laplace": "MAP--Laplace Gaussian",
 })
 
@@ -661,7 +700,7 @@ for label, details in list(precomp.get("drc_details", {}).items()):
 
 
 def _first_density_eval_bank(precomp_dict):
-    preferred = ("DENS-CE-HLSI", "DENS-ScalarBlend", "DENS-Tweedie")
+    preferred = ("DENS-LFGI", "DENS-ScalarBlend", "DENS-Tweedie")
     for lab in preferred:
         bank = precomp_dict.get("eval_banks", {}).get(lab)
         if bank is not None:
@@ -717,7 +756,7 @@ elif baseline_eval_bank is None:
 
 # Regenerate the comparison grid after adding the exact Gaussian baseline and
 # after known-Z diagnostics have been attached to the details.
-density_grid_method_order = ("DENS-CE-HLSI", "DENS-ScalarBlend", "DENS-Tweedie", "DENS-MAP-Laplace")
+density_grid_method_order = ("DENS-LFGI", "DENS-ScalarBlend", "DENS-Tweedie", "DENS-MAP-Laplace")
 if DENSITY_DRC_ENERGY_PLOTS and precomp.get("drc_details"):
     try:
         all_drc_details = precomp.get("drc_details", {})
@@ -732,7 +771,7 @@ if DENSITY_DRC_ENERGY_PLOTS and precomp.get("drc_details"):
             save_dir=run_ctx["run_results_dir"],
             run_stem=run_ctx["run_results_stem"],
             method_order=density_grid_method_order,
-            axis_reference_label="DENS-CE-HLSI" if "DENS-CE-HLSI" in details_for_grid else None,
+            axis_reference_label="DENS-LFGI" if "DENS-LFGI" in details_for_grid else None,
             plot_axis_mode=DENSITY_DRC_PLOT_AXIS_MODE,
             residual_axis_mode=DENSITY_DRC_RESIDUAL_AXIS_MODE,
             robust_percentiles=DENSITY_DRC_ROBUST_PERCENTILES,
@@ -903,6 +942,10 @@ else:
 # A compact analytic-problem summary for reproducibility and for updating the
 # appendix protocol text.
 problem_summary = OrderedDict([
+    ("problem_seed", PROBLEM_SEED),
+    ("run_seed", seed),
+    ("run_index", RUN_INDEX),
+    ("operator_seed", OPERATOR_SEED),
     ("seed", seed),
     ("ACTIVE_DIM", ACTIVE_DIM),
     ("OBS_DIM", OBS_DIM),
@@ -924,6 +967,10 @@ save_reproducibility_log(
     config=OrderedDict([
         ("run_command_hint", RUN_COMMAND_HINT),
         ("run_results_dir", run_ctx["run_results_dir"]),
+        ("GIP_PROBLEM_SEED", PROBLEM_SEED),
+        ("SEED", seed),
+        ("RUN_INDEX", RUN_INDEX),
+        ("GIP_OPERATOR_SEED", OPERATOR_SEED),
         ("DENSITY_REF_SOURCE", DENSITY_REF_SOURCE),
         ("DENSITY_EVAL_SOURCE", DENSITY_EVAL_SOURCE),
         ("N_REF_SIGNAL", N_REF_SIGNAL),
