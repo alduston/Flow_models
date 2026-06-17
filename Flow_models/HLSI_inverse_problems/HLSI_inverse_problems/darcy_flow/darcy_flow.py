@@ -81,23 +81,32 @@ print("Using:", sampling.__file__)
 print("DRC test:", sampling.canonicalize_init_weights("DRC"))
 
 # The shared helper still uses the historical implementation name `ce_hlsi`
-# internally, but the manuscript-facing method name is LFGI.  Patch only the
-# display helper for this script so the density-energy scatterplot grid does
-# not show the obsolete CE-HLSI label.  The score initializer remains `ce_hlsi`
-# for compatibility with sampling.py.
+# internally.  For this Darcy manuscript script, every plot/table-facing
+# occurrence of that method should be displayed as LFGI.  The score initializer
+# remains `ce_hlsi` for compatibility with sampling.py; only labels are changed.
 _orig_drc_method_pretty_name = getattr(sampling, "_drc_method_pretty_name", None)
 if _orig_drc_method_pretty_name is not None:
     def _darcy_lfgi_drc_method_pretty_name(label, cfg=None):
+        cfg = cfg or {}
+        label_s = str(label)
+        display = str(cfg.get("display_name", "")) if isinstance(cfg, dict) else ""
+        init = str(cfg.get("drc_score_init", cfg.get("init", ""))) if isinstance(cfg, dict) else ""
+        tokens = " ".join([label_s, display, init]).lower().replace("_", "-")
+        if ("ce-hlsi" in tokens) or ("hlsi" in tokens) or ("lfgi" in tokens):
+            return "LFGI"
         pretty = _orig_drc_method_pretty_name(label, cfg)
-        if "CE-HLSI" in str(pretty) or "HLSI" in str(pretty):
-            cfg = cfg or {}
-            display = str(cfg.get("display_name", "")) if isinstance(cfg, dict) else ""
-            label_s = str(label)
-            if "gn" in (display + " " + label_s).lower() or "precision" in display.lower():
-                return "LFGI-GN"
+        if ("CE-HLSI" in str(pretty)) or ("HLSI" in str(pretty)):
             return "LFGI"
         return pretty
+
     sampling._drc_method_pretty_name = _darcy_lfgi_drc_method_pretty_name
+    # Be explicit about the exact global lookup used inside the comparison-grid
+    # function that writes the text boxes in Figure 5.  This is the line that
+    # produces the old ``CE-HLSI`` label in the density-energy scatterplot grid.
+    for _fn_name in ("save_drc_energy_comparison_grid", "finalize_drc_energy_benchmark_plots"):
+        _fn = getattr(sampling, _fn_name, None)
+        if _fn is not None and hasattr(_fn, "__globals__"):
+            _fn.__globals__["_drc_method_pretty_name"] = _darcy_lfgi_drc_method_pretty_name
 
 from sampling import (
     GaussianPrior,
@@ -1325,7 +1334,7 @@ SAMPLER_CONFIGS.update(OrderedDict([
     )),
     ('DENS-LFGI', _density_eval_config(
         DENSITY_REF_SOURCE, 'ce_hlsi', DENSITY_LFGI_DIVERGENCE,
-        'DENS-LFGI', 'LFGI-GN',
+        'DENS-LFGI', 'LFGI',
     )),
 ]))
 
@@ -1438,13 +1447,31 @@ if baseline_eval_bank is not None and any(str(b).lower().replace('-', '_') in {'
 elif baseline_eval_bank is None:
     print('WARNING: no density eval bank found; MAP-Laplace density baseline skipped.')
 
+
+
+def _darcy_density_label_alias(label):
+    """Normalize legacy Darcy density labels before manuscript plots are written."""
+    label_s = str(label)
+    if label_s == 'DENS-CE-HLSI':
+        return 'DENS-LFGI'
+    return label_s.replace('CE-HLSI', 'LFGI')
+
+
+def _darcy_alias_drc_details(details):
+    aliased = OrderedDict()
+    for lab, val in (details or {}).items():
+        new_lab = _darcy_density_label_alias(lab)
+        if new_lab not in aliased:
+            aliased[new_lab] = val
+    return aliased
+
 # The standard DRC comparison grid is created inside run_standard_sampler_pipeline,
 # before the closed-form MAP-Laplace baseline row exists. Regenerate the grid here
 # after inserting DENS-MAP-Laplace so the figure matches the metric table.
 density_grid_method_order = ('DENS-LFGI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace')
-if 'DENS-MAP-Laplace' in precomp.get('drc_details', {}):
+if 'DENS-MAP-Laplace' in _darcy_alias_drc_details(precomp.get('drc_details', {})):
     try:
-        all_drc_details = precomp.get('drc_details', {})
+        all_drc_details = _darcy_alias_drc_details(precomp.get('drc_details', {}))
         grid_labels = [lab for lab in density_grid_method_order if lab in all_drc_details]
         grid_labels += [lab for lab in all_drc_details.keys() if lab not in grid_labels and str(lab).startswith('DENS-')]
         details_for_grid = OrderedDict((lab, all_drc_details[lab]) for lab in grid_labels)
