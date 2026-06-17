@@ -17,6 +17,7 @@ ALL_PROBLEMS=(
   "afwi"
   "modulus"
   "helmholtz_alt"
+  "Z_problem"
 )
 
 PROBLEMS=(
