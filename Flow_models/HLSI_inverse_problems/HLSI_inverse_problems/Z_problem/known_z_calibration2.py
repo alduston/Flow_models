@@ -30,7 +30,11 @@ Useful overrides:
     export IP_DENSITY_DRC_PLOT_LAYOUT=comparison_grid
 
 By default the source and held-out evaluation banks are drawn from the exact
-Gaussian-mixture posterior.  To force literal MALA source/eval banks, set for example:
+Gaussian-mixture posterior.  For repeated uncertainty runs on the same analytic
+problem, keep GIP_PROBLEM_SEED fixed and vary SEED/GIP_SEED.  In Slurm array
+runs, if SEED and GIP_SEED are unset, the script uses
+SEED = GIP_PROBLEM_SEED + SLURM_ARRAY_TASK_ID.  To force literal MALA source/eval
+banks, set for example:
 
     export GIP_SOURCE_INIT=map_laplace
     export GIP_SOURCE_MALA_STEPS=600
@@ -137,6 +141,16 @@ def _env_int(name, default):
     return int(os.environ.get(name, str(default)))
 
 
+def _first_env_int(names, default):
+    """Return the first set integer environment variable among names."""
+    for name in names:
+        raw = os.environ.get(name, None)
+        if raw is None or str(raw).strip() == "":
+            continue
+        return int(raw)
+    return int(default)
+
+
 def _env_float(name, default):
     return float(os.environ.get(name, str(default)))
 
@@ -241,7 +255,15 @@ def _sanitize_label(label):
 # Analytic four-component Gaussian-mixture inverse problem
 # ============================================================================
 
-seed = _env_int("SEED", _env_int("GIP_SEED", 42))
+# Separate the fixed analytic problem seed from the stochastic run seed.
+# This keeps the operator, mixture centers, and exact logZ fixed across repeated
+# uncertainty runs while still varying finite reference/evaluation banks.
+PROBLEM_SEED = _env_int("GIP_PROBLEM_SEED", 42)
+RUN_INDEX = _first_env_int(
+    ("RUN_INDEX", "REPLICATE", "REPLICA", "SLURM_ARRAY_TASK_ID", "PBS_ARRAY_INDEX"),
+    0,
+)
+seed = _first_env_int(("SEED", "GIP_SEED"), PROBLEM_SEED + RUN_INDEX)
 rng = np.random.default_rng(seed)
 
 ACTIVE_DIM = _env_int("GIP_DIM", 8)
@@ -250,7 +272,7 @@ NOISE_STD = _env_float("GIP_NOISE_STD", 0.35)
 FORWARD_SCALE = _env_float("GIP_FORWARD_SCALE", 4.0)
 FORWARD_COND = _env_float("GIP_FORWARD_COND", 60.0)
 COMPONENT_SEPARATION = _env_float("GIP_COMPONENT_SEPARATION", 2.0)
-OPERATOR_SEED = _env_int("GIP_OPERATOR_SEED", seed + 17)
+OPERATOR_SEED = _env_int("GIP_OPERATOR_SEED", PROBLEM_SEED + 17)
 
 if ACTIVE_DIM < 2 or OBS_DIM < 2:
     raise ValueError("The four-component mixture benchmark requires GIP_DIM >= 2 and GIP_OBS_DIM >= 2.")
@@ -648,6 +670,7 @@ configure_sampling(
 
 run_ctx = init_run_results("known_z_mixture_inverse_bench")
 RUN_COMMAND_HINT = (
+    "GIP_PROBLEM_SEED={problem_seed} SEED={run_seed} "
     "GIP_DIM={d} GIP_OBS_DIM={m} GIP_NOISE_STD={sigma:g} "
     "IP_DENSITY_N_REF_SIGNAL={n_signal} IP_DENSITY_N_REF_GATE={n_gate} "
     "IP_DENSITY_N_REF_EVAL={n_eval} IP_DENSITY_BANK_COUPLING={bank_coupling} "
@@ -655,6 +678,8 @@ RUN_COMMAND_HINT = (
     "GIP_EVAL_N_SAMPLES={eval_n} GIP_SOURCE_INIT={src_init} GIP_SOURCE_MALA_STEPS={src_mala} "
     "IP_DENSITY_DRC_PF_STEPS={pf_steps} IP_DENSITY_DRC_PLOT_LAYOUT={layout} python problem_v2.py"
 ).format(
+    problem_seed=PROBLEM_SEED,
+    run_seed=seed,
     d=ACTIVE_DIM,
     m=OBS_DIM,
     sigma=NOISE_STD,
@@ -1175,6 +1200,10 @@ else:
 # A compact analytic-problem summary for reproducibility and for updating the
 # appendix protocol text.
 problem_summary = OrderedDict([
+    ("problem_seed", PROBLEM_SEED),
+    ("run_seed", seed),
+    ("run_index", RUN_INDEX),
+    ("operator_seed", OPERATOR_SEED),
     ("seed", seed),
     ("ACTIVE_DIM", ACTIVE_DIM),
     ("OBS_DIM", OBS_DIM),
@@ -1200,6 +1229,10 @@ save_reproducibility_log(
     config=OrderedDict([
         ("run_command_hint", RUN_COMMAND_HINT),
         ("run_results_dir", run_ctx["run_results_dir"]),
+        ("GIP_PROBLEM_SEED", PROBLEM_SEED),
+        ("SEED", seed),
+        ("RUN_INDEX", RUN_INDEX),
+        ("GIP_OPERATOR_SEED", OPERATOR_SEED),
         ("DENSITY_REF_SOURCE", DENSITY_REF_SOURCE),
         ("DENSITY_EVAL_SOURCE", DENSITY_EVAL_SOURCE),
         ("N_REF_SIGNAL", N_REF_SIGNAL),
