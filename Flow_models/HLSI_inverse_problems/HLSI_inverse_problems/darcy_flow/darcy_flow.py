@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- 
 """Darcy flow inverse-problem density-evaluation benchmark.
 
 Updated to match the current Navier-Stokes and Helmholtz density scripts:
