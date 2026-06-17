@@ -10,6 +10,11 @@ The current Darcy/Helmholtz/Navier-Stokes density scripts also write one-row
 CSVs when present because they contain the central Darcy Table 4 metrics and
 run-level uncertainty columns such as ``pointwise_nll_std``.  It falls back to
 compact manuscript density tables when the full files are unavailable.
+
+The known-normalization calibration script writes separate
+``*_known_z_calibration_table.csv`` and
+``*_known_z_density_energy_full.csv`` files.  Those are aggregated into
+mean/std calibration tables for the Sec. 12.7 known-Z controls.
 """
 
 import argparse
@@ -28,6 +33,10 @@ PROBLEMS = [
     "navier_stokes",
     "poisson",
     "afwi",
+    # Known-Z analytic calibration problem directories used in manuscript Sec. 12.7.
+    "analytic_mixture_inverse",
+    "known_z_mixture_inverse",
+    "known_z_calibration",
 ]
 
 NON_METRIC_COLUMNS = {
@@ -95,6 +104,53 @@ TABLE4_METRICS = OrderedDict([
             "pointwise_nll_std",
             "neglogq_std",
             "Pointwise NLL std",
+        ],
+    }),
+])
+
+KNOWN_Z_METRICS = OrderedDict([
+    ("logq_bias", {
+        "display": "$\\log q$ bias",
+        "aliases": [
+            "$\\log q$ bias",
+            "log q bias",
+            "logq_bias",
+            "pointwise_logq_bias",
+        ],
+    }),
+    ("logq_rmse", {
+        "display": "$\\log q$ RMSE",
+        "aliases": [
+            "$\\log q$ RMSE",
+            "log q RMSE",
+            "logq_rmse",
+            "pointwise_logq_rmse",
+        ],
+    }),
+    ("known_logZ_abs_error", {
+        "display": "$|\\widehat{\\log Z}-\\log Z|$",
+        "aliases": [
+            "$|\\widehat{\\log Z}-\\log Z|$",
+            "|logZhat-logZ|",
+            "known_logZ_abs_error",
+            "logZ_abs_error",
+        ],
+    }),
+    ("correction_ess", {
+        "display": "Correction ESS",
+        "aliases": [
+            "Correction ESS",
+            "correction_ess",
+            "raw_logw_ess",
+        ],
+    }),
+    ("correction_ess_frac", {
+        "display": "Correction ESS / $n$",
+        "aliases": [
+            "Correction ESS / $n$",
+            "Correction ESS / n",
+            "correction_ess_frac",
+            "raw_logw_ess_frac",
         ],
     }),
 ])
@@ -490,10 +546,156 @@ def aggregate_density_problem(problem_dir, output_dir):
     }
 
 
+
+
+def find_known_z_csvs(problem_dir):
+    """Find known-normalization calibration outputs from the analytic Z script."""
+    run_results = problem_dir / "run_results"
+    if not run_results.exists():
+        return [], [], []
+    calibration = []
+    full_density = []
+    manuscript = []
+    for p in run_results.rglob("*.csv"):
+        if not p.is_file():
+            continue
+        name = p.name
+        if "meta_" in name:
+            continue
+        if name.endswith("_known_z_calibration_table.csv"):
+            calibration.append(p)
+        elif name.endswith("_known_z_density_energy_full.csv"):
+            full_density.append(p)
+        elif name.endswith("_known_z_density_manuscript_table.csv"):
+            manuscript.append(p)
+    return sorted(calibration), sorted(full_density), sorted(manuscript)
+
+
+def _append_known_z_metric(rows, method, canonical, value, source_metric, csv_path):
+    value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return
+    rows.append({
+        "method": method,
+        "metric": canonical,
+        "value": float(value),
+        "source_metric": str(source_metric),
+        "source_file": str(csv_path),
+    })
+
+
+def load_known_z_table(csv_path):
+    """Load a known-Z calibration/summary CSV into method | metric | value rows.
+
+    Supports both the compact ``*_known_z_calibration_table.csv`` emitted by
+    ``problem_v2.py`` and the full ``*_known_z_density_energy_full.csv`` table
+    from which that compact calibration table is built.
+    """
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, row in df.iterrows():
+        method_source = row.get("Method", row.get("method", row.get("label", csv_path.stem)))
+        method = canonical_method_name(method_source)
+        for canonical, spec in KNOWN_Z_METRICS.items():
+            value, source_metric = row_metric_value(row, spec["aliases"])
+            if value is not None:
+                _append_known_z_metric(rows, method, canonical, value, source_metric, csv_path)
+                continue
+            # The full known-Z density-energy table has raw ESS and n_eval;
+            # compute the ESS fraction when only those primitive columns exist.
+            if canonical == "correction_ess_frac":
+                ess, ess_source = row_metric_value(row, ["raw_logw_ess", "Correction ESS", "correction_ess"])
+                n_eval, _ = row_metric_value(row, ["n_eval", "N eval", "eval_n", "n"])
+                if ess is not None and n_eval is not None and n_eval > 0:
+                    _append_known_z_metric(rows, method, canonical, ess / n_eval, f"{ess_source}/n_eval", csv_path)
+    return pd.DataFrame(rows)
+
+
+def aggregate_known_z_problem(problem_dir, output_dir):
+    problem_name = problem_dir.name
+    calibration_paths, full_density_paths, manuscript_paths = find_known_z_csvs(problem_dir)
+    if calibration_paths:
+        paths = calibration_paths
+        source_kind = "known_z_calibration"
+    elif full_density_paths:
+        paths = full_density_paths
+        source_kind = "known_z_density_full"
+    else:
+        paths = manuscript_paths
+        source_kind = "known_z_density_manuscript"
+    if not paths:
+        return {"n_files": 0, "source_kind": source_kind}
+
+    frames = [load_known_z_table(path) for path in paths]
+    frames = [f for f in frames if isinstance(f, pd.DataFrame) and not f.empty]
+    if not frames:
+        return {"n_files": 0, "source_kind": source_kind}
+    combined = pd.concat(frames, ignore_index=True)
+    stats = aggregate_long_table(combined, ["method", "metric"])
+    stats = stats.sort_values(["method", "metric"], key=lambda col: col.map(method_sort_key) if col.name == "method" else col)
+
+    method_names = sorted(stats["method"].unique().tolist(), key=method_sort_key)
+    numeric_rows = []
+    formatted_rows = []
+    for method in method_names:
+        numeric_row = OrderedDict([("Method", method)])
+        formatted_row = OrderedDict([("Method", method)])
+        run_counts = []
+        for canonical, spec in KNOWN_Z_METRICS.items():
+            metric_rows = stats[(stats["method"] == method) & (stats["metric"] == canonical)]
+            display = spec["display"]
+            if metric_rows.empty:
+                numeric_row[display + "__mean"] = pd.NA
+                numeric_row[display + "__std"] = pd.NA
+                numeric_row[display + "__n_runs"] = pd.NA
+                formatted_row[display] = ""
+                continue
+            row = metric_rows.iloc[0]
+            mean = row["mean"]
+            std = row["std"]
+            n_runs = int(row["n_runs"])
+            run_counts.append(n_runs)
+            numeric_row[display + "__mean"] = mean
+            numeric_row[display + "__std"] = std
+            numeric_row[display + "__n_runs"] = n_runs
+            formatted_row[display] = format_mean_std(mean, std)
+        if run_counts:
+            unique_counts = sorted(set(run_counts))
+            formatted_row["n_runs"] = unique_counts[0] if len(unique_counts) == 1 else ";".join(map(str, unique_counts))
+        numeric_rows.append(numeric_row)
+        formatted_rows.append(formatted_row)
+
+    numeric_known_z = pd.DataFrame(numeric_rows)
+    formatted_known_z = pd.DataFrame(formatted_rows)
+    if "n_runs" in formatted_known_z.columns:
+        cols = ["Method", "n_runs"] + [c for c in formatted_known_z.columns if c not in {"Method", "n_runs"}]
+        formatted_known_z = formatted_known_z[cols]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tidy_path = output_dir / f"{problem_name}_known_z_calibration_tidy.csv"
+    numeric_path = output_dir / f"{problem_name}_known_z_calibration_numeric.csv"
+    formatted_path = output_dir / f"{problem_name}_known_z_calibration_formatted.csv"
+
+    stats.to_csv(str(tidy_path), index=False)
+    numeric_known_z.to_csv(str(numeric_path), index=False)
+    formatted_known_z.to_csv(str(formatted_path), index=False)
+
+    return {
+        "n_files": len(paths),
+        "source_kind": source_kind,
+        "tidy": tidy_path,
+        "numeric": numeric_path,
+        "formatted": formatted_path,
+    }
+
+
 def aggregate_problem(problem_dir, output_dir):
     return {
         "legacy": aggregate_legacy_metrics(problem_dir, output_dir),
         "density": aggregate_density_problem(problem_dir, output_dir),
+        "known_z": aggregate_known_z_problem(problem_dir, output_dir),
     }
 
 
@@ -501,8 +703,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Aggregate inverse-problem run CSVs.  This preserves the legacy "
-            "*_metrics.csv mean/std summaries and also aggregates density "
-            "*_drc_energy_*.csv files for Darcy Table 4 uncertainty."
+            "*_metrics.csv mean/std summaries, aggregates density "
+            "*_drc_energy_*.csv files for Darcy Table 4 uncertainty, "
+            "and aggregates known-Z calibration outputs from problem_v2.py."
         )
     )
     parser.add_argument(
@@ -545,8 +748,9 @@ def main():
 
         legacy = result.get("legacy", {})
         density = result.get("density", {})
-        if legacy.get("n_files", 0) == 0 and density.get("n_files", 0) == 0:
-            print("[skip] {}: no metrics or density CSVs found under {}".format(problem, problem_dir / "run_results"))
+        known_z = result.get("known_z", {})
+        if legacy.get("n_files", 0) == 0 and density.get("n_files", 0) == 0 and known_z.get("n_files", 0) == 0:
+            print("[skip] {}: no metrics, density, or known-Z CSVs found under {}".format(problem, problem_dir / "run_results"))
             continue
 
         any_found = True
@@ -560,9 +764,14 @@ def main():
             print("       tidy      -> {}".format(density["tidy"]))
             print("       table4 numeric   -> {}".format(density["table4_numeric"]))
             print("       table4 formatted -> {}".format(density["table4_formatted"]))
+        if known_z.get("n_files", 0):
+            print("[ok]   {}: aggregated {} known-Z files ({})".format(problem, known_z["n_files"], known_z["source_kind"]))
+            print("       tidy      -> {}".format(known_z["tidy"]))
+            print("       numeric   -> {}".format(known_z["numeric"]))
+            print("       formatted -> {}".format(known_z["formatted"]))
 
     if not any_found:
-        print("No metrics CSV files were found. Check the root path and directory structure.")
+        print("No metrics, density, or known-Z CSV files were found. Check the root path and directory structure.")
 
 
 if __name__ == "__main__":
