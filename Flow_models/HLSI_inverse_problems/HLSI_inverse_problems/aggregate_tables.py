@@ -99,7 +99,7 @@ TABLE4_METRICS = OrderedDict([
     }),
 ])
 
-METHOD_ORDER = ["Tweedie", "Scalar Blend", "LFGI-GN", "MAP-Laplace"]
+METHOD_ORDER = ["Tweedie", "Scalar Blend", "LFGI", "MAP-Laplace"]
 
 
 def sanitize(name):
@@ -131,7 +131,7 @@ def canonical_method_name(name):
     if "scalar" in low and "blend" in low:
         return "Scalar Blend"
     if "ce-hlsi" in low or "hlsi" in low or "lfgi" in low:
-        return "LFGI-GN"
+        return "LFGI"
     if "map" in low and "laplace" in low:
         return "MAP-Laplace"
     # Strip common density suffixes while preserving unknown method names.
