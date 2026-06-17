@@ -2,7 +2,7 @@
 """Darcy flow inverse-problem density-evaluation benchmark.
 
 Updated to match the current Navier-Stokes and Helmholtz density scripts:
-build MALA posterior source/eval banks, fit Tweedie / scalar blend / CE-HLSI
+build MALA posterior source/eval banks, fit Tweedie / scalar blend / LFGI
 probability-flow normalized-density surrogates with independent score-signal
 and gate particle banks, and evaluate density/energy diagnostics on a held-out
 density-evaluation bank.
@@ -79,6 +79,25 @@ sys.modules["sampling"] = sampling
 
 print("Using:", sampling.__file__)
 print("DRC test:", sampling.canonicalize_init_weights("DRC"))
+
+# The shared helper still uses the historical implementation name `ce_hlsi`
+# internally, but the manuscript-facing method name is LFGI.  Patch only the
+# display helper for this script so the density-energy scatterplot grid does
+# not show the obsolete CE-HLSI label.  The score initializer remains `ce_hlsi`
+# for compatibility with sampling.py.
+_orig_drc_method_pretty_name = getattr(sampling, "_drc_method_pretty_name", None)
+if _orig_drc_method_pretty_name is not None:
+    def _darcy_lfgi_drc_method_pretty_name(label, cfg=None):
+        pretty = _orig_drc_method_pretty_name(label, cfg)
+        if "CE-HLSI" in str(pretty) or "HLSI" in str(pretty):
+            cfg = cfg or {}
+            display = str(cfg.get("display_name", "")) if isinstance(cfg, dict) else ""
+            label_s = str(label)
+            if "gn" in (display + " " + label_s).lower() or "precision" in display.lower():
+                return "LFGI-GN"
+            return "LFGI"
+        return pretty
+    sampling._drc_method_pretty_name = _darcy_lfgi_drc_method_pretty_name
 
 from sampling import (
     GaussianPrior,
@@ -796,9 +815,9 @@ BUILD_GNL_BANKS = False
 # DRC density benchmark configuration
 # ==========================================
 # This benchmark matches the updated Navier-Stokes/Helmholtz wiring:
-#   1. build a MALA source bank for score signals and CE-HLSI gate estimation,
+#   1. build a MALA source bank for score signals and LFGI gate estimation,
 #   2. optionally build an independent MALA-EVAL bank for held-out density eval,
-#   3. run ratio-only DRC-R density nodes for Tweedie, scalar blend, and CE-HLSI.
+#   3. run ratio-only DRC-R density nodes for Tweedie, Scalar Blend, and LFGI.
 # Each density node computes probability-flow log q and compares -log q against
 # the true unnormalized posterior energy -log pi at the configured eval points.
 def _env_int(name, default):
@@ -912,7 +931,7 @@ def _env_float_tuple_or_none(name, default=None):
 
 # Darcy keeps its legacy IP_DENSITY_N_REF fallback, but now uses the same split
 # bank controls as Navier-Stokes and Helmholtz. The score-signal bank feeds the
-# frozen score field; the gate bank feeds CE-HLSI gate estimation; the eval bank
+# frozen score field; the gate bank feeds LFGI gate estimation; the eval bank
 # is held out for PF/DRC density-energy diagnostics.
 N_REF_SIGNAL = _env_int('IP_DENSITY_N_REF_SIGNAL', _env_int('IP_DENSITY_N_REF', N_REF))
 N_REF_GATE_ENV_SET = _env_is_set('IP_DENSITY_N_REF_GATE')
@@ -954,7 +973,7 @@ DENSITY_DRC_PLOT_LAYOUT = os.environ.get('IP_DENSITY_DRC_PLOT_LAYOUT', 'comparis
 DENSITY_DRC_GRID_MAX_POINTS = _env_int('IP_DENSITY_DRC_GRID_MAX_POINTS', 5000)
 DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
 
-# Divergence defaults matching the density scripts. CE-HLSI and Tweedie dispatch
+# Divergence defaults matching the density scripts. LFGI and Tweedie dispatch
 # to analytic implementations in sampling.py when available; scalar blend keeps
 # Hutchinson by default for speed unless explicitly overridden.
 DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'auto')
@@ -970,7 +989,7 @@ DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 DENSITY_BASELINES = _env_csv('IP_DENSITY_BASELINES', ('map_laplace',))
 DENSITY_KNOWN_LOGZ = _env_float_or_none('IP_DENSITY_KNOWN_LOGZ', None)
 DENSITY_RUN_PF_SENSITIVITY = _env_bool('IP_DENSITY_RUN_PF_SENSITIVITY', False)
-DENSITY_PF_SENSITIVITY_LABELS = _env_csv('IP_DENSITY_PF_SENSITIVITY_LABELS', ('DENS-CE-HLSI', 'DENS-Tweedie'))
+DENSITY_PF_SENSITIVITY_LABELS = _env_csv('IP_DENSITY_PF_SENSITIVITY_LABELS', ('DENS-LFGI', 'DENS-Tweedie'))
 DENSITY_PF_SENSITIVITY_STEPS = _env_int_tuple('IP_DENSITY_PF_SENSITIVITY_STEPS', (32, 64, 128))
 DENSITY_PF_SENSITIVITY_TMINS = _env_float_tuple_or_none('IP_DENSITY_PF_SENSITIVITY_TMINS', None)
 
@@ -1098,7 +1117,7 @@ dashboard.add_text_page(
         f"Created: {datetime.now().isoformat(timespec='seconds')}",
         'This dashboard matches the updated Navier-Stokes/Helmholtz density-evaluation benchmark, with configurable score-signal, gate, and held-out density-evaluation banks. By default, density values are evaluated on MALA-EVAL rather than on the score-reference bank.',
         'Primary density diagnostic: true posterior energy -log pi(x) versus probability-flow estimated energy -log q(x), plus affine-calibrated residuals in one publication-style comparison grid.',
-        'The comparison-grid plot uses CE-HLSI robust axes to align all rows.',
+        'The comparison-grid plot uses LFGI robust axes to align all rows.',
         'Tables are intentionally limited to two pages: metrics plus a readable split run-info page.',
         'Random progress output from precomputation / Hessian batching is intentionally excluded.',
         f"run_results_dir = {run_ctx['run_results_dir']}",
@@ -1239,8 +1258,8 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         'drc_energy_save_logratio_residual_plots': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
         'drc_energy_plot_layout': DENSITY_DRC_PLOT_LAYOUT,
-        'drc_energy_grid_method_order': ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'),
-        'drc_energy_grid_axis_reference': 'DENS-CE-HLSI',
+        'drc_energy_grid_method_order': ('DENS-LFGI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'),
+        'drc_energy_grid_axis_reference': 'DENS-LFGI',
         'drc_energy_grid_max_points': DENSITY_DRC_GRID_MAX_POINTS,
         'drc_energy_grid_save_pdf': DENSITY_DRC_GRID_SAVE_PDF,
     }
@@ -1298,15 +1317,15 @@ if DENSITY_EVAL_SOURCE == 'MALA-EVAL':
 SAMPLER_CONFIGS.update(OrderedDict([
     ('DENS-Tweedie', _density_eval_config(
         DENSITY_REF_SOURCE, 'tweedie', DENSITY_TWEEDIE_DIVERGENCE,
-        'DENS-Tweedie', 'Tweedie PF',
+        'DENS-Tweedie', 'Tweedie',
     )),
     ('DENS-ScalarBlend', _density_eval_config(
         DENSITY_REF_SOURCE, 'scalar_blend', DENSITY_BLEND_DIVERGENCE,
-        'DENS-ScalarBlend', 'Scalar blend PF',
+        'DENS-ScalarBlend', 'Scalar Blend',
     )),
-    ('DENS-CE-HLSI', _density_eval_config(
+    ('DENS-LFGI', _density_eval_config(
         DENSITY_REF_SOURCE, 'ce_hlsi', DENSITY_LFGI_DIVERGENCE,
-        'DENS-CE-HLSI', 'CE-HLSI/LFGI, GN precision',
+        'DENS-LFGI', 'LFGI-GN',
     )),
 ]))
 
@@ -1366,14 +1385,14 @@ plot_mean_ess_logs(ess_logs, display_names=display_names)
 
 # Add closed-form density baselines on the same held-out density-eval bank.
 # Keep this deliberately small: for the manuscript comparison we need the
-# MAP-Laplace Gaussian row to test whether Darcy nonlinearity separates CE-HLSI
+# MAP-Laplace row to test whether Darcy nonlinearity separates LFGI
 # from a local Gaussian approximation.
 def _first_density_eval_bank(precomp_dict):
-    for lab in ('DENS-CE-HLSI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+    for lab in ('DENS-LFGI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
         bank = precomp_dict.get('eval_banks', {}).get(lab)
         if bank is not None:
             return bank
-    for lab in ('DENS-CE-HLSI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+    for lab in ('DENS-LFGI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
         det = precomp_dict.get('drc_details', {}).get(lab)
         if det is not None:
             return {
@@ -1411,8 +1430,8 @@ if baseline_eval_bank is not None and any(str(b).lower().replace('-', '_') in {'
             affine_fit_scope=DENSITY_DRC_AFFINE_FIT_SCOPE,
             verbose=True,
         )
-        display_names['DENS-MAP-Laplace'] = 'MAP-Laplace Gaussian'
-        print('\n=== Added MAP-Laplace Gaussian density baseline ===')
+        display_names['DENS-MAP-Laplace'] = 'MAP-Laplace'
+        print('\n=== Added MAP-Laplace density baseline ===')
         print(map_df.to_string(index=False))
     except Exception as exc:
         print(f"WARNING: MAP-Laplace density baseline failed and will be skipped: {exc}")
@@ -1422,7 +1441,7 @@ elif baseline_eval_bank is None:
 # The standard DRC comparison grid is created inside run_standard_sampler_pipeline,
 # before the closed-form MAP-Laplace baseline row exists. Regenerate the grid here
 # after inserting DENS-MAP-Laplace so the figure matches the metric table.
-density_grid_method_order = ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace')
+density_grid_method_order = ('DENS-LFGI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace')
 if 'DENS-MAP-Laplace' in precomp.get('drc_details', {}):
     try:
         all_drc_details = precomp.get('drc_details', {})
@@ -1430,14 +1449,14 @@ if 'DENS-MAP-Laplace' in precomp.get('drc_details', {}):
         grid_labels += [lab for lab in all_drc_details.keys() if lab not in grid_labels and str(lab).startswith('DENS-')]
         details_for_grid = OrderedDict((lab, all_drc_details[lab]) for lab in grid_labels)
         cfg_for_grid = {lab: dict(SAMPLER_CONFIGS.get(lab, {})) for lab in grid_labels}
-        cfg_for_grid.setdefault('DENS-MAP-Laplace', {})['display_name'] = 'MAP-Laplace Gaussian'
+        cfg_for_grid.setdefault('DENS-MAP-Laplace', {})['display_name'] = 'MAP-Laplace'
         refreshed_grid = sampling.save_drc_energy_comparison_grid(
             details_for_grid,
             cfg_by_label=cfg_for_grid,
             save_dir=run_ctx['run_results_dir'],
             run_stem=run_ctx['run_results_stem'],
             method_order=density_grid_method_order,
-            axis_reference_label='DENS-CE-HLSI' if 'DENS-CE-HLSI' in details_for_grid else None,
+            axis_reference_label='DENS-LFGI' if 'DENS-LFGI' in details_for_grid else None,
             plot_axis_mode=DENSITY_DRC_PLOT_AXIS_MODE,
             residual_axis_mode=DENSITY_DRC_RESIDUAL_AXIS_MODE,
             robust_percentiles=DENSITY_DRC_ROBUST_PERCENTILES,
@@ -1489,17 +1508,53 @@ if DENSITY_RUN_PF_SENSITIVITY:
     except Exception as exc:
         print(f'WARNING: density PF sensitivity benchmark failed and will be skipped: {exc}')
 
+def _make_darcy_table4_density_table(density_df, display_names=None, method_order=None):
+    """Darcy Table 4 view: central posterior-bulk density metrics plus NLL std."""
+    if density_df is None or len(density_df) == 0:
+        return pd.DataFrame()
+    display_names = display_names or {}
+    method_order = tuple(method_order or ())
+    df = pd.DataFrame(density_df).copy()
+    if 'label' in df.columns:
+        df['Method'] = df['label'].map(lambda x: display_names.get(str(x), str(x)))
+    elif 'Method' not in df.columns:
+        df['Method'] = [display_names.get(str(i), str(i)) for i in range(len(df))]
+    column_map = OrderedDict([
+        ('Method', 'Method'),
+        ('central_energy_neglogq_spearman', 'Spearman'),
+        ('central_affine_energy_slope', 'Central slope'),
+        ('central_affine_energy_r2', 'Central R2'),
+        ('central_affine_energy_rmse', 'Central RMSE'),
+        ('pointwise_nll', 'Pointwise NLL'),
+        ('pointwise_nll_std', 'Pointwise NLL std'),
+    ])
+    cols = [c for c in column_map if c in df.columns]
+    out = df[cols].rename(columns={c: column_map[c] for c in cols})
+    if method_order and 'Method' in out.columns:
+        order_labels = [display_names.get(str(x), str(x)) for x in method_order]
+        order_map = {lab: i for i, lab in enumerate(order_labels)}
+        out['_order'] = out['Method'].map(lambda x: order_map.get(str(x), len(order_map) + 100))
+        out = out.sort_values('_order').drop(columns=['_order']).reset_index(drop=True)
+    return out
+
+
 # Surface the density/energy benchmark produced by ratio-only nodes plus any
 # closed-form baseline rows added above.
 drc_energy_tables = precomp.get('drc_energy_benchmarks', {})
 if drc_energy_tables:
     drc_energy_df = pd.concat(list(drc_energy_tables.values()), ignore_index=True)
-    manuscript_density_df = make_density_manuscript_table(
+    manuscript_density_df = _make_darcy_table4_density_table(
         drc_energy_df,
         display_names=display_names,
-        method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-CE-HLSI', 'DENS-MAP-Laplace'),
-        include_known_z=DENSITY_KNOWN_LOGZ is not None,
+        method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-LFGI', 'DENS-MAP-Laplace'),
     )
+    if manuscript_density_df.empty:
+        manuscript_density_df = make_density_manuscript_table(
+            drc_energy_df,
+            display_names=display_names,
+            method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-LFGI', 'DENS-MAP-Laplace'),
+            include_known_z=DENSITY_KNOWN_LOGZ is not None,
+        )
     print('\n=== Density/energy benchmark on configured density-eval bank ===')
     print(drc_energy_df.to_string(index=False))
     print('\n=== Manuscript density table ===')
