@@ -11,10 +11,10 @@ CSVs when present because they contain the central Darcy Table 4 metrics and
 run-level uncertainty columns such as ``pointwise_nll_std``.  It falls back to
 compact manuscript density tables when the full files are unavailable.
 
-The known-normalization calibration script writes separate
+The known-normalization calibration scripts write separate
 ``*_known_z_calibration_table.csv`` and
 ``*_known_z_density_energy_full.csv`` files.  Those are aggregated into
-mean/std calibration tables for the Sec. 12.7 known-Z controls.
+mean/std calibration tables for the Sec. 12.6--12.7 known-Z controls.
 """
 
 import argparse
@@ -33,10 +33,14 @@ PROBLEMS = [
     "navier_stokes",
     "poisson",
     "afwi",
-    # Known-Z analytic calibration problem directories used in manuscript Sec. 12.7.
+    # Known-Z analytic calibration problem directories used in manuscript Sec. 12.6--12.7.
+    # The current layout places the Gaussian and non-Gaussian known-Z scripts in
+    # known_z_calibration/ and known_z_calibration2/, respectively.  The older
+    # names are retained so archived run folders still aggregate without edits.
+    "known_z_calibration",
+    "known_z_calibration2",
     "analytic_mixture_inverse",
     "known_z_mixture_inverse",
-    "known_z_calibration",
 ]
 
 NON_METRIC_COLUMNS = {
@@ -155,7 +159,7 @@ KNOWN_Z_METRICS = OrderedDict([
     }),
 ])
 
-METHOD_ORDER = ["Tweedie", "Scalar Blend", "LFGI", "MAP-Laplace"]
+METHOD_ORDER = ["Tweedie", "Scalar Blend", "MATRIX BLEND", "LFGI", "MAP-Laplace"]
 
 
 def sanitize(name):
@@ -179,13 +183,16 @@ def sanitize(name):
 def canonical_method_name(name):
     """Normalize historical/internal density labels to manuscript-facing names."""
     s = str(name).strip()
-    low = s.lower().replace("_", "-")
+    low = s.lower().replace("_", "-").replace(" ", "-")
     if low.startswith("dens-"):
         low = low[5:]
+    compact_low = low.replace("-", "")
     if "tweedie" in low:
         return "Tweedie"
     if "scalar" in low and "blend" in low:
         return "Scalar Blend"
+    if ("matrix" in low and "blend" in low) or "matrixblend" in compact_low:
+        return "MATRIX BLEND"
     if "ce-hlsi" in low or "hlsi" in low or "lfgi" in low:
         return "LFGI"
     if "map" in low and "laplace" in low:
