@@ -28,7 +28,7 @@ Paper-matched headline metrics:
   * Sliced Kolmogorov--Smirnov distance for Funnel.
 
 Run modes:
-  * RUN_MODE = 'paper_sweep'  : paper targets: misaligned GMM d=8, misaligned GMM d=24, funnel d=10.
+  * RUN_MODE = 'paper_sweep'  : paper targets: misaligned GMM d=8, misaligned GMM d=24, rings d=2, funnel d=10.
   * RUN_MODE = 'dpsmc_full'   : all overlap toy targets.
   * RUN_MODE = 'dpsmc_single' : quick GMM40 d=2 smoke test.
   * RUN_MODE = 'gn_hessian_sweep' : nonlinear inverse clean/residual GN-vs-full Hessian targets.
@@ -2812,14 +2812,16 @@ def make_dpsmc_overlap_variants(include_blr=False, data_dir=None, include_d50=No
 def make_paper_sweep_variants():
     """Paper-facing targets used for the aggregate benchmark table.
 
-    The sweep is intentionally restricted to the three current paper examples:
+    The sweep is intentionally restricted to the current paper examples:
       1. d=8 misaligned singular-subspace GMM;
       2. d=24 misaligned singular-subspace GMM;
-      3. d=10 Neal funnel with eta^2 controlled by LFGI_BENCH_FUNNEL_ETA2.
+      3. d=2 four-rings target;
+      4. d=10 Neal funnel with eta^2 controlled by LFGI_BENCH_FUNNEL_ETA2.
     """
     variants = OrderedDict()
     variants['misaligned_subspace_gmm_d8'] = MisalignedSingularSubspaceGMMTarget(d=8, rank=3)
     variants['misaligned_subspace_gmm_d24'] = MisalignedSingularSubspaceGMMTarget(d=24, rank=4)
+    variants['rings_d2'] = RingsTarget(sigma=0.15)
     variants['funnel_d10'] = FunnelTarget(d=10, eta2=FUNNEL_D10_ETA2)
     return variants
 
@@ -4643,6 +4645,32 @@ def sliced_w2_distance(X, Y, n_projections=256, max_points=None, seed=0):
     return float(torch.sqrt((Xp - Yp).square().mean()).detach().cpu().item())
 
 
+def reference_w2_distance(samples, reference, target):
+    """Reference-sample W2-like metric that is defined for every target.
+
+    DPSMC headline GMM40/Rings targets keep their entropy-regularised W2.
+    All other targets use sliced W2, which only requires sample clouds and is
+    therefore available for every benchmark target in this harness.
+    """
+    if getattr(target, 'benchmark_metric', None) == 'entropic_w2':
+        return entropic_w2_distance(
+            samples, reference,
+            epsilon=float(getattr(target, 'metric_epsilon', 0.05)),
+        )
+    return sliced_w2_distance(
+        samples, reference,
+        n_projections=int(os.environ.get('LFGI_BENCH_SW2_PROJ',
+                                         os.environ.get('LFGI_BENCH_W2_PROJ', '256'))),
+    )
+
+
+def reference_w2_metric_name(target):
+    """Human-readable label for the always-defined W2 column/plots."""
+    if getattr(target, 'benchmark_metric', None) == 'entropic_w2':
+        return f"Entropic W2 eps={float(getattr(target, 'metric_epsilon', 0.05)):g}"
+    return 'Sliced W2'
+
+
 def _parse_int_list_env(name, default):
     raw = os.environ.get(name, None)
     if raw is None or str(raw).strip() == '':
@@ -6235,10 +6263,7 @@ def run(target, out_dir='outputs', methods=None):
                     n_projections=int(getattr(target, 'metric_n_projections',
                                               os.environ.get('LFGI_BENCH_KS_PROJ', '1000'))),
                 )
-                w2v = (
-                    dpsmc_metric if getattr(target, 'benchmark_metric', None) == 'entropic_w2'
-                    else float('nan')
-                )
+                w2v = reference_w2_distance(sc, xt, target)
                 if DO_AUX_METRICS:
                     mv   = mmd(sc, xt)
                     klev = kl_energy_histogram(sc, xt, target)
@@ -6325,7 +6350,7 @@ def run(target, out_dir='outputs', methods=None):
     t0 = time.time()
     with torch.no_grad():
         gt_dpsmc_metric = dpsmc_benchmark_metric(x_gt2, xt, target)
-        gt_w2 = gt_dpsmc_metric if getattr(target, 'benchmark_metric', None) == 'entropic_w2' else float('nan')
+        gt_w2 = reference_w2_distance(x_gt2, xt, target)
         gt_sliced_ks = sliced_ks_distance(x_gt2, xt, n_projections=int(getattr(target, 'metric_n_projections', os.environ.get('LFGI_BENCH_KS_PROJ', '1000'))))
         if DO_AUX_METRICS:
             gt_mmd    = mmd(x_gt2, xt)
@@ -6401,7 +6426,7 @@ def run(target, out_dir='outputs', methods=None):
         print(f"  {m:<26s} {b_s} {r_s} {c_s}")
 
     for metric, mlabel in [('dpsmc_metric', dpsmc_benchmark_metric_name(target)),
-                           ('w2',         'Entropic W2 eps=0.05'),
+                           ('w2',         reference_w2_metric_name(target)),
                            ('sliced_ks',  'Sliced KS'),
                            ('score_rmse', 'Score RMSE'),
                            ('curl_rel',   'Curl relative RMS'),
@@ -6925,7 +6950,7 @@ def make_cross_variant_metric_plot(all_results, methods, root_dir='outputs_stres
     variants = list(all_results.keys())
     meths_plus = list(methods) + ['GT floor']
     metric_keys = ['dpsmc_metric', 'w2', 'sliced_ks', 'score_rmse', 'curl_rel', 'curl_abs', 'nll', 'ess', 'mmd', 'ksd']
-    metric_labels = ['Paper metric', 'Entropic W2 eps=0.05', 'Sliced KS', 'Score RMSE', 'Curl relative RMS', 'Curl absolute RMS', 'NLL (aux)', 'ESS (aux)', 'MMD (aux)', 'KSD (aux)']
+    metric_labels = ['Paper metric', 'Reference W2 / SW2', 'Sliced KS', 'Score RMSE', 'Curl relative RMS', 'Curl absolute RMS', 'NLL (aux)', 'ESS (aux)', 'MMD (aux)', 'KSD (aux)']
     ncols = 2
     nrows = int(math.ceil(len(metric_keys) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(20, 4.2 * nrows), squeeze=False)
@@ -6970,7 +6995,7 @@ def build_meta_summary_lines(all_results, methods):
     meths_plus = list(methods) + ['GT floor']
     lines = ['LFGI cross-target dashboard', f'Device: {DEVICE}; dtype: {torch.get_default_dtype()}', '']
     for metric, label in [
-        ('dpsmc_metric', 'Paper metric'), ('w2', 'Entropic W2 eps=0.05'),
+        ('dpsmc_metric', 'Paper metric'), ('w2', 'Reference W2 / SW2'),
         ('sliced_ks', 'Sliced KS'), ('score_rmse', 'Score RMSE'),
         ('curl_rel', 'Curl relative RMS'), ('curl_abs', 'Curl absolute RMS'),
         ('nll', 'NLL (aux)'), ('ess', 'ESS (aux)'), ('mmd', 'MMD (aux)'), ('ksd', 'KSD (aux)'),
@@ -7306,7 +7331,7 @@ def plot(results, xt, xr, methods, target, out_dir='outputs'):
     fig, axes = plt.subplots(3, 3, figsize=(24, 14))
     axes = axes.flatten()
     metric_keys   = ['dpsmc_metric', 'w2', 'sliced_ks', 'score_rmse', 'curl_rel', 'curl_abs', 'nll', 'ess', 'mmd']
-    metric_labels = [f'{dpsmc_benchmark_metric_name(target)} (paper, ↓/↑)', 'Entropic W2 ε=0.05 (↓)', 'Sliced KS (↓)',
+    metric_labels = [f'{dpsmc_benchmark_metric_name(target)} (paper, ↓/↑)', f'{reference_w2_metric_name(target)} (↓)', 'Sliced KS (↓)',
                       'Score RMSE (↓)', 'Curl relative RMS (↓)', 'Curl absolute RMS (↓)',
                       'NLL (KDE, ↓)', 'ESS (KDE, ↑)', 'MMD (↓)']
     for ax, mk, ml in zip(axes, metric_keys, metric_labels):
@@ -7612,7 +7637,7 @@ def meta_run(root_dir='outputs_stress_test',
 
     for metric, mlabel, direction in [
         ('dpsmc_metric', 'Paper metric',     'target'),
-        ('w2',         'Entropic W2 (↓)', 'lower'),
+        ('w2',         'Reference W2 / SW2 (↓)', 'lower'),
         ('sliced_ks',  'Sliced KS (↓)',   'lower'),
         ('score_rmse', 'RMSE (↓)',        'lower'),
         ('curl_rel',   'Curl rel (↓)',    'lower'),
@@ -7924,7 +7949,7 @@ def resolve_run_mode_variants(run_mode):
     """Resolve LFGI_BENCH_RUN_MODE into (root_dir, variants).
 
     Supported forms:
-      * paper_sweep / paper / section9 -> misaligned GMM d=8, misaligned GMM d=24, funnel d=10
+      * paper_sweep / paper / section9 -> misaligned GMM d=8, misaligned GMM d=24, rings d=2, funnel d=10
       * dpsmc_full / dpsmc_all / all / full
       * dpsmc_single                 -> gmm40_d2
       * dpsmc_gmm25                  -> gmm40_d25
