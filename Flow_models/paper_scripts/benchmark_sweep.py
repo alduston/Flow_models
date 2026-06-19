@@ -6661,7 +6661,7 @@ AGGREGATE_METRIC_KEYS = [
     'nll', 'ess', 'mmd', 'kl_energy', 'kl_dist', 'ksd',
     'ms', 'nan_pct',
 ]
-PAPER_TABLE_METRIC_KEYS = ['dpsmc_metric', 'score_rmse', 'ksd', 'nll', 'ess']
+PAPER_TABLE_METRIC_KEYS = ['sliced_ks', 'score_rmse', 'ksd', 'nll', 'ess', 'mmd', 'w2']
 
 
 def _metric_float(value):
@@ -7096,10 +7096,10 @@ PAPER_METHOD_LABELS = {
     'tweedie': 'TWEEDIE',
     'blend': 'SCALAR BLEND',
     'plugin-matrix-blend': 'PLUGIN MATRIX BLEND',
-    'centered-matrix-blend': 'CENTERED MATRIX BLEND',
+    'centered-matrix-blend': 'MATRIX BLEND',
     'primal-matrix-blend': 'PLUGIN MATRIX BLEND',
-    'ce-hlsi': 'LFGI BLEND',
-    'gn_lfgi': 'GN-LFGI BLEND',
+    'ce-hlsi': 'LFGI',
+    'gn_lfgi': 'GN-LFGI',
     'GT floor': 'GT FLOOR',
     'True': 'TRUE',
     'True (MALA)': 'TRUE',
@@ -7118,7 +7118,7 @@ PAPER_METHOD_LABELS = {
     'Tweedie': 'TWEEDIE',
     'Blended': 'SCALAR BLEND',
     'Primal Matrix': 'PLUGIN MATRIX BLEND',
-    'CE-HLSI': 'LFGI BLEND',
+    'CE-HLSI': 'LFGI',
     'Leaf-CE-HLSI': 'LEAF LFGI',
 }
 
@@ -7145,7 +7145,7 @@ def paper_method_label(name):
     key = str(name)
     if key in PAPER_METHOD_LABELS:
         return PAPER_METHOD_LABELS[key]
-    return key.replace('_', '-').replace('ce-hlsi', 'lfgi-blend').upper()
+    return key.replace('_', '-').replace('ce-hlsi', 'lfgi').upper()
 
 
 def paper_target_label(target):
