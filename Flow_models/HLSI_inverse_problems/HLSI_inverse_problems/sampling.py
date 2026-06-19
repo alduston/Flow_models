@@ -1398,6 +1398,147 @@ def eval_blend_posterior_score(y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu
         batch_size=batch_size, mode='blend_posterior')
 
 
+
+
+def _symmetrize_batch(A):
+    return 0.5 * (A + A.transpose(-1, -2))
+
+
+def eval_centered_matrix_blend_posterior_score(
+    y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+    batch_size=REF_STREAM_BATCH,
+    ridge=1e-8, ridge_rel=1e-6,
+    center=True, sym_gate=False, gate_clip=1e6,
+    transition_w='ou', P_ref_cpu=None, mu_ref_cpu=None, gated_info=None,
+    gate_X_ref_cpu=None, gate_s0_post_ref_cpu=None, gate_log_lik_ref_cpu=None,
+    gate_P_ref_cpu=None, gate_mu_ref_cpu=None, gate_gated_info=None,
+):
+    """Streaming local matrix-blend score estimator.
+
+    The estimator applies the centered paired-regression matrix gate
+
+        G(y,t) = - Cov_hat(b, d) Cov_hat(d, d)^{-1},  d = c - b,
+
+    to the score-bank means ``s_twd = E_hat[b]`` and ``s_tsi = E_hat[c]``:
+
+        s_hat = s_twd + G (s_tsi - s_twd).
+
+    ``gate_*`` arguments allow the finite-reference moment gate to be estimated
+    from an independent bank while the resulting gate is applied to the score
+    bank.  This mirrors the centered-matrix-blend path in benchmark_sweep.py and
+    the split-bank LFGI density benchmark wiring.
+    """
+    if s0_post_ref_cpu is None:
+        raise ValueError('centered matrix blend requires s0_post_ref_cpu.')
+    transition_w = canonicalize_transition_w(transition_w)
+    t_val = _canonicalize_time(t)
+    et = math.exp(-t_val)
+    var_t = 1.0 - math.exp(-2.0 * t_val)
+    inv_v = 1.0 / var_t
+    inv_et = 1.0 / et
+
+    w = get_posterior_snis_weights(
+        y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=P_ref_cpu,
+        mu_ref_cpu=mu_ref_cpu, gated_info=gated_info,
+    )
+
+    m_query, d = y.shape
+    s_twd = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    s_tsi = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_v
+        c_batch = s0_batch.unsqueeze(0) * inv_et
+        s_twd += torch.einsum('mb,mbd->md', w_batch, b_batch)
+        s_tsi += torch.einsum('mb,mbd->md', w_batch, c_batch)
+        del w_batch, X_batch, s0_batch, b_batch, c_batch
+
+    use_separate_gate_bank = gate_X_ref_cpu is not None
+    if not use_separate_gate_bank:
+        gate_X_ref_cpu = X_ref_cpu
+        gate_s0_post_ref_cpu = s0_post_ref_cpu
+        gate_log_lik_ref_cpu = log_lik_ref_cpu
+        gate_P_ref_cpu = P_ref_cpu
+        gate_mu_ref_cpu = mu_ref_cpu
+        gate_gated_info = gated_info
+        w_gate = w
+    else:
+        if gate_s0_post_ref_cpu is None:
+            raise ValueError('separate matrix-blend gate bank requires gate_s0_post_ref_cpu.')
+        if gate_log_lik_ref_cpu is None:
+            gate_log_lik_ref_cpu = log_lik_ref_cpu
+        w_gate = get_posterior_snis_weights(
+            y, t_val, gate_X_ref_cpu, gate_log_lik_ref_cpu, batch_size=batch_size,
+            transition_w=transition_w, P_ref_cpu=gate_P_ref_cpu,
+            mu_ref_cpu=gate_mu_ref_cpu, gated_info=gate_gated_info,
+        )
+
+    b_mean_gate = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    d_mean_gate = torch.zeros((m_query, d), device=y.device, dtype=y.dtype)
+    if bool(center):
+        for i in range(0, gate_X_ref_cpu.shape[0], batch_size):
+            sl = slice(i, i + batch_size)
+            wg_batch = w_gate[:, sl]
+            X_batch = gate_X_ref_cpu[sl].to(y.device, non_blocking=True)
+            s0_batch = gate_s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+            b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_v
+            c_batch = s0_batch.unsqueeze(0) * inv_et
+            d_batch = c_batch - b_batch
+            b_mean_gate += torch.einsum('mb,mbd->md', wg_batch, b_batch)
+            d_mean_gate += torch.einsum('mb,mbd->md', wg_batch, d_batch)
+            del wg_batch, X_batch, s0_batch, b_batch, c_batch, d_batch
+
+    M = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
+    N = torch.zeros((m_query, d, d), device=y.device, dtype=y.dtype)
+    for i in range(0, gate_X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        wg_batch = w_gate[:, sl]
+        X_batch = gate_X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = gate_s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_v
+        c_batch = s0_batch.unsqueeze(0) * inv_et
+        d_batch = c_batch - b_batch
+        if bool(center):
+            b_mom = b_batch - b_mean_gate.unsqueeze(1)
+            d_mom = d_batch - d_mean_gate.unsqueeze(1)
+        else:
+            b_mom = b_batch
+            d_mom = d_batch
+        M += torch.einsum('mb,mbi,mbj->mij', wg_batch, d_mom, d_mom)
+        N += torch.einsum('mb,mbi,mbj->mij', wg_batch, b_mom, d_mom)
+        del wg_batch, X_batch, s0_batch, b_batch, c_batch, d_batch, b_mom, d_mom
+
+    M = _symmetrize_batch(torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0))
+    N = torch.nan_to_num(N, nan=0.0, posinf=0.0, neginf=0.0)
+    eye = torch.eye(d, device=y.device, dtype=y.dtype).expand(m_query, d, d)
+    tr = torch.diagonal(M, dim1=-2, dim2=-1).sum(dim=-1) / max(d, 1)
+    ridge_vec = float(ridge) + float(ridge_rel) * tr.clamp(min=0.0)
+    M_reg = M + ridge_vec.view(m_query, 1, 1) * eye
+
+    try:
+        G = torch.linalg.solve(M_reg.transpose(-1, -2), (-N).transpose(-1, -2)).transpose(-1, -2)
+    except RuntimeError:
+        G = -torch.matmul(N, torch.linalg.pinv(M_reg))
+    if not bool(torch.isfinite(G).all().detach().cpu().item()):
+        G_pinv = -torch.matmul(N, torch.linalg.pinv(M_reg))
+        G = torch.where(torch.isfinite(G), G, G_pinv)
+    G = torch.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
+    if bool(sym_gate):
+        G = _symmetrize_batch(G)
+    clip = None if gate_clip is None else float(gate_clip)
+    if clip is not None and math.isfinite(clip) and clip > 0.0:
+        G = G.clamp(min=-clip, max=clip)
+
+    out = s_twd + torch.einsum('mij,mj->mi', G, s_tsi - s_twd)
+    if clip is None or not math.isfinite(clip) or clip <= 0.0:
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.nan_to_num(out, nan=0.0, posinf=clip, neginf=-clip)
+
 def eval_score_batched(y, t, X_ref_cpu, s0_ref_cpu, log_lik_ref_cpu,
                        batch_size=REF_STREAM_BATCH, mode='blend_posterior'):
     """
@@ -1913,8 +2054,11 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
                       transition_w='ou', grad_log_pou_denom_ref=None,
                       gate_rho=None, gate_beta=None, gate_kappa=None,
                       gate_topk=64, gate_metric_source='mu',
-                      gate_X_ref=None, gate_log_lik_ref=None, gate_P_ref=None,
-                      gate_mu_ref=None, gate_gated_info=None):
+                      gate_X_ref=None, gate_s0_post_ref=None, gate_log_lik_ref=None, gate_P_ref=None,
+                      gate_mu_ref=None, gate_gated_info=None,
+                      matrix_blend_center=True, matrix_blend_ridge=1e-8,
+                      matrix_blend_ridge_rel=1e-6, matrix_blend_sym_gate=False,
+                      matrix_blend_gate_clip=1e6):
     """
     No-CFG wrapper: returns only the conditional/posterior score estimate.
 
@@ -1940,6 +2084,19 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
         score = eval_blend_posterior_score(
             y, t_val, X_ref, s0_post_ref, log_lik_ref,
             batch_size=REF_STREAM_BATCH)
+
+    elif mode == 'centered_matrix_blend':
+        score = eval_centered_matrix_blend_posterior_score(
+            y, t_val, X_ref, s0_post_ref, log_lik_ref,
+            batch_size=REF_STREAM_BATCH,
+            ridge=matrix_blend_ridge, ridge_rel=matrix_blend_ridge_rel,
+            center=matrix_blend_center, sym_gate=matrix_blend_sym_gate,
+            gate_clip=matrix_blend_gate_clip,
+            transition_w=transition_w, P_ref_cpu=P_ref, mu_ref_cpu=mu_ref, gated_info=gated_info,
+            gate_X_ref_cpu=gate_X_ref, gate_s0_post_ref_cpu=gate_s0_post_ref,
+            gate_log_lik_ref_cpu=gate_log_lik_ref, gate_P_ref_cpu=gate_P_ref,
+            gate_mu_ref_cpu=gate_mu_ref, gate_gated_info=gate_gated_info,
+        )
 
     elif mode in {
         'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
@@ -1988,10 +2145,11 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
 
       * Tweedie: mode='tweedie'
       * scalar blend: mode='blend_posterior'
+      * matrix blend: mode='centered_matrix_blend'
       * HLSI / CE-HLSI / leaf / TL variants
 
     Only fields needed by the chosen score are required.  HLSI-family scores need
-    P_ref/mu_ref; Tweedie and scalar blend only need X_ref, s0_post_ref, and the
+    P_ref/mu_ref; Tweedie, scalar blend, and matrix blend only need X_ref, s0_post_ref, and the
     selected log_weights.  The frozen spec deliberately lives on CPU so the PF
     density evaluator can stream reference chunks without retaining large GPU
     tensors between calls.
@@ -2000,7 +2158,7 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
         return None
     mode = canonicalize_init_name(cfg.get('init'))
     supported = {
-        'tweedie', 'blend_posterior',
+        'tweedie', 'blend_posterior', 'centered_matrix_blend',
         'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
         'gnl_hlsi', 'gnl_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
     }
@@ -2036,6 +2194,11 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
         'n_samples_final': int(final_samples.shape[0]) if torch.is_tensor(final_samples) else None,
         'bank_name': local_bank.get('bank_name', 'unknown'),
         'score_gate_bank_coupling': cfg.get('score_gate_bank_coupling', 'shared'),
+        'matrix_blend_center': bool(cfg.get('matrix_blend_center', True)),
+        'matrix_blend_ridge': float(cfg.get('matrix_blend_ridge', cfg.get('ridge', 1e-8))),
+        'matrix_blend_ridge_rel': float(cfg.get('matrix_blend_ridge_rel', cfg.get('ridge_rel', 1e-6))),
+        'matrix_blend_sym_gate': bool(cfg.get('matrix_blend_sym_gate', cfg.get('sym_gate', False))),
+        'matrix_blend_gate_clip': cfg.get('matrix_blend_gate_clip', cfg.get('gate_clip', 1e6)),
     }
     if gate_local_bank is not None:
         if gate_init_log_weights is None:
@@ -2043,6 +2206,11 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
         spec.update({
             'gate_X_ref': gate_local_bank['X_ref'].detach().cpu(),
             'gate_log_weights': gate_init_log_weights.detach().cpu(),
+            'gate_s0_post_ref': (
+                gate_local_bank['s0_post_ref'].detach().cpu()
+                if 's0_post_ref' in gate_local_bank and torch.is_tensor(gate_local_bank['s0_post_ref'])
+                else None
+            ),
             'gate_bank_name': gate_local_bank.get('bank_name', 'unknown'),
             'n_ref_gate': int(gate_local_bank['X_ref'].shape[0]),
         })
@@ -2071,6 +2239,12 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
         'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
         'gnl_hlsi', 'gnl_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
     }
+    if mode == 'centered_matrix_blend':
+        if spec.get('s0_post_ref') is None:
+            raise KeyError(f"Frozen density score spec for matrix blend is missing s0_post_ref. Available local_bank keys: {sorted(local_bank.keys())}")
+        if gate_local_bank is not None and spec.get('gate_s0_post_ref') is None:
+            raise KeyError(f"Frozen density score spec for separate-gate matrix blend is missing gate_s0_post_ref. Available gate bank keys: {sorted(gate_local_bank.keys())}")
+
     if mode in hlsi_family:
         missing = [k for k in ('P_ref', 'mu_ref') if k not in spec or spec[k] is None]
         if missing:
@@ -2107,6 +2281,7 @@ def _eval_score_from_frozen_spec(y, t, spec):
         init_weights=spec.get('init_weights', 'L'),
         transition_w=spec.get('transition_w', 'ou'),
         gate_X_ref=spec.get('gate_X_ref'),
+        gate_s0_post_ref=spec.get('gate_s0_post_ref'),
         gate_log_lik_ref=spec.get('gate_log_weights'),
         gate_P_ref=spec.get('gate_P_ref'),
         gate_mu_ref=spec.get('gate_mu_ref'),
@@ -2114,6 +2289,11 @@ def _eval_score_from_frozen_spec(y, t, spec):
         gate_rho=spec.get('gate_rho'), gate_beta=spec.get('gate_beta'),
         gate_kappa=spec.get('gate_kappa'), gate_topk=spec.get('gate_topk', 64),
         gate_metric_source=spec.get('gate_metric_source', 'mu'),
+        matrix_blend_center=spec.get('matrix_blend_center', True),
+        matrix_blend_ridge=spec.get('matrix_blend_ridge', 1e-8),
+        matrix_blend_ridge_rel=spec.get('matrix_blend_ridge_rel', 1e-6),
+        matrix_blend_sym_gate=spec.get('matrix_blend_sym_gate', False),
+        matrix_blend_gate_clip=spec.get('matrix_blend_gate_clip', 1e6),
     )
 
 
@@ -2713,7 +2893,9 @@ def _drc_method_pretty_name(label, cfg=None):
                 init = None
     low = label_str.lower()
     if init in {'ce_hlsi', 'hlsi_posterior', 'leaf_ce_hlsi', 'gnl_ce_hlsi'} or 'ce-hlsi' in low or 'hlsi' in low or 'lfgi' in low:
-        return 'CE-HLSI'
+        return 'LFGI'
+    if init == 'centered_matrix_blend' or 'matrix' in low:
+        return 'MATRIX BLEND'
     if init in {'scalar_blend', 'blend_posterior'} or 'blend' in low:
         return 'Blend'
     if init == 'tweedie' or 'tweedie' in low:
@@ -2727,16 +2909,18 @@ def _drc_method_pretty_name(label, cfg=None):
 
 
 def _drc_method_order_key(label, cfg=None):
-    """Prefer the paper-facing row order CE-HLSI, Blend, Tweedie."""
+    """Prefer the paper-facing row order LFGI, MATRIX BLEND, Blend, Tweedie."""
     name = _drc_method_pretty_name(label, cfg).lower()
     if 'ce-hlsi' in name or 'hlsi' in name or 'lfgi' in name:
         return (0, str(label))
-    if 'blend' in name:
+    if 'matrix blend' in name:
         return (1, str(label))
-    if 'tweedie' in name:
+    if 'blend' in name:
         return (2, str(label))
-    if 'map-laplace' in name or ('laplace' in name and 'map' in name):
+    if 'tweedie' in name:
         return (3, str(label))
+    if 'map-laplace' in name or ('laplace' in name and 'map' in name):
+        return (4, str(label))
     return (10, str(label))
 
 
@@ -2886,8 +3070,8 @@ def save_drc_energy_comparison_grid(details_by_label, cfg_by_label=None, save_di
 
     Rows are methods and columns are: (1) affine-normalized estimated energy
     against true energy, and (2) affine-normalized residual against true energy.
-    The default row ordering is CE-HLSI, Blend, Tweedie, MAP-Laplace when present.  Axes are shared across
-    rows and are set by the CE-HLSI/reference-label arrays, matching the intended
+    The default row ordering is LFGI, MATRIX BLEND, Blend, Tweedie, MAP-Laplace when present.  Axes are shared across
+    rows and are set by the LFGI/reference-label arrays, matching the intended
     paper comparison rather than allowing each method to choose its own window.
     """
     if not details_by_label:
@@ -3734,7 +3918,7 @@ def run_drc_pf_sensitivity_benchmark(
     cfg_by_label,
     prior_model,
     lik_model,
-    labels=('DENS-CE-HLSI', 'DENS-Tweedie'),
+    labels=('DENS-LFGI', 'DENS-Tweedie'),
     pf_steps_list=(32, 64, 128),
     tmin_list=None,
     save_dir=None,
@@ -4139,7 +4323,7 @@ def _estimate_sampler_pde_eval_counts(cfg, n_ref=0, n_samples=None):
 
     if init_mode == 'tweedie':
         counts['pde_likelihood_evals'] += n_ref
-    elif init_mode == 'blend_posterior':
+    elif init_mode in {'blend_posterior', 'centered_matrix_blend'}:
         counts['pde_likelihood_evals'] += n_ref
         counts['pde_score_evals'] += n_ref
     elif init_mode in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi', 'ref_laplace', 'drc_ratio_update'}:
@@ -4170,8 +4354,11 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                      grad_log_pou_denom_ref=None, transition_w='ou',
                      gate_rho=None, gate_beta=None, gate_kappa=None,
                      gate_topk=64, gate_metric_source='mu',
-                     gate_X_ref=None, gate_log_lik_ref=None, gate_P_ref=None,
+                     gate_X_ref=None, gate_s0_post_ref=None, gate_log_lik_ref=None, gate_P_ref=None,
                      gate_mu_ref=None, gate_gated_info=None,
+                     matrix_blend_center=True, matrix_blend_ridge=1e-8,
+                     matrix_blend_ridge_rel=1e-6, matrix_blend_sym_gate=False,
+                     matrix_blend_gate_clip=1e6,
                      return_info=False):
     if x_init is None:
         y = torch.randn(n_samples, dim, device=device, dtype=torch.float64)
@@ -4229,9 +4416,14 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                   gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
                                   gate_topk=gate_topk, gate_metric_source=gate_metric_source,
                                   transition_w=transition_w,
-                                  gate_X_ref=gate_X_ref, gate_log_lik_ref=gate_log_lik_ref,
+                                  gate_X_ref=gate_X_ref, gate_s0_post_ref=gate_s0_post_ref, gate_log_lik_ref=gate_log_lik_ref,
                                   gate_P_ref=gate_P_ref, gate_mu_ref=gate_mu_ref,
-                                  gate_gated_info=gate_gated_info)
+                                  gate_gated_info=gate_gated_info,
+                                  matrix_blend_center=matrix_blend_center,
+                                  matrix_blend_ridge=matrix_blend_ridge,
+                                  matrix_blend_ridge_rel=matrix_blend_ridge_rel,
+                                  matrix_blend_sym_gate=matrix_blend_sym_gate,
+                                  matrix_blend_gate_clip=matrix_blend_gate_clip)
         cur_norm = _mean_vector_norm(s_cur)
         if i == 0:
             info['score_norm_initial'] = cur_norm
@@ -4249,9 +4441,14 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                    gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
                                    gate_topk=gate_topk, gate_metric_source=gate_metric_source,
                                    transition_w=transition_w,
-                                  gate_X_ref=gate_X_ref, gate_log_lik_ref=gate_log_lik_ref,
+                                  gate_X_ref=gate_X_ref, gate_s0_post_ref=gate_s0_post_ref, gate_log_lik_ref=gate_log_lik_ref,
                                   gate_P_ref=gate_P_ref, gate_mu_ref=gate_mu_ref,
-                                  gate_gated_info=gate_gated_info)
+                                  gate_gated_info=gate_gated_info,
+                                  matrix_blend_center=matrix_blend_center,
+                                  matrix_blend_ridge=matrix_blend_ridge,
+                                  matrix_blend_ridge_rel=matrix_blend_ridge_rel,
+                                  matrix_blend_sym_gate=matrix_blend_sym_gate,
+                                  matrix_blend_gate_clip=matrix_blend_gate_clip)
         d_next = y_hat + 2.0 * s_next
 
         y = y + 0.5 * (d_cur + d_next) * dt + math.sqrt(2.0 * dt.item()) * z
@@ -4270,9 +4467,14 @@ def run_sampler_heun(n_samples, mode, X_ref, s0_post_ref, log_lik_ref,
                                     gate_rho=gate_rho, gate_beta=gate_beta, gate_kappa=gate_kappa,
                                     gate_topk=gate_topk, gate_metric_source=gate_metric_source,
                                     transition_w=transition_w,
-                                  gate_X_ref=gate_X_ref, gate_log_lik_ref=gate_log_lik_ref,
+                                  gate_X_ref=gate_X_ref, gate_s0_post_ref=gate_s0_post_ref, gate_log_lik_ref=gate_log_lik_ref,
                                   gate_P_ref=gate_P_ref, gate_mu_ref=gate_mu_ref,
-                                  gate_gated_info=gate_gated_info)
+                                  gate_gated_info=gate_gated_info,
+                                  matrix_blend_center=matrix_blend_center,
+                                  matrix_blend_ridge=matrix_blend_ridge,
+                                  matrix_blend_ridge_rel=matrix_blend_ridge_rel,
+                                  matrix_blend_sym_gate=matrix_blend_sym_gate,
+                                  matrix_blend_gate_clip=matrix_blend_gate_clip)
     info['score_norm_mean'] = score_norm_sum / float(max(1, steps))
     info['score_norm_final'] = _mean_vector_norm(final_score)
     info['score_norm_max'] = max(score_norm_max, info['score_norm_final'])
@@ -5262,6 +5464,15 @@ INIT_ALIASES = {
     _normalize_sampler_key('scalar-blend'): 'blend_posterior',
     _normalize_sampler_key('scalar_blend'): 'blend_posterior',
     _normalize_sampler_key('scalar blend'): 'blend_posterior',
+    _normalize_sampler_key('matrix-blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('matrix_blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('matrix blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('centered-matrix-blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('centered_matrix_blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('centered matrix blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('centered-blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('centered_blend'): 'centered_matrix_blend',
+    _normalize_sampler_key('centered blend'): 'centered_matrix_blend',
     _normalize_sampler_key('ref-laplace'): 'ref_laplace',
     _normalize_sampler_key('ref_laplace'): 'ref_laplace',
     _normalize_sampler_key('ref laplace'): 'ref_laplace',
@@ -5324,6 +5535,7 @@ INIT_DISPLAY_NAMES = {
     'prior': 'Prior',
     'tweedie': 'Tweedie',
     'blend_posterior': 'Blend',
+    'centered_matrix_blend': 'MATRIX BLEND',
     'ref_laplace': 'Ref_Laplace',
     'map_laplace': 'MAP_Laplace',
     'hlsi_posterior': 'HLSI',
@@ -5908,8 +6120,8 @@ def normalize_sampler_config(label, config, default_n_samples, default_dim):
     # single method-comparison grid; set to 'individual' for the legacy one-plot-per-method
     # behavior or 'both' for both outputs.
     cfg.setdefault('drc_energy_plot_layout', 'comparison_grid')
-    cfg.setdefault('drc_energy_grid_method_order', ('DENS-CE-HLSI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'))
-    cfg.setdefault('drc_energy_grid_axis_reference', 'DENS-CE-HLSI')
+    cfg.setdefault('drc_energy_grid_method_order', ('DENS-LFGI', 'DENS-MatrixBlend', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'))
+    cfg.setdefault('drc_energy_grid_axis_reference', 'DENS-LFGI')
     cfg.setdefault('drc_energy_grid_max_points', 5000)
     cfg['drc_energy_grid_max_points'] = int(max(100, cfg['drc_energy_grid_max_points']))
     cfg.setdefault('drc_energy_grid_save_pdf', True)
@@ -6233,7 +6445,7 @@ def _config_uses_ce_gate_bank(cfg):
         mode = canonicalize_init_name(mode)
     except Exception:
         return False
-    return mode in {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi'}
+    return mode in {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi', 'centered_matrix_blend'}
 
 
 
@@ -6380,7 +6592,7 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     gate_bank = precomp.get('gate_banks', {}).get(label)
     gate_local_bank = None
     gate_log_weights = None
-    if gate_bank is not None and score_init in _ANALYTIC_CE_HLSI_DRC_DIVERGENCE_MODES:
+    if gate_bank is not None and _config_uses_ce_gate_bank({'init': 'drc_ratio_update', 'drc_score_init': score_init}):
         gate_local_bank = select_local_bank(gate_bank, score_init, score_weights)
         gate_log_weights = get_sampler_log_weights(score_init, score_weights, gate_bank)
         print(
@@ -6460,6 +6672,7 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
                     residual_kind=cfg.get('drc_energy_residual_kind', 'affine_normalized'),
                     affine_fit_scope=cfg.get('drc_energy_affine_fit_scope', 'central'),
                     also_save_logratio_residual_plots=_config_bool(cfg.get('drc_energy_save_logratio_residual_plots', False)),
+                    method_family=_drc_method_pretty_name(label, cfg),
                 )
             except Exception as exc:
                 warnings.warn(
@@ -6592,10 +6805,16 @@ def run_single_sampler_config(label, config, prior_model, lik_model, precomp=Non
             gate_metric_source=cfg.get('gate_metric_source', 'mu'),
             transition_w=cfg.get('transition_w', 'ou'),
             gate_X_ref=gate_local_bank['X_ref'] if gate_local_bank is not None else None,
+            gate_s0_post_ref=gate_local_bank['s0_post_ref'] if gate_local_bank is not None else None,
             gate_log_lik_ref=gate_log_weights,
             gate_P_ref=gate_local_bank['P_ref'] if gate_local_bank is not None else None,
             gate_mu_ref=gate_local_bank['mu_ref'] if gate_local_bank is not None else None,
             gate_gated_info=gate_local_bank['gated_info'] if gate_local_bank is not None else None,
+            matrix_blend_center=cfg.get('matrix_blend_center', True),
+            matrix_blend_ridge=cfg.get('matrix_blend_ridge', cfg.get('ridge', 1e-8)),
+            matrix_blend_ridge_rel=cfg.get('matrix_blend_ridge_rel', cfg.get('ridge_rel', 1e-6)),
+            matrix_blend_sym_gate=cfg.get('matrix_blend_sym_gate', cfg.get('sym_gate', False)),
+            matrix_blend_gate_clip=cfg.get('matrix_blend_gate_clip', cfg.get('gate_clip', 1e6)),
             return_info=True,
         )
         if cfg['log_mean_ess']:
@@ -7300,11 +7519,12 @@ def results_method_family(label, info):
     family_map = {
         'tweedie': 'Tweedie',
         'blend_posterior': 'Blend',
+        'centered_matrix_blend': 'MATRIX BLEND',
         'ref_laplace': 'Ref_Laplace',
         'hlsi_posterior': 'HLSI',
-        'ce_hlsi': 'CE-HLSI',
-        'gnl_hlsi': 'HLSI',
-        'gnl_ce_hlsi': 'CE-HLSI',
+        'ce_hlsi': 'LFGI',
+        'gnl_hlsi': 'LFGI',
+        'gnl_ce_hlsi': 'LFGI',
         'tl_hlsi': 'TL-HLSI',
         'leaf_tl_hlsi': 'Leaf-TL-HLSI',
     }
