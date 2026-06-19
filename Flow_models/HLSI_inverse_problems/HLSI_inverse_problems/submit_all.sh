@@ -17,11 +17,14 @@ ALL_PROBLEMS=(
   "afwi"
   "modulus"
   "helmholtz_alt"
-  "Z_problem"
+  "known_z_calibration"
+  "known_z_calibration2"
 )
 
 PROBLEMS=(
-"navier_stokes"
+"darcy_flow"
+"known_z_calibration"
+"known_z_calibration2"
 )
 
 for p in "${PROBLEMS[@]}"; do
