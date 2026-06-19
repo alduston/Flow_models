@@ -30,10 +30,11 @@ Useful overrides:
     export IP_DENSITY_DRC_PLOT_LAYOUT=comparison_grid
 
 By default the source and held-out evaluation banks are drawn from the exact
-Gaussian-mixture posterior.  For repeated uncertainty runs on the same analytic
-problem, keep GIP_PROBLEM_SEED fixed and vary SEED/GIP_SEED.  In Slurm array
-runs, if SEED and GIP_SEED are unset, the script uses
-SEED = GIP_PROBLEM_SEED + SLURM_ARRAY_TASK_ID.  To force literal MALA source/eval
+Gaussian-mixture posterior.  For repeated uncertainty runs on the same analytic problem, keep
+GIP_PROBLEM_SEED fixed.  The stochastic finite-bank seed is GIP_SEED/SEED plus
+the run index when either is provided; if neither a seed nor a run-index variable
+is provided, it is drawn from OS entropy so repeated standalone invocations do
+not reuse identical banks.  To force literal MALA source/eval
 banks, set for example:
 
     export GIP_SOURCE_INIT=map_laplace
@@ -176,6 +177,49 @@ def _env_is_set(name):
     return name in os.environ and str(os.environ.get(name, "")).strip() != ""
 
 
+_RUN_INDEX_ENV_NAMES = ("RUN_INDEX", "REPLICATE", "REPLICA", "SLURM_ARRAY_TASK_ID", "PBS_ARRAY_INDEX")
+_RUN_SEED_ENV_NAMES = ("GIP_SEED", "SEED")
+
+
+def _first_env_int_or_none(names):
+    """Return the first explicitly set integer environment variable among names."""
+    for name in names:
+        raw = os.environ.get(name, None)
+        if raw is None or str(raw).strip() == "":
+            continue
+        return int(raw), name
+    return None, None
+
+
+def _resolve_stochastic_run_seed(problem_seed, run_index):
+    """Resolve the stochastic seed used for reference/evaluation banks.
+
+    The analytic target itself remains keyed only by GIP_PROBLEM_SEED.  The
+    stochastic finite-bank seed must change across uncertainty replicates.  In
+    particular, many Slurm wrappers export a fixed SEED to every array task; we
+    therefore fold RUN_INDEX / SLURM_ARRAY_TASK_ID into the effective seed even
+    when SEED is set.  If neither a seed nor a run-index environment variable is
+    provided, fall back to OS entropy so repeated standalone invocations do not
+    silently reuse the identical reference/evaluation banks.
+    """
+    seed_base, seed_source = _first_env_int_or_none(_RUN_SEED_ENV_NAMES)
+    _, run_index_source = _first_env_int_or_none(_RUN_INDEX_ENV_NAMES)
+    if seed_base is None:
+        if run_index_source is not None:
+            seed_base = int(problem_seed)
+            seed_source = "GIP_PROBLEM_SEED"
+        else:
+            seed_base = int(np.random.SeedSequence().generate_state(1, dtype=np.uint32)[0])
+            seed_source = "entropy"
+    disable_offset = _env_bool("GIP_DISABLE_RUN_INDEX_SEED_OFFSET", False)
+    offset = 0 if disable_offset else int(run_index)
+    # Keep seeds accepted by numpy/torch while preserving deterministic offsets.
+    effective = int((int(seed_base) + offset) % (2 ** 32 - 1))
+    if effective <= 0:
+        effective += 1
+    return effective, int(seed_base), seed_source, int(offset), bool(disable_offset)
+
+
 def _env_csv(name, default):
     raw = os.environ.get(name, None)
     if raw is None:
@@ -259,11 +303,11 @@ def _sanitize_label(label):
 # This keeps the operator, mixture centers, and exact logZ fixed across repeated
 # uncertainty runs while still varying finite reference/evaluation banks.
 PROBLEM_SEED = _env_int("GIP_PROBLEM_SEED", 42)
-RUN_INDEX = _first_env_int(
-    ("RUN_INDEX", "REPLICATE", "REPLICA", "SLURM_ARRAY_TASK_ID", "PBS_ARRAY_INDEX"),
-    0,
+RUN_INDEX = _first_env_int(_RUN_INDEX_ENV_NAMES, 0)
+seed, RUN_SEED_BASE, RUN_SEED_SOURCE, RUN_SEED_OFFSET, RUN_INDEX_SEED_OFFSET_DISABLED = _resolve_stochastic_run_seed(
+    PROBLEM_SEED,
+    RUN_INDEX,
 )
-seed = _first_env_int(("SEED", "GIP_SEED"), PROBLEM_SEED + RUN_INDEX)
 rng = np.random.default_rng(seed)
 
 ACTIVE_DIM = _env_int("GIP_DIM", 8)
@@ -554,7 +598,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
 print("\n=== Analytic four-component Gaussian-mixture inverse problem ===")
-print(f"d={ACTIVE_DIM}, m={OBS_DIM}, K=4, sigma={NOISE_STD:g}, seed={seed}")
+print(f"d={ACTIVE_DIM}, m={OBS_DIM}, K=4, sigma={NOISE_STD:g}, problem_seed={PROBLEM_SEED}, run_seed={seed}, run_index={RUN_INDEX}")
 print(f"operator singular values = {np.array2string(A_singular_values, precision=4)}")
 print(f"component separation = {COMPONENT_SEPARATION:g}")
 print(f"mixture prior weights = {np.array2string(component_prior_weights_np, precision=4)}")
@@ -1207,6 +1251,10 @@ else:
 problem_summary = OrderedDict([
     ("problem_seed", PROBLEM_SEED),
     ("run_seed", seed),
+    ("run_seed_base", RUN_SEED_BASE),
+    ("run_seed_source", RUN_SEED_SOURCE),
+    ("run_seed_offset", RUN_SEED_OFFSET),
+    ("run_index_seed_offset_disabled", RUN_INDEX_SEED_OFFSET_DISABLED),
     ("run_index", RUN_INDEX),
     ("operator_seed", OPERATOR_SEED),
     ("seed", seed),
@@ -1236,6 +1284,10 @@ save_reproducibility_log(
         ("run_results_dir", run_ctx["run_results_dir"]),
         ("GIP_PROBLEM_SEED", PROBLEM_SEED),
         ("SEED", seed),
+        ("RUN_SEED_BASE", RUN_SEED_BASE),
+        ("RUN_SEED_SOURCE", RUN_SEED_SOURCE),
+        ("RUN_SEED_OFFSET", RUN_SEED_OFFSET),
+        ("RUN_INDEX_SEED_OFFSET_DISABLED", RUN_INDEX_SEED_OFFSET_DISABLED),
         ("RUN_INDEX", RUN_INDEX),
         ("GIP_OPERATOR_SEED", OPERATOR_SEED),
         ("DENSITY_REF_SOURCE", DENSITY_REF_SOURCE),
