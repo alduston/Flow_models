@@ -94,9 +94,13 @@ if _orig_drc_method_pretty_name is not None:
         tokens = " ".join([label_s, display, init]).lower().replace("_", "-")
         if ("ce-hlsi" in tokens) or ("hlsi" in tokens) or ("lfgi" in tokens):
             return "LFGI"
+        if ("matrix" in tokens) or ("centered" in tokens):
+            return "MATRIX BLEND"
         pretty = _orig_drc_method_pretty_name(label, cfg)
         if ("CE-HLSI" in str(pretty)) or ("HLSI" in str(pretty)):
             return "LFGI"
+        if "MATRIX" in str(pretty).upper() or "CENTERED" in str(pretty).upper():
+            return "MATRIX BLEND"
         return pretty
 
     sampling._drc_method_pretty_name = _darcy_lfgi_drc_method_pretty_name
@@ -826,7 +830,7 @@ BUILD_GNL_BANKS = False
 # This benchmark matches the updated Navier-Stokes/Helmholtz wiring:
 #   1. build a MALA source bank for score signals and LFGI gate estimation,
 #   2. optionally build an independent MALA-EVAL bank for held-out density eval,
-#   3. run ratio-only DRC-R density nodes for Tweedie, Scalar Blend, and LFGI.
+#   3. run ratio-only DRC-R density nodes for Tweedie, Scalar Blend, Matrix Blend, and LFGI.
 # Each density node computes probability-flow log q and compares -log q against
 # the true unnormalized posterior energy -log pi at the configured eval points.
 def _env_int(name, default):
@@ -987,6 +991,7 @@ DENSITY_DRC_GRID_SAVE_PDF = _env_bool('IP_DENSITY_DRC_GRID_SAVE_PDF', True)
 # Hutchinson by default for speed unless explicitly overridden.
 DENSITY_TWEEDIE_DIVERGENCE = os.environ.get('IP_DENSITY_TWEEDIE_DIVERGENCE', 'auto')
 DENSITY_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_BLEND_DIVERGENCE', 'auto')
+DENSITY_MATRIX_BLEND_DIVERGENCE = os.environ.get('IP_DENSITY_MATRIX_BLEND_DIVERGENCE', DENSITY_BLEND_DIVERGENCE)
 DENSITY_LFGI_DIVERGENCE = os.environ.get('IP_DENSITY_LFGI_DIVERGENCE', 'auto')
 DENSITY_DIV_PROBES = _env_int('IP_DENSITY_DRC_DIV_PROBES', 1)
 
@@ -1158,6 +1163,7 @@ dashboard.add_text_page(
         f'DENSITY_DRC_PF_STEPS = {DENSITY_DRC_PF_STEPS}',
         f'DENSITY_TWEEDIE_DIVERGENCE = {DENSITY_TWEEDIE_DIVERGENCE}',
         f'DENSITY_BLEND_DIVERGENCE = {DENSITY_BLEND_DIVERGENCE}',
+        f'DENSITY_MATRIX_BLEND_DIVERGENCE = {DENSITY_MATRIX_BLEND_DIVERGENCE}',
         f'DENSITY_LFGI_DIVERGENCE = {DENSITY_LFGI_DIVERGENCE}',
         f'DENSITY_BASELINES = {DENSITY_BASELINES}',
         f'DENSITY_KNOWN_LOGZ = {DENSITY_KNOWN_LOGZ}',
@@ -1267,7 +1273,7 @@ def _density_eval_config(ref_source, score_init, divergence, label, display_name
         'drc_energy_save_logratio_residual_plots': DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         'drc_energy_save_legacy_alias': DENSITY_DRC_SAVE_LEGACY_ALIAS,
         'drc_energy_plot_layout': DENSITY_DRC_PLOT_LAYOUT,
-        'drc_energy_grid_method_order': ('DENS-LFGI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'),
+        'drc_energy_grid_method_order': ('DENS-LFGI', 'DENS-MatrixBlend', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace'),
         'drc_energy_grid_axis_reference': 'DENS-LFGI',
         'drc_energy_grid_max_points': DENSITY_DRC_GRID_MAX_POINTS,
         'drc_energy_grid_save_pdf': DENSITY_DRC_GRID_SAVE_PDF,
@@ -1331,6 +1337,10 @@ SAMPLER_CONFIGS.update(OrderedDict([
     ('DENS-ScalarBlend', _density_eval_config(
         DENSITY_REF_SOURCE, 'scalar_blend', DENSITY_BLEND_DIVERGENCE,
         'DENS-ScalarBlend', 'Scalar Blend',
+    )),
+    ('DENS-MatrixBlend', _density_eval_config(
+        DENSITY_REF_SOURCE, 'matrix_blend', DENSITY_MATRIX_BLEND_DIVERGENCE,
+        'DENS-MatrixBlend', 'MATRIX BLEND',
     )),
     ('DENS-LFGI', _density_eval_config(
         DENSITY_REF_SOURCE, 'ce_hlsi', DENSITY_LFGI_DIVERGENCE,
@@ -1397,11 +1407,11 @@ plot_mean_ess_logs(ess_logs, display_names=display_names)
 # MAP-Laplace row to test whether Darcy nonlinearity separates LFGI
 # from a local Gaussian approximation.
 def _first_density_eval_bank(precomp_dict):
-    for lab in ('DENS-LFGI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+    for lab in ('DENS-LFGI', 'DENS-MatrixBlend', 'DENS-Tweedie', 'DENS-ScalarBlend'):
         bank = precomp_dict.get('eval_banks', {}).get(lab)
         if bank is not None:
             return bank
-    for lab in ('DENS-LFGI', 'DENS-Tweedie', 'DENS-ScalarBlend'):
+    for lab in ('DENS-LFGI', 'DENS-MatrixBlend', 'DENS-Tweedie', 'DENS-ScalarBlend'):
         det = precomp_dict.get('drc_details', {}).get(lab)
         if det is not None:
             return {
@@ -1454,6 +1464,8 @@ def _darcy_density_label_alias(label):
     label_s = str(label)
     if label_s == 'DENS-CE-HLSI':
         return 'DENS-LFGI'
+    if label_s in {'DENS-CenteredBlend', 'DENS-CenteredMatrixBlend', 'DENS-Matrix-Blend'}:
+        return 'DENS-MatrixBlend'
     return label_s.replace('CE-HLSI', 'LFGI')
 
 
@@ -1468,7 +1480,7 @@ def _darcy_alias_drc_details(details):
 # The standard DRC comparison grid is created inside run_standard_sampler_pipeline,
 # before the closed-form MAP-Laplace baseline row exists. Regenerate the grid here
 # after inserting DENS-MAP-Laplace so the figure matches the metric table.
-density_grid_method_order = ('DENS-LFGI', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace')
+density_grid_method_order = ('DENS-LFGI', 'DENS-MatrixBlend', 'DENS-ScalarBlend', 'DENS-Tweedie', 'DENS-MAP-Laplace')
 if 'DENS-MAP-Laplace' in _darcy_alias_drc_details(precomp.get('drc_details', {})):
     try:
         all_drc_details = _darcy_alias_drc_details(precomp.get('drc_details', {}))
@@ -1573,13 +1585,13 @@ if drc_energy_tables:
     manuscript_density_df = _make_darcy_table4_density_table(
         drc_energy_df,
         display_names=display_names,
-        method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-LFGI', 'DENS-MAP-Laplace'),
+        method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-MatrixBlend', 'DENS-LFGI', 'DENS-MAP-Laplace'),
     )
     if manuscript_density_df.empty:
         manuscript_density_df = make_density_manuscript_table(
             drc_energy_df,
             display_names=display_names,
-            method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-LFGI', 'DENS-MAP-Laplace'),
+            method_order=('DENS-Tweedie', 'DENS-ScalarBlend', 'DENS-MatrixBlend', 'DENS-LFGI', 'DENS-MAP-Laplace'),
             include_known_z=DENSITY_KNOWN_LOGZ is not None,
         )
     print('\n=== Density/energy benchmark on configured density-eval bank ===')
