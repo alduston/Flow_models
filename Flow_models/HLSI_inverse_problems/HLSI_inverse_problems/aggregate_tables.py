@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate inverse-problem run tables, including Darcy density Table 4 metrics.
+"""Aggregate inverse-problem run tables into per-problem formatted CSVs.
 
 The legacy path is preserved: run-level ``*_metrics.csv`` files with shape
 ``metric | sampler1 | sampler2 | ...`` are aggregated to mean/std summaries.
@@ -15,6 +15,10 @@ The known-normalization calibration scripts write separate
 ``*_known_z_calibration_table.csv`` and
 ``*_known_z_density_energy_full.csv`` files.  Those are aggregated into
 mean/std calibration tables for the Sec. 12.6--12.7 known-Z controls.
+
+Outputs are written as formatted, copy-to-LaTeX CSVs under
+``meta_results/<problem>/``.  Numeric and tidy diagnostic CSVs are intentionally
+not emitted by default.
 """
 
 import argparse
@@ -297,45 +301,29 @@ def aggregate_legacy_metrics(problem_dir, output_dir):
 
     mean_wide = stats.pivot(index="metric", columns="sampler", values="mean")
     std_wide = stats.pivot(index="metric", columns="sampler", values="std")
-    n_wide = stats.pivot(index="metric", columns="sampler", values="n_runs")
     sampler_order = list(mean_wide.columns)
 
-    numeric_cols = {}
     formatted_cols = {}
     for sampler in sampler_order:
-        safe = sanitize(sampler)
-        numeric_cols["{}__mean".format(safe)] = mean_wide[sampler]
-        numeric_cols["{}__std".format(safe)] = std_wide[sampler]
-        numeric_cols["{}__n_runs".format(safe)] = n_wide[sampler]
         formatted_cols[sampler] = [
             format_mean_std(m, s) for m, s in zip(mean_wide[sampler].tolist(), std_wide[sampler].tolist())
         ]
 
-    numeric_out = pd.DataFrame(numeric_cols, index=mean_wide.index).reset_index()
     formatted_out = pd.DataFrame(formatted_cols, index=mean_wide.index).reset_index()
 
     unique_counts = sorted(set(int(x) for x in stats["n_runs"].dropna().tolist()))
     if len(unique_counts) == 1:
         formatted_out.insert(1, "n_runs", unique_counts[0])
 
-    tidy_out = stats.sort_values(["metric", "sampler"]).reset_index(drop=True)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    numeric_path = output_dir / "{}_meta_metrics_numeric.csv".format(problem_name)
-    formatted_path = output_dir / "{}_meta_metrics_formatted.csv".format(problem_name)
-    tidy_path = output_dir / "{}_meta_metrics_tidy.csv".format(problem_name)
-
-    numeric_out.to_csv(str(numeric_path), index=False)
+    problem_output_dir = output_dir / problem_name
+    problem_output_dir.mkdir(parents=True, exist_ok=True)
+    formatted_path = problem_output_dir / "meta_metrics.csv"
     formatted_out.to_csv(str(formatted_path), index=False)
-    tidy_out.to_csv(str(tidy_path), index=False)
 
     return {
         "n_files": len(csv_paths),
-        "numeric": numeric_path,
         "formatted": formatted_path,
-        "tidy": tidy_path,
     }
-
 
 def row_metric_value(row, aliases):
     for alias in aliases:
@@ -492,10 +480,8 @@ def aggregate_density_problem(problem_dir, output_dir):
 
     # Table 4 matrix, using canonical metrics and manuscript method order.
     method_names = sorted(stats["method"].unique().tolist(), key=method_sort_key)
-    numeric_rows = []
     formatted_rows = []
     for method in method_names:
-        numeric_row = OrderedDict([("Method", method)])
         formatted_row = OrderedDict([("Method", method)])
         run_counts = []
         for canonical, spec in TABLE4_METRICS.items():
@@ -507,10 +493,6 @@ def aggregate_density_problem(problem_dir, output_dir):
                 metric_rows = stats[(stats["method"] == method) & (stats["metric"].isin(aliases))]
             display = spec["display"]
             if metric_rows.empty:
-                numeric_row[display + "__mean"] = pd.NA
-                numeric_row[display + "__std"] = pd.NA
-                numeric_row[display + "__n_runs"] = pd.NA
-                numeric_row[display + "__within_run_std_mean"] = pd.NA
                 formatted_row[display] = ""
                 continue
             row = metric_rows.iloc[0]
@@ -518,39 +500,28 @@ def aggregate_density_problem(problem_dir, output_dir):
             std = row["std"]
             n_runs = int(row["n_runs"])
             run_counts.append(n_runs)
-            numeric_row[display + "__mean"] = mean
-            numeric_row[display + "__std"] = std
-            numeric_row[display + "__n_runs"] = n_runs
-            numeric_row[display + "__within_run_std_mean"] = row.get("within_run_std_mean", pd.NA)
             formatted_row[display] = format_mean_std(mean, std)
         if run_counts:
             unique_counts = sorted(set(run_counts))
             formatted_row["n_runs"] = unique_counts[0] if len(unique_counts) == 1 else ";".join(map(str, unique_counts))
-        numeric_rows.append(numeric_row)
         formatted_rows.append(formatted_row)
 
-    numeric_table4 = pd.DataFrame(numeric_rows)
     formatted_table4 = pd.DataFrame(formatted_rows)
     if "n_runs" in formatted_table4.columns:
         cols = ["Method", "n_runs"] + [c for c in formatted_table4.columns if c not in {"Method", "n_runs"}]
         formatted_table4 = formatted_table4[cols]
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tidy_path = output_dir / "{}_density_metrics_tidy.csv".format(problem_name)
-    table4_numeric_path = output_dir / "{}_density_table4_numeric.csv".format(problem_name)
-    table4_formatted_path = output_dir / "{}_density_table4_formatted.csv".format(problem_name)
-
-    stats.to_csv(str(tidy_path), index=False)
-    numeric_table4.to_csv(str(table4_numeric_path), index=False)
-    formatted_table4.to_csv(str(table4_formatted_path), index=False)
+    problem_output_dir = output_dir / problem_name
+    problem_output_dir.mkdir(parents=True, exist_ok=True)
+    formatted_path = problem_output_dir / "density_table4.csv"
+    formatted_table4.to_csv(str(formatted_path), index=False)
 
     return {
         "n_files": len(paths),
         "source_kind": source_kind,
-        "tidy": tidy_path,
-        "table4_numeric": table4_numeric_path,
-        "table4_formatted": table4_formatted_path,
+        "formatted": formatted_path,
     }
+
 
 
 
@@ -644,19 +615,14 @@ def aggregate_known_z_problem(problem_dir, output_dir):
     stats = stats.sort_values(["method", "metric"], key=lambda col: col.map(method_sort_key) if col.name == "method" else col)
 
     method_names = sorted(stats["method"].unique().tolist(), key=method_sort_key)
-    numeric_rows = []
     formatted_rows = []
     for method in method_names:
-        numeric_row = OrderedDict([("Method", method)])
         formatted_row = OrderedDict([("Method", method)])
         run_counts = []
         for canonical, spec in KNOWN_Z_METRICS.items():
             metric_rows = stats[(stats["method"] == method) & (stats["metric"] == canonical)]
             display = spec["display"]
             if metric_rows.empty:
-                numeric_row[display + "__mean"] = pd.NA
-                numeric_row[display + "__std"] = pd.NA
-                numeric_row[display + "__n_runs"] = pd.NA
                 formatted_row[display] = ""
                 continue
             row = metric_rows.iloc[0]
@@ -664,39 +630,27 @@ def aggregate_known_z_problem(problem_dir, output_dir):
             std = row["std"]
             n_runs = int(row["n_runs"])
             run_counts.append(n_runs)
-            numeric_row[display + "__mean"] = mean
-            numeric_row[display + "__std"] = std
-            numeric_row[display + "__n_runs"] = n_runs
             formatted_row[display] = format_mean_std(mean, std)
         if run_counts:
             unique_counts = sorted(set(run_counts))
             formatted_row["n_runs"] = unique_counts[0] if len(unique_counts) == 1 else ";".join(map(str, unique_counts))
-        numeric_rows.append(numeric_row)
         formatted_rows.append(formatted_row)
 
-    numeric_known_z = pd.DataFrame(numeric_rows)
     formatted_known_z = pd.DataFrame(formatted_rows)
     if "n_runs" in formatted_known_z.columns:
         cols = ["Method", "n_runs"] + [c for c in formatted_known_z.columns if c not in {"Method", "n_runs"}]
         formatted_known_z = formatted_known_z[cols]
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tidy_path = output_dir / f"{problem_name}_known_z_calibration_tidy.csv"
-    numeric_path = output_dir / f"{problem_name}_known_z_calibration_numeric.csv"
-    formatted_path = output_dir / f"{problem_name}_known_z_calibration_formatted.csv"
-
-    stats.to_csv(str(tidy_path), index=False)
-    numeric_known_z.to_csv(str(numeric_path), index=False)
+    problem_output_dir = output_dir / problem_name
+    problem_output_dir.mkdir(parents=True, exist_ok=True)
+    formatted_path = problem_output_dir / "known_z_calibration.csv"
     formatted_known_z.to_csv(str(formatted_path), index=False)
 
     return {
         "n_files": len(paths),
         "source_kind": source_kind,
-        "tidy": tidy_path,
-        "numeric": numeric_path,
         "formatted": formatted_path,
     }
-
 
 def aggregate_problem(problem_dir, output_dir):
     return {
@@ -709,10 +663,8 @@ def aggregate_problem(problem_dir, output_dir):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Aggregate inverse-problem run CSVs.  This preserves the legacy "
-            "*_metrics.csv mean/std summaries, aggregates density "
-            "*_drc_energy_*.csv files for Darcy Table 4 uncertainty, "
-            "and aggregates known-Z calibration outputs from problem_v2.py."
+            "Aggregate inverse-problem run CSVs into formatted, copy-to-LaTeX "
+            "tables under <outdir>/<problem>/ ."
         )
     )
     parser.add_argument(
@@ -725,7 +677,7 @@ def parse_args():
         "--outdir",
         type=str,
         default=None,
-        help="Directory where meta CSVs will be written (default: <root>/meta_results)",
+        help="Directory where per-problem formatted CSV folders will be written (default: <root>/meta_results)",
     )
     parser.add_argument(
         "--problems",
@@ -763,19 +715,13 @@ def main():
         any_found = True
         if legacy.get("n_files", 0):
             print("[ok]   {}: aggregated {} legacy metrics files".format(problem, legacy["n_files"]))
-            print("       numeric   -> {}".format(legacy["numeric"]))
-            print("       formatted -> {}".format(legacy["formatted"]))
-            print("       tidy      -> {}".format(legacy["tidy"]))
+            print("       table     -> {}".format(legacy["formatted"]))
         if density.get("n_files", 0):
             print("[ok]   {}: aggregated {} density files ({})".format(problem, density["n_files"], density["source_kind"]))
-            print("       tidy      -> {}".format(density["tidy"]))
-            print("       table4 numeric   -> {}".format(density["table4_numeric"]))
-            print("       table4 formatted -> {}".format(density["table4_formatted"]))
+            print("       table     -> {}".format(density["formatted"]))
         if known_z.get("n_files", 0):
             print("[ok]   {}: aggregated {} known-Z files ({})".format(problem, known_z["n_files"], known_z["source_kind"]))
-            print("       tidy      -> {}".format(known_z["tidy"]))
-            print("       numeric   -> {}".format(known_z["numeric"]))
-            print("       formatted -> {}".format(known_z["formatted"]))
+            print("       table     -> {}".format(known_z["formatted"]))
 
     if not any_found:
         print("No metrics, density, or known-Z CSV files were found. Check the root path and directory structure.")
