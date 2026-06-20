@@ -1539,6 +1539,174 @@ def eval_centered_matrix_blend_posterior_score(
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     return torch.nan_to_num(out, nan=0.0, posinf=clip, neginf=-clip)
 
+
+def _weighted_global_score_second_moment(s0_ref_cpu, log_weight_cpu=None, device_override=None,
+                                         ridge=1e-12):
+    """Global target-score second moment used by spatially uniform blends.
+
+    The DPSMC/MMCVSI and scalar-CVSI schedules are position-independent: the
+    same coefficient or matrix is used for every query at a fixed diffusion
+    time.  The only fitted object is the global target-score second moment
+    E[s0(X)s0(X)^T] under the static reference law.  In the common MALA-bank
+    density benchmark this is just an empirical moment over the MALA bank; if
+    nonuniform static weights are supplied, they are used through a softmax.
+    """
+    if s0_ref_cpu is None:
+        raise ValueError('spatially uniform blends require s0_ref_cpu.')
+    dev = device if device_override is None else device_override
+    s0 = s0_ref_cpu.to(dev, non_blocking=True)
+    if s0.ndim != 2:
+        raise ValueError(f's0_ref_cpu must have shape [n,d], got {tuple(s0.shape)}')
+    n, d = s0.shape
+    if n <= 0:
+        raise ValueError('spatially uniform blend moment bank is empty.')
+    if log_weight_cpu is None:
+        Ipi = (s0.transpose(0, 1) @ s0) / float(n)
+    else:
+        logw = log_weight_cpu.reshape(-1).to(dev, non_blocking=True, dtype=s0.dtype)
+        if logw.numel() != n:
+            raise ValueError(
+                f'log_weight_cpu has length {logw.numel()}, expected {n} for spatially uniform blend.'
+            )
+        logw = torch.nan_to_num(logw, nan=-float('inf'), posinf=0.0, neginf=-float('inf'))
+        m = torch.max(logw)
+        if not bool(torch.isfinite(m).detach().cpu().item()):
+            w = torch.full((n,), 1.0 / float(n), device=dev, dtype=s0.dtype)
+        else:
+            w = torch.exp(logw - m)
+            z = torch.sum(w).clamp(min=1e-300)
+            w = w / z
+        Ipi = s0.transpose(0, 1) @ (w.unsqueeze(1) * s0)
+    Ipi = 0.5 * (Ipi + Ipi.transpose(0, 1))
+    Ipi = torch.nan_to_num(Ipi, nan=0.0, posinf=0.0, neginf=0.0)
+    if ridge is not None and float(ridge) > 0.0:
+        eye = torch.eye(d, device=dev, dtype=s0.dtype)
+        Ipi = Ipi + float(ridge) * eye
+    return Ipi
+
+
+def _uniform_scalar_tweedie_weight_from_Ipi(Ipi, t, clamp=True):
+    """Return the spatially homogeneous scalar weight on Tweedie/DSI."""
+    t_val = _canonicalize_time(t)
+    lam_t = math.exp(-2.0 * t_val)
+    gamma_t = 1.0 - lam_t
+    d = int(Ipi.shape[-1])
+    tr_ipi = torch.diagonal(Ipi, dim1=-2, dim2=-1).sum().clamp(min=0.0)
+    denom = float(lam_t * max(d, 1)) + gamma_t * tr_ipi
+    alpha = (gamma_t * tr_ipi) / torch.clamp(denom, min=1e-300)
+    if bool(clamp):
+        alpha = alpha.clamp(0.0, 1.0)
+    return alpha
+
+
+def _uniform_matrix_tweedie_weight_from_Ipi(Ipi, t, ridge=1e-8, ridge_rel=1e-6,
+                                            clamp=True):
+    """Return the spatially homogeneous matrix weight on Tweedie/DSI."""
+    t_val = _canonicalize_time(t)
+    lam_t = math.exp(-2.0 * t_val)
+    gamma_t = 1.0 - lam_t
+    d = int(Ipi.shape[-1])
+    Ipi = 0.5 * (Ipi + Ipi.transpose(0, 1))
+    eig, V = _safe_single_symmetric_eigh(Ipi, label='uniform blend global score moment')
+    eig = torch.nan_to_num(eig, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+    tr_scale = float(torch.mean(eig).detach().cpu().item()) if eig.numel() else 0.0
+    ridge_eff = float(ridge) + float(ridge_rel) * max(tr_scale, 0.0)
+    a_eig = (gamma_t * eig) / torch.clamp(lam_t + gamma_t * eig + ridge_eff, min=1e-300)
+    if bool(clamp):
+        a_eig = a_eig.clamp(0.0, 1.0)
+    A = torch.einsum('ik,k,jk->ij', V, a_eig, V)
+    A = 0.5 * (A + A.transpose(0, 1))
+    return torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _eval_tweedie_tsi_posterior_means(
+    y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+    batch_size=REF_STREAM_BATCH,
+    transition_w='ou', P_ref_cpu=None, mu_ref_cpu=None, gated_info=None,
+):
+    """Return finite-bank Tweedie and TSI conditional means."""
+    if s0_post_ref_cpu is None:
+        raise ValueError('TSI-based blend requires s0_post_ref_cpu.')
+    t_val = _canonicalize_time(t)
+    et = math.exp(-t_val)
+    gamma = 1.0 - math.exp(-2.0 * t_val)
+    inv_gamma = 1.0 / gamma
+    inv_et = 1.0 / et
+    w = get_posterior_snis_weights(
+        y, t_val, X_ref_cpu, log_lik_ref_cpu, batch_size=batch_size,
+        transition_w=transition_w, P_ref_cpu=P_ref_cpu,
+        mu_ref_cpu=mu_ref_cpu, gated_info=gated_info,
+    )
+    s_twd = torch.zeros_like(y)
+    s_tsi = torch.zeros_like(y)
+    for i in range(0, X_ref_cpu.shape[0], batch_size):
+        sl = slice(i, i + batch_size)
+        w_batch = w[:, sl]
+        X_batch = X_ref_cpu[sl].to(y.device, non_blocking=True)
+        s0_batch = s0_post_ref_cpu[sl].to(y.device, non_blocking=True)
+        b_batch = -(y.unsqueeze(1) - et * X_batch.unsqueeze(0)) * inv_gamma
+        c_batch = s0_batch.unsqueeze(0) * inv_et
+        s_twd += torch.einsum('mb,mbd->md', w_batch, b_batch)
+        s_tsi += torch.einsum('mb,mbd->md', w_batch, c_batch)
+        del w_batch, X_batch, s0_batch, b_batch, c_batch
+    del w
+    return s_twd, s_tsi
+
+
+def eval_uniform_scalar_blend_posterior_score(
+    y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+    batch_size=REF_STREAM_BATCH,
+    transition_w='ou', P_ref_cpu=None, mu_ref_cpu=None, gated_info=None,
+    gate_s0_post_ref_cpu=None, gate_log_lik_ref_cpu=None,
+    ridge=1e-12, clamp=True,
+):
+    """Spatially homogeneous scalar blend for density/sampling benchmarks.
+
+    The output is alpha_t * Tweedie + (1-alpha_t) * TSI, where alpha_t is fitted
+    once per t from the global target-score moment and is independent of y.
+    """
+    s_twd, s_tsi = _eval_tweedie_tsi_posterior_means(
+        y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+        batch_size=batch_size, transition_w=transition_w,
+        P_ref_cpu=P_ref_cpu, mu_ref_cpu=mu_ref_cpu, gated_info=gated_info,
+    )
+    moment_s0 = s0_post_ref_cpu if gate_s0_post_ref_cpu is None else gate_s0_post_ref_cpu
+    moment_logw = log_lik_ref_cpu if gate_log_lik_ref_cpu is None else gate_log_lik_ref_cpu
+    Ipi = _weighted_global_score_second_moment(
+        moment_s0, moment_logw, device_override=y.device, ridge=ridge,
+    )
+    alpha = _uniform_scalar_tweedie_weight_from_Ipi(Ipi, t, clamp=clamp)
+    return torch.nan_to_num(s_tsi + alpha * (s_twd - s_tsi), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def eval_uniform_matrix_blend_posterior_score(
+    y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+    batch_size=REF_STREAM_BATCH,
+    transition_w='ou', P_ref_cpu=None, mu_ref_cpu=None, gated_info=None,
+    gate_s0_post_ref_cpu=None, gate_log_lik_ref_cpu=None,
+    ridge=1e-8, ridge_rel=1e-6, clamp=True,
+):
+    """Spatially homogeneous DPSMC/MMCVSI matrix blend for density benchmarks.
+
+    A single matrix A_t, estimated from a global target-score moment, is shared
+    across every query y at fixed t.  The output is TSI + A_t(Tweedie-TSI).
+    """
+    s_twd, s_tsi = _eval_tweedie_tsi_posterior_means(
+        y, t, X_ref_cpu, s0_post_ref_cpu, log_lik_ref_cpu,
+        batch_size=batch_size, transition_w=transition_w,
+        P_ref_cpu=P_ref_cpu, mu_ref_cpu=mu_ref_cpu, gated_info=gated_info,
+    )
+    moment_s0 = s0_post_ref_cpu if gate_s0_post_ref_cpu is None else gate_s0_post_ref_cpu
+    moment_logw = log_lik_ref_cpu if gate_log_lik_ref_cpu is None else gate_log_lik_ref_cpu
+    Ipi = _weighted_global_score_second_moment(
+        moment_s0, moment_logw, device_override=y.device, ridge=0.0,
+    )
+    A = _uniform_matrix_tweedie_weight_from_Ipi(
+        Ipi, t, ridge=ridge, ridge_rel=ridge_rel, clamp=clamp,
+    )
+    return torch.nan_to_num(s_tsi + torch.einsum('ij,mj->mi', A, s_twd - s_tsi),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+
 def eval_score_batched(y, t, X_ref_cpu, s0_ref_cpu, log_lik_ref_cpu,
                        batch_size=REF_STREAM_BATCH, mode='blend_posterior'):
     """
@@ -2058,7 +2226,8 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
                       gate_mu_ref=None, gate_gated_info=None,
                       matrix_blend_center=True, matrix_blend_ridge=1e-8,
                       matrix_blend_ridge_rel=1e-6, matrix_blend_sym_gate=False,
-                      matrix_blend_gate_clip=1e6):
+                      matrix_blend_gate_clip=1e6,
+                      uniform_blend_clamp=True):
     """
     No-CFG wrapper: returns only the conditional/posterior score estimate.
 
@@ -2084,6 +2253,28 @@ def get_score_wrapper(y, t, mode, X_ref, s0_post_ref, log_lik_ref,
         score = eval_blend_posterior_score(
             y, t_val, X_ref, s0_post_ref, log_lik_ref,
             batch_size=REF_STREAM_BATCH)
+
+    elif mode == 'uniform_scalar_blend':
+        score = eval_uniform_scalar_blend_posterior_score(
+            y, t_val, X_ref, s0_post_ref, log_lik_ref,
+            batch_size=REF_STREAM_BATCH,
+            transition_w=transition_w, P_ref_cpu=P_ref, mu_ref_cpu=mu_ref, gated_info=gated_info,
+            gate_s0_post_ref_cpu=gate_s0_post_ref,
+            gate_log_lik_ref_cpu=gate_log_lik_ref,
+            ridge=matrix_blend_ridge,
+            clamp=uniform_blend_clamp,
+        )
+
+    elif mode == 'uniform_matrix_blend':
+        score = eval_uniform_matrix_blend_posterior_score(
+            y, t_val, X_ref, s0_post_ref, log_lik_ref,
+            batch_size=REF_STREAM_BATCH,
+            transition_w=transition_w, P_ref_cpu=P_ref, mu_ref_cpu=mu_ref, gated_info=gated_info,
+            gate_s0_post_ref_cpu=gate_s0_post_ref,
+            gate_log_lik_ref_cpu=gate_log_lik_ref,
+            ridge=matrix_blend_ridge, ridge_rel=matrix_blend_ridge_rel,
+            clamp=uniform_blend_clamp,
+        )
 
     elif mode == 'centered_matrix_blend':
         score = eval_centered_matrix_blend_posterior_score(
@@ -2145,6 +2336,8 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
 
       * Tweedie: mode='tweedie'
       * scalar blend: mode='blend_posterior'
+      * spatially uniform scalar blend: mode='uniform_scalar_blend'
+      * spatially uniform matrix blend: mode='uniform_matrix_blend'
       * matrix blend: mode='centered_matrix_blend'
       * HLSI / CE-HLSI / leaf / TL variants
 
@@ -2158,7 +2351,8 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
         return None
     mode = canonicalize_init_name(cfg.get('init'))
     supported = {
-        'tweedie', 'blend_posterior', 'centered_matrix_blend',
+        'tweedie', 'blend_posterior', 'uniform_scalar_blend',
+        'uniform_matrix_blend', 'centered_matrix_blend',
         'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
         'gnl_hlsi', 'gnl_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
     }
@@ -2239,11 +2433,11 @@ def _make_frozen_density_score_spec(label, cfg, local_bank, init_log_weights, fi
         'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi',
         'gnl_hlsi', 'gnl_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi',
     }
-    if mode == 'centered_matrix_blend':
+    if mode in {'centered_matrix_blend', 'uniform_scalar_blend', 'uniform_matrix_blend'}:
         if spec.get('s0_post_ref') is None:
-            raise KeyError(f"Frozen density score spec for matrix blend is missing s0_post_ref. Available local_bank keys: {sorted(local_bank.keys())}")
+            raise KeyError(f"Frozen density score spec for blend mode={mode!r} is missing s0_post_ref. Available local_bank keys: {sorted(local_bank.keys())}")
         if gate_local_bank is not None and spec.get('gate_s0_post_ref') is None:
-            raise KeyError(f"Frozen density score spec for separate-gate matrix blend is missing gate_s0_post_ref. Available gate bank keys: {sorted(gate_local_bank.keys())}")
+            raise KeyError(f"Frozen density score spec for separate-gate blend mode={mode!r} is missing gate_s0_post_ref. Available gate bank keys: {sorted(gate_local_bank.keys())}")
 
     if mode in hlsi_family:
         missing = [k for k in ('P_ref', 'mu_ref') if k not in spec or spec[k] is None]
@@ -2621,8 +2815,9 @@ def _eval_score_and_divergence_from_frozen_spec(y, t, spec, divergence_mode='aut
         raise ValueError(
             "Requested drc_divergence='analytic', but the frozen score spec does not "
             "support an analytic divergence. Currently supported: Tweedie and "
-            "CE-HLSI-family modes with transition_w='ou'. For scalar blend, use "
-            "drc_divergence='coordinate_fd' or 'hutchinson'."
+            "CE-HLSI-family modes with transition_w='ou'. For scalar, uniform scalar, "
+            "uniform matrix, or centered matrix blend, use drc_divergence='coordinate_fd' "
+            "or 'hutchinson'."
         )
 
     if mode == 'coordinate_fd':
@@ -2894,6 +3089,10 @@ def _drc_method_pretty_name(label, cfg=None):
     low = label_str.lower()
     if init in {'ce_hlsi', 'hlsi_posterior', 'leaf_ce_hlsi', 'gnl_ce_hlsi'} or 'ce-hlsi' in low or 'hlsi' in low or 'lfgi' in low:
         return 'LFGI'
+    if init == 'uniform_matrix_blend' or 'uniform-matrix' in low or 'unif-matrix' in low:
+        return 'UNIF. MATRIX BLEND'
+    if init == 'uniform_scalar_blend' or 'uniform-scalar' in low or 'unif-scalar' in low:
+        return 'UNIF. SCALAR BLEND'
     if init == 'centered_matrix_blend' or 'matrix' in low:
         return 'MATRIX BLEND'
     if init in {'scalar_blend', 'blend_posterior'} or 'blend' in low:
@@ -4323,7 +4522,7 @@ def _estimate_sampler_pde_eval_counts(cfg, n_ref=0, n_samples=None):
 
     if init_mode == 'tweedie':
         counts['pde_likelihood_evals'] += n_ref
-    elif init_mode in {'blend_posterior', 'centered_matrix_blend'}:
+    elif init_mode in {'blend_posterior', 'uniform_scalar_blend', 'uniform_matrix_blend', 'centered_matrix_blend'}:
         counts['pde_likelihood_evals'] += n_ref
         counts['pde_score_evals'] += n_ref
     elif init_mode in {'hlsi_posterior', 'ce_hlsi', 'leaf_hlsi', 'leaf_ce_hlsi', 'tl_hlsi', 'leaf_tl_hlsi', 'ref_laplace', 'drc_ratio_update'}:
@@ -5464,6 +5663,31 @@ INIT_ALIASES = {
     _normalize_sampler_key('scalar-blend'): 'blend_posterior',
     _normalize_sampler_key('scalar_blend'): 'blend_posterior',
     _normalize_sampler_key('scalar blend'): 'blend_posterior',
+    _normalize_sampler_key('unif-scalar-blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('unif_scalar_blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('unif scalar blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('uniform-scalar-blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('uniform_scalar_blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('uniform scalar blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('spatially-homogeneous-scalar-blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('spatially homogeneous scalar blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('global-scalar-blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('global_scalar_blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('global scalar blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('cvsi-scalar'): 'uniform_scalar_blend',
+    _normalize_sampler_key('mcvsi-scalar'): 'uniform_scalar_blend',
+    _normalize_sampler_key('kahouli-scalar-blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('kahouli_scalar_blend'): 'uniform_scalar_blend',
+    _normalize_sampler_key('unif-matrix-blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('unif_matrix_blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('unif matrix blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('uniform-matrix-blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('uniform_matrix_blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('uniform matrix blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('spatially-homogeneous-matrix-blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('spatially homogeneous matrix blend'): 'uniform_matrix_blend',
+    _normalize_sampler_key('mmcvsi-matrix'): 'uniform_matrix_blend',
+    _normalize_sampler_key('matrix-mmcvsi'): 'uniform_matrix_blend',
     _normalize_sampler_key('matrix-blend'): 'centered_matrix_blend',
     _normalize_sampler_key('matrix_blend'): 'centered_matrix_blend',
     _normalize_sampler_key('matrix blend'): 'centered_matrix_blend',
@@ -5535,6 +5759,8 @@ INIT_DISPLAY_NAMES = {
     'prior': 'Prior',
     'tweedie': 'Tweedie',
     'blend_posterior': 'Blend',
+    'uniform_scalar_blend': 'UNIF. SCALAR BLEND',
+    'uniform_matrix_blend': 'UNIF. MATRIX BLEND',
     'centered_matrix_blend': 'MATRIX BLEND',
     'ref_laplace': 'Ref_Laplace',
     'map_laplace': 'MAP_Laplace',
@@ -6445,7 +6671,10 @@ def _config_uses_ce_gate_bank(cfg):
         mode = canonicalize_init_name(mode)
     except Exception:
         return False
-    return mode in {'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi', 'centered_matrix_blend'}
+    return mode in {
+        'ce_hlsi', 'leaf_ce_hlsi', 'gnl_ce_hlsi', 'centered_matrix_blend',
+        'uniform_scalar_blend', 'uniform_matrix_blend',
+    }
 
 
 
@@ -6581,7 +6810,8 @@ def _run_drc_ratio_update_config(label, cfg, prior_model, lik_model, precomp,
     # The proposal/density model estimated by this DRC-R node is configurable.
     # Backwards-compatible default: CE-HLSI with cfg['init_weights'], which matches
     # the original alternating DRC implementation.  For density benchmarks, set
-    # e.g. drc_score_init='tweedie' or 'blend_posterior' and usually
+    # e.g. drc_score_init='tweedie', 'blend_posterior', 'uniform_scalar_blend',
+    # 'uniform_matrix_blend', and usually
     # drc_score_init_weights='None' when ref_source is already a MALA posterior bank.
     score_init = canonicalize_init_name(cfg.get('drc_score_init', 'ce_hlsi'))
     score_weights = canonicalize_init_weights(
@@ -7172,7 +7402,7 @@ def summarize_sampler_run(sampler_run_info):
         init_weights = info.get('init_weights', 'prior')
         gate_family = info.get('gate_family', '-')
         gate_bits = ''
-        if init_mode not in {'prior', 'tweedie', 'blend_posterior', 'ref_laplace', 'map_laplace'}:
+        if init_mode not in {'prior', 'tweedie', 'blend_posterior', 'uniform_scalar_blend', 'uniform_matrix_blend', 'ref_laplace', 'map_laplace'}:
             gate_bits = (
                 f" | gate={gate_family}"
                 f" | rho={info.get('gate_rho', '-') }"
@@ -7519,6 +7749,8 @@ def results_method_family(label, info):
     family_map = {
         'tweedie': 'Tweedie',
         'blend_posterior': 'Blend',
+        'uniform_scalar_blend': 'UNIF. SCALAR BLEND',
+        'uniform_matrix_blend': 'UNIF. MATRIX BLEND',
         'centered_matrix_blend': 'MATRIX BLEND',
         'ref_laplace': 'Ref_Laplace',
         'hlsi_posterior': 'HLSI',
