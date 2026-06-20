@@ -53,7 +53,7 @@ Environment knobs:
   * LFGI_BENCH_MALA_STATIONARITY_STEP_SIZE overrides the exact-MALA refresh step.
     If unset, hard inverse targets use conservative target-specific defaults.
   * METHODS or LFGI_BENCH_METHODS: comma-separated sampler list, e.g.
-      METHODS=tweedie,scalar_blend,plugin_blend,centered_blend,lfgi,gn_lfgi
+      METHODS=tweedie,unif_scalar_blend,scalar_blend,unif_matrix_blend,centered_blend,lfgi,gn_lfgi
   * LFGI_BENCH_SCORE_RMSE=0/1
   * LFGI_BENCH_AUX_METRICS=0/1
   * LFGI_BENCH_CURL=0/1
@@ -420,6 +420,24 @@ SAMPLER_CONFIGS = OrderedDict([
         'family': 'blend',
         'transition_w': 'ou',
     }),
+    ('unif-scalar-blend', {
+        # Spatially homogeneous scalar control-variate blend.  The coefficient
+        # depends on t only and is estimated from the global target-score
+        # second moment, matching the scalar CVSI/MCVSI schedule.
+        'family': 'uniform-scalar-blend',
+        'transition_w': 'ou',
+        'ridge': DPSMC_GLOBAL_BLEND_RIDGE,
+        'clamp': DPSMC_GLOBAL_BLEND_CLAMP,
+    }),
+    ('unif-matrix-blend', {
+        # Spatially homogeneous DPSMC/MMCVSI matrix blend.  One matrix schedule
+        # A_t is estimated from a global target-score moment and shared across
+        # all query points at the same t.
+        'family': 'uniform-matrix-blend',
+        'transition_w': 'ou',
+        'ridge': DPSMC_GLOBAL_BLEND_RIDGE,
+        'clamp': DPSMC_GLOBAL_BLEND_CLAMP,
+    }),
     ('plugin-matrix-blend', {
         # Uncentered plug-in normal-equation estimator of the local optimal
         # operator-valued gate:
@@ -574,6 +592,32 @@ _SAMPLER_ALIASES = {
     'scalar-blend': 'blend',
     'scalar_blend': 'blend',
     'scalar blend': 'blend',
+    'unif-scalar-blend': 'unif-scalar-blend',
+    'unif_scalar_blend': 'unif-scalar-blend',
+    'unif scalar blend': 'unif-scalar-blend',
+    'uniform-scalar-blend': 'unif-scalar-blend',
+    'uniform_scalar_blend': 'unif-scalar-blend',
+    'uniform scalar blend': 'unif-scalar-blend',
+    'spatially-homogeneous-scalar-blend': 'unif-scalar-blend',
+    'spatially homogeneous scalar blend': 'unif-scalar-blend',
+    'global-scalar-blend': 'unif-scalar-blend',
+    'global_scalar_blend': 'unif-scalar-blend',
+    'global scalar blend': 'unif-scalar-blend',
+    'mcvsi-scalar': 'unif-scalar-blend',
+    'scalar-mcvsi': 'unif-scalar-blend',
+    'cvsi-scalar': 'unif-scalar-blend',
+    'kahouli-scalar-blend': 'unif-scalar-blend',
+    'kahouli_scalar_blend': 'unif-scalar-blend',
+    'unif-matrix-blend': 'unif-matrix-blend',
+    'unif_matrix_blend': 'unif-matrix-blend',
+    'unif matrix blend': 'unif-matrix-blend',
+    'uniform-matrix-blend': 'unif-matrix-blend',
+    'uniform_matrix_blend': 'unif-matrix-blend',
+    'uniform matrix blend': 'unif-matrix-blend',
+    'spatially-homogeneous-matrix-blend': 'unif-matrix-blend',
+    'spatially homogeneous matrix blend': 'unif-matrix-blend',
+    'mmcvsi-matrix': 'unif-matrix-blend',
+    'matrix-mmcvsi': 'unif-matrix-blend',
     'plugin-matrix-blend': 'plugin-matrix-blend',
     'plugin_matrix_blend': 'plugin-matrix-blend',
     'plugin matrix blend': 'plugin-matrix-blend',
@@ -818,7 +862,7 @@ def resolve_sampler_configs(methods=None):
 
 def sampler_needs_base_precomp(cfg):
     family = cfg.get('family')
-    if family in {'blend', 'tsi', 'primal-matrix-blend', 'dpsmc-matrix-blend'}:
+    if family in {'blend', 'uniform-scalar-blend', 'uniform-matrix-blend', 'tsi', 'primal-matrix-blend', 'dpsmc-matrix-blend'}:
         return True
     if family == 'hlsi':
         return cfg.get('hlsi_gate_mode') in {'base', 'leaf', 'adaptive-leaf'}
@@ -4243,6 +4287,69 @@ def _dpsmc_global_A_from_Ipi(Ipi, t, ridge=1e-8, clamp=True):
     return sym(torch.einsum('ij,j,kj->ik', evecs, a_eigs, evecs))
 
 
+def _uniform_global_scalar_alpha_from_Ipi(Ipi, t, clamp=True):
+    """Return the spatially homogeneous scalar CV weight on Tweedie/DSI.
+
+    In the OU convention used here, lambda_t=a_t^2 and 1-lambda_t=v_t.
+    For a standard Gaussian base, the scalar CVSI/MCVSI schedule is
+
+        alpha_t = v_t Tr(I_pi) / (a_t^2 d + v_t Tr(I_pi)),
+
+    where I_pi is the target score covariance/Fisher matrix.  The score
+    estimator is (1-alpha_t) TSI + alpha_t Tweedie.
+    """
+    d = int(Ipi.shape[-1])
+    lam_t = (at(t) ** 2).clamp(min=1e-30)
+    v_t = vt(t).clamp(min=1e-30)
+    tr_ipi = torch.diagonal(Ipi, dim1=-2, dim2=-1).sum().clamp(min=0.0)
+    alpha = (v_t * tr_ipi) / (lam_t * float(max(d, 1)) + v_t * tr_ipi).clamp(min=1e-30)
+    if clamp:
+        alpha = alpha.clamp(0.0, 1.0)
+    return alpha
+
+
+def est_uniform_scalar_blend(y, t, xr, w, target, s0_ref=None, moment_s0_ref=None,
+                             ridge=DPSMC_GLOBAL_BLEND_RIDGE,
+                             clamp=DPSMC_GLOBAL_BLEND_CLAMP):
+    """Spatially homogeneous scalar blend of Tweedie and TSI.
+
+    This is the scalar counterpart of the DPSMC/MMCVSI schedule: one scalar
+    alpha_t is estimated from a global target-score moment and shared across
+    all query locations at the same t.
+    """
+    a, v = at(t), vt(t)
+    s0 = target.score(xr) if s0_ref is None else s0_ref
+    moment_s0 = s0 if moment_s0_ref is None else moment_s0_ref
+    tsi_atom = s0.unsqueeze(0) / a
+    twd_atom = -(y.unsqueeze(1) - a * xr.unsqueeze(0)) / v
+    s_tsi = (w.unsqueeze(2) * tsi_atom).sum(1)
+    s_twd = (w.unsqueeze(2) * twd_atom).sum(1)
+    Ipi = _dpsmc_global_Ipi_reference(moment_s0)
+    alpha = _uniform_global_scalar_alpha_from_Ipi(Ipi, t, clamp=clamp)
+    return s_tsi + alpha * (s_twd - s_tsi)
+
+
+def est_uniform_matrix_blend(y, t, xr, w, target, s0_ref=None, moment_s0_ref=None,
+                             ridge=DPSMC_GLOBAL_BLEND_RIDGE,
+                             clamp=DPSMC_GLOBAL_BLEND_CLAMP):
+    """Spatially homogeneous matrix blend of Tweedie and TSI.
+
+    This is the reference-bank global-moment version of the DPSMC/MMCVSI
+    matrix schedule.  The matrix A_t depends on t but not on the query y and
+    is applied as TSI + A_t(Tweedie - TSI).
+    """
+    a, v = at(t), vt(t)
+    s0 = target.score(xr) if s0_ref is None else s0_ref
+    moment_s0 = s0 if moment_s0_ref is None else moment_s0_ref
+    tsi_atom = s0.unsqueeze(0) / a
+    twd_atom = -(y.unsqueeze(1) - a * xr.unsqueeze(0)) / v
+    s_tsi = (w.unsqueeze(2) * tsi_atom).sum(1)
+    s_twd = (w.unsqueeze(2) * twd_atom).sum(1)
+    Ipi = _dpsmc_global_Ipi_reference(moment_s0)
+    A = _dpsmc_global_A_from_Ipi(Ipi, t, ridge=ridge, clamp=clamp)
+    return s_tsi + torch.einsum('ij,bj->bi', A, s_twd - s_tsi)
+
+
 def est_dpsmc_matrix_blend(y, t, xr, w, target, s0_ref=None, cov='snis',
                            ridge=DPSMC_GLOBAL_BLEND_RIDGE,
                            clamp=DPSMC_GLOBAL_BLEND_CLAMP):
@@ -5876,6 +5983,10 @@ def run(target, out_dir='outputs', methods=None):
         cfg.get('family') == 'primal-matrix-blend'
         for cfg in sampler_configs.values()
     )
+    need_uniform_global_gate = any(
+        cfg.get('family') in {'uniform-scalar-blend', 'uniform-matrix-blend'}
+        for cfg in sampler_configs.values()
+    )
     need_base_leaf_gate = GATE_BANK_SEPARATE and any(
         cfg.get('family') == 'hlsi'
         and canonical_gate_law(cfg.get('hlsi_gate_law', 'dirac')) == 'CE'
@@ -5957,8 +6068,8 @@ def run(target, out_dir='outputs', methods=None):
             gpu_log(f'after gate Hessian precompute [{_source}]')
         precomp_gate = precomp_gate_by_source.get('true', next(iter(precomp_gate_by_source.values()), None))
 
-    if need_primal_matrix_gate and GATE_BANK_SEPARATE and precomp_gate is None:
-        print(f"\n[2m] Precomputing separate primal moment-gate scores (NG={NG}) …")
+    if (need_primal_matrix_gate or need_uniform_global_gate) and GATE_BANK_SEPARATE and precomp_gate is None:
+        print(f"\n[2m] Precomputing separate moment-gate/global-blend scores (NG={NG}) …")
         gpu_log('before primal gate score precompute', reset_peak=True)
         t0 = time.time()
         s0_gate_only = target.score(xg)
@@ -6094,6 +6205,26 @@ def run(target, out_dir='outputs', methods=None):
             if family == 'blend':
                 s0_ref = precomp['s0'] if precomp is not None else None
                 return est_blended(y, t, xr, w_ou, target, s0_ref=s0_ref)
+            if family in {'uniform-scalar-blend', 'uniform-matrix-blend'}:
+                s0_ref = precomp['s0'] if precomp is not None else None
+                moment_s0_ref = s0_ref
+                if GATE_BANK_SEPARATE:
+                    moment_s0_ref = precomp_gate['s0'] if precomp_gate is not None else s0_gate_only
+                    if moment_s0_ref is None:
+                        moment_s0_ref = target.score(xg)
+                if family == 'uniform-scalar-blend':
+                    return est_uniform_scalar_blend(
+                        y, t, xr, w_ou, target, s0_ref=s0_ref,
+                        moment_s0_ref=moment_s0_ref,
+                        ridge=float(cfg.get('ridge', DPSMC_GLOBAL_BLEND_RIDGE)),
+                        clamp=bool(cfg.get('clamp', DPSMC_GLOBAL_BLEND_CLAMP)),
+                    )
+                return est_uniform_matrix_blend(
+                    y, t, xr, w_ou, target, s0_ref=s0_ref,
+                    moment_s0_ref=moment_s0_ref,
+                    ridge=float(cfg.get('ridge', DPSMC_GLOBAL_BLEND_RIDGE)),
+                    clamp=bool(cfg.get('clamp', DPSMC_GLOBAL_BLEND_CLAMP)),
+                )
             if family == 'primal-matrix-blend':
                 s0_ref = precomp['s0'] if precomp is not None else None
                 if GATE_BANK_SEPARATE:
@@ -7016,7 +7147,7 @@ def build_meta_summary_lines(all_results, methods):
             if 'blend' not in res:
                 continue
             rb = res['blend']
-            for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'dpsmc-matrix-blend', 'dpsmc-ref-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi', 'gn_lfgi'):
+            for target_name in ('unif-scalar-blend', 'unif-matrix-blend', 'plugin-matrix-blend', 'centered-matrix-blend', 'dpsmc-matrix-blend', 'dpsmc-ref-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi', 'gn_lfgi'):
                 if target_name not in res:
                     continue
                 rl = res[target_name]
@@ -7095,6 +7226,8 @@ _apply_publication_rcparams()
 PAPER_METHOD_LABELS = {
     'tweedie': 'TWEEDIE',
     'blend': 'SCALAR BLEND',
+    'unif-scalar-blend': 'UNIF. SCALAR BLEND',
+    'unif-matrix-blend': 'UNIF. MATRIX BLEND',
     'plugin-matrix-blend': 'PLUGIN MATRIX BLEND',
     'centered-matrix-blend': 'MATRIX BLEND',
     'primal-matrix-blend': 'PLUGIN MATRIX BLEND',
@@ -7166,6 +7299,8 @@ def _style_publication_axis(ax, *, grid=True):
 COLORS = {
     'tweedie':           '#D62728',
     'blend':             '#1F77B4',
+    'unif-scalar-blend':  '#7F7F7F',
+    'unif-matrix-blend':  '#000000',
     'plugin-matrix-blend': '#FF7F0E',
     'centered-matrix-blend': '#9467BD',
     'primal-matrix-blend': '#FF7F0E',
@@ -7206,6 +7341,8 @@ MARKERS = {
     'surrogate_leaf_ce-hlsi': '<', 'mp-leaf_hlsi': 'p',
     'mp-leaf_ce-hlsi': '*', 'adaptive-mp-ce': '8', 'asym-adaptive-mp-ce': 'd',
     'asym-adaptive-mp-ce-static': 'd', 'asym-adaptive-mp-ce-conditional': 'D', 'blend': 's',
+    'unif-scalar-blend': 'P',
+    'unif-matrix-blend': 'x',
     'plugin-matrix-blend': 'v',
     'centered-matrix-blend': '^',
     'primal-matrix-blend': 'v',
@@ -7670,7 +7807,7 @@ def meta_run(root_dir='outputs_stress_test',
         if 'blend' not in res:
             continue
         rb = res['blend']
-        for target_name in ('plugin-matrix-blend', 'centered-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi', 'gn_lfgi'):
+        for target_name in ('unif-scalar-blend', 'unif-matrix-blend', 'plugin-matrix-blend', 'centered-matrix-blend', 'leaf_ce-hlsi', 'mp-leaf_ce-hlsi', 'adaptive-mp-ce', 'asym-adaptive-mp-ce', 'asym-adaptive-mp-ce-static', 'asym-adaptive-mp-ce-conditional', 'ce-hlsi', 'gn_lfgi'):
             if target_name not in res:
                 continue
             rl = res[target_name]
