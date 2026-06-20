@@ -28,6 +28,7 @@ Useful overrides:
     export IP_DENSITY_EVAL_SOURCE=POSTERIOR-EVAL
     export IP_DENSITY_DRC_PF_STEPS=64
     export IP_DENSITY_DRC_PLOT_LAYOUT=comparison_grid
+    export HLSI_SAMPLING_MODULE=sampling_uniform_blends  # or merge helper into sampling.py
 
 By default the source and held-out evaluation banks are drawn from the exact
 Gaussian-mixture posterior.  For repeated uncertainty runs on the same analytic problem, keep
@@ -84,8 +85,22 @@ import torch
 linecache.clearcache()
 if "sampling" in sys.modules:
     del sys.modules["sampling"]
-SAMPLING_MODULE_NAME = os.environ.get("HLSI_SAMPLING_MODULE", "sampling")
-sampling = importlib.import_module(SAMPLING_MODULE_NAME)
+if "HLSI_SAMPLING_MODULE" in os.environ:
+    SAMPLING_MODULE_NAME = os.environ["HLSI_SAMPLING_MODULE"]
+    sampling = importlib.import_module(SAMPLING_MODULE_NAME)
+else:
+    # Patched comparison scripts prefer the suffixed shared harness that contains
+    # spatially uniform scalar/matrix blends, but fall back to repository
+    # sampling.py so the script remains usable after the helper is merged.
+    _sampling_import_errors = []
+    for SAMPLING_MODULE_NAME in ("sampling_uniform_blends", "sampling"):
+        try:
+            sampling = importlib.import_module(SAMPLING_MODULE_NAME)
+            break
+        except ModuleNotFoundError as exc:
+            _sampling_import_errors.append(exc)
+    else:
+        raise _sampling_import_errors[-1]
 importlib.reload(sampling)
 sys.modules["sampling"] = sampling
 
@@ -655,12 +670,28 @@ DENSITY_DRC_GRID_SAVE_PDF = _env_bool("IP_DENSITY_DRC_GRID_SAVE_PDF", True)
 DENSITY_TWEEDIE_DIVERGENCE = os.environ.get("IP_DENSITY_TWEEDIE_DIVERGENCE", "auto")
 DENSITY_BLEND_DIVERGENCE = os.environ.get("IP_DENSITY_BLEND_DIVERGENCE", "auto")
 DENSITY_MATRIX_BLEND_DIVERGENCE = os.environ.get("IP_DENSITY_MATRIX_BLEND_DIVERGENCE", "auto")
+DENSITY_UNIF_SCALAR_BLEND_DIVERGENCE = os.environ.get(
+    "IP_DENSITY_UNIF_SCALAR_BLEND_DIVERGENCE", DENSITY_BLEND_DIVERGENCE
+)
+DENSITY_UNIF_MATRIX_BLEND_DIVERGENCE = os.environ.get(
+    "IP_DENSITY_UNIF_MATRIX_BLEND_DIVERGENCE", DENSITY_MATRIX_BLEND_DIVERGENCE
+)
 DENSITY_LFGI_DIVERGENCE = os.environ.get("IP_DENSITY_LFGI_DIVERGENCE", "auto")
 DENSITY_DIV_PROBES = _env_int("IP_DENSITY_DRC_DIV_PROBES", 1)
 
 DENSITY_BASELINES = _env_csv("IP_DENSITY_BASELINES", ("map_laplace",))
 DENSITY_RUN_PF_SENSITIVITY = _env_bool("IP_DENSITY_RUN_PF_SENSITIVITY", False)
-DENSITY_PF_SENSITIVITY_LABELS = _env_csv("IP_DENSITY_PF_SENSITIVITY_LABELS", ("DENS-LFGI", "DENS-MatrixBlend", "DENS-Tweedie"))
+DENSITY_PF_SENSITIVITY_LABELS = _env_csv(
+    "IP_DENSITY_PF_SENSITIVITY_LABELS",
+    (
+        "DENS-LFGI",
+        "DENS-MatrixBlend",
+        "DENS-UnifMatrixBlend",
+        "DENS-ScalarBlend",
+        "DENS-UnifScalarBlend",
+        "DENS-Tweedie",
+    ),
+)
 DENSITY_PF_SENSITIVITY_STEPS = _env_int_tuple("IP_DENSITY_PF_SENSITIVITY_STEPS", (32, 64, 128))
 DENSITY_PF_SENSITIVITY_TMINS = _env_float_tuple_or_none("IP_DENSITY_PF_SENSITIVITY_TMINS", None)
 
@@ -898,7 +929,15 @@ def _density_eval_config(ref_source, score_init, divergence, display_name):
         "drc_energy_save_logratio_residual_plots": DENSITY_DRC_SAVE_LOGRATIO_RESIDUAL_PLOTS,
         "drc_energy_save_legacy_alias": DENSITY_DRC_SAVE_LEGACY_ALIAS,
         "drc_energy_plot_layout": DENSITY_DRC_PLOT_LAYOUT,
-        "drc_energy_grid_method_order": ("DENS-LFGI", "DENS-MatrixBlend", "DENS-ScalarBlend", "DENS-Tweedie", "DENS-MAP-Laplace"),
+        "drc_energy_grid_method_order": (
+            "DENS-LFGI",
+            "DENS-MatrixBlend",
+            "DENS-UnifMatrixBlend",
+            "DENS-ScalarBlend",
+            "DENS-UnifScalarBlend",
+            "DENS-Tweedie",
+            "DENS-MAP-Laplace",
+        ),
         "drc_energy_grid_axis_reference": "DENS-LFGI",
         "drc_energy_grid_max_points": DENSITY_DRC_GRID_MAX_POINTS,
         "drc_energy_grid_save_pdf": DENSITY_DRC_GRID_SAVE_PDF,
@@ -933,8 +972,14 @@ SAMPLER_CONFIGS.update(OrderedDict([
     ("DENS-Tweedie", _density_eval_config(
         DENSITY_REF_SOURCE, "tweedie", DENSITY_TWEEDIE_DIVERGENCE, "Tweedie PF",
     )),
+    ("DENS-UnifScalarBlend", _density_eval_config(
+        DENSITY_REF_SOURCE, "uniform_scalar_blend", DENSITY_UNIF_SCALAR_BLEND_DIVERGENCE, "UNIF. SCALAR BLEND",
+    )),
     ("DENS-ScalarBlend", _density_eval_config(
         DENSITY_REF_SOURCE, "scalar_blend", DENSITY_BLEND_DIVERGENCE, "Scalar Blend PF",
+    )),
+    ("DENS-UnifMatrixBlend", _density_eval_config(
+        DENSITY_REF_SOURCE, "uniform_matrix_blend", DENSITY_UNIF_MATRIX_BLEND_DIVERGENCE, "UNIF. MATRIX BLEND",
     )),
     ("DENS-MatrixBlend", _density_eval_config(
         DENSITY_REF_SOURCE, "matrix_blend", DENSITY_MATRIX_BLEND_DIVERGENCE, "MATRIX BLEND",
@@ -966,7 +1011,9 @@ reference_title = pipeline["reference_title"]
 
 display_names.update({
     "DENS-Tweedie": "Tweedie",
+    "DENS-UnifScalarBlend": "UNIF. SCALAR BLEND",
     "DENS-ScalarBlend": "Scalar Blend",
+    "DENS-UnifMatrixBlend": "UNIF. MATRIX BLEND",
     "DENS-MatrixBlend": "MATRIX BLEND",
     "DENS-LFGI": "LFGI--GN",
     "DENS-MAP-Laplace": "MAP--Laplace Gaussian",
@@ -1063,7 +1110,15 @@ elif baseline_eval_bank is None:
 
 # Regenerate the comparison grid after adding the MAP--Laplace baseline and
 # after known-Z diagnostics have been attached to the details.
-density_grid_method_order = ("DENS-LFGI", "DENS-MatrixBlend", "DENS-ScalarBlend", "DENS-Tweedie", "DENS-MAP-Laplace")
+density_grid_method_order = (
+    "DENS-LFGI",
+    "DENS-MatrixBlend",
+    "DENS-UnifMatrixBlend",
+    "DENS-ScalarBlend",
+    "DENS-UnifScalarBlend",
+    "DENS-Tweedie",
+    "DENS-MAP-Laplace",
+)
 if DENSITY_DRC_ENERGY_PLOTS and precomp.get("drc_details"):
     try:
         all_drc_details = precomp.get("drc_details", {})
@@ -1310,7 +1365,9 @@ save_reproducibility_log(
         ("DENSITY_DRC_TMAX", DENSITY_DRC_TMAX),
         ("DENSITY_DRC_EVAL_BATCH_SIZE", DENSITY_DRC_EVAL_BATCH_SIZE),
         ("DENSITY_TWEEDIE_DIVERGENCE", DENSITY_TWEEDIE_DIVERGENCE),
+        ("DENSITY_UNIF_SCALAR_BLEND_DIVERGENCE", DENSITY_UNIF_SCALAR_BLEND_DIVERGENCE),
         ("DENSITY_BLEND_DIVERGENCE", DENSITY_BLEND_DIVERGENCE),
+        ("DENSITY_UNIF_MATRIX_BLEND_DIVERGENCE", DENSITY_UNIF_MATRIX_BLEND_DIVERGENCE),
         ("DENSITY_MATRIX_BLEND_DIVERGENCE", DENSITY_MATRIX_BLEND_DIVERGENCE),
         ("DENSITY_LFGI_DIVERGENCE", DENSITY_LFGI_DIVERGENCE),
         ("DENSITY_DRC_ROBUST_PERCENTILES", DENSITY_DRC_ROBUST_PERCENTILES),
