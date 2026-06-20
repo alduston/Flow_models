@@ -14,7 +14,9 @@ compact manuscript density tables when the full files are unavailable.
 The known-normalization calibration scripts write separate
 ``*_known_z_calibration_table.csv`` and
 ``*_known_z_density_energy_full.csv`` files.  Those are aggregated into
-mean/std calibration tables for the Sec. 12.6--12.7 known-Z controls.
+mean/std calibration tables for the Sec. 12.6--12.7 known-Z controls.  The
+spatially uniform scalar/matrix blends are kept as separate aggregate rows from
+the local Scalar Blend and centered MATRIX BLEND comparisons.
 
 Outputs are written as formatted, copy-to-LaTeX CSVs under
 ``meta_results/<problem>/``.  Numeric and tidy diagnostic CSVs are intentionally
@@ -163,7 +165,15 @@ KNOWN_Z_METRICS = OrderedDict([
     }),
 ])
 
-METHOD_ORDER = ["Tweedie", "Scalar Blend", "MATRIX BLEND", "LFGI", "MAP-Laplace"]
+METHOD_ORDER = [
+    "Tweedie",
+    "UNIF. SCALAR BLEND",
+    "Scalar Blend",
+    "UNIF. MATRIX BLEND",
+    "MATRIX BLEND",
+    "LFGI",
+    "MAP-Laplace",
+]
 
 
 def sanitize(name):
@@ -185,14 +195,25 @@ def sanitize(name):
 
 
 def canonical_method_name(name):
-    """Normalize historical/internal density labels to manuscript-facing names."""
+    """Normalize historical/internal density labels to manuscript-facing names.
+
+    Keep the spatially uniform scalar/matrix controls distinct from the local
+    scalar and centered-matrix blends.  The uniform labels must be detected
+    before the generic ``scalar``/``matrix`` branches or aggregate rows from
+    DENS-UnifScalarBlend / DENS-UnifMatrixBlend collapse into the older methods.
+    """
     s = str(name).strip()
     low = s.lower().replace("_", "-").replace(" ", "-")
     if low.startswith("dens-"):
         low = low[5:]
     compact_low = low.replace("-", "")
+    is_uniform = any(token in low for token in ("unif", "uniform", "global", "spatially-homogeneous", "mcvsi", "mmcvsi"))
     if "tweedie" in low:
         return "Tweedie"
+    if is_uniform and (("scalar" in low and "blend" in low) or "unifscalarblend" in compact_low or "uniformscalarblend" in compact_low):
+        return "UNIF. SCALAR BLEND"
+    if is_uniform and (("matrix" in low and "blend" in low) or "unifmatrixblend" in compact_low or "uniformmatrixblend" in compact_low):
+        return "UNIF. MATRIX BLEND"
     if "scalar" in low and "blend" in low:
         return "Scalar Blend"
     if ("matrix" in low and "blend" in low) or "matrixblend" in compact_low:
