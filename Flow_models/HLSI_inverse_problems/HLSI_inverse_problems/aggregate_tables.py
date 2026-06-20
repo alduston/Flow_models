@@ -14,9 +14,10 @@ compact manuscript density tables when the full files are unavailable.
 The known-normalization calibration scripts write separate
 ``*_known_z_calibration_table.csv`` and
 ``*_known_z_density_energy_full.csv`` files.  Those are aggregated into
-mean/std calibration tables for the Sec. 12.6--12.7 known-Z controls.  The
-spatially uniform scalar/matrix blends are kept as separate aggregate rows from
-the local Scalar Blend and centered MATRIX BLEND comparisons.
+mean/std calibration tables for the Sec. 12.6--12.7 known-Z controls, including
+the third misaligned-anisotropic known-Z calibration problem.  The spatially
+uniform scalar/matrix blends are kept as separate aggregate rows from the local
+Scalar Blend and centered MATRIX BLEND comparisons.
 
 Outputs are written as formatted, copy-to-LaTeX CSVs under
 ``meta_results/<problem>/``.  Numeric and tidy diagnostic CSVs are intentionally
@@ -40,13 +41,17 @@ PROBLEMS = [
     "poisson",
     "afwi",
     # Known-Z analytic calibration problem directories used in manuscript Sec. 12.6--12.7.
-    # The current layout places the Gaussian and non-Gaussian known-Z scripts in
-    # known_z_calibration/ and known_z_calibration2/, respectively.  The older
-    # names are retained so archived run folders still aggregate without edits.
+    # The current layout places the Gaussian, shared-geometry mixture, and
+    # misaligned-anisotropic mixture known-Z scripts in known_z_calibration/,
+    # known_z_calibration2/, and known_z_calibration3/, respectively.  Older
+    # aliases are retained so archived run folders still aggregate without edits.
     "known_z_calibration",
     "known_z_calibration2",
+    "known_z_calibration3",
     "analytic_mixture_inverse",
     "known_z_mixture_inverse",
+    "analytic_misaligned_inverse",
+    "known_z_misaligned_inverse",
 ]
 
 NON_METRIC_COLUMNS = {
@@ -218,7 +223,7 @@ def canonical_method_name(name):
         return "Scalar Blend"
     if ("matrix" in low and "blend" in low) or "matrixblend" in compact_low:
         return "MATRIX BLEND"
-    if "ce-hlsi" in low or "hlsi" in low or "lfgi" in low:
+    if "ce-hlsi" in low or "hlsi" in low or "lfgi" in low or "lfgi-gn" in low or "lfgign" in compact_low:
         return "LFGI"
     if "map" in low and "laplace" in low:
         return "MAP-Laplace"
