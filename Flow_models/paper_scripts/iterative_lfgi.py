@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-alternating_drc_lfgi_vs_blend_misaligned8d.py
+iterative_lfgi_convergence_check.py
 
-Compare alternating density-ratio-corrected bootstrapping from isotropic
-Gaussian-prior or oracle-target reference samples on a selectable normalized target.
+Compare no-likelihood-correction iterated score-to-transport bootstrapping from
+an isotropic Gaussian reference on the normalized 8D misaligned GMM target.
 
 Targets now include the original d=8 misaligned singular-subspace GMM,
 the d=10 Neal funnel stress test from the benchmark sweep, and intermediate-dimensional
@@ -12,7 +12,23 @@ molecular LJ/DW-style particle potentials with exact t=0 score and Hessian evalu
 
 Purpose
 -------
-This is the exact test described in the chat:
+This version is wired for the theorem-5.3 numerical sanity check:
+
+  * Default target: normalized 8D misaligned subspace GMM.
+  * Default methods: LFGI, Tweedie, and local scalar Blend, all with
+    correction_method=None.  The sampler registry also includes local matrix
+    Blend, uniform scalar Blend, and uniform matrix Blend.
+  * No likelihood correction: every next reference bank is unweighted, so the
+    loop is q_{k+1}=F_A(q_k).
+  * Diagnostics: adjacent proposal movement, adjacent probability-flow score
+    discrepancy Delta_PF(s_k,s_{k+1}) on induced PF paths, the same
+    discrepancy evaluated on true target OU marginals x_t~pi_t, and the
+    corresponding PF endpoint movement d_Q(TPF(s_k),TPF(s_{k+1})).
+
+The original broader alternating-DRC machinery is still present, but the
+default flags disable the ratio step.
+
+Original broader test context:
 
   * Targets: choose with --target.  The default is the original d=8, K=8,
     rank=3 misaligned near-singular subspace GMM.  The --target funnel_d10 option
@@ -25,10 +41,12 @@ This is the exact test described in the chat:
   * Inputs available to the estimators: prior/reference coordinates, target
     energy/log-density, target gradient/score, and target Hessian at those
     coordinates.  Target samples are used for evaluation metrics/plots, and optionally for oracle initial references with --initial_reference_mode target.
-  * Methods: selected with --methods.  Atomic estimators include Blend,
-    CE-HLSI/LFGI, MP-Leaf-LFGI, Tweedie, and None.  Hybrid tokens use
+  * Methods: selected with --methods.  Atomic estimators include Blend, Matrix Blend, Uniform Scalar Blend,
+    Uniform Matrix Blend, CE-HLSI/LFGI, MP-Leaf-LFGI, Tweedie, and None.  Hybrid tokens use
     transport_correction order, e.g. blend_lfgi, lfgi_blend, tweedie_lfgi,
-    lfgi_none, none_lfgi.
+    lfgi_none, none_lfgi.  A transport repeat count can be attached to the
+    transport method as <transport>-<n>_<correction>, e.g. lfgi-2_lfgi means
+    two LFGI transport rounds followed by one LFGI likelihood-ratio correction.
   * Algorithm: alternating projected-IPF-style DRC:
 
         (R_j, rho_j) --S(score estimator)--> q_j samples R_{j+1}
@@ -44,7 +62,9 @@ Outputs
 -------
   outdir/config.json
   outdir/metrics_by_round.csv
-  outdir/stage_diagnostics.csv  # includes PF-vs-KDE likelihood correction calibration
+  outdir/stage_diagnostics.csv  # includes Delta_PF and no-correction stage diagnostics
+  outdir/convergence_by_round.csv
+  outdir/convergence_curves.png
   outdir/heatmaps_final.png
   outdir/heatmaps_by_round.png
   outdir/metric_curves.png
@@ -52,31 +72,32 @@ Outputs
 
 Example
 -------
-python alternating_drc_lfgi_vs_blend_targets.py \
+python iterative_lfgi_convergence_check.py \
   --target misaligned_gmm \
-  --outdir results/alt_drc_misaligned8d \
+  --outdir results/theorem53_misaligned8d \
   --device cuda --dtype float64 \
   --n_ref 3000 --n_samples 3000 --n_truth 12000 \
-  --n_rounds 4 --n_steps 150 --pf_steps 64 \
+  --n_rounds 6 --n_steps 150 \
   --t_min 0.005 --t_max 3.0 --time_schedule linear \
-  --methods blend_blend,blend_lfgi,lfgi_blend,lfgi_lfgi,tweedie_lfgi,lfgi_none,none_lfgi
+  --methods lfgi_none,tweedie_none,blend_none \
+  --force_no_likelihood_correction \
+  --delta_pf_n 256 --delta_pf_steps 24
 
-python alternating_drc_lfgi_vs_blend_targets.py \
-  --target lj13_2d \
-  --outdir results/alt_drc_lj13_2d \
-  --device cuda --dtype float64 \
-  --n_ref 3000 --n_samples 3000 --n_truth 12000 \
-  --n_rounds 4 --n_steps 150 --pf_steps 64 \
-  --mol_sample_steps 900 --mol_norm_samples 4096 --mol_score_bank 8192 \
-  --methods blend_blend,blend_lfgi,lfgi_blend,lfgi_lfgi
+The most direct theorem-5.3 columns are in convergence_by_round.csv:
+  delta_pf, delta_pf_target, delta_pf_endpoint_mmd, delta_pf_endpoint_sw2,
+  adjacent_sample_mmd, adjacent_sample_sw2, fisher_rmse, mmd.
+
+Here delta_pf is evaluated on the two induced PF path laws, while
+delta_pf_target estimates int E_{x_t~pi_t} ||s_k(x_t,t)-s_{k+1}(x_t,t)||^2 dt.
 
 Quick smoke test
 ----------------
-python alternating_drc_lfgi_vs_blend_misaligned8d.py \
-  --outdir /tmp/alt_drc_smoke --device cpu --dtype float32 \
-  --n_ref 128 --n_samples 128 --n_truth 512 \
-  --n_rounds 1 --n_steps 8 --pf_steps 4 --metrics_max_n 128 \
-  --fisher_n_t 2 --fisher_n_per_t 64 --eval_chunk 64 --rho_batch 64
+python iterative_lfgi_convergence_check.py \
+  --outdir /tmp/lfgi_conv_smoke --device cpu --dtype float32 \
+  --n_ref 64 --n_samples 64 --n_truth 256 \
+  --n_rounds 2 --n_steps 4 --metrics_max_n 64 \
+  --fisher_n_t 2 --fisher_n_per_t 32 --eval_chunk 64 \
+  --delta_pf_n 32 --delta_pf_steps 3
 """
 
 from __future__ import annotations
@@ -181,23 +202,50 @@ class Config:
     n_truth: int = 12000
     metrics_max_n: int = 2000
 
-    # Alternating rounds
-    n_rounds: int = 4
+    # Iterated no-correction convergence rounds.  The default harness is the
+    # theorem-5.3 diagnostic loop q_{k+1}=F_A(q_k), not the ratio-corrected
+    # alternating DRC loop.
+    n_rounds: int = 6
     # Initial proposal/reference law:
     #   prior/gaussian : draw the initial split-compatible pool from N(0,I).
     #   target/oracle  : draw the initial split-compatible pool from the target.
     #                    This is an oracle-reference stability test; initial
     #                    density-ratio weights are forced to zero because q0=p0.
     initial_reference_mode: str = "prior"
-    initial_weight_mode: str = "prior_ratio"  # prior_ratio or zero; ignored for target initial references
-    # Comma-separated estimator pairs to run. Atomic aliases such as blend,
-    # lfgi/ce-hlsi, or leaf-lfgi/mp-leaf-lfgi mean diagonal transport/correction.
+    initial_weight_mode: str = "zero"  # prior_ratio or zero; ignored for target initial references
+    # Comma-separated estimator pairs to run. Atomic aliases such as blend, matrix_blend, unif_blend,
+    # unif_matrix_blend, lfgi/ce-hlsi, or leaf-lfgi/mp-leaf-lfgi mean diagonal transport/correction.
     # Hybrid aliases use transport_correction order, e.g. blend_lfgi or lfgi_blend.
+    # Multi-transport aliases use <transport>-<n>_<correction>, e.g. lfgi-2_lfgi
+    # means two uncorrected LFGI transports followed by one LFGI ratio step.
+    # Current names are interpreted as <transport>-1_<correction>.
     # Special values:
-    #   all/default = diagonal blend, lfgi, leaf-lfgi, tweedie
+    #   all/default = diagonal blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, leaf-lfgi, tweedie
     #   hybrids     = four blend/lfgi pairs
-    #   grid/full   = full transport/correction grid over blend, lfgi, leaf-lfgi, tweedie, none
-    methods: str = "blend_blend,blend_lfgi,lfgi_blend,lfgi_lfgi"
+    #   grid/full   = full transport/correction grid over blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, leaf-lfgi, tweedie, none
+    methods: str = "lfgi_none,tweedie_none,blend_none"
+    # Which frozen reference bank to use for PF likelihood correction after the
+    # transport block.  endpoint matches the new TSC workflow: after n transports,
+    # build the correction score estimator from the settled endpoint reference.
+    # generator preserves the old single-step exact-induced-density convention by
+    # using the bank that generated the final endpoint cloud.
+    ratio_reference_mode: str = "endpoint"
+    # Force the R/projection step to be the identity: all next-round references
+    # are unweighted endpoint particles.  This is the convergence check for the
+    # score-to-transport map, not a test of likelihood-ratio correction.
+    force_no_likelihood_correction: bool = True
+
+    # Adjacent-field convergence diagnostics for Theorem 5.3.  delta_pf_* uses
+    # deterministic probability-flow paths and estimates
+    #   int ||s_k(y,t)-s_{k+1}(y,t)||^2 d( q_{s_k,t}^{PF}+q_{s_{k+1},t}^{PF})/2 dt.
+    convergence_check: bool = True
+    delta_pf_n: int = 256
+    delta_pf_steps: int = 24
+    # Additional fixed-law diagnostic requested for theorem debugging:
+    #   delta_pf_target^2 = int E_{x_t~pi_t} ||s_k(x_t,t)-s_{k+1}(x_t,t)||^2 dt.
+    # Use <=0 to default to delta_pf_n.
+    delta_pf_target_n: int = 0
+    adjacent_metrics_max_n: int = 2000
 
     # Reverse OU sampler / probability-flow time interval.
     # The old names t_start/t_end are kept as aliases for backward compatibility;
@@ -219,6 +267,18 @@ class Config:
     curvature_cap: float = 1.0e6
     resolvent_eps: float = 1.0e-8
     gate_clip: float = 50.0
+
+    # Matrix/uniform blend controls, matching the sampler-mode defaults used in
+    # sampling.py.  matrix_blend is the centered local matrix regression gate;
+    # unif_blend and unif_matrix_blend use spatially homogeneous scalar/matrix
+    # gates estimated from the global target-score second moment.
+    matrix_blend_center: bool = True
+    matrix_blend_ridge: float = 1.0e-8
+    matrix_blend_ridge_rel: float = 1.0e-6
+    matrix_blend_sym_gate: bool = False
+    matrix_blend_gate_clip: float = 1.0e6
+    uniform_blend_clamp: bool = True
+
     # Minimal MP-leaf precision completion for Leaf-LFGI.  The completed
     # gate precision is Q = V diag(max(lambda, mp_leaf_floor)) V^T.
     # This is the fixed-floor/moment-preserving correction: score signals are
@@ -242,7 +302,7 @@ class Config:
     # Likelihood-correction calibration against particle KDE in full d=8.
     # The diagnostic compares PF log q and rho=log pi-log q against a
     # leave-one-out Gaussian KDE fit to the same generated proposal bank.
-    likelihood_calibration: bool = True
+    likelihood_calibration: bool = False
     kde_n_eval: int = 1000
     kde_n_fit: int = 3000
     kde_bandwidth: float = 0.0  # <=0: median distance * Scott factor
@@ -1457,6 +1517,9 @@ class SNISScoreBank:
             "gate_bank_n": int(self.N_gate),
             "gate_bank_separate": bool(not self.gate_is_score_bank),
         })
+        self._uniform_score_moment_cache: Optional[torch.Tensor] = None
+        self._uniform_matrix_gate_cache: Dict[Tuple[float, float, float, bool], torch.Tensor] = {}
+        self._uniform_scalar_gate_cache: Dict[Tuple[float, float, bool], torch.Tensor] = {}
 
     def _weights_and_signals_for(self, y: torch.Tensor, t: float, x: torch.Tensor, score0: torch.Tensor, log_weights: torch.Tensor):
         alpha, gamma = alpha_gamma(float(t), device=self.device, dtype=self.dtype)
@@ -1485,6 +1548,70 @@ class SNISScoreBank:
             return self.P_gate_mp
         return self.P_gate
 
+    def _global_gate_score_second_moment(self) -> torch.Tensor:
+        """Weighted global E[s_0(X)s_0(X)^T] for spatially uniform blends."""
+        if self._uniform_score_moment_cache is not None:
+            return self._uniform_score_moment_cache
+        s0 = self.score0_gate
+        n, d = s0.shape
+        if n <= 0:
+            raise ValueError("uniform blend moment bank is empty")
+        logw = torch.nan_to_num(self.log_gate_weights.reshape(-1), nan=-float("inf"), posinf=0.0, neginf=-float("inf"))
+        if logw.numel() != n:
+            raise ValueError(f"log_gate_weights has length {logw.numel()} but gate score bank has length {n}")
+        m = torch.max(logw)
+        if not bool(torch.isfinite(m).detach().cpu().item()):
+            w = torch.full((n,), 1.0 / float(n), device=self.device, dtype=self.dtype)
+        else:
+            w = torch.exp(logw - m)
+            w = w / torch.clamp(w.sum(), min=1.0e-300)
+        Ipi = s0.transpose(0, 1) @ (w[:, None] * s0)
+        Ipi = sym(torch.nan_to_num(Ipi, nan=0.0, posinf=0.0, neginf=0.0))
+        self._uniform_score_moment_cache = Ipi
+        return Ipi
+
+    def _uniform_scalar_tweedie_weight(self, t: float, alpha: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+        ridge = float(getattr(self.cfg, "matrix_blend_ridge", 1.0e-8))
+        clamp = bool(getattr(self.cfg, "uniform_blend_clamp", True))
+        cache_key = (round(float(t), 15), ridge, clamp)
+        cached = self._uniform_scalar_gate_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        Ipi = self._global_gate_score_second_moment()
+        if ridge > 0.0:
+            Ipi = Ipi + ridge * torch.eye(self.d, device=self.device, dtype=self.dtype)
+        tr_ipi = torch.diagonal(Ipi, dim1=-2, dim2=-1).sum().clamp(min=0.0)
+        alpha2 = alpha * alpha
+        denom = alpha2 * float(max(self.d, 1)) + gamma * tr_ipi
+        a = (gamma * tr_ipi) / torch.clamp(denom, min=1.0e-300)
+        if clamp:
+            a = a.clamp(0.0, 1.0)
+        a = torch.nan_to_num(a, nan=0.0, posinf=1.0 if clamp else 0.0, neginf=0.0)
+        self._uniform_scalar_gate_cache[cache_key] = a
+        return a
+
+    def _uniform_matrix_tweedie_weight(self, t: float, alpha: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+        ridge = float(getattr(self.cfg, "matrix_blend_ridge", 1.0e-8))
+        ridge_rel = float(getattr(self.cfg, "matrix_blend_ridge_rel", 1.0e-6))
+        clamp = bool(getattr(self.cfg, "uniform_blend_clamp", True))
+        cache_key = (round(float(t), 15), ridge, ridge_rel, clamp)
+        cached = self._uniform_matrix_gate_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        Ipi = self._global_gate_score_second_moment()
+        evals, evecs = torch.linalg.eigh(sym(Ipi))
+        evals = torch.nan_to_num(evals, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+        tr_scale = torch.mean(evals).clamp(min=0.0) if evals.numel() else torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        ridge_eff = ridge + ridge_rel * float(tr_scale.detach().cpu().item())
+        alpha2 = alpha * alpha
+        a_eig = (gamma * evals) / torch.clamp(alpha2 + gamma * evals + ridge_eff, min=1.0e-300)
+        if clamp:
+            a_eig = a_eig.clamp(0.0, 1.0)
+        A = torch.einsum("ik,k,jk->ij", evecs, a_eig, evecs)
+        A = sym(torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0))
+        self._uniform_matrix_gate_cache[cache_key] = A
+        return A
+
     def estimate_chunk(self, y: torch.Tensor, t: float, method: str) -> torch.Tensor:
         key = str(method).strip().lower().replace("_", "-")
         w, b, c, alpha, gamma = self._weights_and_signals(y, t)
@@ -1502,6 +1629,46 @@ class SNISScoreBank:
             den = (va + vb - 2.0 * cab).clamp(min=1.0e-20)
             g = ((va - cab) / den).clamp(0.0, 1.0)
             return cbar + g * (bbar - cbar)
+        if key in {"unif-blend", "unif-scalar-blend", "uniform-blend", "uniform-scalar-blend", "global-scalar-blend"}:
+            a = self._uniform_scalar_tweedie_weight(float(t), alpha, gamma)
+            return cbar + a * (bbar - cbar)
+        if key in {"unif-matrix-blend", "uniform-matrix-blend", "global-matrix-blend"}:
+            A = self._uniform_matrix_tweedie_weight(float(t), alpha, gamma)
+            return cbar + torch.einsum("ij,bj->bi", A, bbar - cbar)
+        if key in {"matrix-blend", "centered-matrix-blend", "centered-blend", "local-matrix-blend"}:
+            wg, bg, cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t)
+            dg = cg - bg
+            if bool(getattr(self.cfg, "matrix_blend_center", True)):
+                bgbar = torch.sum(wg[:, :, None] * bg, dim=1)
+                dgbar = torch.sum(wg[:, :, None] * dg, dim=1)
+                b_mom = bg - bgbar[:, None, :]
+                d_mom = dg - dgbar[:, None, :]
+            else:
+                b_mom = bg
+                d_mom = dg
+            M = torch.einsum("bn,bni,bnj->bij", wg, d_mom, d_mom)
+            N = torch.einsum("bn,bni,bnj->bij", wg, b_mom, d_mom)
+            M = sym(torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0))
+            N = torch.nan_to_num(N, nan=0.0, posinf=0.0, neginf=0.0)
+            Bsz, d = M.shape[0], M.shape[-1]
+            eye = torch.eye(d, device=y.device, dtype=y.dtype).expand(Bsz, d, d)
+            tr = torch.diagonal(M, dim1=-2, dim2=-1).sum(dim=-1) / float(max(d, 1))
+            ridge_vec = float(getattr(self.cfg, "matrix_blend_ridge", 1.0e-8)) + float(getattr(self.cfg, "matrix_blend_ridge_rel", 1.0e-6)) * tr.clamp(min=0.0)
+            M_reg = M + ridge_vec[:, None, None] * eye
+            try:
+                G = torch.linalg.solve(M_reg.transpose(-1, -2), (-N).transpose(-1, -2)).transpose(-1, -2)
+            except RuntimeError:
+                G = -torch.matmul(N, torch.linalg.pinv(M_reg))
+            if not bool(torch.isfinite(G).all().detach().cpu().item()):
+                G_pinv = -torch.matmul(N, torch.linalg.pinv(M_reg))
+                G = torch.where(torch.isfinite(G), G, G_pinv)
+            G = torch.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
+            if bool(getattr(self.cfg, "matrix_blend_sym_gate", False)):
+                G = sym(G)
+            clip = float(getattr(self.cfg, "matrix_blend_gate_clip", 1.0e6))
+            if math.isfinite(clip) and clip > 0.0:
+                G = G.clamp(min=-clip, max=clip)
+            return bbar + torch.einsum("bij,bj->bi", G, cbar - bbar)
         if key in {"ce-hlsi", "lfgi", "ce-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
             wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t)
             Pgate = self._gate_precision_for_method(method)
@@ -1811,6 +1978,359 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
         "pf_logq_std": safe_float(logq_all.std(unbiased=False)),
         "pf_logq_min": safe_float(logq_all.min()),
         "pf_logq_max": safe_float(logq_all.max()),
+    }
+
+
+
+# -----------------------------------------------------------------------------
+# Theorem-5.3 no-correction convergence diagnostics
+# -----------------------------------------------------------------------------
+
+
+def blank_convergence_info(reason: str = "skipped") -> Dict[str, float | bool | str]:
+    return {
+        "delta_pf_skipped": True,
+        "delta_pf_skip_reason": str(reason),
+        "delta_pf": float("nan"),
+        "delta_pf_sq": float("nan"),
+        "delta_pf_n": 0,
+        "delta_pf_steps": 0,
+        "delta_pf_t_min": float("nan"),
+        "delta_pf_t_max": float("nan"),
+        "delta_pf_time_schedule": "none",
+        "delta_pf_dt_min": float("nan"),
+        "delta_pf_dt_max": float("nan"),
+        "delta_pf_dt_sum": float("nan"),
+        "delta_pf_integral_path_a": float("nan"),
+        "delta_pf_integral_path_b": float("nan"),
+        "delta_pf_endpoint_mmd": float("nan"),
+        "delta_pf_endpoint_sw2": float("nan"),
+        "delta_pf_endpoint_sliced_ks": float("nan"),
+        "delta_pf_endpoint_mean_l2": float("nan"),
+        "delta_pf_max_score_diff": float("nan"),
+        "delta_pf_max_abs_state": float("nan"),
+        "delta_pf_failed": False,
+        "delta_pf_fail_reason": "",
+        "delta_pf_target": float("nan"),
+        "delta_pf_target_sq": float("nan"),
+        "delta_pf_target_n": 0,
+        "delta_pf_target_steps": 0,
+        "delta_pf_target_t_min": float("nan"),
+        "delta_pf_target_t_max": float("nan"),
+        "delta_pf_target_time_schedule": "none",
+        "delta_pf_target_dt_min": float("nan"),
+        "delta_pf_target_dt_max": float("nan"),
+        "delta_pf_target_dt_sum": float("nan"),
+        "delta_pf_target_max_score_diff": float("nan"),
+        "delta_pf_target_max_abs_state": float("nan"),
+        "delta_pf_target_failed": False,
+        "delta_pf_target_fail_reason": "",
+    }
+
+
+@torch.no_grad()
+def _pf_path_integral_for_delta(
+    path_bank: SNISScoreBank,
+    path_method: str,
+    other_bank: SNISScoreBank,
+    other_method: str,
+    z_base: torch.Tensor,
+    cfg: Config,
+    ts: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float | bool | str]]:
+    """Integrate one half of Delta_PF along q_{path_bank,t}^{PF} paths.
+
+    The probability-flow ODE is dz_t/dt=-z_t-s(z_t,t).  We integrate it from
+    t_max down to t_min on the same nonuniform physical-time grid used elsewhere.
+    Scores are norm-clipped exactly as in the transport integrator, so the
+    diagnostic measures the numerical frozen field actually queried by this
+    script.
+    """
+    x = z_base.detach().clone()
+    integral = torch.zeros((), device=x.device, dtype=x.dtype)
+    max_score_diff = 0.0
+    max_abs_state = safe_float(x.abs().max())
+    failed = False
+    fail_reason = ""
+
+    for i in range(int(ts.numel()) - 1):
+        tc = float(ts[i].item())
+        tn = float(ts[i + 1].item())
+        h = tn - tc
+        dt_abs = abs(h)
+
+        s_path = clamp_norm(path_bank.estimate(x, tc, path_method), cfg.score_clip)
+        s_other = clamp_norm(other_bank.estimate(x, tc, other_method), cfg.score_clip)
+        diff0 = torch.sum((s_path - s_other) ** 2, dim=1)
+        v0 = -x - s_path
+        x_e = x + h * v0
+        if cfg.sample_clip and cfg.sample_clip > 0:
+            x_e = torch.clamp(x_e, min=-float(cfg.sample_clip), max=float(cfg.sample_clip))
+
+        s_path_e = clamp_norm(path_bank.estimate(x_e, tn, path_method), cfg.score_clip)
+        s_other_e = clamp_norm(other_bank.estimate(x_e, tn, other_method), cfg.score_clip)
+        diff1 = torch.sum((s_path_e - s_other_e) ** 2, dim=1)
+        v1 = -x_e - s_path_e
+
+        finite = (
+            torch.isfinite(x).all()
+            and torch.isfinite(x_e).all()
+            and torch.isfinite(s_path).all()
+            and torch.isfinite(s_other).all()
+            and torch.isfinite(s_path_e).all()
+            and torch.isfinite(s_other_e).all()
+        )
+        if not bool(finite):
+            failed = True
+            fail_reason = f"nonfinite path state or score at step {i}"
+            break
+
+        integral = integral + 0.5 * dt_abs * (diff0.mean() + diff1.mean())
+        max_score_diff = max(max_score_diff, safe_float(torch.sqrt(torch.clamp(torch.cat([diff0, diff1]).max(), min=0.0))))
+        x = x + 0.5 * h * (v0 + v1)
+        if cfg.sample_clip and cfg.sample_clip > 0:
+            x = torch.clamp(x, min=-float(cfg.sample_clip), max=float(cfg.sample_clip))
+        max_abs_state = max(max_abs_state, safe_float(x.abs().max()))
+
+    return integral.detach(), x.detach(), {
+        "failed": bool(failed),
+        "fail_reason": fail_reason,
+        "max_score_diff": float(max_score_diff),
+        "max_abs_state": float(max_abs_state),
+    }
+
+
+@torch.no_grad()
+def probability_flow_score_discrepancy(
+    bank_a: SNISScoreBank,
+    method_a: str,
+    bank_b: SNISScoreBank,
+    method_b: str,
+    cfg: Config,
+    generator: torch.Generator,
+) -> Dict[str, float | bool | str]:
+    """Monte Carlo estimate of Delta_PF(s_a,s_b) and endpoint movement.
+
+    This is the finite-reference diagnostic corresponding to the theorem's
+    adjacent-field condition.  It samples shared Gaussian base points, transports
+    them deterministically under each frozen field, and averages the score-field
+    discrepancy on both induced PF path laws.
+    """
+    if not bool(cfg.convergence_check):
+        return blank_convergence_info("convergence_check_false")
+    n = int(getattr(cfg, "delta_pf_n", 0))
+    steps = int(getattr(cfg, "delta_pf_steps", 0))
+    if n <= 0 or steps <= 0:
+        return blank_convergence_info("delta_pf_n_or_steps_nonpositive")
+    if str(method_a).lower() == "none" or str(method_b).lower() == "none":
+        return blank_convergence_info("none_transport_method")
+
+    ts = make_time_grid(cfg, steps, direction="reverse", device=bank_a.device, dtype=bank_a.dtype)
+    ts_stats = time_grid_step_stats(ts)
+    z = torch.randn((n, int(bank_a.d)), device=bank_a.device, dtype=bank_a.dtype, generator=generator)
+
+    int_a, end_a, info_a = _pf_path_integral_for_delta(bank_a, method_a, bank_b, method_b, z, cfg, ts)
+    int_b, end_b, info_b = _pf_path_integral_for_delta(bank_b, method_b, bank_a, method_a, z, cfg, ts)
+    delta_sq = 0.5 * (int_a + int_b)
+    delta = torch.sqrt(torch.clamp(delta_sq, min=0.0))
+    endpoint_gen = make_generator(int(cfg.seed + 811_000 + steps + n), bank_a.device)
+    max_n = min(int(getattr(cfg, "adjacent_metrics_max_n", cfg.metrics_max_n)), int(end_a.shape[0]), int(end_b.shape[0]))
+    endpoint_mmd = mmd_rbf(end_a, end_b, max_n=max_n)
+    endpoint_sw2 = sliced_w2(end_a, end_b, cfg.sw2_projections, endpoint_gen, max_n=max_n)
+    endpoint_sks = sliced_ks(end_a, end_b, cfg.sw2_projections, endpoint_gen, max_n=max_n)
+    mean_l2 = safe_float(torch.linalg.norm(end_a[:max_n].mean(dim=0) - end_b[:max_n].mean(dim=0))) if max_n > 0 else float("nan")
+    failed = bool(info_a.get("failed", False)) or bool(info_b.get("failed", False))
+    fail_reason = str(info_a.get("fail_reason", "") or info_b.get("fail_reason", ""))
+    return {
+        "delta_pf_skipped": False,
+        "delta_pf_skip_reason": "",
+        "delta_pf": safe_float(delta),
+        "delta_pf_sq": safe_float(delta_sq),
+        "delta_pf_n": int(n),
+        "delta_pf_steps": int(steps),
+        "delta_pf_t_min": float(effective_time_bounds(cfg)[0]),
+        "delta_pf_t_max": float(effective_time_bounds(cfg)[1]),
+        "delta_pf_time_schedule": canonical_time_schedule(cfg.time_schedule),
+        "delta_pf_dt_min": float(ts_stats["dt_min"]),
+        "delta_pf_dt_max": float(ts_stats["dt_max"]),
+        "delta_pf_dt_sum": float(ts_stats["dt_sum"]),
+        "delta_pf_integral_path_a": safe_float(int_a),
+        "delta_pf_integral_path_b": safe_float(int_b),
+        "delta_pf_endpoint_mmd": endpoint_mmd,
+        "delta_pf_endpoint_sw2": endpoint_sw2,
+        "delta_pf_endpoint_sliced_ks": endpoint_sks,
+        "delta_pf_endpoint_mean_l2": mean_l2,
+        "delta_pf_max_score_diff": max(float(info_a.get("max_score_diff", float("nan"))), float(info_b.get("max_score_diff", float("nan")))),
+        "delta_pf_max_abs_state": max(float(info_a.get("max_abs_state", float("nan"))), float(info_b.get("max_abs_state", float("nan")))),
+        "delta_pf_failed": failed,
+        "delta_pf_fail_reason": fail_reason,
+    }
+
+
+@torch.no_grad()
+def target_marginal_score_discrepancy(
+    target,
+    bank_a: SNISScoreBank,
+    method_a: str,
+    bank_b: SNISScoreBank,
+    method_b: str,
+    cfg: Config,
+    generator: torch.Generator,
+) -> Dict[str, float | bool | str]:
+    """Estimate Delta_PF on the true target OU marginals pi_t.
+
+    This diagnostic keeps the adjacent frozen score estimators constructed from
+    their respective reference clouds q_k and q_{k+1}, but changes only the
+    evaluation law.  Instead of querying along the round-dependent PF path laws,
+    it estimates
+
+        int_{t_min}^{t_max} E_{x_t~pi_t} ||s_a(x_t,t)-s_b(x_t,t)||^2 dt,
+
+    using a coupled OU draw x_t = alpha_t x_0 + sqrt(gamma_t) eps with
+    x_0~pi and eps~N(0,I).  The square-root column delta_pf_target is reported
+    alongside the squared integral delta_pf_target_sq.
+    """
+    if not bool(cfg.convergence_check):
+        return {
+            "delta_pf_target": float("nan"),
+            "delta_pf_target_sq": float("nan"),
+            "delta_pf_target_n": 0,
+            "delta_pf_target_steps": 0,
+            "delta_pf_target_t_min": float("nan"),
+            "delta_pf_target_t_max": float("nan"),
+            "delta_pf_target_time_schedule": "none",
+            "delta_pf_target_dt_min": float("nan"),
+            "delta_pf_target_dt_max": float("nan"),
+            "delta_pf_target_dt_sum": float("nan"),
+            "delta_pf_target_max_score_diff": float("nan"),
+            "delta_pf_target_max_abs_state": float("nan"),
+            "delta_pf_target_failed": False,
+            "delta_pf_target_fail_reason": "convergence_check_false",
+        }
+    n = int(getattr(cfg, "delta_pf_target_n", 0))
+    if n <= 0:
+        n = int(getattr(cfg, "delta_pf_n", 0))
+    steps = int(getattr(cfg, "delta_pf_steps", 0))
+    if n <= 0 or steps <= 0:
+        return {
+            "delta_pf_target": float("nan"),
+            "delta_pf_target_sq": float("nan"),
+            "delta_pf_target_n": 0,
+            "delta_pf_target_steps": 0,
+            "delta_pf_target_t_min": float("nan"),
+            "delta_pf_target_t_max": float("nan"),
+            "delta_pf_target_time_schedule": "none",
+            "delta_pf_target_dt_min": float("nan"),
+            "delta_pf_target_dt_max": float("nan"),
+            "delta_pf_target_dt_sum": float("nan"),
+            "delta_pf_target_max_score_diff": float("nan"),
+            "delta_pf_target_max_abs_state": float("nan"),
+            "delta_pf_target_failed": False,
+            "delta_pf_target_fail_reason": "delta_pf_target_n_or_steps_nonpositive",
+        }
+    if str(method_a).lower() == "none" or str(method_b).lower() == "none":
+        return {
+            "delta_pf_target": float("nan"),
+            "delta_pf_target_sq": float("nan"),
+            "delta_pf_target_n": 0,
+            "delta_pf_target_steps": 0,
+            "delta_pf_target_t_min": float("nan"),
+            "delta_pf_target_t_max": float("nan"),
+            "delta_pf_target_time_schedule": "none",
+            "delta_pf_target_dt_min": float("nan"),
+            "delta_pf_target_dt_max": float("nan"),
+            "delta_pf_target_dt_sum": float("nan"),
+            "delta_pf_target_max_score_diff": float("nan"),
+            "delta_pf_target_max_abs_state": float("nan"),
+            "delta_pf_target_failed": False,
+            "delta_pf_target_fail_reason": "none_transport_method",
+        }
+
+    ts = make_time_grid(cfg, steps, direction="forward", device=bank_a.device, dtype=bank_a.dtype)
+    ts_stats = time_grid_step_stats(ts)
+    x0 = target.sample(n, generator=generator).detach()
+    eps = torch.randn(x0.shape, device=x0.device, dtype=x0.dtype, generator=generator)
+
+    vals: List[torch.Tensor] = []
+    max_score_diff = 0.0
+    max_abs_state = 0.0
+    failed = False
+    fail_reason = ""
+    for i in range(int(ts.numel())):
+        t_val = float(ts[i].item())
+        alpha, gamma = alpha_gamma(t_val, device=x0.device, dtype=x0.dtype)
+        xt = alpha * x0 + torch.sqrt(torch.clamp(gamma, min=0.0)) * eps
+        s_a = clamp_norm(bank_a.estimate(xt, t_val, method_a), cfg.score_clip)
+        s_b = clamp_norm(bank_b.estimate(xt, t_val, method_b), cfg.score_clip)
+        diff_sq = torch.sum((s_a - s_b) ** 2, dim=1)
+        finite = torch.isfinite(xt).all() and torch.isfinite(s_a).all() and torch.isfinite(s_b).all() and torch.isfinite(diff_sq).all()
+        if not bool(finite):
+            failed = True
+            fail_reason = f"nonfinite target-marginal state or score at step {i}"
+            break
+        vals.append(diff_sq.mean())
+        max_score_diff = max(max_score_diff, safe_float(torch.sqrt(torch.clamp(diff_sq.max(), min=0.0))))
+        max_abs_state = max(max_abs_state, safe_float(xt.abs().max()))
+
+    if failed or len(vals) < 2:
+        delta_sq = torch.tensor(float("nan"), device=bank_a.device, dtype=bank_a.dtype)
+    else:
+        delta_sq = torch.zeros((), device=bank_a.device, dtype=bank_a.dtype)
+        for i in range(len(vals) - 1):
+            dt_abs = abs(float(ts[i + 1].item() - ts[i].item()))
+            delta_sq = delta_sq + 0.5 * dt_abs * (vals[i] + vals[i + 1])
+    delta = torch.sqrt(torch.clamp(delta_sq, min=0.0)) if torch.isfinite(delta_sq) else delta_sq
+    return {
+        "delta_pf_target": safe_float(delta),
+        "delta_pf_target_sq": safe_float(delta_sq),
+        "delta_pf_target_n": int(n),
+        "delta_pf_target_steps": int(steps),
+        "delta_pf_target_t_min": float(effective_time_bounds(cfg)[0]),
+        "delta_pf_target_t_max": float(effective_time_bounds(cfg)[1]),
+        "delta_pf_target_time_schedule": canonical_time_schedule(cfg.time_schedule),
+        "delta_pf_target_dt_min": float(ts_stats["dt_min"]),
+        "delta_pf_target_dt_max": float(ts_stats["dt_max"]),
+        "delta_pf_target_dt_sum": float(ts_stats["dt_sum"]),
+        "delta_pf_target_max_score_diff": float(max_score_diff),
+        "delta_pf_target_max_abs_state": float(max_abs_state),
+        "delta_pf_target_failed": bool(failed),
+        "delta_pf_target_fail_reason": fail_reason,
+    }
+
+
+@torch.no_grad()
+def adjacent_sample_discrepancy(
+    samples: torch.Tensor,
+    previous: Optional[torch.Tensor],
+    cfg: Config,
+    generator: torch.Generator,
+) -> Dict[str, float]:
+    """Distributional movement between adjacent unweighted proposal clouds."""
+    if previous is None or samples.numel() == 0 or previous.numel() == 0:
+        return {
+            "adjacent_sample_n": 0.0,
+            "adjacent_sample_mmd": float("nan"),
+            "adjacent_sample_sw2": float("nan"),
+            "adjacent_sample_sliced_ks": float("nan"),
+            "adjacent_sample_mean_l2": float("nan"),
+            "adjacent_sample_cov_frob": float("nan"),
+        }
+    n = min(int(getattr(cfg, "adjacent_metrics_max_n", cfg.metrics_max_n)), int(samples.shape[0]), int(previous.shape[0]))
+    x = samples[:n]
+    y = previous[:n]
+    mx = x.mean(dim=0)
+    my = y.mean(dim=0)
+    X = x - mx
+    Y = y - my
+    Cx = (X.T @ X) / max(n - 1, 1)
+    Cy = (Y.T @ Y) / max(n - 1, 1)
+    return {
+        "adjacent_sample_n": float(n),
+        "adjacent_sample_mmd": mmd_rbf(x, y, max_n=n),
+        "adjacent_sample_sw2": sliced_w2(x, y, cfg.sw2_projections, generator, max_n=n),
+        "adjacent_sample_sliced_ks": sliced_ks(x, y, cfg.sw2_projections, generator, max_n=n),
+        "adjacent_sample_mean_l2": safe_float(torch.linalg.norm(mx - my)),
+        "adjacent_sample_cov_frob": safe_float(torch.linalg.matrix_norm(Cx - Cy, ord="fro")),
     }
 
 
@@ -2442,6 +2962,98 @@ def save_metric_curves(outdir: str, rows: List[Dict[str, object]]):
     plt.close(fig)
 
 
+
+def combine_convergence_rows(metric_rows: List[Dict[str, object]], stage_rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Merge sample-level and PF-field convergence diagnostics by family/round."""
+    stage_lookup = {}
+    for row in stage_rows:
+        key = (row.get("family"), row.get("method"), row.get("round"))
+        stage_lookup[key] = row
+    keys_from_stage = [
+        "delta_pf",
+        "delta_pf_sq",
+        "delta_pf_n",
+        "delta_pf_steps",
+        "delta_pf_endpoint_mmd",
+        "delta_pf_endpoint_sw2",
+        "delta_pf_endpoint_sliced_ks",
+        "delta_pf_endpoint_mean_l2",
+        "delta_pf_max_score_diff",
+        "delta_pf_max_abs_state",
+        "delta_pf_failed",
+        "delta_pf_target",
+        "delta_pf_target_sq",
+        "delta_pf_target_n",
+        "delta_pf_target_steps",
+        "delta_pf_target_t_min",
+        "delta_pf_target_t_max",
+        "delta_pf_target_time_schedule",
+        "delta_pf_target_dt_min",
+        "delta_pf_target_dt_max",
+        "delta_pf_target_dt_sum",
+        "delta_pf_target_max_score_diff",
+        "delta_pf_target_max_abs_state",
+        "delta_pf_target_failed",
+        "delta_pf_target_fail_reason",
+        "mode_l1_unweighted_next_refs",
+        "mode_l1_weighted_next_refs",
+        "rho_ess_frac",
+        "pf_skipped",
+        "pf_skip_reason",
+    ]
+    out: List[Dict[str, object]] = []
+    for row in metric_rows:
+        if row.get("kind") != "sample":
+            continue
+        key = (row.get("family"), row.get("method"), row.get("round"))
+        st = stage_lookup.get(key, {})
+        merged = dict(row)
+        for k in keys_from_stage:
+            if k in st:
+                merged[k] = st[k]
+        out.append(merged)
+    return out
+
+
+def save_convergence_curves(outdir: str, convergence_rows: List[Dict[str, object]]):
+    try:
+        import pandas as pd
+    except Exception:
+        return
+    if not convergence_rows:
+        return
+    df = pd.DataFrame(convergence_rows)
+    if df.empty:
+        return
+    metrics = [
+        ("delta_pf", r"$\Delta_{PF}$ on induced PF paths ↓"),
+        ("delta_pf_target", r"$\Delta_{PF}$ on true $\pi_t$ ↓"),
+        ("delta_pf_endpoint_mmd", r"PF endpoint MMD ↓"),
+        ("delta_pf_endpoint_sw2", r"PF endpoint SW2 ↓"),
+        ("adjacent_sample_mmd", "sample q_k MMD ↓"),
+        ("adjacent_sample_sw2", r"sample SW2 ↓"),
+        ("fisher_rmse", r"score RMSE to target ↓"),
+        ("mmd", r"MMD to target ↓"),
+    ]
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8), constrained_layout=True)
+    axes = axes.reshape(-1)
+    family_order = list(dict.fromkeys(df["family"].tolist()))
+    for ax, (metric, title) in zip(axes, metrics):
+        if metric not in df.columns:
+            ax.axis("off")
+            continue
+        for fam in family_order:
+            sub = df[df["family"] == fam].sort_values("round")
+            ax.plot(sub["round"], sub[metric], marker="o", label=fam)
+        ax.set_title(title)
+        ax.set_xlabel("iteration round")
+        ax.grid(True, alpha=0.25)
+    axes[0].legend()
+    fig.suptitle("No-correction convergence diagnostics", fontsize=12)
+    fig.savefig(os.path.join(outdir, "convergence_curves.png"), dpi=220)
+    plt.close(fig)
+
+
 def write_csv(path: str, rows: List[Dict[str, object]]) -> None:
     if not rows:
         return
@@ -2561,103 +3173,252 @@ def blank_calibration_info(reason: str = "skipped") -> Dict[str, float | str]:
     }
 
 
+def canonical_ratio_reference_mode(value: str) -> str:
+    """Normalize the PF-ratio reference-bank convention."""
+    key = str(value or "endpoint").strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "endpoint": "endpoint",
+        "settled": "endpoint",
+        "final": "endpoint",
+        "fixed-point": "endpoint",
+        "fixedpoint": "endpoint",
+        "tsc": "endpoint",
+        "generator": "generator",
+        "generating": "generator",
+        "source": "generator",
+        "pre-endpoint": "generator",
+        "old": "generator",
+        "legacy": "generator",
+        "exact-induced": "generator",
+    }
+    if key not in aliases:
+        raise ValueError(f"Unknown ratio_reference_mode={value!r}; use endpoint or generator")
+    return aliases[key]
+
+
+def method_label(transport_method: str, transport_repeats: int, correction_method: str) -> str:
+    """Stable method label for CSV joins and plot titles."""
+    n = int(transport_repeats)
+    prefix = str(transport_method) if n == 1 else f"{transport_method}-{n}"
+    return f"{prefix}_{correction_method}"
+
+
 @torch.no_grad()
 def run_family(
     family: str,
     transport_method: str,
     correction_method: str,
+    transport_repeats: int,
     target,
     init_refs: torch.Tensor,
     init_rho: torch.Tensor,
     truth: torch.Tensor,
     cfg: Config,
 ) -> Tuple[List[torch.Tensor], List[Dict[str, object]], List[Dict[str, object]]]:
+    """Run one estimator family.
+
+    Each outer round consists of ``transport_repeats`` uncorrected S-steps
+    followed by a single optional R-step.  This implements method tokens of the
+    form ``<transport>-<n>_<correction>``.  During the transport block, only the
+    first substep sees the incoming ratio weights from the previous outer round;
+    intermediate reference clouds are unweighted endpoint proposals.  This is the
+    intended "settle to a transport-self-consistent reference, then correct"
+    workflow.
+    """
+    transport_repeats = int(transport_repeats)
+    if transport_repeats < 1:
+        raise ValueError(f"transport_repeats must be >=1; got {transport_repeats}")
+    ratio_reference_mode = canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint"))
+    method_name = method_label(transport_method, transport_repeats, correction_method)
+
     current_pool = init_refs.detach().clone()
     current_rho = init_rho.detach().clone()
     samples_by_round: List[torch.Tensor] = []
     metric_rows: List[Dict[str, object]] = []
     stage_rows: List[Dict[str, object]] = []
+    previous_samples_for_adj: Optional[torch.Tensor] = None
 
     for r in range(1, int(cfg.n_rounds) + 1):
         round_t0 = time.time()
-        score_refs, score_rho, gate_refs, gate_rho, split_info = split_score_gate_banks(current_pool, current_rho, cfg)
-        bank = SNISScoreBank(
-            target,
-            score_refs,
-            cfg,
-            log_ref_weights=score_rho,
-            gate_anchors=gate_refs,
-            gate_log_ref_weights=gate_rho,
-        )
-        gen = make_generator(int(cfg.seed + 10_000 * r + family_seed_offset(family)), target.device)
         next_pool_n = proposal_pool_size(cfg)
         generate_n = max(int(cfg.n_samples), int(next_pool_n))
 
-        # S-step / transport field.  The special transport method ``none`` is a
-        # true no-op on coordinates: it never instantiates a reverse score field.
-        # For plots/metrics, we resample from the current weighted empirical law
-        # represented by the score bank, while the next proposal pool preserves
-        # the current split-compatible pool coordinates.
-        if str(transport_method).lower() == "none":
-            score_fn = None
-            samples_all = current_pool[:next_pool_n].detach()
-            if int(cfg.n_samples) <= int(samples_all.shape[0]):
-                samples_eval = samples_all[:int(cfg.n_samples)].detach()
-            else:
-                samples_eval = weighted_resample(score_refs, score_rho, int(cfg.n_samples), gen)
-            sampler_info = {
-                "failed": False,
-                "fail_reason": "",
-                "max_abs_score": 0.0,
-                "transport_none": True,
-                "generated_n": int(samples_all.shape[0]),
-                "sampler_t_min": float(effective_time_bounds(cfg)[0]),
-                "sampler_t_max": float(effective_time_bounds(cfg)[1]),
-                "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
-            }
-        else:
-            # This is the field used to generate R_{j+1}.  We generate enough
-            # samples to populate both the next score bank and the next gate bank.
-            score_fn = lambda y, t, bank=bank, method=transport_method: bank.estimate(y, t, method)
-            samples_all, sampler_info = reverse_ou_heun_sde(
+        # Keep the incoming bank diagnostics for the round-level CSV row.
+        input_score_refs, input_score_rho, input_gate_refs, input_gate_rho, input_split_info = split_score_gate_banks(
+            current_pool, current_rho, cfg
+        )
+        if previous_samples_for_adj is None:
+            previous_samples_for_adj = input_score_refs.detach()
+        in_ess, in_ess_frac = log_weight_ess(input_score_rho)
+
+        # The transport block.  Substep 1 consumes the current possibly weighted
+        # empirical reference.  Subsequent substeps are pure uncorrected transport
+        # iterations, so they receive zero ratio weights.
+        transport_pool = current_pool.detach()
+        transport_rho = current_rho.detach()
+        samples_all: Optional[torch.Tensor] = None
+        samples_eval: Optional[torch.Tensor] = None
+        sampler_info: Dict[str, object] = {}
+        generator_bank: Optional[SNISScoreBank] = None
+        endpoint_bank: Optional[SNISScoreBank] = None
+        endpoint_score_refs: Optional[torch.Tensor] = None
+        endpoint_score_rho0: Optional[torch.Tensor] = None
+        endpoint_gate_refs: Optional[torch.Tensor] = None
+        endpoint_gate_rho0: Optional[torch.Tensor] = None
+        endpoint_split_info: Optional[Dict[str, object]] = None
+        last_convergence_info: Dict[str, object] = blank_convergence_info("not_computed")
+        transport_substep_infos: List[Dict[str, object]] = []
+
+        for m in range(1, transport_repeats + 1):
+            score_refs, score_rho, gate_refs, gate_rho, split_info = split_score_gate_banks(transport_pool, transport_rho, cfg)
+            bank = SNISScoreBank(
                 target,
-                score_fn,
+                score_refs,
                 cfg,
-                generator=gen,
-                n_samples=generate_n,
-                final_denoise=cfg.final_denoise,
+                log_ref_weights=score_rho,
+                gate_anchors=gate_refs,
+                gate_log_ref_weights=gate_rho,
             )
-            sampler_info["generated_n"] = int(samples_all.shape[0])
-            if cfg.eval_final_denoise:
-                samples_eval, _ = reverse_ou_heun_sde(
-                    target,
-                    score_fn,
-                    cfg,
-                    generator=make_generator(int(cfg.seed + 999_000 + 10_000 * r + family_seed_offset(family)), target.device),
-                    n_samples=int(cfg.n_samples),
-                    final_denoise=True,
-                )
+            gen = make_generator(int(cfg.seed + 10_000 * r + 701 * m + family_seed_offset(family)), target.device)
+
+            if str(transport_method).lower() == "none":
+                step_samples_all = transport_pool[:next_pool_n].detach()
+                if int(cfg.n_samples) <= int(step_samples_all.shape[0]):
+                    step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
+                else:
+                    step_samples_eval = weighted_resample(score_refs, score_rho, int(cfg.n_samples), gen)
+                step_sampler_info = {
+                    "failed": False,
+                    "fail_reason": "",
+                    "max_abs_score": 0.0,
+                    "transport_none": True,
+                    "generated_n": int(step_samples_all.shape[0]),
+                    "sampler_t_min": float(effective_time_bounds(cfg)[0]),
+                    "sampler_t_max": float(effective_time_bounds(cfg)[1]),
+                    "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
+                }
             else:
-                samples_eval = samples_all[:int(cfg.n_samples)].detach()
+                score_fn_step = lambda y, t, bank=bank, method=transport_method: bank.estimate(y, t, method)
+                step_samples_all, step_sampler_info = reverse_ou_heun_sde(
+                    target,
+                    score_fn_step,
+                    cfg,
+                    generator=gen,
+                    n_samples=generate_n,
+                    final_denoise=cfg.final_denoise,
+                )
+                step_sampler_info["generated_n"] = int(step_samples_all.shape[0])
+                if m == transport_repeats and cfg.eval_final_denoise:
+                    step_samples_eval, _ = reverse_ou_heun_sde(
+                        target,
+                        score_fn_step,
+                        cfg,
+                        generator=make_generator(int(cfg.seed + 999_000 + 10_000 * r + 701 * m + family_seed_offset(family)), target.device),
+                        n_samples=int(cfg.n_samples),
+                        final_denoise=True,
+                    )
+                else:
+                    step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
+
+            next_pool = step_samples_all[:next_pool_n].detach()
+            zero_next_rho = torch.zeros((next_pool.shape[0],), device=next_pool.device, dtype=next_pool.dtype)
+            next_score_refs0, next_score_rho0, next_gate_refs0, next_gate_rho0, next_split_info0 = split_score_gate_banks(
+                next_pool, zero_next_rho, cfg
+            )
+            next_bank0 = SNISScoreBank(
+                target,
+                next_score_refs0,
+                cfg,
+                log_ref_weights=next_score_rho0,
+                gate_anchors=next_gate_refs0,
+                gate_log_ref_weights=next_gate_rho0,
+            )
+
+            # The full Delta_PF diagnostics are the expensive theorem-facing
+            # quantities.  For multi-transport blocks we report them for the final
+            # adjacent pair only: s_{k+n-1} versus s_{k+n}, immediately before
+            # the optional ratio correction.
+            if (
+                m == transport_repeats
+                and bool(getattr(cfg, "convergence_check", False))
+                and str(transport_method).lower() != "none"
+            ):
+                delta_gen = make_generator(int(cfg.seed + 440_000 + 10_000 * r + 701 * m + family_seed_offset(family)), target.device)
+                step_conv = probability_flow_score_discrepancy(
+                    bank, transport_method, next_bank0, transport_method, cfg, delta_gen
+                )
+                target_delta_gen = make_generator(int(cfg.seed + 441_000 + 10_000 * r + 701 * m + family_seed_offset(family)), target.device)
+                step_conv.update(target_marginal_score_discrepancy(
+                    target, bank, transport_method, next_bank0, transport_method, cfg, target_delta_gen
+                ))
+            else:
+                reason = "nonfinal_transport_substep" if m != transport_repeats else "convergence_check_false_or_none_transport"
+                step_conv = blank_convergence_info(reason)
+
+            transport_substep_infos.append({
+                "transport_substep": int(m),
+                "transport_substeps_total": int(transport_repeats),
+                "transport_substep_input_rho_ess_frac": log_weight_ess(score_rho)[1],
+                "transport_substep_generated_n": int(step_sampler_info.get("generated_n", step_samples_all.shape[0])),
+                "transport_substep_sampler_failed": bool(step_sampler_info.get("failed", False)),
+                "transport_substep_sampler_fail_reason": str(step_sampler_info.get("fail_reason", "")),
+                "transport_substep_sampler_max_abs_score": safe_float(step_sampler_info.get("max_abs_score", float("nan"))),
+                "transport_substep_delta_pf": safe_float(step_conv.get("delta_pf", float("nan"))),
+                "transport_substep_delta_pf_target": safe_float(step_conv.get("delta_pf_target", float("nan"))),
+            })
+
+            # Final-substep objects are used for metrics, convergence reporting,
+            # and the optional likelihood-ratio correction.
+            generator_bank = bank
+            endpoint_bank = next_bank0
+            endpoint_score_refs = next_score_refs0
+            endpoint_score_rho0 = next_score_rho0
+            endpoint_gate_refs = next_gate_refs0
+            endpoint_gate_rho0 = next_gate_rho0
+            endpoint_split_info = next_split_info0
+            samples_all = step_samples_all
+            samples_eval = step_samples_eval
+            sampler_info = step_sampler_info
+            last_convergence_info = step_conv
+
+            # Intermediate transport rounds are deliberately unweighted.
+            transport_pool = next_pool
+            transport_rho = zero_next_rho
+
+        assert samples_all is not None and samples_eval is not None
+        assert endpoint_bank is not None and generator_bank is not None
+        assert endpoint_score_refs is not None and endpoint_score_rho0 is not None
+        assert endpoint_gate_refs is not None and endpoint_gate_rho0 is not None
+        assert endpoint_split_info is not None
         samples_by_round.append(samples_eval.detach())
 
+        # Report score quality for the settled endpoint reference rather than the
+        # pre-final generator bank.  This is the object the new TSC workflow uses
+        # for ratio evaluation by default.
+        if str(transport_method).lower() == "none":
+            metric_score_fn = None
+        else:
+            metric_score_fn = lambda y, t, bank=endpoint_bank, method=transport_method: bank.estimate(y, t, method)
         metric_gen = make_generator(int(cfg.seed + 220_000 + 10_000 * r + family_seed_offset(family)), target.device)
-        metrics = compute_metrics(target, samples_eval, truth, score_fn, cfg, metric_gen)
-        in_ess, in_ess_frac = log_weight_ess(score_rho)
+        metrics = compute_metrics(target, samples_eval, truth, metric_score_fn, cfg, metric_gen)
+        adjacent_gen = make_generator(int(cfg.seed + 330_000 + 10_000 * r + family_seed_offset(family)), target.device)
+        adjacent_metrics = adjacent_sample_discrepancy(samples_eval, previous_samples_for_adj, cfg, adjacent_gen)
         row = {
             "kind": "sample",
             "family": family,
-            "method": f"{transport_method}_{correction_method}",
+            "method": method_name,
             "transport_method": transport_method,
+            "transport_repeats": int(transport_repeats),
             "correction_method": correction_method,
+            "ratio_reference_mode": ratio_reference_mode,
             "round": int(r),
-            "input_ref_n": int(score_refs.shape[0]),
-            "input_gate_n": int(gate_refs.shape[0]),
+            "input_ref_n": int(input_score_refs.shape[0]),
+            "input_gate_n": int(input_gate_refs.shape[0]),
             "input_pool_n": int(current_pool.shape[0]),
-            "bank_coupling": split_info["bank_coupling"],
-            "score_slice": split_info["score_slice"],
-            "gate_slice": split_info["gate_slice"],
-            "bank_overlap_n": int(split_info["bank_overlap_n"]),
+            "bank_coupling": input_split_info["bank_coupling"],
+            "score_slice": input_split_info["score_slice"],
+            "gate_slice": input_split_info["gate_slice"],
+            "bank_overlap_n": int(input_split_info["bank_overlap_n"]),
             "input_rho_ess": in_ess,
             "input_rho_ess_frac": in_ess_frac,
             "sampler_failed": bool(sampler_info.get("failed", False)),
@@ -2669,45 +3430,44 @@ def run_family(
             "generated_n": int(sampler_info.get("generated_n", samples_all.shape[0])),
             "elapsed_sec_so_far": float(time.time() - round_t0),
             **metrics,
+            **adjacent_metrics,
         }
         metric_rows.append(row)
+        previous_samples_for_adj = samples_eval.detach()
 
-        # R-step: compute weights for the next S-step on the entire split-compatible
-        # proposal pool, not only on the score slice.  This is necessary when
-        # bank_coupling=independent because the gate-only samples need their own
-        # density-ratio weights in the following round.
-        next_pool = samples_all[:next_pool_n].detach()
-        next_score_refs, _next_score_rho_placeholder, next_gate_refs, _next_gate_rho_placeholder, next_split_info = split_score_gate_banks(
-            next_pool,
-            torch.zeros((next_pool.shape[0],), device=next_pool.device, dtype=next_pool.dtype),
-            cfg,
-        )
+        # R-step on the settled endpoint proposal pool.  With ratio_reference_mode
+        # = endpoint, the PF score estimator is built from the final endpoint
+        # reference cloud; this is the intended post-TSC correction.  With
+        # ratio_reference_mode = generator, it is built from the bank that created
+        # the endpoint, preserving the old exact-induced-density convention.
+        final_pool = samples_all[:next_pool_n].detach()
         pf_t0 = time.time()
-        logpi = target.log_prob(next_pool, t=0.0)
-        if str(correction_method).lower() == "none":
+        logpi = target.log_prob(final_pool, t=0.0)
+        skip_likelihood_correction = bool(getattr(cfg, "force_no_likelihood_correction", False)) or str(correction_method).lower() == "none"
+        if skip_likelihood_correction:
             logq = torch.full_like(logpi, float("nan"))
             raw_rho = torch.zeros_like(logpi)
-            pf_info = blank_pf_info(correction_method, reason="correction_method_none")
-            calib_info = blank_calibration_info(reason="correction_method_none")
+            skip_reason = "force_no_likelihood_correction" if bool(getattr(cfg, "force_no_likelihood_correction", False)) else "correction_method_none"
+            pf_info = blank_pf_info(correction_method, reason=skip_reason)
+            calib_info = blank_calibration_info(reason=skip_reason)
+            ratio_bank_source = "none"
         else:
-            # This estimates the endpoint density used in rho = log pi - log q.
-            # Hybrid runs intentionally allow this field to differ from the
-            # transport field above.  Tweedie corrections are supported and use
-            # the generic Hutchinson divergence path unless pf_divergence forces
-            # another mode.
-            logq, pf_info = pf_logprob_bank(bank, next_pool, correction_method, cfg)
+            correction_bank = endpoint_bank if ratio_reference_mode == "endpoint" else generator_bank
+            ratio_bank_source = ratio_reference_mode
+            logq, pf_info = pf_logprob_bank(correction_bank, final_pool, correction_method, cfg)
             raw_rho = logpi - logq
-            # Keep the expensive PF-vs-KDE diagnostic on the score slice so the
-            # reported calibration remains comparable across coupling modes.
-            next_score_start = int(effective_gate_n(cfg)) if next_split_info["bank_coupling"] == "independent" else 0
+            next_score_start = int(effective_gate_n(cfg)) if endpoint_split_info["bank_coupling"] == "independent" else 0
             score_raw_rho = raw_rho[next_score_start:next_score_start + int(cfg.n_ref)]
             score_logq = logq[next_score_start:next_score_start + int(cfg.n_ref)]
-            calib_info = likelihood_correction_calibration(target, next_score_refs, score_logq, score_raw_rho, cfg)
+            calib_info = likelihood_correction_calibration(target, endpoint_score_refs, score_logq, score_raw_rho, cfg)
         next_rho, rho_info = finalize_density_ratio_weights(raw_rho, cfg)
         pf_elapsed = time.time() - pf_t0
+
+        # Re-split with actual next-round weights; this is what the next outer
+        # round consumes.  These weights are not used to define the pre-correction
+        # TSC diagnostics above.
+        next_score_refs, next_score_rho, next_gate_refs, next_gate_rho, next_split_info = split_score_gate_banks(final_pool, next_rho, cfg)
         mode_before = mode_mass_l1(target, next_score_refs)
-        next_score_start = int(effective_gate_n(cfg)) if next_split_info["bank_coupling"] == "independent" else 0
-        next_score_rho = next_rho[next_score_start:next_score_start + int(cfg.n_ref)]
         w = torch.exp(next_score_rho - torch.max(next_score_rho))
         w = w / torch.clamp(w.sum(), min=1.0e-30)
         if hasattr(target, "responsibilities") and int(getattr(target, "K", 0)) > 0:
@@ -2716,19 +3476,28 @@ def run_family(
             weighted_mode_l1 = safe_float(torch.sum(torch.abs(weighted_mode - target.weights)))
         else:
             weighted_mode_l1 = float("nan")
+
+        # Flatten final substep diagnostics into the stage row.  The full list is
+        # stored as JSON for auditability without exploding the main CSV width.
+        convergence_info = dict(last_convergence_info)
         stage_rows.append({
             "family": family,
-            "method": f"{transport_method}_{correction_method}",
+            "method": method_name,
             "transport_method": transport_method,
+            "transport_repeats": int(transport_repeats),
             "correction_method": correction_method,
+            "ratio_reference_mode": ratio_reference_mode,
+            "ratio_bank_source": ratio_bank_source,
             "round": int(r),
             "r_step_ref_n": int(next_score_refs.shape[0]),
             "r_step_gate_n": int(next_gate_refs.shape[0]),
-            "r_step_pool_n": int(next_pool.shape[0]),
+            "r_step_pool_n": int(final_pool.shape[0]),
             "bank_coupling": next_split_info["bank_coupling"],
             "score_slice": next_split_info["score_slice"],
             "gate_slice": next_split_info["gate_slice"],
             "bank_overlap_n": int(next_split_info["bank_overlap_n"]),
+            "transport_substep_summary_json": json.dumps(transport_substep_infos),
+            "final_transport_substep": int(transport_repeats),
             "r_step_elapsed_sec": float(pf_elapsed),
             "raw_rho_mean": safe_float(raw_rho.mean()),
             "raw_rho_std": safe_float(raw_rho.std(unbiased=False)),
@@ -2736,26 +3505,29 @@ def run_family(
             "logpi_std": safe_float(logpi.std(unbiased=False)),
             "mode_l1_unweighted_next_refs": mode_before,
             "mode_l1_weighted_next_refs": weighted_mode_l1,
+            **convergence_info,
             **pf_info,
             **calib_info,
-            **(bank.mp_leaf_info if any(str(m).lower().replace("_", "-") in {"leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"} for m in (transport_method, correction_method)) else {}),
+            **(endpoint_bank.mp_leaf_info if any(str(m).lower().replace("_", "-") in {"leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"} for m in (transport_method, correction_method)) else {}),
             **rho_info,
         })
 
-        # Option B alternating update: the next S-step uses the same coordinates
-        # produced by this S-step, plus the endpoint ratio weights from the R-step.
-        current_pool = next_pool
+        current_pool = final_pool
         current_rho = next_rho.detach()
         print(
-            f"[{family} | S={transport_method}, R={correction_method}] round {r}/{cfg.n_rounds}: "
+            f"[{family} | S={transport_method}x{transport_repeats}, R={correction_method}, ratio_ref={ratio_reference_mode}] "
+            f"round {r}/{cfg.n_rounds}: "
             f"MMD={metrics['mmd']:.4g}, KSD={metrics['ksd']:.4g}, SW2={metrics['sw2']:.4g}, "
-            f"FisherRMSE={metrics['fisher_rmse']:.4g}, rhoESS={rho_info['rho_ess_frac']:.3f}, "
-            f"bank={next_split_info['bank_coupling']} score_n={next_split_info['score_n']} gate_n={next_split_info['gate_n']}, "
-            f"pf_fail={pf_info['pf_failed_frac']:.3f}, "
-            f"rhoPF-KDEcorr={calib_info.get('calib_rho_pf_vs_kde_corr', float('nan')):.3f}",
+            f"FisherRMSE={metrics['fisher_rmse']:.4g}, adjMMD={adjacent_metrics['adjacent_sample_mmd']:.4g}, "
+            f"DeltaPF={convergence_info.get('delta_pf', float('nan')):.4g}, DeltaPF_pi={convergence_info.get('delta_pf_target', float('nan')):.4g}, "
+            f"PFEpMMD={convergence_info.get('delta_pf_endpoint_mmd', float('nan')):.4g}, "
+            f"rhoESS={rho_info['rho_ess_frac']:.3f}, bank={next_split_info['bank_coupling']} "
+            f"score_n={next_split_info['score_n']} gate_n={next_split_info['gate_n']}, "
+            f"pf_skip={pf_info.get('pf_skipped', False)}",
             flush=True,
         )
     return samples_by_round, metric_rows, stage_rows
+
 
 
 
@@ -2766,7 +3538,34 @@ def _estimator_alias_table() -> Dict[str, Tuple[str, str]]:
         "blend": ("Blend", "blend"),
         "blended": ("Blend", "blend"),
         "scalar-blend": ("Blend", "blend"),
+        "scalar_blend": ("Blend", "blend"),
+        "local-scalar-blend": ("Blend", "blend"),
+        "local_scalar_blend": ("Blend", "blend"),
         "scalar": ("Blend", "blend"),
+        "matrix-blend": ("MatrixBlend", "matrix-blend"),
+        "matrix_blend": ("MatrixBlend", "matrix-blend"),
+        "centered-blend": ("MatrixBlend", "matrix-blend"),
+        "centered_blend": ("MatrixBlend", "matrix-blend"),
+        "centered-matrix-blend": ("MatrixBlend", "matrix-blend"),
+        "centered_matrix_blend": ("MatrixBlend", "matrix-blend"),
+        "local-matrix-blend": ("MatrixBlend", "matrix-blend"),
+        "local_matrix_blend": ("MatrixBlend", "matrix-blend"),
+        "unif-blend": ("UnifBlend", "unif-blend"),
+        "unif_blend": ("UnifBlend", "unif-blend"),
+        "unif-scalar-blend": ("UnifBlend", "unif-blend"),
+        "unif_scalar_blend": ("UnifBlend", "unif-blend"),
+        "uniform-blend": ("UnifBlend", "unif-blend"),
+        "uniform_blend": ("UnifBlend", "unif-blend"),
+        "uniform-scalar-blend": ("UnifBlend", "unif-blend"),
+        "uniform_scalar_blend": ("UnifBlend", "unif-blend"),
+        "global-scalar-blend": ("UnifBlend", "unif-blend"),
+        "global_scalar_blend": ("UnifBlend", "unif-blend"),
+        "unif-matrix-blend": ("UnifMatrixBlend", "unif-matrix-blend"),
+        "unif_matrix_blend": ("UnifMatrixBlend", "unif-matrix-blend"),
+        "uniform-matrix-blend": ("UnifMatrixBlend", "unif-matrix-blend"),
+        "uniform_matrix_blend": ("UnifMatrixBlend", "unif-matrix-blend"),
+        "global-matrix-blend": ("UnifMatrixBlend", "unif-matrix-blend"),
+        "global_matrix_blend": ("UnifMatrixBlend", "unif-matrix-blend"),
         "lfgi": ("LFGI", "ce-hlsi"),
         "ce-hlsi": ("LFGI", "ce-hlsi"),
         "ce_hlsi": ("LFGI", "ce-hlsi"),
@@ -2780,6 +3579,7 @@ def _estimator_alias_table() -> Dict[str, Tuple[str, str]]:
         "tweedie": ("Tweedie", "tweedie"),
         "twd": ("Tweedie", "tweedie"),
         "none": ("None", "none"),
+        "nome": ("None", "none"),
         "no-op": ("None", "none"),
         "noop": ("None", "none"),
         "no_correction": ("None", "none"),
@@ -2798,13 +3598,41 @@ def _normalize_estimator_alias(key: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _parse_method_token(token: str) -> Tuple[str, str, str]:
-    """Resolve one --methods token to (display family, transport method, correction method).
+def _parse_transport_spec(text: str) -> Optional[Tuple[str, str, int]]:
+    """Parse a transport estimator alias with optional trailing -<n>."""
+    raw = str(text).strip().lower()
+    spec = _normalize_estimator_alias(raw)
+    if spec is not None:
+        disp, method = spec
+        return disp, method, 1
+    import re
+    m = re.match(r"^(.+)-([0-9]+)$", raw)
+    if m is None:
+        return None
+    base, n_raw = m.group(1), m.group(2)
+    n = int(n_raw)
+    if n < 1:
+        raise ValueError(f"transport repeat count must be >=1 in {text!r}")
+    spec = _normalize_estimator_alias(base)
+    if spec is None:
+        return None
+    disp, method = spec
+    return disp, method, n
 
-    Atomic tokens such as ``blend`` or ``lfgi`` mean diagonal pairs.  Hybrid tokens
-    use transport_correction order, for example ``blend_lfgi`` means Blend for the
-    S-step transport and LFGI for the R-step likelihood correction.  We also accept
-    ``transport:correction``, ``transport/correction``, and ``transport->correction``.
+
+def _parse_method_token(token: str) -> Tuple[str, str, str, int]:
+    """Resolve one --methods token to (display family, transport, correction, repeats).
+
+    Atomic tokens such as ``blend`` or ``lfgi`` mean diagonal pairs with one
+    transport step.  Hybrid tokens use transport_correction order, for example
+    ``blend_lfgi`` means Blend for transport and LFGI for likelihood correction.
+
+    Multi-transport tokens attach a count to the transport alias:
+        ``lfgi-2_lfgi`` means LFGI transport twice, then LFGI ratio correction.
+        ``blend-3_lfgi`` means three Blend transports, then LFGI correction.
+
+    The current names are exactly the ``n=1`` case: ``lfgi_lfgi`` is equivalent
+    to ``lfgi-1_lfgi``.
     """
     raw = str(token).strip().lower()
     if not raw:
@@ -2815,66 +3643,73 @@ def _parse_method_token(token: str) -> Tuple[str, str, str]:
     for sep in ("->", ":", "/"):
         if sep in raw:
             left, right = raw.split(sep, 1)
-            lspec = _normalize_estimator_alias(left)
+            lspec = _parse_transport_spec(left)
             rspec = _normalize_estimator_alias(right)
             if lspec is None or rspec is None:
                 break
-            ldisp, lmethod = lspec
+            ldisp, lmethod, repeats = lspec
             rdisp, rmethod = rspec
-            return f"{ldisp}->{rdisp}", lmethod, rmethod
+            if repeats == 1:
+                return f"{ldisp}->{rdisp}", lmethod, rmethod, repeats
+            return f"{ldisp}x{repeats}->{rdisp}", lmethod, rmethod, repeats
 
-    # Atomic diagonal alias.
-    spec = _normalize_estimator_alias(raw)
-    if spec is not None:
-        disp, method = spec
-        return f"{disp}->{disp}", method, method
+    # Atomic diagonal alias, with optional repeat count: lfgi or lfgi-3.
+    lspec = _parse_transport_spec(raw)
+    if lspec is not None:
+        disp, method, repeats = lspec
+        if repeats == 1:
+            return f"{disp}->{disp}", method, method, repeats
+        return f"{disp}x{repeats}->{disp}", method, method, repeats
 
-    # Hybrid underscore syntax.  Try every split position so ce_hlsi_blend and
+    # Hybrid underscore syntax.  Try every split position so ce_hlsi-2_blend and
     # blend_leaf_lfgi can still be parsed unambiguously.
     parts = raw.split("_")
     for i in range(1, len(parts)):
         left = "_".join(parts[:i])
         right = "_".join(parts[i:])
-        lspec = _normalize_estimator_alias(left)
+        lspec = _parse_transport_spec(left)
         rspec = _normalize_estimator_alias(right)
         if lspec is not None and rspec is not None:
-            ldisp, lmethod = lspec
+            ldisp, lmethod, repeats = lspec
             rdisp, rmethod = rspec
-            return f"{ldisp}->{rdisp}", lmethod, rmethod
+            if repeats == 1:
+                return f"{ldisp}->{rdisp}", lmethod, rmethod, repeats
+            return f"{ldisp}x{repeats}->{rdisp}", lmethod, rmethod, repeats
 
     valid = ", ".join(sorted(_estimator_alias_table().keys()) + ["all", "hybrids"])
     raise ValueError(
         f"Unknown method/hybrid token {token!r}. Use atomic aliases or transport_correction "
-        f"tokens like blend_lfgi, lfgi_none, none_lfgi, or tweedie_lfgi. Valid estimator aliases: {valid}"
+        f"tokens like blend_lfgi, lfgi_none, none_lfgi, tweedie_lfgi, or the "
+        f"multi-transport form lfgi-2_lfgi. Valid estimator aliases: {valid}"
     )
 
 
-def selected_method_specs(methods: str) -> List[Tuple[str, str, str]]:
+def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int]]:
     """Resolve comma-separated method/hybrid aliases.
 
-    Returns tuples ``(display_family, transport_method, correction_method)``.
+    Returns tuples ``(display_family, transport_method, correction_method, transport_repeats)``.
     The token order for hybrids is always transport/correction.
     """
     raw = str(methods or "hybrids").strip().lower()
     if raw in {"all", "default", "*"}:
-        keys = ["blend", "lfgi", "leaf-lfgi", "tweedie"]
+        keys = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "leaf-lfgi", "tweedie"]
     elif raw in {"hybrid", "hybrids", "blend-lfgi-hybrids", "lfgi-blend-hybrids"}:
         keys = ["blend_blend", "blend_lfgi", "lfgi_blend", "lfgi_lfgi"]
     elif raw in {"grid", "full-grid", "fullgrid", "full", "allpairs", "all-pairs"}:
-        atoms = ["blend", "lfgi", "leaf-lfgi", "tweedie", "none"]
+        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "leaf-lfgi", "tweedie", "none"]
         keys = [f"{a}_{b}" for a in atoms for b in atoms]
     else:
         keys = [k.strip() for k in raw.replace(";", ",").split(",") if k.strip()]
-    out: List[Tuple[str, str, str]] = []
+    out: List[Tuple[str, str, str, int]] = []
     seen = set()
     for key in keys:
-        fam, transport, correction = _parse_method_token(key)
-        unique = (transport, correction)
+        fam, transport, correction, repeats = _parse_method_token(key)
+        unique = (transport, int(repeats), correction)
         if unique not in seen:
-            out.append((fam, transport, correction))
+            out.append((fam, transport, correction, int(repeats)))
             seen.add(unique)
     if not out:
-        raise ValueError("No methods selected. Example: --methods blend_lfgi,lfgi_blend,lfgi_none,none_lfgi,tweedie_lfgi")
+        raise ValueError("No methods selected. Example: --methods blend_lfgi,matrix_blend-2_unif_blend,lfgi_none,none_lfgi,tweedie_lfgi")
     return out
 
 
@@ -3000,6 +3835,7 @@ def run(cfg: Config) -> None:
         "effective_t_min": float(effective_time_bounds(cfg)[0]),
         "effective_t_max": float(effective_time_bounds(cfg)[1]),
         "effective_time_schedule": canonical_time_schedule(cfg.time_schedule),
+        "effective_ratio_reference_mode": canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint")),
         "proposal_pool_n": int(proposal_pool_size(cfg)),
         "target_moment_mean_norm": target.moment_mean_norm,
         "target_moment_cov_frob_err": target.moment_cov_frob_err,
@@ -3030,6 +3866,14 @@ def run(cfg: Config) -> None:
     truth_gen = make_generator(int(cfg.seed + 202), device)
     truth = target.sample(int(cfg.n_truth), generator=truth_gen).detach()
     init_rho, init_info = initial_log_weights(target, init_refs, cfg)
+    if bool(getattr(cfg, "force_no_likelihood_correction", False)):
+        init_rho = torch.zeros_like(init_rho)
+        ess, ess_frac = log_weight_ess(init_rho)
+        init_info.update({
+            "initial_weight_mode": "zero_forced_no_likelihood_correction",
+            "initial_rho_ess": ess,
+            "initial_rho_ess_frac": ess_frac,
+        })
     init_info.update(init_ref_info)
     print(
         f"Initial references: mode={init_info['initial_reference_mode']}; "
@@ -3047,21 +3891,29 @@ def run(cfg: Config) -> None:
 
     all_samples: Dict[str, List[torch.Tensor]] = {}
     method_specs = selected_method_specs(cfg.methods)
-    print("Selected method pairs: " + ", ".join([f"{fam} (S={tm}, R={cm})" for fam, tm, cm in method_specs]), flush=True)
-    for family, transport_method, correction_method in method_specs:
-        print(f"\n=== Running alternating DRC pair: {family} (S={transport_method}, R={correction_method}) ===", flush=True)
-        samples_by_round, rows, stages = run_family(family, transport_method, correction_method, target, init_refs, init_rho, truth, cfg)
+    if bool(getattr(cfg, "force_no_likelihood_correction", False)):
+        # The theorem-5.3 numerical harness iterates only the score-to-transport
+        # map q_{k+1}=F_A(q_k).  Keep each selected S-step estimator and its
+        # transport repeat count, but force the projection/ratio node to identity.
+        method_specs = [(f"{fam.split('->')[0]}->None", tm, "none", rep) for fam, tm, _cm, rep in method_specs]
+    print("Selected method pairs: " + ", ".join([f"{fam} (S={tm}x{rep}, R={cm})" for fam, tm, cm, rep in method_specs]), flush=True)
+    for family, transport_method, correction_method, transport_repeats in method_specs:
+        print(f"\n=== Running alternating DRC pair: {family} (S={transport_method}x{transport_repeats}, R={correction_method}) ===", flush=True)
+        samples_by_round, rows, stages = run_family(family, transport_method, correction_method, transport_repeats, target, init_refs, init_rho, truth, cfg)
         all_samples[family] = samples_by_round
         metric_rows.extend(rows)
         stage_rows.extend(stages)
 
+    convergence_rows = combine_convergence_rows(metric_rows, stage_rows)
     write_csv(os.path.join(cfg.outdir, "metrics_by_round.csv"), metric_rows)
     write_csv(os.path.join(cfg.outdir, "stage_diagnostics.csv"), stage_rows)
+    write_csv(os.path.join(cfg.outdir, "convergence_by_round.csv"), convergence_rows)
     save_heatmaps(cfg.outdir, target, truth, init_score_refs, all_samples, cfg)
     save_metric_curves(cfg.outdir, metric_rows)
+    save_convergence_curves(cfg.outdir, convergence_rows)
 
     print("\nDone. Wrote:", flush=True)
-    for name in ["config.json", "metrics_by_round.csv", "stage_diagnostics.csv", "heatmaps_final.png", "heatmaps_by_round.png", "metric_curves.png", "projection_basis.npz"]:
+    for name in ["config.json", "metrics_by_round.csv", "stage_diagnostics.csv", "convergence_by_round.csv", "heatmaps_final.png", "heatmaps_by_round.png", "metric_curves.png", "convergence_curves.png", "projection_basis.npz"]:
         print("  " + os.path.join(cfg.outdir, name), flush=True)
 
 
@@ -3093,6 +3945,7 @@ def parse_args() -> Config:
     ns.t_start = float(ns.t_max)
     ns.t_end = float(ns.t_min)
     ns.time_schedule = canonical_time_schedule(ns.time_schedule)
+    ns.ratio_reference_mode = canonical_ratio_reference_mode(getattr(ns, "ratio_reference_mode", "endpoint"))
 
     cfg = Config(**vars(ns))
     # Fail fast for invalid interval/schedule.
