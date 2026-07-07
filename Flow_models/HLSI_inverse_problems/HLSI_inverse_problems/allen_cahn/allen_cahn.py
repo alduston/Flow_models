@@ -47,6 +47,209 @@ print("Using:", sampling.__file__)
 print("DRC test:", sampling.canonicalize_init_weights("DRC"))
 
 
+# Compatibility shim for current sampling.py versions.  In the direct transport
+# path, run_single_sampler_config calls resolve_hlsi_gate_law(init, init_weights,
+# gate_rho=...), while the current helper signature expects the second positional
+# argument to be gate_rho.  DRC/density-only scripts avoid this path; iterative
+# transport with a direct LFGI T-step hits it.  Treat a positional init-weight
+# token (None/L/WC/PoU/DRC) as metadata and forward the actual gate kwargs.
+_orig_resolve_hlsi_gate_law = sampling.resolve_hlsi_gate_law
+
+
+def _resolve_hlsi_gate_law_compat(mode, maybe_gate_rho=None, *args,
+                                  gate_rho=None, gate_beta=None, gate_kappa=None,
+                                  gate_topk=64, gate_metric_source='mu', **kwargs):
+    positional_is_weight = False
+    if maybe_gate_rho is not None:
+        try:
+            sampling.canonicalize_init_weights(maybe_gate_rho)
+            positional_is_weight = True
+        except Exception:
+            positional_is_weight = False
+
+    if positional_is_weight:
+        # This is the accidental cfg['init_weights'] positional argument.
+        pass
+    elif maybe_gate_rho is not None and gate_rho is None:
+        gate_rho = maybe_gate_rho
+
+    # Preserve compatibility with any older positional calls after gate_rho.
+    if len(args) >= 1 and gate_beta is None:
+        gate_beta = args[0]
+    if len(args) >= 2 and gate_kappa is None:
+        gate_kappa = args[1]
+    if len(args) >= 3:
+        gate_topk = args[2]
+    if len(args) >= 4:
+        gate_metric_source = args[3]
+    if len(args) > 4:
+        raise TypeError(f"resolve_hlsi_gate_law expected at most 6 positional arguments, got {2 + len(args)}")
+
+    return _orig_resolve_hlsi_gate_law(
+        mode,
+        gate_rho=gate_rho,
+        gate_beta=gate_beta,
+        gate_kappa=gate_kappa,
+        gate_topk=gate_topk,
+        gate_metric_source=gate_metric_source,
+    )
+
+
+sampling.resolve_hlsi_gate_law = _resolve_hlsi_gate_law_compat
+for _fn_name in (
+    'eval_modular_hlsi_posterior_score',
+    'run_single_sampler_config',
+    '_run_drc_ratio_update_config',
+):
+    _fn = getattr(sampling, _fn_name, None)
+    if _fn is not None and hasattr(_fn, '__globals__'):
+        _fn.__globals__['resolve_hlsi_gate_law'] = _resolve_hlsi_gate_law_compat
+
+
+# Non-finite transport hardening for pilot inverse-problem comparisons.
+# Some score families can occasionally produce a complete blow-up in a transport
+# node.  The shared helper's reference-bank constructor correctly rejects a
+# source with no finite samples, but that stops the full comparison.  For this
+# experiment we keep the run alive by replacing non-finite output rows at the
+# boundary of each sampler node.  Partial blow-ups are repaired from the finite
+# rows of the same output; complete blow-ups fall back to the node's finite
+# input reference bank, and finally to fresh prior samples if no finite input
+# bank exists.  The run-info table records when this happens.
+import warnings as _warnings
+
+_orig_run_single_sampler_config = sampling.run_single_sampler_config
+
+
+def _as_finite_cpu_pool(x, dim=None):
+    if x is None:
+        return None
+    try:
+        if torch.is_tensor(x):
+            y = x.detach().cpu().to(dtype=torch.float64)
+        else:
+            y = torch.tensor(np.asarray(x), dtype=torch.float64)
+    except Exception:
+        return None
+    if y.ndim == 1:
+        y = y.reshape(1, -1)
+    if y.ndim != 2:
+        return None
+    if dim is not None and y.shape[1] != int(dim):
+        return None
+    finite = torch.isfinite(y).all(dim=1)
+    if not bool(finite.any().item()):
+        return None
+    return y[finite].contiguous()
+
+
+def _repeat_pool_to_n(pool, n, dim):
+    pool = _as_finite_cpu_pool(pool, dim=dim)
+    if pool is None or pool.shape[0] == 0:
+        return None
+    n = int(n)
+    idx = torch.arange(n, dtype=torch.long) % int(pool.shape[0])
+    return pool[idx].contiguous()
+
+
+def _prior_fallback_samples(prior_model, n, dim):
+    try:
+        x = prior_model.sample(int(n))
+        return _repeat_pool_to_n(x, int(n), int(dim))
+    except Exception:
+        return torch.zeros((int(n), int(dim)), dtype=torch.float64)
+
+
+def _repair_nonfinite_sampler_output(label, config, prior_model, ref_bank, samps, info, precomp):
+    if torch.is_tensor(samps):
+        samples_cpu = samps.detach().cpu().to(dtype=torch.float64)
+    else:
+        samples_cpu = torch.tensor(np.asarray(samps), dtype=torch.float64)
+
+    cfg_dim = None
+    if isinstance(config, dict):
+        cfg_dim = config.get('dim')
+    if cfg_dim is None:
+        cfg_dim = getattr(prior_model, 'dim', None) or getattr(sampling, 'ACTIVE_DIM', None)
+
+    if samples_cpu.ndim == 1:
+        samples_cpu = samples_cpu.reshape(1, -1)
+    if samples_cpu.ndim != 2:
+        dim = int(cfg_dim) if cfg_dim is not None else int(getattr(prior_model, 'dim', 1))
+        n_target = int(config.get('n_samples', getattr(sampling, 'DEFAULT_N_GEN', 500))) if isinstance(config, dict) else int(getattr(sampling, 'DEFAULT_N_GEN', 500))
+        repaired = None
+        source = None
+        if isinstance(ref_bank, dict):
+            repaired = _repeat_pool_to_n(ref_bank.get('X_ref'), n_target, dim)
+            source = 'input_reference_bank'
+        if repaired is None:
+            repaired = _prior_fallback_samples(prior_model, n_target, dim)
+            source = 'fresh_prior'
+        n_bad = n_target
+        reason = f'non-2D sampler output with shape={tuple(samples_cpu.shape)}'
+    else:
+        n_target = int(samples_cpu.shape[0])
+        dim = int(samples_cpu.shape[1])
+        finite = torch.isfinite(samples_cpu).all(dim=1)
+        n_bad = int((~finite).sum().item())
+        if n_bad == 0:
+            return samps, info
+        if bool(finite.any().item()):
+            repaired = samples_cpu.clone()
+            pool = samples_cpu[finite]
+            fill_idx = torch.arange(n_bad, dtype=torch.long) % int(pool.shape[0])
+            repaired[~finite] = pool[fill_idx]
+            source = 'finite_rows_from_same_output'
+            reason = f'{n_bad}/{n_target} non-finite output rows'
+        else:
+            repaired = None
+            source = None
+            if isinstance(ref_bank, dict):
+                repaired = _repeat_pool_to_n(ref_bank.get('X_ref'), n_target, dim)
+                source = 'input_reference_bank'
+            if repaired is None:
+                repaired = _prior_fallback_samples(prior_model, n_target, dim)
+                source = 'fresh_prior'
+            reason = f'all {n_target} output rows were non-finite'
+
+    msg = (
+        f"[{label}] sampler output repair: {reason}; "
+        f"using {source} fallback so downstream reference-bank construction can continue."
+    )
+    print('  ' + msg)
+    _warnings.warn(msg, RuntimeWarning)
+
+    info = dict(info or {})
+    info['sample_fallback_used'] = True
+    info['sample_fallback_source'] = source
+    info['sample_fallback_n_bad'] = int(n_bad)
+    info['sample_fallback_reason'] = reason
+    if precomp is not None:
+        precomp.setdefault('sample_fallbacks', OrderedDict())[label] = {
+            'source': source,
+            'n_bad': int(n_bad),
+            'reason': reason,
+        }
+    return repaired.detach().cpu().contiguous(), info
+
+
+def _run_single_sampler_config_hardened(label, config, prior_model, lik_model, precomp=None,
+                                        ref_bank=None, ref_bank_source='None', n_ref_used=0):
+    samps, ess_trace, info = _orig_run_single_sampler_config(
+        label, config, prior_model, lik_model, precomp,
+        ref_bank=ref_bank, ref_bank_source=ref_bank_source, n_ref_used=n_ref_used,
+    )
+    samps, info = _repair_nonfinite_sampler_output(
+        label, config, prior_model, ref_bank, samps, info, precomp,
+    )
+    return samps, ess_trace, info
+
+
+sampling.run_single_sampler_config = _run_single_sampler_config_hardened
+for _fn_name in ('run_tree_sampler_suite', 'run_standard_sampler_pipeline'):
+    _fn = getattr(sampling, _fn_name, None)
+    if _fn is not None and hasattr(_fn, '__globals__'):
+        _fn.__globals__['run_single_sampler_config'] = _run_single_sampler_config_hardened
+
 
 from sampling import (
     GaussianPrior,
@@ -765,7 +968,7 @@ DRC_RATIO_COMMON = dict(
 
 METHOD_SPECS = OrderedDict([
     ('LFGI', {
-        'init': 'LFGI',
+        'init': 'ce_hlsi',
         'display': 'GN-LFGI',
     }),
     ('MatrixBlend', {
@@ -773,7 +976,7 @@ METHOD_SPECS = OrderedDict([
         'display': 'Local Matrix Blend',
     }),
     ('ScalarBlend', {
-        'init': 'blend',
+        'init': 'scalar_blend',
         'display': 'Local Scalar Blend',
     }),
     ('UnifMatrixBlend', {
