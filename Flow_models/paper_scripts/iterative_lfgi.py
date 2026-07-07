@@ -201,6 +201,12 @@ class Config:
     n_samples: int = 3000
     n_truth: int = 12000
     metrics_max_n: int = 2000
+    # Benchmark-sweep-compatible sample-quality metrics.  The sliced KS default
+    # matches benchmark_sweep.py's LFGI_BENCH_KS_PROJ fallback, while nll_kde_n_fit
+    # matches benchmark_sweep.py's nll_kde(samples, truth, n_fit=min(5000, n)).
+    ks_projections: int = int(os.environ.get("LFGI_BENCH_KS_PROJ", "1000"))
+    nll_kde_n_fit: int = 5000
+    nll_kde_min_bandwidth: float = 0.05
 
     # Iterated no-correction convergence rounds.  The default harness is the
     # theorem-5.3 diagnostic loop q_{k+1}=F_A(q_k), not the ratio-corrected
@@ -2522,8 +2528,47 @@ def likelihood_correction_calibration(
 
 
 @torch.no_grad()
-def nll_metric(target, samples: torch.Tensor) -> float:
+def target_nll_metric(target, samples: torch.Tensor) -> float:
+    """Average target negative log density at generated samples.
+
+    This is the old iterative_lfgi.py NLL diagnostic.  The benchmark_sweep.py
+    NLL is KDE-based and is added below as nll_kde_metric.
+    """
     return safe_float((-target.log_prob(samples, t=0.0)).mean())
+
+
+def nll_kde_metric(samples: torch.Tensor, test_points: torch.Tensor, n_fit: int = 5000, min_bandwidth: float = 0.05, seed: Optional[int] = None) -> float:
+    """Benchmark-sweep-compatible KDE NLL.
+
+    Fits a Gaussian KDE to generated samples and evaluates -E_{test}[log q_hat].
+    This mirrors benchmark_sweep.py::nll_kde, with optional deterministic
+    subsampling and configurable bandwidth floor.
+    """
+    try:
+        from sklearn.neighbors import KernelDensity
+    except Exception:
+        return float("nan")
+    if samples.dim() > 2:
+        samples = samples.reshape(samples.shape[0], -1)
+    if test_points.dim() > 2:
+        test_points = test_points.reshape(test_points.shape[0], -1)
+    if int(samples.shape[0]) <= 1 or int(test_points.shape[0]) <= 0:
+        return float("nan")
+    sc_np = samples.detach().cpu().double().numpy()
+    te_np = test_points.detach().cpu().double().numpy()
+    n, d = len(sc_np), sc_np.shape[1]
+    n_fit = int(n_fit) if n_fit is not None else n
+    if n_fit > 0 and n_fit < n:
+        if seed is None:
+            idx = np.random.choice(n, n_fit, replace=False)
+        else:
+            rng = np.random.default_rng(int(seed))
+            idx = rng.choice(n, n_fit, replace=False)
+        sc_np = sc_np[idx]
+        n = len(sc_np)
+    bw = max(n ** (-1.0 / (d + 4)), float(min_bandwidth))
+    kde = KernelDensity(kernel="gaussian", bandwidth=bw).fit(sc_np)
+    return float(-kde.score_samples(te_np).mean())
 
 
 @torch.no_grad()
@@ -2575,23 +2620,66 @@ def sliced_w2(x: torch.Tensor, y: torch.Tensor, n_proj: int, generator: torch.Ge
 
 
 @torch.no_grad()
-def sliced_ks(x: torch.Tensor, y: torch.Tensor, n_proj: int, generator: torch.Generator, max_n: int = 2000) -> float:
-    n = min(max_n, x.shape[0], y.shape[0])
-    x = x[:n]
-    y = y[:n]
-    dirs = torch.randn((int(n_proj), x.shape[1]), device=x.device, dtype=x.dtype, generator=generator)
-    dirs = dirs / torch.linalg.norm(dirs, dim=1, keepdim=True).clamp(min=1.0e-30)
-    xp = (x @ dirs.T).detach().cpu().numpy()
-    yp = (y @ dirs.T).detach().cpu().numpy()
-    vals = []
-    for j in range(xp.shape[1]):
-        xs = np.sort(xp[:, j])
-        ys = np.sort(yp[:, j])
-        grid = np.concatenate([xs, ys])
-        cdfx = np.searchsorted(xs, grid, side="right") / max(len(xs), 1)
-        cdfy = np.searchsorted(ys, grid, side="right") / max(len(ys), 1)
-        vals.append(np.max(np.abs(cdfx - cdfy)))
+def _ks_1d_sorted(x, y) -> float:
+    x = np.sort(np.asarray(x, dtype=np.float64))
+    y = np.sort(np.asarray(y, dtype=np.float64))
+    n, m = len(x), len(y)
+    vals = np.concatenate([x, y])
+    cdf_x = np.searchsorted(x, vals, side="right") / max(n, 1)
+    cdf_y = np.searchsorted(y, vals, side="right") / max(m, 1)
+    return float(np.max(np.abs(cdf_x - cdf_y))) if vals.size else float("nan")
+
+
+@torch.no_grad()
+def sliced_ks_distance(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    n_projections: int = 1000,
+    max_points: Optional[int] = None,
+    seed: int = 0,
+    reduce: str = "mean",
+    generator: Optional[torch.Generator] = None,
+) -> float:
+    """Sliced Kolmogorov--Smirnov distance from benchmark_sweep.py.
+
+    The benchmark version uses random one-dimensional projections and averages
+    the 1D KS distance.  This port keeps the same direction seeding and adds an
+    optional torch generator for deterministic subsampling inside this script.
+    """
+    if X.dim() > 2:
+        X = X.reshape(X.shape[0], -1)
+    if Y.dim() > 2:
+        Y = Y.reshape(Y.shape[0], -1)
+    if max_points is None:
+        max_points = int(os.environ.get("LFGI_BENCH_METRIC_MAX", "4096"))
+    n = min(int(max_points), int(X.shape[0]), int(Y.shape[0]))
+    if n <= 1:
+        return float("inf")
+    if generator is None:
+        X = X[torch.randperm(X.shape[0], device=X.device)[:n]]
+        Y = Y[torch.randperm(Y.shape[0], device=Y.device)[:n]]
+    else:
+        X = X[torch.randperm(X.shape[0], device=X.device, generator=generator)[:n]]
+        Y = Y[torch.randperm(Y.shape[0], device=Y.device, generator=generator)[:n]]
+    d = X.shape[1]
+    dir_gen = torch.Generator(device=X.device)
+    dir_gen.manual_seed(int(seed))
+    dirs = torch.randn(int(n_projections), d, generator=dir_gen, dtype=X.dtype, device=X.device)
+    dirs = dirs / torch.linalg.norm(dirs, dim=1, keepdim=True).clamp_min(1.0e-30)
+    Xp = (X @ dirs.T).detach().cpu().numpy()
+    Yp = (Y @ dirs.T).detach().cpu().numpy()
+    vals = np.array([_ks_1d_sorted(Xp[:, j], Yp[:, j]) for j in range(dirs.shape[0])], dtype=np.float64)
+    if reduce == "max":
+        return float(np.max(vals))
+    if reduce == "median":
+        return float(np.median(vals))
     return float(np.mean(vals))
+
+
+@torch.no_grad()
+def sliced_ks(x: torch.Tensor, y: torch.Tensor, n_proj: int, generator: torch.Generator, max_n: int = 2000) -> float:
+    """Backward-compatible wrapper used by adjacent/convergence diagnostics."""
+    return sliced_ks_distance(x, y, n_projections=int(n_proj), max_points=int(max_n), seed=0, generator=generator)
 
 
 @torch.no_grad()
@@ -2640,15 +2728,46 @@ def compute_metrics(target, samples: torch.Tensor, truth: torch.Tensor, score_fn
     x = samples[:n]
     y = truth[:n]
     if not torch.isfinite(x).all():
-        return {"metric_n": n, "nll": float("nan"), "mmd": float("nan"), "ksd": float("nan"), "sw2": float("nan"), "sliced_ks": float("nan"), "mode_l1": float("nan"), "mean_norm": float("nan"), "cov_frob_err": float("nan"), "fisher_rmse": float("nan")}
+        return {
+            "metric_n": n,
+            "nll": float("nan"),
+            "kde_nll": float("nan"),
+            "target_nll": float("nan"),
+            "mmd": float("nan"),
+            "ksd": float("nan"),
+            "sw2": float("nan"),
+            "sliced_ks": float("nan"),
+            "mode_l1": float("nan"),
+            "mean_norm": float("nan"),
+            "cov_frob_err": float("nan"),
+            "fisher_rmse": float("nan"),
+        }
     mean_norm, cov_err = moment_errors(x)
+    kde_nll = nll_kde_metric(
+        x,
+        y,
+        n_fit=min(int(cfg.nll_kde_n_fit), int(n)),
+        min_bandwidth=float(cfg.nll_kde_min_bandwidth),
+        seed=int(cfg.seed + 9_001),
+    )
     out = {
         "metric_n": float(n),
-        "nll": nll_metric(target, x),
+        # Match benchmark_sweep.py: nll is KDE-based sample-quality NLL.
+        "nll": kde_nll,
+        "kde_nll": kde_nll,
+        # Preserve the previous iterative_lfgi.py target-energy diagnostic.
+        "target_nll": target_nll_metric(target, x),
         "mmd": mmd_rbf(x, y, max_n=n),
         "ksd": ksd_rbf(target, x, max_n=min(n, 1000)),
         "sw2": sliced_w2(x, y, cfg.sw2_projections, generator=generator, max_n=n),
-        "sliced_ks": sliced_ks(x, y, cfg.sw2_projections, generator=generator, max_n=n),
+        "sliced_ks": sliced_ks_distance(
+            x,
+            y,
+            n_projections=int(getattr(target, "metric_n_projections", cfg.ks_projections)),
+            max_points=n,
+            seed=0,
+            generator=generator,
+        ),
         "mode_l1": mode_mass_l1(target, x),
         "mean_norm": mean_norm,
         "cov_frob_err": cov_err,
@@ -2942,8 +3061,8 @@ def save_metric_curves(outdir: str, rows: List[Dict[str, object]]):
     df = df[df["kind"] == "sample"].copy()
     if df.empty:
         return
-    metrics = ["mmd", "ksd", "sw2", "sliced_ks", "mode_l1", "fisher_rmse"]
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
+    metrics = ["mmd", "ksd", "sw2", "sliced_ks", "nll", "target_nll", "mode_l1", "fisher_rmse"]
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8), constrained_layout=True)
     axes = axes.reshape(-1)
     for ax, metric in zip(axes, metrics):
         if metric not in df.columns:
@@ -3518,6 +3637,7 @@ def run_family(
             f"[{family} | S={transport_method}x{transport_repeats}, R={correction_method}, ratio_ref={ratio_reference_mode}] "
             f"round {r}/{cfg.n_rounds}: "
             f"MMD={metrics['mmd']:.4g}, KSD={metrics['ksd']:.4g}, SW2={metrics['sw2']:.4g}, "
+            f"SKS={metrics['sliced_ks']:.4g}, NLL={metrics['nll']:.4g}, "
             f"FisherRMSE={metrics['fisher_rmse']:.4g}, adjMMD={adjacent_metrics['adjacent_sample_mmd']:.4g}, "
             f"DeltaPF={convergence_info.get('delta_pf', float('nan')):.4g}, DeltaPF_pi={convergence_info.get('delta_pf_target', float('nan')):.4g}, "
             f"PFEpMMD={convergence_info.get('delta_pf_endpoint_mmd', float('nan')):.4g}, "
