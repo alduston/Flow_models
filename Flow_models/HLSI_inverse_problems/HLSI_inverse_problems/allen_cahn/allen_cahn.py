@@ -952,7 +952,8 @@ y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_
 # Each public result row is a transport node T_r.  The hidden ratio node R_r
 # stores endpoint log-ratio weights for the next round, so every round consists
 # of exactly one transport step followed by one ratio step.
-ITERATIVE_TRANSPORT_ROUNDS = 4
+ITERATIVE_TRANSPORT_ROUNDS = 3
+DISPLAY_TRANSPORT_ROUNDS = {1, 3}
 TRANSPORT_STEPS = 200
 
 DRC_RATIO_COMMON = dict(
@@ -1012,7 +1013,7 @@ def make_iterative_transport_sampler_configs(method_specs, rounds=ITERATIVE_TRAN
                 'mala_steps': 0,
                 'mala_burnin': 0,
                 'log_mean_ess': True,
-                'include_results': True,
+                'include_results': round_idx in DISPLAY_TRANSPORT_ROUNDS,
                 'display_name': f'{display_base} round {round_idx}',
             }
             if prev_ratio_label is not None:
@@ -1061,6 +1062,7 @@ dashboard.add_text_page(
         f'N_REF = {N_REF}',
         f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
         f'ITERATIVE_TRANSPORT_ROUNDS = {ITERATIVE_TRANSPORT_ROUNDS}',
+        f'DISPLAY_TRANSPORT_ROUNDS = {sorted(DISPLAY_TRANSPORT_ROUNDS)}',
         f'TRANSPORT_STEPS = {TRANSPORT_STEPS}',
         f'DRC_RATIO_COMMON = {DRC_RATIO_COMMON}',
         f'NOISE_STD = {NOISE_STD}',
@@ -1240,6 +1242,7 @@ save_reproducibility_log(
         'N_REF': N_REF,
         'BUILD_GNL_BANKS': BUILD_GNL_BANKS,
         'ITERATIVE_TRANSPORT_ROUNDS': ITERATIVE_TRANSPORT_ROUNDS,
+        'DISPLAY_TRANSPORT_ROUNDS': sorted(DISPLAY_TRANSPORT_ROUNDS),
         'TRANSPORT_STEPS': TRANSPORT_STEPS,
         'DRC_RATIO_COMMON': DRC_RATIO_COMMON,
         'METHOD_SPECS': METHOD_SPECS,
