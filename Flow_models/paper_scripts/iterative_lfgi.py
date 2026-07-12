@@ -30,11 +30,12 @@ default flags disable the ratio step.
 
 Original broader test context:
 
-  * Targets: choose with --target.  The default is the original d=8, K=8,
-    rank=3 misaligned near-singular subspace GMM.  The --target funnel_d10 option
-    adds the benchmark-sweep Neal funnel example.  The molecular option
-    --target lj13_2d builds a 26d LJ13-like bonded cluster with manifold
-    concentration, heterogeneous anisotropy, and exact autograd Hessians.
+  * Targets: choose with --target.  Alongside the original misaligned GMM,
+    Neal funnel, and molecular examples, this version includes exact-sampling
+    stiff 2D targets: banana, sine, ring, rings, spiral, and double_well.  Their
+    t=0 scores and observed-information Hessians are evaluated exactly by
+    autodiff; target OU scores used only for diagnostics are empirical Tweedie
+    estimates from cached exact target samples.
   * Normalization: targets are affinely whitened so E[X]≈0 and Cov[X]≈I.
     Therefore the initial N(0,I) prior bank has the same global location and
     volume as the target, but it is not a target sample bank unless --initial_reference_mode target is used.
@@ -138,9 +139,9 @@ class Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "float64"
 
-    # Target selector.  Use misaligned_gmm/gmm8 for the original benchmark;
-    # lj13_2d/molecular for a 26d LJ13-like bonded cluster; dw4_16d for a
-    # smaller 16d molecular stress test.
+    # Target selector.  In addition to the original GMM/funnel/molecular
+    # targets, the script includes stiff two-dimensional non-Gaussian toys:
+    # banana, sine, ring, rings, spiral, and double_well.
     target: str = "misaligned_gmm"
 
     # Original misaligned singular-subspace GMM parameters
@@ -160,6 +161,33 @@ class Config:
     funnel_eta2: float = 6.0
     funnel_score_bank: int = 8192
     funnel_score_chunk: int = 512
+
+    # Stiff analytic 2D target controls.  These targets are affinely normalized
+    # to mean zero and covariance identity when normalize_target=True, while
+    # retaining strong local anisotropy through thin curved/radial directions.
+    toy_norm_samples: int = 32768
+    toy_norm_eig_floor: float = 1.0e-8
+    toy_score_bank: int = 8192
+    toy_score_chunk: int = 512
+    toy_hessian_chunk: int = 1024
+    banana_bend: float = 0.50
+    banana_normal_std: float = 0.12
+    sine_amplitude: float = 0.70
+    sine_frequency: float = 1.35
+    sine_normal_std: float = 0.10
+    ring_radius: float = 3.0
+    ring_radial_std: float = 0.12
+    rings_inner_radius: float = 2.0
+    rings_outer_radius: float = 4.0
+    rings_radial_std: float = 0.11
+    double_well_barrier: float = 4.0
+    double_well_bend: float = 0.20
+    double_well_normal_std: float = 0.12
+    spiral_turns: float = 2.25
+    spiral_r_min: float = 1.0
+    spiral_r_max: float = 4.5
+    spiral_u_std: float = 0.85
+    spiral_logradial_std: float = 0.055
 
     # Molecular LJ/DW-style target parameters.  The defaults define a 2D LJ13-like
     # cluster: 13 particles x 2 coordinates = 26 dimensions.  The target is a
@@ -273,6 +301,10 @@ class Config:
     curvature_cap: float = 1.0e6
     resolvent_eps: float = 1.0e-8
     gate_clip: float = 50.0
+    # Optional eigenvalue floor for symmetric gate matrices.  The default -inf
+    # leaves gates unchanged.  Setting 0 projects to PSD; setting 1e-2, for
+    # example, projects to eigenvalues >= 0.01.
+    gate_min_eval: float = -float("inf")
 
     # Matrix/uniform blend controls, matching the sampler-mode defaults used in
     # sampling.py.  matrix_blend is the centered local matrix regression gate;
@@ -807,6 +839,211 @@ class MisalignedSubspaceGMM:
         eps = torch.randn(x0.shape, device=self.device, dtype=self.dtype, generator=generator)
         return alpha * x0 + torch.sqrt(torch.clamp(gamma, min=0.0)) * eps
 
+
+# -----------------------------------------------------------------------------
+# Exact normalized stiff, heterogeneous, misaligned 3D GMM used by the
+# focused gate-comparison experiment.
+# -----------------------------------------------------------------------------
+
+
+class StiffMisalignedGMM3D:
+    """The exact six-component 3D GMM from lfgi_d3_gate_comparison_normalized.py.
+
+    The raw mixture parameters and analytic global whitening are intentionally
+    fixed so this target can be used to cross-reference the focused 3D harness
+    without changing any other behavior in this script.
+    """
+
+    def __init__(
+        self,
+        normalize: bool = True,
+        device: torch.device = torch.device("cpu"),
+        dtype: torch.dtype = torch.float64,
+    ):
+        self.device = device
+        self.dtype = dtype
+        self.d = 3
+        self.K = 6
+        self.normalized = bool(normalize)
+        self.name = "stiff_misaligned_gmm3d"
+
+        w = torch.tensor([0.07, 0.13, 0.18, 0.21, 0.17, 0.24], device=device, dtype=dtype)
+        self.weights = w / w.sum()
+        self.log_weights = torch.log(self.weights)
+
+        radius = 2.7
+        raw_means = torch.tensor([
+            [-1.10, -0.55,  0.25],
+            [-0.62,  0.92, -0.52],
+            [ 0.10, -1.02,  0.78],
+            [ 0.78,  0.62,  0.55],
+            [ 1.08, -0.28, -0.62],
+            [-0.18,  0.18, -1.08],
+        ], device=device, dtype=dtype)
+        raw_means = radius * raw_means / torch.linalg.norm(raw_means, dim=1, keepdim=True)
+
+        stiff_std = 0.075
+        mid_std = 0.24
+        soft_std = 0.72
+        base_stds = torch.tensor([
+            [stiff_std,        1.05 * mid_std, 0.95 * soft_std],
+            [1.15 * stiff_std, 0.88 * mid_std, 1.10 * soft_std],
+            [0.90 * stiff_std, 1.18 * mid_std, 0.84 * soft_std],
+            [1.05 * stiff_std, 0.95 * mid_std, 1.20 * soft_std],
+            [0.82 * stiff_std, 1.10 * mid_std, 0.92 * soft_std],
+            [1.22 * stiff_std, 0.82 * mid_std, 1.05 * soft_std],
+        ], device=device, dtype=dtype)
+        angles = torch.tensor([
+            [ 0.15,  0.52, -0.35],
+            [ 0.72, -0.28,  0.61],
+            [-0.44,  0.83,  0.24],
+            [ 0.91,  0.38, -0.76],
+            [-0.68, -0.57,  0.88],
+            [ 0.37, -0.92, -0.21],
+        ], device=device, dtype=dtype)
+        Q = self._rotation_matrix_xyz(angles)
+        raw_covs = Q @ torch.diag_embed(base_stds.square()) @ Q.transpose(-1, -2)
+        raw_covs = raw_covs + 0.015 ** 2 * torch.eye(3, device=device, dtype=dtype)
+
+        raw_global_mean = torch.einsum("k,kd->d", self.weights, raw_means)
+        raw_centered_means = raw_means - raw_global_mean
+        raw_global_cov = torch.einsum("k,kij->ij", self.weights, raw_covs)
+        raw_global_cov = raw_global_cov + torch.einsum(
+            "k,ki,kj->ij", self.weights, raw_centered_means, raw_centered_means
+        )
+        raw_evals, raw_evecs = torch.linalg.eigh(sym(raw_global_cov))
+        whitening = raw_evecs @ torch.diag(torch.clamp(raw_evals, min=1.0e-12).rsqrt()) @ raw_evecs.T
+
+        if self.normalized:
+            self.means = raw_centered_means @ whitening.T
+            self.covs = sym(whitening[None, :, :] @ raw_covs @ whitening.T[None, :, :])
+        else:
+            self.means = raw_means
+            self.covs = raw_covs
+
+        self.precisions = torch.linalg.inv(self.covs)
+        self.logdets = torch.linalg.slogdet(self.covs).logabsdet
+        self.chols = torch.linalg.cholesky(self.covs)
+
+        global_mean = torch.einsum("k,kd->d", self.weights, self.means)
+        centered = self.means - global_mean
+        global_cov = torch.einsum("k,kij->ij", self.weights, self.covs)
+        global_cov = global_cov + torch.einsum("k,ki,kj->ij", self.weights, centered, centered)
+        eye = torch.eye(3, device=device, dtype=dtype)
+        self.global_cov = global_cov.detach()
+        self.moment_mean_norm = safe_float(torch.linalg.norm(global_mean))
+        self.moment_cov_frob_err = safe_float(torch.linalg.matrix_norm(global_cov - eye, ord="fro"))
+        self.original_cov_eigs = raw_evals.detach().cpu().numpy()
+        self._raw_global_mean = raw_global_mean.detach()
+        self._raw_global_cov = raw_global_cov.detach()
+        self._whitening = whitening.detach()
+
+        if self.normalized:
+            tol = max(1.0e-9, 100.0 * torch.finfo(dtype).eps)
+            if self.moment_mean_norm > tol or self.moment_cov_frob_err > tol:
+                raise RuntimeError(
+                    "Analytic target normalization failed: "
+                    f"||E[X]||={self.moment_mean_norm:.3e}, "
+                    f"||Cov[X]-I||_F={self.moment_cov_frob_err:.3e}, tol={tol:.3e}"
+                )
+
+    @staticmethod
+    def _rotation_matrix_xyz(angles: torch.Tensor) -> torch.Tensor:
+        ax, ay, az = angles.unbind(dim=-1)
+        one = torch.ones_like(ax)
+        zero = torch.zeros_like(ax)
+        cx, sx = torch.cos(ax), torch.sin(ax)
+        cy, sy = torch.cos(ay), torch.sin(ay)
+        cz, sz = torch.cos(az), torch.sin(az)
+        Rx = torch.stack([
+            one, zero, zero,
+            zero, cx, -sx,
+            zero, sx, cx,
+        ], dim=-1).reshape(*angles.shape[:-1], 3, 3)
+        Ry = torch.stack([
+            cy, zero, sy,
+            zero, one, zero,
+            -sy, zero, cy,
+        ], dim=-1).reshape(*angles.shape[:-1], 3, 3)
+        Rz = torch.stack([
+            cz, -sz, zero,
+            sz, cz, zero,
+            zero, zero, one,
+        ], dim=-1).reshape(*angles.shape[:-1], 3, 3)
+        return Rz @ Ry @ Rx
+
+    def marginal_params(self, t: float | torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        tt = torch.as_tensor(t, device=self.device, dtype=self.dtype)
+        alpha, gamma = alpha_gamma(tt)
+        means_t = alpha * self.means
+        eye = torch.eye(3, device=self.device, dtype=self.dtype)[None, :, :]
+        covs_t = alpha * alpha * self.covs + gamma * eye
+        precs_t = torch.linalg.inv(covs_t)
+        logdets_t = torch.linalg.slogdet(covs_t).logabsdet
+        return means_t, covs_t, precs_t, logdets_t
+
+    def component_log_probs(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        means_t, _covs_t, precs_t, logdets_t = self.marginal_params(t)
+        diff = x[:, None, :] - means_t[None, :, :]
+        quad = torch.einsum("nki,kij,nkj->nk", diff, precs_t, diff)
+        return self.log_weights[None, :] - 0.5 * (
+            3.0 * math.log(2.0 * math.pi) + logdets_t[None, :] + quad
+        )
+
+    def responsibilities(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        return torch.softmax(self.component_log_probs(x, t=t), dim=1)
+
+    def log_prob(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        return torch.logsumexp(self.component_log_probs(x, t=t), dim=1)
+
+    def energy(self, x: torch.Tensor) -> torch.Tensor:
+        return -self.log_prob(x, t=0.0)
+
+    def score(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        means_t, _covs_t, precs_t, _logdets_t = self.marginal_params(t)
+        r = self.responsibilities(x, t=t)
+        diff = x[:, None, :] - means_t[None, :, :]
+        comp_scores = -torch.einsum("kij,nkj->nki", precs_t, diff)
+        return torch.sum(r[:, :, None] * comp_scores, dim=1)
+
+    def observed_information(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        means_t, _covs_t, precs_t, _logdets_t = self.marginal_params(t)
+        r = self.responsibilities(x, t=t)
+        diff = x[:, None, :] - means_t[None, :, :]
+        comp_scores = -torch.einsum("kij,nkj->nki", precs_t, diff)
+        score = torch.sum(r[:, :, None] * comp_scores, dim=1)
+        mean_precision = torch.einsum("nk,kij->nij", r, precs_t)
+        second = torch.einsum("nk,nki,nkj->nij", r, comp_scores, comp_scores)
+        cov_scores = second - score[:, :, None] * score[:, None, :]
+        return sym(mean_precision - cov_scores)
+
+    def sample(self, n: int, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        ids = torch.multinomial(self.weights, int(n), replacement=True, generator=generator)
+        z = torch.randn((int(n), 3), device=self.device, dtype=self.dtype, generator=generator)
+        return self.means[ids] + torch.einsum("nij,nj->ni", self.chols[ids], z)
+
+    def sample_pt(self, n: int, t: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        x0 = self.sample(int(n), generator=generator)
+        alpha, gamma = alpha_gamma(torch.tensor(float(t), device=self.device, dtype=self.dtype))
+        eps = torch.randn(x0.shape, device=self.device, dtype=self.dtype, generator=generator)
+        return alpha * x0 + torch.sqrt(torch.clamp(gamma, min=0.0)) * eps
+
+    def target_info(self) -> Dict[str, object]:
+        local_eigs = torch.linalg.eigvalsh(self.covs)
+        return {
+            "target_name": self.name,
+            "target_type": "gmm",
+            "target_dim": 3,
+            "gmm_n_components": 6,
+            "gmm_weights": [float(v) for v in self.weights.detach().cpu()],
+            "target_normalized": bool(self.normalized),
+            "normalization_definition": "E_pi[X]=0 and Cov_pi[X]=I",
+            "raw_global_mean": self._raw_global_mean.cpu().tolist(),
+            "raw_global_covariance": self._raw_global_cov.cpu().tolist(),
+            "whitening_matrix": self._whitening.cpu().tolist(),
+            "normalized_means": self.means.detach().cpu().tolist(),
+            "normalized_covariance_eigenvalues": local_eigs.detach().cpu().tolist(),
+        }
 
 # -----------------------------------------------------------------------------
 # Neal funnel target
@@ -1380,6 +1617,446 @@ class MolecularLJTarget:
         }
 
 
+
+# -----------------------------------------------------------------------------
+# Stiff analytic two-dimensional non-Gaussian targets
+# -----------------------------------------------------------------------------
+
+
+class AnalyticToy2DTarget:
+    """Base class for exact-sampling 2D targets with autodiff score/Hessian.
+
+    Subclasses define a normalized native-coordinate density and an exact native
+    sampler.  The public coordinates optionally apply an affine whitening
+    transform.  This removes trivial global scale mismatch while retaining the
+    local ill-conditioning generated by thin curved tubes, shells, and wells.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        seed: int,
+        normalize: bool,
+        norm_samples: int,
+        norm_eig_floor: float,
+        score_bank_size: int,
+        score_chunk: int,
+        hessian_chunk: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        self.name = str(name)
+        self.seed = int(seed)
+        self.d = 2
+        self.D = 2
+        self.K = 0
+        self.weights = torch.empty((0,), device=device, dtype=dtype)
+        self.device = device
+        self.dtype = dtype
+        self.normalized = bool(normalize)
+        self.norm_samples = int(norm_samples)
+        self.norm_eig_floor = float(norm_eig_floor)
+        self.score_bank_size = int(score_bank_size)
+        self.score_chunk = int(score_chunk)
+        self.hessian_chunk = int(hessian_chunk)
+        self._ou_score_bank: Optional[torch.Tensor] = None
+
+        self.norm_mean = torch.zeros((2,), device=device, dtype=dtype)
+        self.norm_L = torch.eye(2, device=device, dtype=dtype)
+        self.norm_W = torch.eye(2, device=device, dtype=dtype)
+        self.norm_logabsdet_L = torch.tensor(0.0, device=device, dtype=dtype)
+
+        pilot_gen = make_generator(self.seed + 41_003, self.device)
+        pilot_n = max(4096, int(self.norm_samples))
+        pilot_native = self._sample_native(pilot_n, pilot_gen).detach()
+        native_mean = pilot_native.mean(dim=0)
+        Xn = pilot_native - native_mean
+        native_cov = sym((Xn.T @ Xn) / max(pilot_n - 1, 1))
+        native_evals, native_evecs = torch.linalg.eigh(native_cov)
+        self.original_cov_eigs = as_numpy(native_evals)
+
+        if self.normalized:
+            evals = torch.clamp(native_evals, min=self.norm_eig_floor)
+            sqrt_e = torch.sqrt(evals)
+            inv_sqrt_e = 1.0 / sqrt_e
+            self.norm_mean = native_mean.detach()
+            self.norm_L = (native_evecs @ torch.diag(sqrt_e) @ native_evecs.T).detach()
+            self.norm_W = (native_evecs @ torch.diag(inv_sqrt_e) @ native_evecs.T).detach()
+            self.norm_logabsdet_L = torch.sum(torch.log(sqrt_e)).detach()
+            pilot = self._from_native(pilot_native)
+        else:
+            pilot = pilot_native
+
+        with torch.no_grad():
+            m = pilot.mean(dim=0)
+            X = pilot - m
+            C = sym((X.T @ X) / max(int(pilot.shape[0]) - 1, 1))
+            eye = torch.eye(2, device=device, dtype=dtype)
+            self.moment_mean_norm = safe_float(torch.linalg.norm(m))
+            self.moment_cov_frob_err = safe_float(torch.linalg.matrix_norm(C - eye, ord="fro"))
+            self.global_cov = C.detach()
+
+    def _sample_native(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _native_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _extra_target_info(self) -> Dict[str, object]:
+        return {}
+
+    def _to_native(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm_mean[None, :] + x @ self.norm_L.T
+
+    def _from_native(self, z: torch.Tensor) -> torch.Tensor:
+        return (z - self.norm_mean[None, :]) @ self.norm_W.T
+
+    def log_prob(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        t_float = float(torch.as_tensor(t).detach().cpu().item())
+        if abs(t_float) > 0.0:
+            return self._empirical_ou_log_prob(x, t_float)
+        z = self._to_native(x)
+        return self._native_log_prob(z) + self.norm_logabsdet_L.to(device=x.device, dtype=x.dtype)
+
+    def energy(self, x: torch.Tensor) -> torch.Tensor:
+        return -self.log_prob(x, t=0.0)
+
+    def score(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        t_float = float(torch.as_tensor(t).detach().cpu().item())
+        if abs(t_float) > 0.0:
+            return self._empirical_ou_score(x, t_float)
+        with torch.enable_grad():
+            x_req = x.detach().clone().requires_grad_(True)
+            lp = self.log_prob(x_req, t=0.0).sum()
+            grad = torch.autograd.grad(lp, x_req, create_graph=False, retain_graph=False)[0]
+        return torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def observed_information(self, x: torch.Tensor, t: float | torch.Tensor = 0.0) -> torch.Tensor:
+        t_float = float(torch.as_tensor(t).detach().cpu().item())
+        if abs(t_float) > 0.0:
+            raise NotImplementedError(f"{self.name} only provides exact observed information at t=0")
+        outs: List[torch.Tensor] = []
+        chunk = max(1, int(self.hessian_chunk))
+        with torch.enable_grad():
+            try:
+                from torch.func import hessian, vmap
+
+                def energy_single(x1: torch.Tensor) -> torch.Tensor:
+                    return self.energy(x1.unsqueeze(0))[0]
+
+                hess_fn = vmap(hessian(energy_single))
+                for start in range(0, x.shape[0], chunk):
+                    outs.append(hess_fn(x[start:start + chunk].detach()).detach())
+            except Exception:
+                for start in range(0, x.shape[0], chunk):
+                    local: List[torch.Tensor] = []
+                    for xi0 in x[start:start + chunk]:
+                        xi = xi0.detach().clone().requires_grad_(True)
+                        H = torch.autograd.functional.hessian(lambda zz: self.energy(zz.unsqueeze(0))[0], xi)
+                        local.append(H.detach())
+                    outs.append(torch.stack(local, dim=0))
+        return torch.nan_to_num(sym(torch.cat(outs, dim=0)), nan=0.0, posinf=1.0e12, neginf=-1.0e12)
+
+    @torch.no_grad()
+    def sample(self, n: int, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        return self._from_native(self._sample_native(int(n), generator)).detach()
+
+    @torch.no_grad()
+    def sample_pt(self, n: int, t: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        x0 = self.sample(int(n), generator=generator)
+        alpha, gamma = alpha_gamma(float(t), device=self.device, dtype=self.dtype)
+        eps = torch.randn(x0.shape, device=self.device, dtype=self.dtype, generator=generator)
+        return alpha * x0 + torch.sqrt(torch.clamp(gamma, min=0.0)) * eps
+
+    def _ensure_ou_score_bank(self) -> torch.Tensor:
+        need = max(8, int(self.score_bank_size))
+        if self._ou_score_bank is None or int(self._ou_score_bank.shape[0]) < need:
+            self._ou_score_bank = self.sample(need, generator=make_generator(self.seed + 71_003, self.device)).detach()
+        return self._ou_score_bank
+
+    @torch.no_grad()
+    def _empirical_ou_score(self, y: torch.Tensor, t: float) -> torch.Tensor:
+        bank = self._ensure_ou_score_bank()
+        alpha, gamma = alpha_gamma(float(t), device=self.device, dtype=self.dtype)
+        gamma = torch.clamp(gamma, min=torch.as_tensor(1.0e-8, device=self.device, dtype=self.dtype))
+        outs: List[torch.Tensor] = []
+        for start in range(0, y.shape[0], max(1, int(self.score_chunk))):
+            yy = y[start:start + max(1, int(self.score_chunk))]
+            diff = yy[:, None, :] - alpha * bank[None, :, :]
+            logw = -0.5 * torch.sum(diff * diff, dim=-1) / gamma
+            logw = logw - torch.max(logw, dim=1, keepdim=True).values
+            w = torch.exp(logw)
+            w = w / torch.clamp(w.sum(dim=1, keepdim=True), min=1.0e-300)
+            b = (alpha * bank[None, :, :] - yy[:, None, :]) / gamma
+            outs.append(torch.sum(w[:, :, None] * b, dim=1))
+        return torch.nan_to_num(torch.cat(outs, dim=0), nan=0.0, posinf=0.0, neginf=0.0)
+
+    @torch.no_grad()
+    def _empirical_ou_log_prob(self, y: torch.Tensor, t: float) -> torch.Tensor:
+        bank = self._ensure_ou_score_bank()
+        alpha, gamma = alpha_gamma(float(t), device=self.device, dtype=self.dtype)
+        gamma = torch.clamp(gamma, min=torch.as_tensor(1.0e-8, device=self.device, dtype=self.dtype))
+        outs: List[torch.Tensor] = []
+        const = -math.log(2.0 * math.pi) - torch.log(gamma)
+        for start in range(0, y.shape[0], max(1, int(self.score_chunk))):
+            yy = y[start:start + max(1, int(self.score_chunk))]
+            diff = yy[:, None, :] - alpha * bank[None, :, :]
+            logk = const - 0.5 * torch.sum(diff * diff, dim=-1) / gamma
+            outs.append(torch.logsumexp(logk, dim=1) - math.log(int(bank.shape[0])))
+        return torch.nan_to_num(torch.cat(outs, dim=0), nan=-1.0e6, posinf=1.0e6, neginf=-1.0e6)
+
+    def target_info(self) -> Dict[str, object]:
+        return {
+            "target_name": self.name,
+            "target_type": "analytic_toy_2d",
+            "target_dim": 2,
+            "toy_normalized": bool(self.normalized),
+            "toy_score_t_mode": "empirical_ou_for_t_gt_0",
+            **self._extra_target_info(),
+        }
+
+
+class BananaTarget2D(AnalyticToy2DTarget):
+    def __init__(self, *, bend: float = 0.50, normal_std: float = 0.12, **kwargs):
+        self.bend = float(bend)
+        self.normal_std = float(normal_std)
+        if self.normal_std <= 0.0:
+            raise ValueError("banana_normal_std must be positive")
+        super().__init__(name="banana", **kwargs)
+
+    def _sample_native(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        u = torch.randn((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        v = self.normal_std * torch.randn((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        return torch.stack([u, self.bend * (u.square() - 1.0) + v], dim=1)
+
+    def _native_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        u = z[:, 0]
+        v = z[:, 1] - self.bend * (u.square() - 1.0)
+        return -0.5 * u.square() - 0.5 * (v / self.normal_std).square() - math.log(2.0 * math.pi * self.normal_std)
+
+    def _extra_target_info(self) -> Dict[str, object]:
+        return {"banana_bend": self.bend, "banana_normal_std": self.normal_std}
+
+
+class SineTarget2D(AnalyticToy2DTarget):
+    def __init__(self, *, amplitude: float = 0.70, frequency: float = 1.35, normal_std: float = 0.10, **kwargs):
+        self.amplitude = float(amplitude)
+        self.frequency = float(frequency)
+        self.normal_std = float(normal_std)
+        if self.normal_std <= 0.0:
+            raise ValueError("sine_normal_std must be positive")
+        super().__init__(name="sine", **kwargs)
+
+    def _sample_native(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        u = torch.randn((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        v = self.normal_std * torch.randn((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        return torch.stack([u, self.amplitude * torch.sin(self.frequency * u) + v], dim=1)
+
+    def _native_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        u = z[:, 0]
+        v = z[:, 1] - self.amplitude * torch.sin(self.frequency * u)
+        return -0.5 * u.square() - 0.5 * (v / self.normal_std).square() - math.log(2.0 * math.pi * self.normal_std)
+
+    def _extra_target_info(self) -> Dict[str, object]:
+        return {
+            "sine_amplitude": self.amplitude,
+            "sine_frequency": self.frequency,
+            "sine_normal_std": self.normal_std,
+        }
+
+
+class RadialShellTarget2D(AnalyticToy2DTarget):
+    def __init__(self, *, name: str, radii: Tuple[float, ...], radial_stds: Tuple[float, ...], **kwargs):
+        if len(radii) < 1 or len(radii) != len(radial_stds):
+            raise ValueError("radii and radial_stds must be nonempty and have equal length")
+        self.radii_tuple = tuple(float(v) for v in radii)
+        self.radial_stds_tuple = tuple(float(v) for v in radial_stds)
+        if min(self.radii_tuple) <= 0.0 or min(self.radial_stds_tuple) <= 0.0:
+            raise ValueError("ring radii and radial standard deviations must be positive")
+        self.shell_radii = torch.tensor(self.radii_tuple, device=kwargs["device"], dtype=kwargs["dtype"])
+        self.shell_stds = torch.tensor(self.radial_stds_tuple, device=kwargs["device"], dtype=kwargs["dtype"])
+        # Approximately equalize integrated mass across shells: Cartesian shell
+        # mass scales as radius times its radial width.
+        amp = 1.0 / (self.shell_radii * self.shell_stds)
+        self.shell_log_amplitudes = torch.log(amp / amp.sum())
+        self._prepare_radial_quadrature()
+        super().__init__(name=name, **kwargs)
+
+    def _radial_log_unnormalized(self, r: torch.Tensor) -> torch.Tensor:
+        q = (r[..., None] - self.shell_radii) / self.shell_stds
+        return torch.logsumexp(self.shell_log_amplitudes - 0.5 * q.square(), dim=-1)
+
+    def _prepare_radial_quadrature(self) -> None:
+        r_max = max(self.radii_tuple) + 10.0 * max(self.radial_stds_tuple)
+        grid = torch.linspace(0.0, r_max, 65536, device=self.shell_radii.device, dtype=self.shell_radii.dtype)
+        logf = self._radial_log_unnormalized(grid)
+        density = grid * torch.exp(logf)
+        dr = grid[1] - grid[0]
+        cdf = torch.zeros_like(grid)
+        cdf[1:] = torch.cumsum(0.5 * (density[1:] + density[:-1]) * dr, dim=0)
+        radial_integral = cdf[-1]
+        cdf = cdf / torch.clamp(radial_integral, min=1.0e-300)
+        self.radial_grid = grid
+        self.radial_cdf = cdf
+        self.native_log_normalizer = torch.log(2.0 * math.pi * torch.clamp(radial_integral, min=1.0e-300))
+
+    def _sample_radius(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        u = torch.rand((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        idx = torch.searchsorted(self.radial_cdf, u, right=False).clamp(1, self.radial_grid.numel() - 1)
+        c0, c1 = self.radial_cdf[idx - 1], self.radial_cdf[idx]
+        r0, r1 = self.radial_grid[idx - 1], self.radial_grid[idx]
+        frac = (u - c0) / torch.clamp(c1 - c0, min=1.0e-30)
+        return r0 + frac * (r1 - r0)
+
+    def _sample_native(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        r = self._sample_radius(int(n), generator)
+        theta = 2.0 * math.pi * torch.rand((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        return torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=1)
+
+    def _native_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        r = torch.sqrt(torch.sum(z.square(), dim=1) + 1.0e-18)
+        return self._radial_log_unnormalized(r) - self.native_log_normalizer
+
+    def _extra_target_info(self) -> Dict[str, object]:
+        return {
+            "ring_radii": list(self.radii_tuple),
+            "ring_radial_stds": list(self.radial_stds_tuple),
+            "ring_n_shells": len(self.radii_tuple),
+        }
+
+
+class DoubleWellTarget2D(AnalyticToy2DTarget):
+    def __init__(self, *, barrier: float = 4.0, bend: float = 0.20, normal_std: float = 0.12, **kwargs):
+        self.barrier = float(barrier)
+        self.bend = float(bend)
+        self.normal_std = float(normal_std)
+        if self.barrier <= 0.0 or self.normal_std <= 0.0:
+            raise ValueError("double-well barrier and normal_std must be positive")
+        self._prepare_x_quadrature(kwargs["device"], kwargs["dtype"])
+        super().__init__(name="double_well", **kwargs)
+
+    def _x_log_unnormalized(self, x: torch.Tensor) -> torch.Tensor:
+        return -self.barrier * (x.square() - 1.0).square()
+
+    def _prepare_x_quadrature(self, device: torch.device, dtype: torch.dtype) -> None:
+        grid = torch.linspace(-3.0, 3.0, 65536, device=device, dtype=dtype)
+        density = torch.exp(self._x_log_unnormalized(grid))
+        dx = grid[1] - grid[0]
+        cdf = torch.zeros_like(grid)
+        cdf[1:] = torch.cumsum(0.5 * (density[1:] + density[:-1]) * dx, dim=0)
+        integral = cdf[-1]
+        self.x_grid = grid
+        self.x_cdf = cdf / torch.clamp(integral, min=1.0e-300)
+        self.x_log_normalizer = torch.log(torch.clamp(integral, min=1.0e-300))
+
+    def _sample_x(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        u = torch.rand((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        idx = torch.searchsorted(self.x_cdf, u, right=False).clamp(1, self.x_grid.numel() - 1)
+        c0, c1 = self.x_cdf[idx - 1], self.x_cdf[idx]
+        x0, x1 = self.x_grid[idx - 1], self.x_grid[idx]
+        frac = (u - c0) / torch.clamp(c1 - c0, min=1.0e-30)
+        return x0 + frac * (x1 - x0)
+
+    def _sample_native(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        x = self._sample_x(int(n), generator)
+        mean_y = self.bend * (x.square() - 1.0)
+        y = mean_y + self.normal_std * torch.randn((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        return torch.stack([x, y], dim=1)
+
+    def _native_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        x, y = z[:, 0], z[:, 1]
+        resid = y - self.bend * (x.square() - 1.0)
+        logpy = -0.5 * (resid / self.normal_std).square() - 0.5 * math.log(2.0 * math.pi) - math.log(self.normal_std)
+        return self._x_log_unnormalized(x) - self.x_log_normalizer + logpy
+
+    def _extra_target_info(self) -> Dict[str, object]:
+        return {
+            "double_well_barrier": self.barrier,
+            "double_well_bend": self.bend,
+            "double_well_normal_std": self.normal_std,
+        }
+
+
+class SpiralTarget2D(AnalyticToy2DTarget):
+    """Finite multi-turn Archimedean spiral with exact latent change of variables.
+
+    A bounded logistic-normal angular coordinate u controls the spiral radius,
+    while a narrow Gaussian log-radial perturbation supplies the normal tube.
+    The Cartesian density sums exactly over all wrapped angular preimages.
+    """
+
+    def __init__(
+        self,
+        *,
+        turns: float = 2.25,
+        r_min: float = 1.0,
+        r_max: float = 4.5,
+        u_std: float = 0.85,
+        logradial_std: float = 0.055,
+        **kwargs,
+    ):
+        self.turns = float(turns)
+        self.r_min = float(r_min)
+        self.r_max = float(r_max)
+        self.u_std = float(u_std)
+        self.logradial_std = float(logradial_std)
+        if self.turns <= 0.5 or self.r_min <= 0.0 or self.r_max <= self.r_min:
+            raise ValueError("spiral requires turns>0.5 and 0<r_min<r_max")
+        if self.u_std <= 0.0 or self.logradial_std <= 0.0:
+            raise ValueError("spiral latent standard deviations must be positive")
+        self.u_lo = -math.pi * self.turns
+        self.u_hi = math.pi * self.turns
+        self.u_mid = 0.5 * (self.u_lo + self.u_hi)
+        self.u_half = 0.5 * (self.u_hi - self.u_lo)
+        self.pitch = (self.r_max - self.r_min) / (self.u_hi - self.u_lo)
+        kmax = int(math.ceil(self.turns / 2.0)) + 3
+        self.branch_ks = tuple(range(-kmax, kmax + 1))
+        super().__init__(name="spiral", **kwargs)
+
+    def _radius_curve(self, u: torch.Tensor) -> torch.Tensor:
+        return self.r_min + self.pitch * (u - self.u_lo)
+
+    def _sample_native(self, n: int, generator: Optional[torch.Generator]) -> torch.Tensor:
+        z_u = self.u_std * torch.randn((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        u = self.u_mid + self.u_half * torch.tanh(z_u)
+        v = self.logradial_std * torch.randn((int(n),), device=self.device, dtype=self.dtype, generator=generator)
+        rho = self._radius_curve(u) * torch.exp(v)
+        return torch.stack([rho * torch.cos(u), rho * torch.sin(u)], dim=1)
+
+    def _log_pu(self, u: torch.Tensor) -> torch.Tensor:
+        q_raw = (u - self.u_mid) / self.u_half
+        valid = torch.abs(q_raw) < 1.0
+        q = torch.clamp(q_raw, min=-1.0 + 1.0e-12, max=1.0 - 1.0e-12)
+        z_u = torch.atanh(q)
+        log_jac_inv = -math.log(self.u_half) - torch.log(torch.clamp(1.0 - q.square(), min=1.0e-30))
+        lp = -0.5 * (z_u / self.u_std).square() - 0.5 * math.log(2.0 * math.pi) - math.log(self.u_std) + log_jac_inv
+        return torch.where(valid, lp, torch.full_like(lp, -float("inf")))
+
+    def _native_log_prob(self, z: torch.Tensor) -> torch.Tensor:
+        rho = torch.sqrt(torch.sum(z.square(), dim=1) + 1.0e-24)
+        phi = torch.atan2(z[:, 1], z[:, 0])
+        components: List[torch.Tensor] = []
+        for k in self.branch_ks:
+            u = phi + 2.0 * math.pi * float(k)
+            r_curve = self._radius_curve(u)
+            valid_r = r_curve > 0.0
+            v = torch.log(rho / torch.clamp(r_curve, min=1.0e-30))
+            lpv = -0.5 * (v / self.logradial_std).square() - 0.5 * math.log(2.0 * math.pi) - math.log(self.logradial_std)
+            comp = self._log_pu(u) + lpv - 2.0 * torch.log(rho)
+            components.append(torch.where(valid_r, comp, torch.full_like(comp, -float("inf"))))
+        return torch.logsumexp(torch.stack(components, dim=1), dim=1)
+
+    def _extra_target_info(self) -> Dict[str, object]:
+        return {
+            "spiral_turns": self.turns,
+            "spiral_r_min": self.r_min,
+            "spiral_r_max": self.r_max,
+            "spiral_u_std": self.u_std,
+            "spiral_logradial_std": self.logradial_std,
+        }
+
+
 # -----------------------------------------------------------------------------
 # Weighted SNIS score bank: Blend and CE-HLSI/LFGI
 # -----------------------------------------------------------------------------
@@ -1436,7 +2113,25 @@ def mp_leaf_precision_completion(H: torch.Tensor, floor: float = 0.0, tol: float
     }
     return Q.detach(), info
 
-def resolvent_gate(P: torch.Tensor, alpha: torch.Tensor, gamma: torch.Tensor, eps: float, gate_clip: Optional[float]) -> torch.Tensor:
+def project_symmetric_gate_min_eval(G: torch.Tensor, gate_min_eval: float) -> torch.Tensor:
+    """Project a symmetric gate to eigenvalues >= gate_min_eval when finite."""
+    floor = float(gate_min_eval)
+    G = sym(G)
+    if not math.isfinite(floor):
+        return G
+    evals, evecs = torch.linalg.eigh(G)
+    evals = torch.clamp(evals, min=floor)
+    return sym(evecs @ torch.diag_embed(evals) @ evecs.transpose(-1, -2))
+
+
+def resolvent_gate(
+    P: torch.Tensor,
+    alpha: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    gate_clip: Optional[float],
+    gate_min_eval: float = -float("inf"),
+) -> torch.Tensor:
     d = P.shape[-1]
     I = torch.eye(d, device=P.device, dtype=P.dtype)
     A = sym(alpha * alpha * I + gamma * P)
@@ -1446,6 +2141,8 @@ def resolvent_gate(P: torch.Tensor, alpha: torch.Tensor, gamma: torch.Tensor, ep
     gvals = (alpha * alpha) / evals_safe
     if gate_clip is not None and gate_clip > 0:
         gvals = torch.clamp(gvals, min=-float(gate_clip), max=float(gate_clip))
+    if math.isfinite(float(gate_min_eval)):
+        gvals = torch.clamp(gvals, min=float(gate_min_eval))
     return sym(evecs @ torch.diag_embed(gvals) @ evecs.transpose(-1, -2))
 
 
@@ -1615,6 +2312,8 @@ class SNISScoreBank:
             a_eig = a_eig.clamp(0.0, 1.0)
         A = torch.einsum("ik,k,jk->ij", evecs, a_eig, evecs)
         A = sym(torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0))
+        if math.isfinite(float(getattr(self.cfg, "gate_min_eval", -float("inf")))):
+            A = project_symmetric_gate_min_eval(A, float(self.cfg.gate_min_eval))
         self._uniform_matrix_gate_cache[cache_key] = A
         return A
 
@@ -1669,17 +2368,23 @@ class SNISScoreBank:
                 G_pinv = -torch.matmul(N, torch.linalg.pinv(M_reg))
                 G = torch.where(torch.isfinite(G), G, G_pinv)
             G = torch.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
-            if bool(getattr(self.cfg, "matrix_blend_sym_gate", False)):
+            projection_active = math.isfinite(float(getattr(self.cfg, "gate_min_eval", -float("inf"))))
+            if bool(getattr(self.cfg, "matrix_blend_sym_gate", False)) or projection_active:
                 G = sym(G)
             clip = float(getattr(self.cfg, "matrix_blend_gate_clip", 1.0e6))
             if math.isfinite(clip) and clip > 0.0:
                 G = G.clamp(min=-clip, max=clip)
+            if projection_active:
+                G = project_symmetric_gate_min_eval(G, float(self.cfg.gate_min_eval))
             return bbar + torch.einsum("bij,bj->bi", G, cbar - bbar)
         if key in {"ce-hlsi", "lfgi", "ce-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
             wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t)
             Pgate = self._gate_precision_for_method(method)
             Pbar = torch.sum(wg[:, :, None, None] * Pgate[None, :, :, :], dim=1)
-            G = resolvent_gate(Pbar, alpha, gamma, self.cfg.resolvent_eps, self.cfg.gate_clip)
+            G = resolvent_gate(
+                Pbar, alpha, gamma, self.cfg.resolvent_eps, self.cfg.gate_clip,
+                getattr(self.cfg, "gate_min_eval", -float("inf")),
+            )
             return bbar + torch.einsum("bij,bj->bi", G, cbar - bbar)
         if key in {"tweedie", "twd"}:
             return bbar
@@ -1711,7 +2416,10 @@ class SNISScoreBank:
         bbar_gate = torch.sum(wg[:, :, None] * bg, dim=1)
         Pgate = self._gate_precision_for_method(method)
         Pbar = torch.sum(wg[:, :, None, None] * Pgate[None, :, :, :], dim=1)
-        G = resolvent_gate(Pbar, alpha, gamma, self.cfg.resolvent_eps, self.cfg.gate_clip)
+        G = resolvent_gate(
+            Pbar, alpha, gamma, self.cfg.resolvent_eps, self.cfg.gate_clip,
+            getattr(self.cfg, "gate_min_eval", -float("inf")),
+        )
         r = cbar - bbar
         score = bbar + torch.einsum("bij,bj->bi", G, r)
 
@@ -1901,7 +2609,12 @@ def score_and_hutchinson_divergence(bank: SNISScoreBank, x: torch.Tensor, t: flo
 def bank_score_and_divergence(bank: SNISScoreBank, x: torch.Tensor, t: float, method: str, cfg: Config) -> Tuple[torch.Tensor, torch.Tensor]:
     div_mode = str(cfg.pf_divergence).lower()
     key = str(method).lower()
-    if div_mode in {"auto", "analytic_ce", "analytic"} and key in {"ce-hlsi", "lfgi", "ce-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
+    projection_active = math.isfinite(float(getattr(cfg, "gate_min_eval", -float("inf"))))
+    if (
+        not projection_active
+        and div_mode in {"auto", "analytic_ce", "analytic"}
+        and key in {"ce-hlsi", "lfgi", "ce-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}
+    ):
         return bank.ce_score_and_divergence(x, t, method=method)
     return score_and_hutchinson_divergence(bank, x, t, method, cfg)
 
@@ -2967,9 +3680,12 @@ def save_heatmaps(outdir: str, target, truth: torch.Tensor, init_refs: torch.Ten
         if arrs:
             final_arrays.append(to_plot_np(arrs[-1]))
 
-    lims = make_funnel_projection_limits(all_arrays) if is_funnel else make_projection_limits(final_arrays)
+    # Use target truth only to determine the plotted window and color normalization.
+    # This prevents a single diverged variant from expanding the visible extent and
+    # shrinking the target into a tiny star in the corner.
+    lims = make_funnel_projection_limits([truth2]) if is_funnel else make_projection_limits([truth2])
     vmax = shared_heatmap_vmax(
-        all_arrays if is_funnel else [truth2],
+        [truth2],
         lims,
         cfg,
         bins=heatmap_bins,
@@ -3835,6 +4551,12 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int]]:
 
 def make_target(cfg: Config, device: torch.device, dtype: torch.dtype):
     key = str(cfg.target).strip().lower().replace("-", "_")
+    if key in {"stiff_misaligned_gmm3d", "stiff_gmm3d", "gate_comparison_gmm3d", "d3_gate_gmm", "gmm3d"}:
+        return StiffMisalignedGMM3D(
+            normalize=bool(cfg.normalize_target),
+            device=device,
+            dtype=dtype,
+        )
     if key in {"misaligned_gmm", "gmm", "gmm8", "misaligned8d", "current", "current8d"}:
         target = MisalignedSubspaceGMM(
             d=cfg.d,
@@ -3867,6 +4589,67 @@ def make_target(cfg: Config, device: torch.device, dtype: torch.dtype):
             score_chunk=int(cfg.funnel_score_chunk),
             device=device,
             dtype=dtype,
+        )
+
+    toy_common = dict(
+        seed=int(cfg.target_seed),
+        normalize=bool(cfg.normalize_target),
+        norm_samples=int(cfg.toy_norm_samples),
+        norm_eig_floor=float(cfg.toy_norm_eig_floor),
+        score_bank_size=int(cfg.toy_score_bank),
+        score_chunk=int(cfg.toy_score_chunk),
+        hessian_chunk=int(cfg.toy_hessian_chunk),
+        device=device,
+        dtype=dtype,
+    )
+
+    if key in {"banana", "banana_2d", "curved_banana"}:
+        return BananaTarget2D(
+            bend=float(cfg.banana_bend),
+            normal_std=float(cfg.banana_normal_std),
+            **toy_common,
+        )
+
+    if key in {"sine", "sine_2d", "sinusoid", "wave", "wavy"}:
+        return SineTarget2D(
+            amplitude=float(cfg.sine_amplitude),
+            frequency=float(cfg.sine_frequency),
+            normal_std=float(cfg.sine_normal_std),
+            **toy_common,
+        )
+
+    if key in {"ring", "ring_2d", "single_ring"}:
+        return RadialShellTarget2D(
+            name="ring",
+            radii=(float(cfg.ring_radius),),
+            radial_stds=(float(cfg.ring_radial_std),),
+            **toy_common,
+        )
+
+    if key in {"rings", "rings_2d", "double_ring", "two_rings", "concentric_rings"}:
+        return RadialShellTarget2D(
+            name="rings",
+            radii=(float(cfg.rings_inner_radius), float(cfg.rings_outer_radius)),
+            radial_stds=(float(cfg.rings_radial_std), float(cfg.rings_radial_std)),
+            **toy_common,
+        )
+
+    if key in {"double_well", "doublewell", "double_well_2d", "dw2"}:
+        return DoubleWellTarget2D(
+            barrier=float(cfg.double_well_barrier),
+            bend=float(cfg.double_well_bend),
+            normal_std=float(cfg.double_well_normal_std),
+            **toy_common,
+        )
+
+    if key in {"spiral", "spiral_2d", "archimedean_spiral"}:
+        return SpiralTarget2D(
+            turns=float(cfg.spiral_turns),
+            r_min=float(cfg.spiral_r_min),
+            r_max=float(cfg.spiral_r_max),
+            u_std=float(cfg.spiral_u_std),
+            logradial_std=float(cfg.spiral_logradial_std),
+            **toy_common,
         )
 
     if key in {"lj13", "lj13_2d", "molecular", "molecular_lj", "mol_lj13"}:
@@ -3929,7 +4712,10 @@ def make_target(cfg: Config, device: torch.device, dtype: torch.dtype):
             name="dw4_16d",
         )
 
-    raise ValueError("Unknown --target {!r}. Use misaligned_gmm, funnel_d10, lj13_2d, or dw4_16d.".format(cfg.target))
+    raise ValueError(
+        "Unknown --target {!r}. Use stiff_misaligned_gmm3d, misaligned_gmm, funnel_d10, banana, sine, ring, rings, "
+        "spiral, double_well, lj13_2d, or dw4_16d.".format(cfg.target)
+    )
 
 def run(cfg: Config) -> None:
     ensure_dir(cfg.outdir)
@@ -3945,6 +4731,11 @@ def run(cfg: Config) -> None:
 
     target = make_target(cfg, device, dtype)
     cfg.d = int(target.d)
+    if math.isfinite(float(getattr(cfg, "gate_min_eval", -float("inf")))) and str(cfg.pf_divergence).lower() in {"auto", "analytic_ce", "analytic"}:
+        print(
+            "Finite gate_min_eval activates spectral gate projection; PF divergence will use Hutchinson finite differences.",
+            flush=True,
+        )
     config_dict = asdict(cfg)
     target_info = target.target_info() if hasattr(target, "target_info") else {"target_name": type(target).__name__, "target_dim": int(target.d)}
     config_dict.update({
@@ -3972,7 +4763,8 @@ def run(cfg: Config) -> None:
     print(
         f"  device={device}, dtype={dtype}, n_ref={cfg.n_ref}, gate_n={effective_gate_n(cfg)}, "
         f"bank_coupling={cfg.bank_coupling}, pool_n={init_pool_n}, n_samples={cfg.n_samples}, n_rounds={cfg.n_rounds}, "
-        f"t_min={effective_time_bounds(cfg)[0]:.6g}, t_max={effective_time_bounds(cfg)[1]:.6g}, schedule={canonical_time_schedule(cfg.time_schedule)}",
+        f"t_min={effective_time_bounds(cfg)[0]:.6g}, t_max={effective_time_bounds(cfg)[1]:.6g}, schedule={canonical_time_schedule(cfg.time_schedule)}, "
+        f"gate_min_eval={cfg.gate_min_eval}",
         flush=True,
     )
 
