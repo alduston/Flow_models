@@ -248,15 +248,15 @@ class Config:
     initial_reference_mode: str = "prior"
     initial_weight_mode: str = "zero"  # prior_ratio or zero; ignored for target initial references
     # Comma-separated estimator pairs to run. Atomic aliases such as blend, matrix_blend, unif_blend,
-    # unif_matrix_blend, lfgi/ce-hlsi, or leaf-lfgi/mp-leaf-lfgi mean diagonal transport/correction.
+    # unif_matrix_blend, lfgi/ce-hlsi, pi-lfgi, or leaf-lfgi/mp-leaf-lfgi mean diagonal transport/correction.
     # Hybrid aliases use transport_correction order, e.g. blend_lfgi or lfgi_blend.
     # Multi-transport aliases use <transport>-<n>_<correction>, e.g. lfgi-2_lfgi
     # means two uncorrected LFGI transports followed by one LFGI ratio step.
     # Current names are interpreted as <transport>-1_<correction>.
     # Special values:
-    #   all/default = diagonal blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, leaf-lfgi, tweedie
+    #   all/default = diagonal blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, pi-lfgi, leaf-lfgi, tweedie
     #   hybrids     = four blend/lfgi pairs
-    #   grid/full   = full transport/correction grid over blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, leaf-lfgi, tweedie, none
+    #   grid/full   = full transport/correction grid over blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, pi-lfgi, leaf-lfgi, tweedie, none
     methods: str = "lfgi_none,tweedie_none,blend_none"
     # Which frozen reference bank to use for PF likelihood correction after the
     # transport block.  endpoint matches the new TSC workflow: after n transports,
@@ -2146,6 +2146,22 @@ def resolvent_gate(
     return sym(evecs @ torch.diag_embed(gvals) @ evecs.transpose(-1, -2))
 
 
+PI_LFGI_METHOD_KEYS = {
+    "pi-lfgi",
+    "pi-ce-hlsi",
+    "oracle-lfgi",
+    "target-lfgi",
+}
+
+
+def canonical_score_method_key(method: str) -> str:
+    return str(method).strip().lower().replace("_", "-")
+
+
+def is_pi_lfgi_method(method: str) -> bool:
+    return canonical_score_method_key(method) in PI_LFGI_METHOD_KEYS
+
+
 class SNISScoreBank:
     def __init__(
         self,
@@ -2155,6 +2171,8 @@ class SNISScoreBank:
         log_ref_weights: Optional[torch.Tensor] = None,
         gate_anchors: Optional[torch.Tensor] = None,
         gate_log_ref_weights: Optional[torch.Tensor] = None,
+        pi_gate_anchors: Optional[torch.Tensor] = None,
+        pi_gate_log_ref_weights: Optional[torch.Tensor] = None,
     ):
         self.target = target
         self.x = anchors.detach().to(device=target.device, dtype=target.dtype)
@@ -2220,6 +2238,44 @@ class SNISScoreBank:
             "gate_bank_n": int(self.N_gate),
             "gate_bank_separate": bool(not self.gate_is_score_bank),
         })
+
+        # Optional oracle target gate bank for pi-LFGI. The evolving q bank
+        # still supplies Tweedie and TSI/cross-score signals; only the LFGI
+        # curvature resolvent is localized with independent target samples.
+        self.has_pi_gate_bank = pi_gate_anchors is not None
+        if self.has_pi_gate_bank:
+            self.x_pi_gate = pi_gate_anchors.detach().to(device=target.device, dtype=target.dtype)
+            self.N_pi_gate = int(self.x_pi_gate.shape[0])
+            if self.N_pi_gate <= 0:
+                raise ValueError("pi_gate_anchors must contain at least one target sample")
+            if pi_gate_log_ref_weights is None:
+                self.log_pi_gate_weights = torch.zeros((self.N_pi_gate,), device=self.device, dtype=self.dtype)
+            else:
+                plw = pi_gate_log_ref_weights.detach().to(device=self.device, dtype=self.dtype).reshape(-1)
+                if plw.shape[0] != self.N_pi_gate:
+                    raise ValueError(
+                        f"pi_gate_log_ref_weights has length {plw.shape[0]} but pi_gate_anchors have length {self.N_pi_gate}"
+                    )
+                self.log_pi_gate_weights = torch.nan_to_num(plw, nan=0.0, posinf=0.0, neginf=0.0)
+            self.score0_pi_gate = target.score(self.x_pi_gate, t=0.0).detach()
+            Hpi_gate = target.observed_information(self.x_pi_gate, t=0.0).detach()
+            self.H_pi_gate_raw = sym(Hpi_gate).detach()
+            self.P_pi_gate = process_curvature(
+                self.H_pi_gate_raw, cfg.curvature_mode, cfg.curvature_floor, cfg.curvature_cap
+            ).detach()
+        else:
+            self.x_pi_gate = None
+            self.N_pi_gate = 0
+            self.log_pi_gate_weights = None
+            self.score0_pi_gate = None
+            self.H_pi_gate_raw = None
+            self.P_pi_gate = None
+
+        self.mp_leaf_info.update({
+            "pi_gate_bank_available": bool(self.has_pi_gate_bank),
+            "pi_gate_bank_n": int(self.N_pi_gate),
+            "pi_gate_bank_source": "target" if self.has_pi_gate_bank else "none",
+        })
         self._uniform_score_moment_cache: Optional[torch.Tensor] = None
         self._uniform_matrix_gate_cache: Dict[Tuple[float, float, float, bool], torch.Tensor] = {}
         self._uniform_scalar_gate_cache: Dict[Tuple[float, float, bool], torch.Tensor] = {}
@@ -2242,11 +2298,25 @@ class SNISScoreBank:
     def _weights_and_signals(self, y: torch.Tensor, t: float):
         return self._weights_and_signals_for(y, t, self.x, self.score0, self.log_ref_weights)
 
-    def _gate_weights_and_signals(self, y: torch.Tensor, t: float):
+    def _gate_weights_and_signals(self, y: torch.Tensor, t: float, method: Optional[str] = None):
+        if method is not None and is_pi_lfgi_method(method):
+            if not self.has_pi_gate_bank:
+                raise RuntimeError(
+                    "pi-LFGI requested, but this SNISScoreBank has no independently drawn target gate bank"
+                )
+            return self._weights_and_signals_for(
+                y, t, self.x_pi_gate, self.score0_pi_gate, self.log_pi_gate_weights
+            )
         return self._weights_and_signals_for(y, t, self.x_gate, self.score0_gate, self.log_gate_weights)
 
     def _gate_precision_for_method(self, method: str) -> torch.Tensor:
-        key = str(method).strip().lower().replace("_", "-")
+        key = canonical_score_method_key(method)
+        if is_pi_lfgi_method(key):
+            if self.P_pi_gate is None:
+                raise RuntimeError(
+                    "pi-LFGI requested, but this SNISScoreBank has no independently drawn target gate bank"
+                )
+            return self.P_pi_gate
         if key in {"leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
             return self.P_gate_mp
         return self.P_gate
@@ -2377,8 +2447,8 @@ class SNISScoreBank:
             if projection_active:
                 G = project_symmetric_gate_min_eval(G, float(self.cfg.gate_min_eval))
             return bbar + torch.einsum("bij,bj->bi", G, cbar - bbar)
-        if key in {"ce-hlsi", "lfgi", "ce-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
-            wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t)
+        if key in {"ce-hlsi", "lfgi", "ce-lfgi", "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
+            wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t, method=method)
             Pgate = self._gate_precision_for_method(method)
             Pbar = torch.sum(wg[:, :, None, None] * Pgate[None, :, :, :], dim=1)
             G = resolvent_gate(
@@ -2412,7 +2482,7 @@ class SNISScoreBank:
         bbar = torch.sum(w[:, :, None] * b, dim=1)
         cbar = torch.sum(w[:, :, None] * c, dim=1)
 
-        wg, bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t)
+        wg, bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t, method=method)
         bbar_gate = torch.sum(wg[:, :, None] * bg, dim=1)
         Pgate = self._gate_precision_for_method(method)
         Pbar = torch.sum(wg[:, :, None, None] * Pgate[None, :, :, :], dim=1)
@@ -2613,7 +2683,7 @@ def bank_score_and_divergence(bank: SNISScoreBank, x: torch.Tensor, t: float, me
     if (
         not projection_active
         and div_mode in {"auto", "analytic_ce", "analytic"}
-        and key in {"ce-hlsi", "lfgi", "ce-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}
+        and key in {"ce-hlsi", "lfgi", "ce-lfgi", "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}
     ):
         return bank.ce_score_and_divergence(x, t, method=method)
     return score_and_hutchinson_divergence(bank, x, t, method, cfg)
@@ -4066,6 +4136,19 @@ def run_family(
     ratio_reference_mode = canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint"))
     method_name = method_label(transport_method, transport_repeats, correction_method)
 
+    # pi-LFGI keeps q-derived score signals but estimates its curvature gate
+    # from an independent target sample bank. Reuse one fixed oracle bank across
+    # rounds/substeps so target-gate Monte Carlo refresh does not masquerade as
+    # adaptation of the evolving reference.
+    needs_pi_gate = is_pi_lfgi_method(transport_method) or is_pi_lfgi_method(correction_method)
+    if needs_pi_gate:
+        pi_gate_gen = make_generator(int(cfg.seed + 606_000), target.device)
+        pi_gate_refs = target.sample(int(effective_gate_n(cfg)), generator=pi_gate_gen).detach()
+        pi_gate_rho = torch.zeros((pi_gate_refs.shape[0],), device=target.device, dtype=target.dtype)
+    else:
+        pi_gate_refs = None
+        pi_gate_rho = None
+
     current_pool = init_refs.detach().clone()
     current_rho = init_rho.detach().clone()
     samples_by_round: List[torch.Tensor] = []
@@ -4113,6 +4196,8 @@ def run_family(
                 log_ref_weights=score_rho,
                 gate_anchors=gate_refs,
                 gate_log_ref_weights=gate_rho,
+                pi_gate_anchors=pi_gate_refs,
+                pi_gate_log_ref_weights=pi_gate_rho,
             )
             gen = make_generator(int(cfg.seed + 10_000 * r + 701 * m + family_seed_offset(family)), target.device)
 
@@ -4167,6 +4252,8 @@ def run_family(
                 log_ref_weights=next_score_rho0,
                 gate_anchors=next_gate_refs0,
                 gate_log_ref_weights=next_gate_rho0,
+                pi_gate_anchors=pi_gate_refs,
+                pi_gate_log_ref_weights=pi_gate_rho,
             )
 
             # The full Delta_PF diagnostics are the expensive theorem-facing
@@ -4254,6 +4341,9 @@ def run_family(
             "score_slice": input_split_info["score_slice"],
             "gate_slice": input_split_info["gate_slice"],
             "bank_overlap_n": int(input_split_info["bank_overlap_n"]),
+            "pi_gate_source": "target" if needs_pi_gate else "none",
+            "pi_gate_n": int(pi_gate_refs.shape[0]) if pi_gate_refs is not None else 0,
+            "pi_gate_fixed_across_rounds": bool(needs_pi_gate),
             "input_rho_ess": in_ess,
             "input_rho_ess_frac": in_ess_frac,
             "sampler_failed": bool(sampler_info.get("failed", False)),
@@ -4331,6 +4421,9 @@ def run_family(
             "score_slice": next_split_info["score_slice"],
             "gate_slice": next_split_info["gate_slice"],
             "bank_overlap_n": int(next_split_info["bank_overlap_n"]),
+            "pi_gate_source": "target" if needs_pi_gate else "none",
+            "pi_gate_n": int(pi_gate_refs.shape[0]) if pi_gate_refs is not None else 0,
+            "pi_gate_fixed_across_rounds": bool(needs_pi_gate),
             "transport_substep_summary_json": json.dumps(transport_substep_infos),
             "final_transport_substep": int(transport_repeats),
             "r_step_elapsed_sec": float(pf_elapsed),
@@ -4406,6 +4499,15 @@ def _estimator_alias_table() -> Dict[str, Tuple[str, str]]:
         "ce-hlsi": ("LFGI", "ce-hlsi"),
         "ce_hlsi": ("LFGI", "ce-hlsi"),
         "ce-lfgi": ("LFGI", "ce-hlsi"),
+        "pi-lfgi": ("pi-LFGI", "pi-lfgi"),
+        # Backward-compatible legacy spelling; canonical user-facing token is pi-lfgi.
+        "pi_lfgi": ("pi-LFGI", "pi-lfgi"),
+        "pi-ce-hlsi": ("pi-LFGI", "pi-lfgi"),
+        "pi_ce_hlsi": ("pi-LFGI", "pi-lfgi"),
+        "oracle-lfgi": ("pi-LFGI", "pi-lfgi"),
+        "oracle_lfgi": ("pi-LFGI", "pi-lfgi"),
+        "target-lfgi": ("pi-LFGI", "pi-lfgi"),
+        "target_lfgi": ("pi-LFGI", "pi-lfgi"),
         "leaf-lfgi": ("Leaf-LFGI", "mp-leaf-lfgi"),
         "leaf_lfgi": ("Leaf-LFGI", "mp-leaf-lfgi"),
         "mp-leaf-lfgi": ("Leaf-LFGI", "mp-leaf-lfgi"),
@@ -4515,7 +4617,7 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int]:
     valid = ", ".join(sorted(_estimator_alias_table().keys()) + ["all", "hybrids"])
     raise ValueError(
         f"Unknown method/hybrid token {token!r}. Use atomic aliases or transport_correction "
-        f"tokens like blend_lfgi, lfgi_none, none_lfgi, tweedie_lfgi, or the "
+        f"tokens like blend_lfgi, lfgi_none, pi-lfgi_none, none_lfgi, tweedie_lfgi, or the "
         f"multi-transport form lfgi-2_lfgi. Valid estimator aliases: {valid}"
     )
 
@@ -4528,11 +4630,11 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int]]:
     """
     raw = str(methods or "hybrids").strip().lower()
     if raw in {"all", "default", "*"}:
-        keys = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "leaf-lfgi", "tweedie"]
+        keys = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "pi-lfgi", "leaf-lfgi", "tweedie"]
     elif raw in {"hybrid", "hybrids", "blend-lfgi-hybrids", "lfgi-blend-hybrids"}:
         keys = ["blend_blend", "blend_lfgi", "lfgi_blend", "lfgi_lfgi"]
     elif raw in {"grid", "full-grid", "fullgrid", "full", "allpairs", "all-pairs"}:
-        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "leaf-lfgi", "tweedie", "none"]
+        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "pi-lfgi", "leaf-lfgi", "tweedie", "none"]
         keys = [f"{a}_{b}" for a in atoms for b in atoms]
     else:
         keys = [k.strip() for k in raw.replace(";", ",").split(",") if k.strip()]
@@ -4545,7 +4647,7 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int]]:
             out.append((fam, transport, correction, int(repeats)))
             seen.add(unique)
     if not out:
-        raise ValueError("No methods selected. Example: --methods blend_lfgi,matrix_blend-2_unif_blend,lfgi_none,none_lfgi,tweedie_lfgi")
+        raise ValueError("No methods selected. Example: --methods lfgi_none,pi-lfgi_none,blend_lfgi,matrix_blend-2_unif_blend,none_lfgi,tweedie_lfgi")
     return out
 
 
