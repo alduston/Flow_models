@@ -43,7 +43,7 @@ Original broader test context:
     energy/log-density, target gradient/score, and target Hessian at those
     coordinates.  Target samples are used for evaluation metrics/plots, and optionally for oracle initial references with --initial_reference_mode target.
   * Methods: selected with --methods.  Atomic estimators include Blend, Matrix Blend, Uniform Scalar Blend,
-    Uniform Matrix Blend, CE-HLSI/LFGI, MP-Leaf-LFGI, Tweedie, and None.  Hybrid tokens use
+    Uniform Matrix Blend, CE-HLSI/LFGI, OS-LFGI, pi-LFGI, LFGI-N, MP-Leaf-LFGI, Tweedie, and None.  Hybrid tokens use
     transport_correction order, e.g. blend_lfgi, lfgi_blend, tweedie_lfgi,
     lfgi_none, none_lfgi.  A transport repeat count can be attached to the
     transport method as <transport>-<n>_<correction>, e.g. lfgi-2_lfgi means
@@ -54,10 +54,11 @@ Original broader test context:
         q_j --R(probability-flow logq)--> rho_{j+1} = log pi - log q_j
 
     The same number of S/R rounds is run for Blend and CE-HLSI.  The R-step for
-    CE-HLSI uses the analytic CE-HLSI divergence; the R-step for Blend uses a
-    Hutchinson finite-difference divergence of the same frozen Blend field.
-    Use --pf_divergence hutchinson to force both methods through the generic
-    divergence estimator.
+    CE-HLSI uses the analytic CE-HLSI divergence.  OS-LFGI preserves this
+    analytic LFGI contribution and uses Hutchinson finite differences only for
+    the one-step residual correction.  The R-step for Blend uses Hutchinson on
+    the full frozen Blend field.  Use --pf_divergence hutchinson to force every
+    method through the generic full-field divergence estimator.
 
 Outputs
 -------
@@ -248,15 +249,15 @@ class Config:
     initial_reference_mode: str = "prior"
     initial_weight_mode: str = "zero"  # prior_ratio or zero; ignored for target initial references
     # Comma-separated estimator pairs to run. Atomic aliases such as blend, matrix_blend, unif_blend,
-    # unif_matrix_blend, lfgi/ce-hlsi, pi-lfgi, or leaf-lfgi/mp-leaf-lfgi mean diagonal transport/correction.
+    # unif_matrix_blend, lfgi/ce-hlsi, os-lfgi, pi-lfgi, lfgi-N, or leaf-lfgi/mp-leaf-lfgi mean diagonal transport/correction.
     # Hybrid aliases use transport_correction order, e.g. blend_lfgi or lfgi_blend.
     # Multi-transport aliases use <transport>-<n>_<correction>, e.g. lfgi-2_lfgi
     # means two uncorrected LFGI transports followed by one LFGI ratio step.
     # Current names are interpreted as <transport>-1_<correction>.
     # Special values:
-    #   all/default = diagonal blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, pi-lfgi, leaf-lfgi, tweedie
+    #   all/default = diagonal blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, os-lfgi, pi-lfgi, lfgi-N, leaf-lfgi, tweedie
     #   hybrids     = four blend/lfgi pairs
-    #   grid/full   = full transport/correction grid over blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, pi-lfgi, leaf-lfgi, tweedie, none
+    #   grid/full   = full transport/correction grid over blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, os-lfgi, pi-lfgi, lfgi-N, leaf-lfgi, tweedie, none
     methods: str = "lfgi_none,tweedie_none,blend_none"
     # Which frozen reference bank to use for PF likelihood correction after the
     # transport block.  endpoint matches the new TSC workflow: after n transports,
@@ -305,6 +306,11 @@ class Config:
     # leaves gates unchanged.  Setting 0 projects to PSD; setting 1e-2, for
     # example, projects to eigenvalues >= 0.01.
     gate_min_eval: float = -float("inf")
+
+    # One-step residual-corrected q-LFGI.  tau=1 applies the full matrix-free
+    # first-order normal-equation correction from the paired particle-wise
+    # TSI/Tweedie signals; tau=0 reduces exactly to ordinary q-LFGI.
+    os_lfgi_tau: float = 1.0
 
     # Matrix/uniform blend controls, matching the sampler-mode defaults used in
     # sampling.py.  matrix_blend is the centered local matrix regression gate;
@@ -2153,6 +2159,20 @@ PI_LFGI_METHOD_KEYS = {
     "target-lfgi",
 }
 
+N_LFGI_METHOD_KEYS = {
+    "lfgi-n",
+    "normal-lfgi",
+    "gaussian-lfgi",
+    "standard-normal-lfgi",
+    "n-lfgi",
+}
+
+OS_LFGI_METHOD_KEYS = {
+    "os-lfgi",
+    "one-step-lfgi",
+    "residual-corrected-lfgi",
+}
+
 
 def canonical_score_method_key(method: str) -> str:
     return str(method).strip().lower().replace("_", "-")
@@ -2160,6 +2180,14 @@ def canonical_score_method_key(method: str) -> str:
 
 def is_pi_lfgi_method(method: str) -> bool:
     return canonical_score_method_key(method) in PI_LFGI_METHOD_KEYS
+
+
+def is_n_lfgi_method(method: str) -> bool:
+    return canonical_score_method_key(method) in N_LFGI_METHOD_KEYS
+
+
+def is_os_lfgi_method(method: str) -> bool:
+    return canonical_score_method_key(method) in OS_LFGI_METHOD_KEYS
 
 
 class SNISScoreBank:
@@ -2173,6 +2201,8 @@ class SNISScoreBank:
         gate_log_ref_weights: Optional[torch.Tensor] = None,
         pi_gate_anchors: Optional[torch.Tensor] = None,
         pi_gate_log_ref_weights: Optional[torch.Tensor] = None,
+        n_gate_anchors: Optional[torch.Tensor] = None,
+        n_gate_log_ref_weights: Optional[torch.Tensor] = None,
     ):
         self.target = target
         self.x = anchors.detach().to(device=target.device, dtype=target.dtype)
@@ -2276,6 +2306,45 @@ class SNISScoreBank:
             "pi_gate_bank_n": int(self.N_pi_gate),
             "pi_gate_bank_source": "target" if self.has_pi_gate_bank else "none",
         })
+
+        # Optional fixed standard-normal gate bank for LFGI-N.  As with pi-LFGI,
+        # the evolving q bank still supplies the Tweedie and TSI/cross-score
+        # signals.  Only the curvature-resolvent localization measure changes,
+        # here to an independently drawn N(0,I_d) bank.
+        self.has_n_gate_bank = n_gate_anchors is not None
+        if self.has_n_gate_bank:
+            self.x_n_gate = n_gate_anchors.detach().to(device=target.device, dtype=target.dtype)
+            self.N_n_gate = int(self.x_n_gate.shape[0])
+            if self.N_n_gate <= 0:
+                raise ValueError("n_gate_anchors must contain at least one standard-normal sample")
+            if n_gate_log_ref_weights is None:
+                self.log_n_gate_weights = torch.zeros((self.N_n_gate,), device=self.device, dtype=self.dtype)
+            else:
+                nlw = n_gate_log_ref_weights.detach().to(device=self.device, dtype=self.dtype).reshape(-1)
+                if nlw.shape[0] != self.N_n_gate:
+                    raise ValueError(
+                        f"n_gate_log_ref_weights has length {nlw.shape[0]} but n_gate_anchors have length {self.N_n_gate}"
+                    )
+                self.log_n_gate_weights = torch.nan_to_num(nlw, nan=0.0, posinf=0.0, neginf=0.0)
+            self.score0_n_gate = target.score(self.x_n_gate, t=0.0).detach()
+            Hn_gate = target.observed_information(self.x_n_gate, t=0.0).detach()
+            self.H_n_gate_raw = sym(Hn_gate).detach()
+            self.P_n_gate = process_curvature(
+                self.H_n_gate_raw, cfg.curvature_mode, cfg.curvature_floor, cfg.curvature_cap
+            ).detach()
+        else:
+            self.x_n_gate = None
+            self.N_n_gate = 0
+            self.log_n_gate_weights = None
+            self.score0_n_gate = None
+            self.H_n_gate_raw = None
+            self.P_n_gate = None
+
+        self.mp_leaf_info.update({
+            "n_gate_bank_available": bool(self.has_n_gate_bank),
+            "n_gate_bank_n": int(self.N_n_gate),
+            "n_gate_bank_source": "standard_normal" if self.has_n_gate_bank else "none",
+        })
         self._uniform_score_moment_cache: Optional[torch.Tensor] = None
         self._uniform_matrix_gate_cache: Dict[Tuple[float, float, float, bool], torch.Tensor] = {}
         self._uniform_scalar_gate_cache: Dict[Tuple[float, float, bool], torch.Tensor] = {}
@@ -2307,6 +2376,14 @@ class SNISScoreBank:
             return self._weights_and_signals_for(
                 y, t, self.x_pi_gate, self.score0_pi_gate, self.log_pi_gate_weights
             )
+        if method is not None and is_n_lfgi_method(method):
+            if not self.has_n_gate_bank:
+                raise RuntimeError(
+                    "LFGI-N requested, but this SNISScoreBank has no independently drawn standard-normal gate bank"
+                )
+            return self._weights_and_signals_for(
+                y, t, self.x_n_gate, self.score0_n_gate, self.log_n_gate_weights
+            )
         return self._weights_and_signals_for(y, t, self.x_gate, self.score0_gate, self.log_gate_weights)
 
     def _gate_precision_for_method(self, method: str) -> torch.Tensor:
@@ -2317,6 +2394,12 @@ class SNISScoreBank:
                     "pi-LFGI requested, but this SNISScoreBank has no independently drawn target gate bank"
                 )
             return self.P_pi_gate
+        if is_n_lfgi_method(key):
+            if self.P_n_gate is None:
+                raise RuntimeError(
+                    "LFGI-N requested, but this SNISScoreBank has no independently drawn standard-normal gate bank"
+                )
+            return self.P_n_gate
         if key in {"leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
             return self.P_gate_mp
         return self.P_gate
@@ -2387,8 +2470,93 @@ class SNISScoreBank:
         self._uniform_matrix_gate_cache[cache_key] = A
         return A
 
+    def _q_lfgi_score_and_os_correction_chunk(
+        self,
+        y: torch.Tensor,
+        t: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ordinary q-LFGI and its one-step residual correction.
+
+        Let B be the particle-wise Tweedie signal, U the particle-wise TSI
+        signal, R=U-B, r=E[R|y], and G0 the usual q-LFGI gate.  With
+
+            D  = R-r,
+            E0 = (B-E[B|y]) + G0 D,
+
+        the one-step score correction is
+
+            -tau Cov(E0,D|y) M0^{-1} r.
+
+        Because G0=(1/gamma) M0^{-1} for the unprojected resolvent, the action
+        M0^{-1}r is evaluated as gamma*G0*r.  This keeps the implementation
+        matrix-free and inherits the same spectral clipping/projection used by
+        the actual LFGI gate.
+        """
+        w, b, c, alpha, gamma = self._weights_and_signals(y, t)
+        bbar = torch.sum(w[:, :, None] * b, dim=1)
+        cbar = torch.sum(w[:, :, None] * c, dim=1)
+
+        wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t, method="ce-hlsi")
+        Pbar = torch.sum(wg[:, :, None, None] * self.P_gate[None, :, :, :], dim=1)
+        G0 = resolvent_gate(
+            Pbar,
+            alpha,
+            gamma,
+            self.cfg.resolvent_eps,
+            self.cfg.gate_clip,
+            getattr(self.cfg, "gate_min_eval", -float("inf")),
+        )
+
+        rbar = cbar - bbar
+        G0r = torch.einsum("bij,bj->bi", G0, rbar)
+        lfgi_score = bbar + G0r
+
+        # Center the paired disagreement and the LFGI residual under the same
+        # score-bank conditional weights.  Only the covariance action needed by
+        # the score is formed; no dense dxd moment matrix is materialized.
+        D = (c - b) - rbar[:, None, :]
+        G0D = torch.einsum("bij,bnj->bni", G0, D)
+        E0 = (b - bbar[:, None, :]) + G0D
+        z = gamma * G0r
+        Dz = torch.einsum("bni,bi->bn", D, z)
+        correction = -torch.sum(w[:, :, None] * E0 * Dz[:, :, None], dim=1)
+
+        tau = float(getattr(self.cfg, "os_lfgi_tau", 1.0))
+        if not math.isfinite(tau):
+            raise ValueError(f"os_lfgi_tau must be finite; got {tau}")
+        correction = tau * correction
+        return (
+            torch.nan_to_num(lfgi_score, nan=0.0, posinf=0.0, neginf=0.0),
+            torch.nan_to_num(correction, nan=0.0, posinf=0.0, neginf=0.0),
+        )
+
+    @torch.no_grad()
+    def os_lfgi_score_and_correction(
+        self,
+        y: torch.Tensor,
+        t: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores: List[torch.Tensor] = []
+        corrections: List[torch.Tensor] = []
+        for start in range(0, y.shape[0], int(self.cfg.eval_chunk)):
+            score, correction = self._q_lfgi_score_and_os_correction_chunk(
+                y[start:start + int(self.cfg.eval_chunk)],
+                t,
+            )
+            scores.append(score)
+            corrections.append(correction)
+        return torch.cat(scores, dim=0), torch.cat(corrections, dim=0)
+
+    @torch.no_grad()
+    def os_lfgi_correction(self, y: torch.Tensor, t: float) -> torch.Tensor:
+        _score, correction = self.os_lfgi_score_and_correction(y, t)
+        return correction
+
     def estimate_chunk(self, y: torch.Tensor, t: float, method: str) -> torch.Tensor:
         key = str(method).strip().lower().replace("_", "-")
+        if is_os_lfgi_method(key):
+            lfgi_score, correction = self._q_lfgi_score_and_os_correction_chunk(y, t)
+            return lfgi_score + correction
         w, b, c, alpha, gamma = self._weights_and_signals(y, t)
         bbar = torch.sum(w[:, :, None] * b, dim=1)
         cbar = torch.sum(w[:, :, None] * c, dim=1)
@@ -2447,7 +2615,7 @@ class SNISScoreBank:
             if projection_active:
                 G = project_symmetric_gate_min_eval(G, float(self.cfg.gate_min_eval))
             return bbar + torch.einsum("bij,bj->bi", G, cbar - bbar)
-        if key in {"ce-hlsi", "lfgi", "ce-lfgi", "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
+        if key in {"ce-hlsi", "lfgi", "ce-lfgi", "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi", "lfgi-n", "normal-lfgi", "gaussian-lfgi", "standard-normal-lfgi", "n-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
             wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t, method=method)
             Pgate = self._gate_precision_for_method(method)
             Pbar = torch.sum(wg[:, :, None, None] * Pgate[None, :, :, :], dim=1)
@@ -2676,17 +2844,72 @@ def score_and_hutchinson_divergence(bank: SNISScoreBank, x: torch.Tensor, t: flo
 
 
 @torch.no_grad()
+def os_lfgi_score_and_hybrid_divergence(
+    bank: SNISScoreBank,
+    x: torch.Tensor,
+    t: float,
+    cfg: Config,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Analytic q-LFGI divergence plus Hutchinson OS-correction divergence.
+
+    The ordinary LFGI field retains the closed-form CE-HLSI divergence.  Only
+    the additional one-step residual correction is finite-differenced, avoiding
+    Hutchinson noise on the dominant closed-form part of the score field.
+    """
+    lfgi_score, lfgi_div = bank.ce_score_and_divergence(x, t, method="ce-hlsi")
+    correction = bank.os_lfgi_correction(x, t)
+
+    probes = max(int(cfg.hutchinson_probes), 1)
+    eps = float(cfg.hutchinson_eps)
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"hutchinson_eps must be positive and finite; got {eps}")
+    div_corr = torch.zeros((x.shape[0],), device=x.device, dtype=x.dtype)
+    for _ in range(probes):
+        v = torch.empty_like(x).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+        cp = bank.os_lfgi_correction(x + eps * v, t)
+        cm = bank.os_lfgi_correction(x - eps * v, t)
+        div_corr = div_corr + torch.sum((cp - cm) * v, dim=1) / (2.0 * eps)
+    div_corr = div_corr / float(probes)
+    score = lfgi_score + correction
+    div = lfgi_div + div_corr
+    return (
+        torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0),
+        torch.nan_to_num(div, nan=0.0, posinf=0.0, neginf=0.0),
+    )
+
+
+@torch.no_grad()
 def bank_score_and_divergence(bank: SNISScoreBank, x: torch.Tensor, t: float, method: str, cfg: Config) -> Tuple[torch.Tensor, torch.Tensor]:
     div_mode = str(cfg.pf_divergence).lower()
-    key = str(method).lower()
+    key = canonical_score_method_key(method)
     projection_active = math.isfinite(float(getattr(cfg, "gate_min_eval", -float("inf"))))
     if (
         not projection_active
         and div_mode in {"auto", "analytic_ce", "analytic"}
-        and key in {"ce-hlsi", "lfgi", "ce-lfgi", "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}
+        and is_os_lfgi_method(key)
+    ):
+        return os_lfgi_score_and_hybrid_divergence(bank, x, t, cfg)
+    if (
+        not projection_active
+        and div_mode in {"auto", "analytic_ce", "analytic"}
+        and key in {"ce-hlsi", "lfgi", "ce-lfgi", "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi", "lfgi-n", "normal-lfgi", "gaussian-lfgi", "standard-normal-lfgi", "n-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}
     ):
         return bank.ce_score_and_divergence(x, t, method=method)
     return score_and_hutchinson_divergence(bank, x, t, method, cfg)
+
+
+def effective_pf_divergence_mode(method: str, cfg: Config) -> str:
+    """Describe the divergence path actually used for a frozen score field."""
+    div_mode = str(cfg.pf_divergence).lower()
+    key = canonical_score_method_key(method)
+    projection_active = math.isfinite(float(getattr(cfg, "gate_min_eval", -float("inf"))))
+    if projection_active or div_mode not in {"auto", "analytic_ce", "analytic"}:
+        return "hutchinson_full"
+    if is_os_lfgi_method(key):
+        return "analytic_lfgi_plus_hutchinson_os"
+    if key in {"ce-hlsi", "lfgi", "ce-lfgi", "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi", "lfgi-n", "normal-lfgi", "gaussian-lfgi", "standard-normal-lfgi", "n-lfgi", "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"}:
+        return "analytic_ce"
+    return "hutchinson_full"
 
 
 @torch.no_grad()
@@ -2753,6 +2976,7 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
     return logq_all, {
         "pf_method": str(method),
         "pf_divergence_mode": str(cfg.pf_divergence),
+        "pf_divergence_effective": effective_pf_divergence_mode(method, cfg),
         "pf_failed_frac": float(failed_total) / float(max(1, x0.shape[0])),
         "pf_steps": int(cfg.pf_steps),
         "pf_t_min": float(effective_time_bounds(cfg)[0]),
@@ -4044,6 +4268,7 @@ def blank_pf_info(method: str, reason: str = "skipped") -> Dict[str, float | boo
     return {
         "pf_method": str(method),
         "pf_divergence_mode": "none",
+        "pf_divergence_effective": "none",
         "pf_skipped": True,
         "pf_skip_reason": reason,
         "pf_failed_frac": 0.0,
@@ -4136,9 +4361,9 @@ def run_family(
     ratio_reference_mode = canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint"))
     method_name = method_label(transport_method, transport_repeats, correction_method)
 
-    # pi-LFGI keeps q-derived score signals but estimates its curvature gate
-    # from an independent target sample bank. Reuse one fixed oracle bank across
-    # rounds/substeps so target-gate Monte Carlo refresh does not masquerade as
+    # pi-LFGI and LFGI-N keep q-derived score signals but estimate the
+    # curvature gate from an external localization bank.  Reuse one fixed bank
+    # across rounds/substeps so Monte Carlo refresh cannot masquerade as
     # adaptation of the evolving reference.
     needs_pi_gate = is_pi_lfgi_method(transport_method) or is_pi_lfgi_method(correction_method)
     if needs_pi_gate:
@@ -4148,6 +4373,20 @@ def run_family(
     else:
         pi_gate_refs = None
         pi_gate_rho = None
+
+    needs_n_gate = is_n_lfgi_method(transport_method) or is_n_lfgi_method(correction_method)
+    if needs_n_gate:
+        n_gate_gen = make_generator(int(cfg.seed + 707_000), target.device)
+        n_gate_refs = torch.randn(
+            (int(effective_gate_n(cfg)), int(target.d)),
+            device=target.device,
+            dtype=target.dtype,
+            generator=n_gate_gen,
+        ).detach()
+        n_gate_rho = torch.zeros((n_gate_refs.shape[0],), device=target.device, dtype=target.dtype)
+    else:
+        n_gate_refs = None
+        n_gate_rho = None
 
     current_pool = init_refs.detach().clone()
     current_rho = init_rho.detach().clone()
@@ -4198,6 +4437,8 @@ def run_family(
                 gate_log_ref_weights=gate_rho,
                 pi_gate_anchors=pi_gate_refs,
                 pi_gate_log_ref_weights=pi_gate_rho,
+                n_gate_anchors=n_gate_refs,
+                n_gate_log_ref_weights=n_gate_rho,
             )
             gen = make_generator(int(cfg.seed + 10_000 * r + 701 * m + family_seed_offset(family)), target.device)
 
@@ -4254,6 +4495,8 @@ def run_family(
                 gate_log_ref_weights=next_gate_rho0,
                 pi_gate_anchors=pi_gate_refs,
                 pi_gate_log_ref_weights=pi_gate_rho,
+                n_gate_anchors=n_gate_refs,
+                n_gate_log_ref_weights=n_gate_rho,
             )
 
             # The full Delta_PF diagnostics are the expensive theorem-facing
@@ -4344,6 +4587,9 @@ def run_family(
             "pi_gate_source": "target" if needs_pi_gate else "none",
             "pi_gate_n": int(pi_gate_refs.shape[0]) if pi_gate_refs is not None else 0,
             "pi_gate_fixed_across_rounds": bool(needs_pi_gate),
+            "n_gate_source": "standard_normal" if needs_n_gate else "none",
+            "n_gate_n": int(n_gate_refs.shape[0]) if n_gate_refs is not None else 0,
+            "n_gate_fixed_across_rounds": bool(needs_n_gate),
             "input_rho_ess": in_ess,
             "input_rho_ess_frac": in_ess_frac,
             "sampler_failed": bool(sampler_info.get("failed", False)),
@@ -4499,6 +4745,12 @@ def _estimator_alias_table() -> Dict[str, Tuple[str, str]]:
         "ce-hlsi": ("LFGI", "ce-hlsi"),
         "ce_hlsi": ("LFGI", "ce-hlsi"),
         "ce-lfgi": ("LFGI", "ce-hlsi"),
+        "os-lfgi": ("OS-LFGI", "os-lfgi"),
+        "os_lfgi": ("OS-LFGI", "os-lfgi"),
+        "one-step-lfgi": ("OS-LFGI", "os-lfgi"),
+        "one_step_lfgi": ("OS-LFGI", "os-lfgi"),
+        "residual-corrected-lfgi": ("OS-LFGI", "os-lfgi"),
+        "residual_corrected_lfgi": ("OS-LFGI", "os-lfgi"),
         "pi-lfgi": ("pi-LFGI", "pi-lfgi"),
         # Backward-compatible legacy spelling; canonical user-facing token is pi-lfgi.
         "pi_lfgi": ("pi-LFGI", "pi-lfgi"),
@@ -4508,6 +4760,17 @@ def _estimator_alias_table() -> Dict[str, Tuple[str, str]]:
         "oracle_lfgi": ("pi-LFGI", "pi-lfgi"),
         "target-lfgi": ("pi-LFGI", "pi-lfgi"),
         "target_lfgi": ("pi-LFGI", "pi-lfgi"),
+        "lfgi-n": ("LFGI-N", "lfgi-N"),
+        # Backward-compatible/verbose aliases; canonical user-facing token is lfgi-N.
+        "lfgi_n": ("LFGI-N", "lfgi-N"),
+        "normal-lfgi": ("LFGI-N", "lfgi-N"),
+        "normal_lfgi": ("LFGI-N", "lfgi-N"),
+        "gaussian-lfgi": ("LFGI-N", "lfgi-N"),
+        "gaussian_lfgi": ("LFGI-N", "lfgi-N"),
+        "standard-normal-lfgi": ("LFGI-N", "lfgi-N"),
+        "standard_normal_lfgi": ("LFGI-N", "lfgi-N"),
+        "n-lfgi": ("LFGI-N", "lfgi-N"),
+        "n_lfgi": ("LFGI-N", "lfgi-N"),
         "leaf-lfgi": ("Leaf-LFGI", "mp-leaf-lfgi"),
         "leaf_lfgi": ("Leaf-LFGI", "mp-leaf-lfgi"),
         "mp-leaf-lfgi": ("Leaf-LFGI", "mp-leaf-lfgi"),
@@ -4617,7 +4880,7 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int]:
     valid = ", ".join(sorted(_estimator_alias_table().keys()) + ["all", "hybrids"])
     raise ValueError(
         f"Unknown method/hybrid token {token!r}. Use atomic aliases or transport_correction "
-        f"tokens like blend_lfgi, lfgi_none, pi-lfgi_none, none_lfgi, tweedie_lfgi, or the "
+        f"tokens like blend_lfgi, lfgi_none, os-lfgi_none, lfgi_os-lfgi, pi-lfgi_none, lfgi-N_none, none_lfgi, tweedie_lfgi, or the "
         f"multi-transport form lfgi-2_lfgi. Valid estimator aliases: {valid}"
     )
 
@@ -4630,11 +4893,11 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int]]:
     """
     raw = str(methods or "hybrids").strip().lower()
     if raw in {"all", "default", "*"}:
-        keys = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "pi-lfgi", "leaf-lfgi", "tweedie"]
+        keys = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie"]
     elif raw in {"hybrid", "hybrids", "blend-lfgi-hybrids", "lfgi-blend-hybrids"}:
         keys = ["blend_blend", "blend_lfgi", "lfgi_blend", "lfgi_lfgi"]
     elif raw in {"grid", "full-grid", "fullgrid", "full", "allpairs", "all-pairs"}:
-        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "pi-lfgi", "leaf-lfgi", "tweedie", "none"]
+        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie", "none"]
         keys = [f"{a}_{b}" for a in atoms for b in atoms]
     else:
         keys = [k.strip() for k in raw.replace(";", ",").split(",") if k.strip()]
@@ -4647,7 +4910,7 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int]]:
             out.append((fam, transport, correction, int(repeats)))
             seen.add(unique)
     if not out:
-        raise ValueError("No methods selected. Example: --methods lfgi_none,pi-lfgi_none,blend_lfgi,matrix_blend-2_unif_blend,none_lfgi,tweedie_lfgi")
+        raise ValueError("No methods selected. Example: --methods lfgi_none,os-lfgi_none,lfgi_os-lfgi,pi-lfgi_none,lfgi-N_none,blend_lfgi,matrix_blend-2_unif_blend,none_lfgi,tweedie_lfgi")
     return out
 
 
