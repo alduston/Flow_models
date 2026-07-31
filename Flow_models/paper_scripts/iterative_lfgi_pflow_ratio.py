@@ -1,105 +1,78 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-iterative_lfgi_convergence_check.py
+iterative_transport_bflow_ratio_fisher_v7.py
 
-Compare no-likelihood-correction iterated score-to-transport bootstrapping from
-an isotropic Gaussian reference on the normalized 8D misaligned GMM target.
+Certificate-consistent refreshed alternating transport and ratio-flow test bench.
 
-Targets now include the original d=8 misaligned singular-subspace GMM,
-the d=10 Neal funnel stress test from the benchmark sweep, and intermediate-dimensional
-molecular LJ/DW-style particle potentials with exact t=0 score and Hessian evaluations.
+The default run applies one LFGI transport probability flow followed by one
+LFGI-complement ratio probability flow per outer cycle.  Every half-step
+rebuilds its estimator from the particles produced by the preceding half-step.
+Each generated bank carries the incoming Liouville log-density certificate
+emitted by the same realized field that generated it, so endpoint ratio labels
+remain valid away from transport self-consistency.
 
-Purpose
--------
-This version is wired for the theorem-5.3 numerical sanity check:
+Supported targets include the normalized stiff 8D misaligned GMM, the fixed
+stiff 3D GMM, Neal's funnel, stiff analytic 2D targets, and molecular LJ/DW
+examples.  Supported gate families include local scalar/matrix Blend, uniform
+scalar/matrix Blend, LFGI variants, Tweedie (G=0), and TSI (G=I).
 
-  * Default target: normalized 8D misaligned subspace GMM.
-  * Default methods: LFGI, Tweedie, and local scalar Blend, all with
-    correction_method=None.  The sampler registry also includes local matrix
-    Blend, uniform scalar Blend, and uniform matrix Blend.
-  * No likelihood correction: every next reference bank is unweighted, so the
-    loop is q_{k+1}=F_A(q_k).
-  * Diagnostics: adjacent proposal movement, adjacent probability-flow score
-    discrepancy Delta_PF(s_k,s_{k+1}) on induced PF paths, the same
-    discrepancy evaluated on true target OU marginals x_t~pi_t, and the
-    corresponding PF endpoint movement d_Q(TPF(s_k),TPF(s_{k+1})).
+Method syntax
+-------------
 
-The original broader alternating-DRC machinery is still present, but the
-default flags disable the ratio step.
+    <transport>-<repeats>_<ratio-carrier>_<ratio-node>-<ratio-rounds>
 
-Original broader test context:
+The two moved-particle ratio nodes are retained side by side:
 
-  * Targets: choose with --target.  Alongside the original misaligned GMM,
-    Neal funnel, and molecular examples, this version includes exact-sampling
-    stiff 2D targets: banana, sine, ring, rings, spiral, and double_well.  Their
-    t=0 scores and observed-information Hessians are evaluated exactly by
-    autodiff; target OU scores used only for diagnostics are empirical Tweedie
-    estimates from cached exact target samples.
-  * Normalization: targets are affinely whitened so E[X]≈0 and Cov[X]≈I.
-    Therefore the initial N(0,I) prior bank has the same global location and
-    volume as the target, but it is not a target sample bank unless --initial_reference_mode target is used.
-  * Inputs available to the estimators: prior/reference coordinates, target
-    energy/log-density, target gradient/score, and target Hessian at those
-    coordinates.  Target samples are used for evaluation metrics/plots, and optionally for oracle initial references with --initial_reference_mode target.
-  * Methods: selected with --methods.  Atomic estimators include Blend, Matrix Blend, Uniform Scalar Blend,
-    Uniform Matrix Blend, CE-HLSI/LFGI, OS-LFGI, pi-LFGI, LFGI-N, MP-Leaf-LFGI, Tweedie, and None.  Hybrid tokens use
-    transport_correction order, e.g. blend_lfgi, lfgi_blend, tweedie_lfgi,
-    lfgi_none, none_lfgi.  A transport repeat count can be attached to the
-    transport method as <transport>-<n>_<correction>, e.g. lfgi-2_lfgi means
-    two LFGI transport rounds followed by one LFGI likelihood-ratio correction.
-  * Algorithm: alternating projected-IPF-style DRC:
+* ``gated-pflow`` (legacy):
+  ``s_R=s_A+lambda(I-G_A)(b_t^pi-s_A)``.
+* ``gated-bflow`` (shared-statistic complement):
+  ``s_R=s_A+lambda(I-G_A)(b_t^pi-b_t^q)``.
 
-        (R_j, rho_j) --S(score estimator)--> q_j samples R_{j+1}
-        q_j --R(probability-flow logq)--> rho_{j+1} = log pi - log q_j
+For example, strict refreshed LFGI b-flow alternation is
+``lfgi_lfgi_gated-bflow-1``.  With Tweedie as the ratio estimator, both
+flow definitions reduce to the full tilted Tweedie/Doob score because
+``s_A=b_t^q`` and ``G_A=0``.
 
-    The same number of S/R rounds is run for Blend and CE-HLSI.  The R-step for
-    CE-HLSI uses the analytic CE-HLSI divergence.  OS-LFGI preserves this
-    analytic LFGI contribution and uses Hutchinson finite differences only for
-    the one-step residual correction.  The R-step for Blend uses Hutchinson on
-    the full frozen Blend field.  Use --pf_divergence hutchinson to force every
-    method through the generic full-field divergence estimator.
+Algorithmic invariants
+----------------------
+
+* Transport substep m builds its frozen field from the actual output particles
+  of substep m-1.
+* Ratio substep r rebuilds its carrier, gate, density tilt, and conditional
+  particle bank from the actual output particles of ratio substep r-1.
+* The density denominator at q_k is the incoming certificate produced by the
+  field built from q_{k-1}; rebuilding an outgoing q_k field is not substituted
+  away from TSC.
+* Certified generation and density evaluation use the same deterministic
+  probability-flow path and divergence convention.
+* The ratio flow returns moved unweighted particles and its own incoming
+  certificate for the next half-step.
+* FisherRMSE on each full-cycle sample row is evaluated from a score bank
+  rebuilt on the actual post-ratio law that is fed into the next transport
+  half-step; it is not inherited from the pre-ratio transport bank.
 
 Outputs
 -------
-  outdir/config.json
-  outdir/metrics_by_round.csv
-  outdir/stage_diagnostics.csv  # includes Delta_PF and no-correction stage diagnostics
-  outdir/convergence_by_round.csv
-  outdir/convergence_curves.png
-  outdir/heatmaps_final.png
-  outdir/heatmaps_by_round.png
-  outdir/metric_curves.png
-  outdir/projection_basis.npz
+``config.json``, ``metrics_by_round.csv``, ``stage_diagnostics.csv``,
+``convergence_by_round.csv``, and plotting dashboards in ``outdir``.
 
-Example
--------
-python iterative_lfgi_convergence_check.py \
+Strict alternating example
+--------------------------
+
+python iterative_transport_bflow_ratio_fisher_v7.py \
   --target misaligned_gmm \
-  --outdir results/theorem53_misaligned8d \
+  --outdir results/certified_lfgi_bflow \
   --device cuda --dtype float64 \
   --n_ref 3000 --n_samples 3000 --n_truth 12000 \
-  --n_rounds 6 --n_steps 150 \
-  --t_min 0.005 --t_max 3.0 --time_schedule linear \
-  --methods lfgi_none,tweedie_none,blend_none \
-  --force_no_likelihood_correction \
-  --delta_pf_n 256 --delta_pf_steps 24
+  --n_rounds 6 --n_steps 150 --pf_steps 64 \
+  --t_min 0.005 --t_max 3.0 \
+  --methods lfgi_lfgi_gated-bflow-1 \
+  --ratio_reference_mode incoming \
+  --ratio_tilt_policy exact --lambda_guard 1
 
-The most direct theorem-5.3 columns are in convergence_by_round.csv:
-  delta_pf, delta_pf_target, delta_pf_endpoint_mmd, delta_pf_endpoint_sw2,
-  adjacent_sample_mmd, adjacent_sample_sw2, fisher_rmse, mmd.
-
-Here delta_pf is evaluated on the two induced PF path laws, while
-delta_pf_target estimates int E_{x_t~pi_t} ||s_k(x_t,t)-s_{k+1}(x_t,t)||^2 dt.
-
-Quick smoke test
-----------------
-python iterative_lfgi_convergence_check.py \
-  --outdir /tmp/lfgi_conv_smoke --device cpu --dtype float32 \
-  --n_ref 64 --n_samples 64 --n_truth 256 \
-  --n_rounds 2 --n_steps 4 --metrics_max_n 64 \
-  --fisher_n_t 2 --fisher_n_per_t 32 --eval_chunk 64 \
-  --delta_pf_n 32 --delta_pf_steps 3
+Transport-only theorem diagnostics remain available with
+``--force_no_likelihood_correction`` and a ``*_none`` method token.
 """
 
 from __future__ import annotations
@@ -135,7 +108,7 @@ FUNNEL_HEATMAP_Y_Q_ABS = float(os.environ.get("LFGI_BENCH_FUNNEL_HEATMAP_Y_Q_ABS
 
 @dataclass
 class Config:
-    outdir: str = "results/alternating_drc_misaligned8d"
+    outdir: str = "results/refreshed_certified_alternation_v4"
     seed: int = 123
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "float64"
@@ -237,9 +210,9 @@ class Config:
     nll_kde_n_fit: int = 5000
     nll_kde_min_bandwidth: float = 0.05
 
-    # Iterated no-correction convergence rounds.  The default harness is the
-    # theorem-5.3 diagnostic loop q_{k+1}=F_A(q_k), not the ratio-corrected
-    # alternating DRC loop.
+    # Number of strict alternating outer cycles.  The production default is
+    # one refreshed transport step followed by one refreshed ratio-flow step.
+    # No-correction transport-only diagnostics remain available by flag.
     n_rounds: int = 6
     # Initial proposal/reference law:
     #   prior/gaussian : draw the initial split-compatible pool from N(0,I).
@@ -252,27 +225,62 @@ class Config:
     #
     #   <transport score>-<transport repeats>_<ratio/PF score>_<ratio mode>-<ratio rounds>
     #
-    # e.g. ``lfgi-2_lfgi_gated-pflow-1``.  ``raw-w`` keeps the legacy
+    # e.g. ``lfgi-2_lfgi_gated-bflow-1``.  ``raw-w`` keeps the legacy
     # fixed-coordinate importance-weight correction and ignores the optional
-    # ratio-round count.  ``gated-pflow`` performs one or more complement-gated
-    # probability-flow ratio transports.  The second score method is used both
-    # for PF reconstruction of q(x) and for the frozen q-score/gate inside the
-    # ratio flow.  Legacy two-field labels remain accepted and default to raw-w.
+    # ratio-round count.  ``gated-pflow`` retains the previous residual
+    # s_A+(I-G_A)(b^pi-s_A), while ``gated-bflow`` implements the shared-statistic
+    # complement s_A+(I-G_A)(b^pi-b^q).  The first score method generates the
+    # transport endpoint and therefore supplies its incoming density certificate.
+    # The second score method supplies the refreshed ratio carrier and native
+    # gate.  The b^q and b^pi vectors are the canonical untilted and density-tilted
+    # Tweedie conditional statistics on that same current score bank; they do not
+    # introduce a separate estimator choice.  Each inner ratio round refreshes all
+    # current-law objects from the moved particles and carries forward the incoming
+    # certificate emitted by the preceding ratio field.  Legacy two-field labels
+    # remain accepted and default to raw-w.
     # Special values:
     #   all/default = diagonal blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, os-lfgi, pi-lfgi, lfgi-N, leaf-lfgi, tweedie
     #   hybrids     = four blend/lfgi pairs
     #   grid/full   = full transport/correction grid over blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, os-lfgi, pi-lfgi, lfgi-N, leaf-lfgi, tweedie, none
-    methods: str = "lfgi_none,tweedie_none,blend_none"
-    # Which frozen reference bank to use for PF likelihood correction after the
-    # transport block.  endpoint matches the new TSC workflow: after n transports,
-    # build the correction score estimator from the settled endpoint reference.
-    # generator preserves the old single-step exact-induced-density convention by
-    # using the bank that generated the final endpoint cloud.
-    ratio_reference_mode: str = "endpoint"
+    methods: str = "lfgi_lfgi_gated-pflow-1"
+    # Density provenance for the first ratio labels after a transport block.
+    # incoming (default) uses the field that actually generated the endpoint and
+    # is valid away from TSC.  endpoint is a legacy outgoing-field diagnostic and
+    # is only justified at transport TSC.
+    ratio_reference_mode: str = "incoming"
+    # auto uses certified probability flow whenever a ratio/weight correction is
+    # enabled and preserves the legacy reverse SDE only for no-correction tests.
+    transport_dynamics: str = "auto"  # auto, probability_flow, reverse_sde
+    # Native uses the literal estimator gate and literal I-G.  Project first
+    # projects to 0<=G<=I and rebuilds a gate-consistent carrier.
+    ratio_gate_policy: str = "native"  # native or project
+    # Ratio endpoint labels: exact uses log pi-log q without clipping, tempering,
+    # or ESS adaptation. stabilized preserves the legacy guarded-weight policy.
+    ratio_tilt_policy: str = "exact"  # exact or stabilized
+    # The outgoing endpoint-field density is a legacy TSC-only diagnostic and
+    # is rejected during correction unless this escape hatch is explicit.
+    allow_legacy_endpoint_certificate: bool = False
+    # A certified law must not be silently altered by final denoising or clipping.
+    certified_flow_strict: bool = True
+    # Explicit abort thresholds for the certified generating flow.  These are
+    # intentionally separate from the legacy score/sample/divergence clipping
+    # knobs: certified PF never clips the state, score, or divergence because
+    # doing so would invalidate the incoming Liouville density certificate.
+    # A nonpositive value disables the corresponding optional audit threshold;
+    # nonfinite values are always fatal.
+    certified_score_abort: float = 0.0
+    certified_state_abort: float = 0.0
+    certified_div_abort: float = 0.0
+    # Raw indefinite LFGI followed by a hard post-resolvent spectral gate floor
+    # can be discontinuous when the resolvent denominator crosses zero.  Such a
+    # field does not have an ordinary pointwise divergence suitable for the
+    # certified PF density path.  The default rejects that configuration before
+    # a long run.  This escape hatch exists only for reproducing legacy behavior.
+    allow_raw_lfgi_hard_projection_certified: bool = False
     # Force the R/projection step to be the identity: all next-round references
     # are unweighted endpoint particles.  This is the convergence check for the
     # score-to-transport map, not a test of likelihood-ratio correction.
-    force_no_likelihood_correction: bool = True
+    force_no_likelihood_correction: bool = False
 
     # Adjacent-field convergence diagnostics for Theorem 5.3.  delta_pf_* uses
     # deterministic probability-flow paths and estimates
@@ -334,8 +342,9 @@ class Config:
     mp_leaf_floor: float = 0.0
     mp_leaf_tol: float = 1.0e-12
     weight_temp: float = 1.0
-    # Complement strength for the gated-pflow ratio node:
-    #   s_R = s_q + lambda_guard (I-G)(s_pi,dens-s_q).
+    # Complement strength for either moved-particle ratio node.
+    # gated-pflow: s_R = s_A + lambda_guard (I-G_A)(b_pi-s_A).
+    # gated-bflow: s_R = s_A + lambda_guard (I-G_A)(b_pi-b_q).
     # The name is retained to match the requested command-line interface.
     lambda_guard: float = 1.0
     eval_chunk: int = 512
@@ -2169,7 +2178,7 @@ def project_symmetric_gate_interval(
 
     The q-LFGI resolvent is not automatically a contraction when the localized
     observed-information estimate is indefinite.  The complement ``I-G`` used
-    by the gated-pflow ratio node is meaningful only for a contraction gate.
+    by either complement-gated ratio node is meaningful only for a contraction gate.
     This helper therefore performs the explicit spectral safeguard required by
     that node and returns both the projected gate and the pre-projection
     eigenvalues for diagnostics.
@@ -2219,6 +2228,23 @@ def is_n_lfgi_method(method: str) -> bool:
 
 def is_os_lfgi_method(method: str) -> bool:
     return canonical_score_method_key(method) in OS_LFGI_METHOD_KEYS
+
+
+RAW_LFGI_RESOLVENT_METHOD_KEYS = {
+    "ce-hlsi", "lfgi", "ce-lfgi",
+    *PI_LFGI_METHOD_KEYS,
+    *N_LFGI_METHOD_KEYS,
+    *OS_LFGI_METHOD_KEYS,
+}
+
+
+def is_raw_lfgi_resolvent_method(method: str) -> bool:
+    """True for LFGI variants that use the configured raw/PSD curvature bank.
+
+    MP-leaf LFGI is deliberately excluded because it uses an explicitly PSD
+    completed precision bank and therefore has no raw resolvent pole.
+    """
+    return canonical_score_method_key(method) in RAW_LFGI_RESOLVENT_METHOD_KEYS
 
 
 class SNISScoreBank:
@@ -2583,6 +2609,191 @@ class SNISScoreBank:
         _score, correction = self.os_lfgi_score_and_correction(y, t)
         return correction
 
+    def estimator_gate_components_chunk(
+        self,
+        y: torch.Tensor,
+        t: float,
+        method: str,
+    ) -> Dict[str, object]:
+        """Return an estimator carrier together with its native gate.
+
+        All supported score estimators are expressed, where possible, in the
+        common form
+
+            s_A = bbar + G_A (cbar - bbar).
+
+        Here ``bbar`` is the current-reference Tweedie score and ``cbar`` is the
+        target-on-reference conditional score signal.  The ratio flow uses the
+        literal complement of the same estimator-native gate.
+        ``ratio_gate_policy=native`` preserves that gate exactly.
+        ``ratio_gate_policy=project`` instead projects to ``0 <= G <= I`` and
+        rebuilds a carrier consistent with the projected gate; diagnostics make
+        that change explicit.
+
+        OS-LFGI contains an additive one-step residual correction that is not
+        itself represented by a unique matrix gate.  Its carrier retains that
+        correction, while its complement uses the underlying q-LFGI resolvent.
+        This is the canonical gate associated with the estimator, but the
+        returned consistency residual makes the distinction auditable.
+        """
+        key = canonical_score_method_key(method)
+        if key == "none":
+            raise ValueError("The complement ratio flow requires a score estimator with a defined carrier/gate; 'none' is not admissible")
+
+        w, b, c, alpha, gamma = self._weights_and_signals(y, t)
+        bbar = torch.sum(w[:, :, None] * b, dim=1)
+        cbar = torch.sum(w[:, :, None] * c, dim=1)
+        disagreement = cbar - bbar
+        B, d = bbar.shape
+        eye = torch.eye(d, device=y.device, dtype=y.dtype)
+        eye_b = eye.expand(B, d, d)
+        gate_kind = "unknown"
+
+        if key in {"blend", "blended", "scalar-blend", "scalar"}:
+            # Existing Blend uses a coordinate-wise Tweedie weight g.  In the
+            # target-correction convention s=bbar+G(cbar-bbar), G=diag(1-g).
+            wg, bg, cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t)
+            bgbar = torch.sum(wg[:, :, None] * bg, dim=1)
+            cgbar = torch.sum(wg[:, :, None] * cg, dim=1)
+            Ac = cg - cgbar[:, None, :]
+            Bc = bg - bgbar[:, None, :]
+            va = torch.sum(wg[:, :, None] * Ac.square(), dim=1).clamp(min=1.0e-30)
+            vb = torch.sum(wg[:, :, None] * Bc.square(), dim=1).clamp(min=1.0e-30)
+            cab = torch.sum(wg[:, :, None] * Ac * Bc, dim=1)
+            den = (va + vb - 2.0 * cab).clamp(min=1.0e-20)
+            tweedie_weight = ((va - cab) / den).clamp(0.0, 1.0)
+            G_raw = torch.diag_embed(1.0 - tweedie_weight)
+            carrier = cbar + tweedie_weight * (bbar - cbar)
+            gate_kind = "local-diagonal-blend"
+
+        elif key in {"unif-blend", "unif-scalar-blend", "uniform-blend", "uniform-scalar-blend", "global-scalar-blend"}:
+            tweedie_weight = self._uniform_scalar_tweedie_weight(float(t), alpha, gamma)
+            G0 = (1.0 - tweedie_weight) * eye
+            G_raw = G0.expand(B, d, d)
+            carrier = cbar + tweedie_weight * (bbar - cbar)
+            gate_kind = "uniform-scalar-blend"
+
+        elif key in {"unif-matrix-blend", "uniform-matrix-blend", "global-matrix-blend"}:
+            A = self._uniform_matrix_tweedie_weight(float(t), alpha, gamma)
+            G0 = eye - A
+            G_raw = G0.expand(B, d, d)
+            carrier = cbar + torch.einsum("ij,bj->bi", A, bbar - cbar)
+            gate_kind = "uniform-matrix-blend"
+
+        elif key in {"matrix-blend", "centered-matrix-blend", "centered-blend", "local-matrix-blend"}:
+            wg, bg, cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t)
+            dg = cg - bg
+            if bool(getattr(self.cfg, "matrix_blend_center", True)):
+                bgbar = torch.sum(wg[:, :, None] * bg, dim=1)
+                dgbar = torch.sum(wg[:, :, None] * dg, dim=1)
+                b_mom = bg - bgbar[:, None, :]
+                d_mom = dg - dgbar[:, None, :]
+            else:
+                b_mom = bg
+                d_mom = dg
+            M = torch.einsum("bn,bni,bnj->bij", wg, d_mom, d_mom)
+            N = torch.einsum("bn,bni,bnj->bij", wg, b_mom, d_mom)
+            M = sym(torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0))
+            N = torch.nan_to_num(N, nan=0.0, posinf=0.0, neginf=0.0)
+            tr = torch.diagonal(M, dim1=-2, dim2=-1).sum(dim=-1) / float(max(d, 1))
+            ridge_vec = float(getattr(self.cfg, "matrix_blend_ridge", 1.0e-8)) + float(getattr(self.cfg, "matrix_blend_ridge_rel", 1.0e-6)) * tr.clamp(min=0.0)
+            M_reg = M + ridge_vec[:, None, None] * eye_b
+            try:
+                G_raw = torch.linalg.solve(M_reg.transpose(-1, -2), (-N).transpose(-1, -2)).transpose(-1, -2)
+            except RuntimeError:
+                G_raw = -torch.matmul(N, torch.linalg.pinv(M_reg))
+            if not bool(torch.isfinite(G_raw).all().detach().cpu().item()):
+                G_pinv = -torch.matmul(N, torch.linalg.pinv(M_reg))
+                G_raw = torch.where(torch.isfinite(G_raw), G_raw, G_pinv)
+            G_raw = torch.nan_to_num(G_raw, nan=0.0, posinf=0.0, neginf=0.0)
+            projection_active = math.isfinite(float(getattr(self.cfg, "gate_min_eval", -float("inf"))))
+            if bool(getattr(self.cfg, "matrix_blend_sym_gate", False)) or projection_active:
+                G_raw = sym(G_raw)
+            clip = float(getattr(self.cfg, "matrix_blend_gate_clip", 1.0e6))
+            if math.isfinite(clip) and clip > 0.0:
+                G_raw = G_raw.clamp(min=-clip, max=clip)
+            if projection_active:
+                G_raw = project_symmetric_gate_min_eval(G_raw, float(self.cfg.gate_min_eval))
+            carrier = bbar + torch.einsum("bij,bj->bi", G_raw, disagreement)
+            gate_kind = "local-matrix-blend"
+
+        elif key in {
+            "ce-hlsi", "lfgi", "ce-lfgi",
+            "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi",
+            "lfgi-n", "normal-lfgi", "gaussian-lfgi", "standard-normal-lfgi", "n-lfgi",
+            "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi",
+        } or is_os_lfgi_method(key):
+            gate_method = "ce-hlsi" if is_os_lfgi_method(key) else method
+            wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t, method=gate_method)
+            Pgate = self._gate_precision_for_method(gate_method)
+            Pbar = torch.sum(wg[:, :, None, None] * Pgate[None, :, :, :], dim=1)
+            G_raw = resolvent_gate(
+                Pbar,
+                alpha,
+                gamma,
+                self.cfg.resolvent_eps,
+                self.cfg.gate_clip,
+                getattr(self.cfg, "gate_min_eval", -float("inf")),
+            )
+            if is_os_lfgi_method(key):
+                lfgi_score, correction = self._q_lfgi_score_and_os_correction_chunk(y, t)
+                carrier = lfgi_score + correction
+                gate_kind = "os-lfgi-with-base-lfgi-gate"
+            else:
+                carrier = bbar + torch.einsum("bij,bj->bi", G_raw, disagreement)
+                gate_kind = "lfgi-resolvent"
+
+        elif key in {"tweedie", "twd"}:
+            G_raw = torch.zeros((B, d, d), device=y.device, dtype=y.dtype)
+            carrier = bbar
+            gate_kind = "zero-gate-tweedie"
+
+        elif key in {"tsi", "target-score", "target-side-information", "target-side-score"}:
+            G_raw = eye_b.clone()
+            carrier = cbar
+            gate_kind = "identity-gate-tsi"
+
+        else:
+            raise ValueError(
+                f"Score method {method!r} does not expose a mathematically defined gate for a complement-gated ratio flow. "
+                "Supported families are Blend, Matrix Blend, uniform scalar/matrix Blend, LFGI variants, Tweedie, and TSI."
+            )
+
+        G_raw = torch.nan_to_num(G_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        G_admissible, raw_gate_eigs = project_symmetric_gate_interval(G_raw, lower=0.0, upper=1.0)
+        projected_carrier = bbar + torch.einsum("bij,bj->bi", G_admissible, disagreement)
+        gate_policy = canonical_ratio_gate_policy(getattr(self.cfg, "ratio_gate_policy", "native"))
+        if gate_policy == "native":
+            G_used = G_raw
+            carrier_used = carrier
+        elif gate_policy == "project":
+            G_used = G_admissible
+            carrier_used = projected_carrier
+        else:
+            raise RuntimeError(f"Unhandled ratio_gate_policy={gate_policy!r}")
+        gate_consistent_carrier = bbar + torch.einsum("bij,bj->bi", G_used, disagreement)
+        consistency_residual = carrier_used - gate_consistent_carrier
+        antisym = G_raw - G_raw.transpose(-1, -2)
+        antisym_norm = torch.linalg.matrix_norm(antisym, ord="fro", dim=(-2, -1))
+        interval_violation = (raw_gate_eigs < 0.0) | (raw_gate_eigs > 1.0)
+        return {
+            "carrier_score": torch.nan_to_num(carrier_used, nan=0.0, posinf=0.0, neginf=0.0),
+            "base_score": torch.nan_to_num(bbar, nan=0.0, posinf=0.0, neginf=0.0),
+            "target_signal_score": torch.nan_to_num(cbar, nan=0.0, posinf=0.0, neginf=0.0),
+            "disagreement": torch.nan_to_num(disagreement, nan=0.0, posinf=0.0, neginf=0.0),
+            "gate_raw": G_raw,
+            "gate_projected": G_admissible,
+            "gate": G_used,
+            "gate_policy": gate_policy,
+            "raw_gate_eigs": raw_gate_eigs,
+            "raw_gate_interval_violation": interval_violation,
+            "gate_kind": gate_kind,
+            "gate_antisym_frob": antisym_norm,
+            "gate_consistency_residual": torch.nan_to_num(consistency_residual, nan=0.0, posinf=0.0, neginf=0.0),
+            "conditional_weights": w,
+            "particle_tweedie_signals": b,
+        }
+
     def gated_pflow_components_chunk(
         self,
         y: torch.Tensor,
@@ -2591,30 +2802,18 @@ class SNISScoreBank:
         endpoint_log_tilt: torch.Tensor,
         complement_strength: float,
     ) -> Dict[str, torch.Tensor]:
-        """Evaluate the complement-gated ratio score on one query chunk.
+        """Evaluate an estimator-native complement-gated ratio score.
 
-        The selected ``method`` supplies the frozen q-LFGI carrier and its
-        localized matrix gate.  The target-side score is instead obtained by
-        tilting the same q-fiber with endpoint log-density-ratio labels.  These
-        information channels are deliberately kept distinct.
+        The selected score estimator supplies both the carrier and its native
+        gate modality.  The density-derived target score is rebuilt from the
+        current particle bank and endpoint density-ratio labels.  The flow is
 
-        Only LFGI-resolvent score methods are accepted.  The carrier uses the
-        score method exactly as implemented, while the complement gate is
-        spectrally projected to [0,1] so that ``I-G`` is a genuine contraction
-        channel even when the raw observed-information resolvent is indefinite.
+            s_R = s_A + lambda (I-G_A) (s_pi,dens - s_A).
+
+        ``G_A`` is the estimator-native gate under the configured gate policy.
+        This generalizes the old LFGI-only implementation without changing the
+        information used by the tilt.
         """
-        key = canonical_score_method_key(method)
-        supported = {
-            "ce-hlsi", "lfgi", "ce-lfgi",
-            "pi-lfgi", "pi-ce-hlsi", "oracle-lfgi", "target-lfgi",
-            "lfgi-n", "normal-lfgi", "gaussian-lfgi", "standard-normal-lfgi", "n-lfgi",
-            "leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi",
-        }
-        if key not in supported:
-            raise ValueError(
-                "gated-pflow requires an LFGI-resolvent ratio/PF score method; "
-                f"got {method!r}. Use lfgi (or another LFGI gate variant)."
-            )
         log_tilt = endpoint_log_tilt.to(device=y.device, dtype=y.dtype).reshape(-1)
         if int(log_tilt.numel()) != int(self.N):
             raise ValueError(
@@ -2624,36 +2823,18 @@ class SNISScoreBank:
         if not math.isfinite(strength):
             raise ValueError(f"lambda_guard/complement strength must be finite; got {strength}")
 
-        wq, b, c, alpha, gamma = self._weights_and_signals(y, t)
-        bbar = torch.sum(wq[:, :, None] * b, dim=1)
-        cbar = torch.sum(wq[:, :, None] * c, dim=1)
+        native = self.estimator_gate_components_chunk(y, t, method)
+        wq = native["conditional_weights"]
+        b = native["particle_tweedie_signals"]
+        s_q = native["carrier_score"]
+        G_comp = native["gate"]
 
-        wg, _bg, _cg, _alpha_g, _gamma_g = self._gate_weights_and_signals(y, t, method=method)
-        Pgate = self._gate_precision_for_method(method)
-        Pbar = torch.sum(wg[:, :, None, None] * Pgate[None, :, :, :], dim=1)
-        G_raw = resolvent_gate(
-            Pbar,
-            alpha,
-            gamma,
-            self.cfg.resolvent_eps,
-            self.cfg.gate_clip,
-            getattr(self.cfg, "gate_min_eval", -float("inf")),
-        )
-        s_q = bbar + torch.einsum("bij,bj->bi", G_raw, cbar - bbar)
-
-        # The q-fiber weights are proportional to the kernel times any carried
-        # empirical reference weights.  Multiplying by exp(endpoint_log_tilt)
-        # therefore gives the density-tilted target fiber without requiring
-        # positive-time target oracle information.
+        # Multiplying the current q-fiber by the current endpoint tilt gives the
+        # current particle approximation of the diffused target density score.
         target_logits = torch.log(torch.clamp(wq, min=1.0e-300)) + log_tilt[None, :]
         wpi = torch.softmax(target_logits, dim=1)
         s_pi_dens = torch.sum(wpi[:, :, None] * b, dim=1)
 
-        lower = float(getattr(self.cfg, "gate_min_eval", 0.0))
-        if not math.isfinite(lower):
-            lower = 0.0
-        lower = min(max(lower, 0.0), 1.0)
-        G_comp, raw_gate_eigs = project_symmetric_gate_interval(G_raw, lower=lower, upper=1.0)
         residual = s_pi_dens - s_q
         complement = torch.eye(self.d, device=y.device, dtype=y.dtype)[None, :, :] - G_comp
         correction = torch.einsum("bij,bj->bi", complement, residual)
@@ -2664,7 +2845,9 @@ class SNISScoreBank:
             "s_q": torch.nan_to_num(s_q, nan=0.0, posinf=0.0, neginf=0.0),
             "s_pi_dens": torch.nan_to_num(s_pi_dens, nan=0.0, posinf=0.0, neginf=0.0),
             "gate": G_comp,
-            "raw_gate_eigs": raw_gate_eigs,
+            "raw_gate_eigs": native["raw_gate_eigs"],
+            "gate_antisym_frob": native["gate_antisym_frob"],
+            "gate_consistency_residual": native["gate_consistency_residual"],
             "residual": torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0),
             "correction": torch.nan_to_num(correction, nan=0.0, posinf=0.0, neginf=0.0),
             "target_cond_ess": torch.nan_to_num(cond_ess, nan=0.0, posinf=0.0, neginf=0.0),
@@ -2683,6 +2866,95 @@ class SNISScoreBank:
         chunk = max(int(self.cfg.eval_chunk), 1)
         for start in range(0, y.shape[0], chunk):
             parts = self.gated_pflow_components_chunk(
+                y[start:start + chunk], t, method, endpoint_log_tilt, complement_strength
+            )
+            outs.append(parts["score"])
+        return torch.cat(outs, dim=0)
+
+    def gated_bflow_components_chunk(
+        self,
+        y: torch.Tensor,
+        t: float,
+        method: str,
+        endpoint_log_tilt: torch.Tensor,
+        complement_strength: float,
+    ) -> Dict[str, torch.Tensor]:
+        """Evaluate the shared-statistic complement b-flow ratio score.
+
+        The selected estimator supplies the current-law carrier ``s_A`` and its
+        native gate ``G_A``.  The OU Tweedie statistic is evaluated twice on the
+        same current score bank and with the same OU kernel:
+
+            b_q  = E_q[beta_t(X;y) | Y_t=y],
+            b_pi = E_q[exp(r(X)) beta_t(X;y) | Y_t=y]
+                   / E_q[exp(r(X)) | Y_t=y].
+
+        The field is
+
+            s_R = s_A + lambda (I-G_A) (b_pi-b_q).
+
+        There is no independent estimator modality for ``b_q`` or ``b_pi``:
+        they are the canonical untilted/tilted Tweedie conditionals.  ``method``
+        controls the carrier, gate, score bank convention, and any external gate
+        bank used by the selected estimator.
+        """
+        log_tilt = endpoint_log_tilt.to(device=y.device, dtype=y.dtype).reshape(-1)
+        if int(log_tilt.numel()) != int(self.N):
+            raise ValueError(
+                f"endpoint_log_tilt has length {log_tilt.numel()} but score bank has {self.N} anchors"
+            )
+        strength = float(complement_strength)
+        if not math.isfinite(strength):
+            raise ValueError(f"lambda_guard/complement strength must be finite; got {strength}")
+
+        native = self.estimator_gate_components_chunk(y, t, method)
+        wq = native["conditional_weights"]
+        b_particles = native["particle_tweedie_signals"]
+        s_q_method = native["carrier_score"]
+        b_q = native["base_score"]
+        G_comp = native["gate"]
+
+        # The same endpoint labels and OU kernel tilt the current q fiber to the
+        # target fiber.  At population level b_pi=s_pi, while finite-bank b_pi
+        # remains coupled to b_q through the common particles and kernel weights.
+        target_logits = torch.log(torch.clamp(wq, min=1.0e-300)) + log_tilt[None, :]
+        wpi = torch.softmax(target_logits, dim=1)
+        b_pi = torch.sum(wpi[:, :, None] * b_particles, dim=1)
+
+        b_residual = b_pi - b_q
+        complement = torch.eye(self.d, device=y.device, dtype=y.dtype)[None, :, :] - G_comp
+        correction = torch.einsum("bij,bj->bi", complement, b_residual)
+        score = s_q_method + strength * correction
+        cond_ess = 1.0 / torch.clamp(torch.sum(wpi * wpi, dim=1), min=1.0e-30)
+        return {
+            "score": torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0),
+            "s_q": torch.nan_to_num(s_q_method, nan=0.0, posinf=0.0, neginf=0.0),
+            "b_q": torch.nan_to_num(b_q, nan=0.0, posinf=0.0, neginf=0.0),
+            "b_pi": torch.nan_to_num(b_pi, nan=0.0, posinf=0.0, neginf=0.0),
+            # Keep the common diagnostic key used by the ratio-field probes.
+            "s_pi_dens": torch.nan_to_num(b_pi, nan=0.0, posinf=0.0, neginf=0.0),
+            "gate": G_comp,
+            "raw_gate_eigs": native["raw_gate_eigs"],
+            "gate_antisym_frob": native["gate_antisym_frob"],
+            "gate_consistency_residual": native["gate_consistency_residual"],
+            "residual": torch.nan_to_num(b_residual, nan=0.0, posinf=0.0, neginf=0.0),
+            "correction": torch.nan_to_num(correction, nan=0.0, posinf=0.0, neginf=0.0),
+            "target_cond_ess": torch.nan_to_num(cond_ess, nan=0.0, posinf=0.0, neginf=0.0),
+        }
+
+    @torch.no_grad()
+    def gated_bflow_score(
+        self,
+        y: torch.Tensor,
+        t: float,
+        method: str,
+        endpoint_log_tilt: torch.Tensor,
+        complement_strength: float,
+    ) -> torch.Tensor:
+        outs: List[torch.Tensor] = []
+        chunk = max(int(self.cfg.eval_chunk), 1)
+        for start in range(0, y.shape[0], chunk):
+            parts = self.gated_bflow_components_chunk(
                 y[start:start + chunk], t, method, endpoint_log_tilt, complement_strength
             )
             outs.append(parts["score"])
@@ -3131,7 +3403,11 @@ def pf_logprob_bank(bank: SNISScoreBank, x0: torch.Tensor, method: str, cfg: Con
 
 
 class GatedPFlowRatioField:
-    """Frozen complement-gated ratio score for one inner ratio-flow round."""
+    """One-inner-round field using the selected estimator's native complement.
+
+    The field is frozen only during its ODE integration.  The enclosing ratio
+    iteration reconstructs this object from the current moved particle bank.
+    """
 
     def __init__(
         self,
@@ -3163,6 +3439,16 @@ class GatedPFlowRatioField:
         )
 
     @torch.no_grad()
+    def estimate_and_divergence(
+        self,
+        y: torch.Tensor,
+        t: float,
+        cfg: Config,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the ratio field and a divergence estimate of that same field."""
+        return score_fn_hutchinson_divergence(self.estimate, y, float(t), cfg)
+
+    @torch.no_grad()
     def probe_diagnostics(self, cfg: Config, n: int = 128, n_t: int = 5) -> Dict[str, float]:
         n = min(max(int(n), 1), int(self.bank.N))
         ids = torch.linspace(0, self.bank.N - 1, n, device=self.bank.device).round().long()
@@ -3182,6 +3468,8 @@ class GatedPFlowRatioField:
         raw_eig_vals: List[torch.Tensor] = []
         corr_norm_vals: List[torch.Tensor] = []
         residual_norm_vals: List[torch.Tensor] = []
+        gate_consistency_vals: List[torch.Tensor] = []
+        gate_antisym_vals: List[torch.Tensor] = []
         for tt in ts:
             alpha, gamma = alpha_gamma(tt, device=self.bank.device, dtype=self.bank.dtype)
             # Deterministic probe locations avoid adding a second source of
@@ -3198,20 +3486,147 @@ class GatedPFlowRatioField:
             raw_eig_vals.append(parts["raw_gate_eigs"].reshape(-1))
             corr_norm_vals.append(torch.linalg.norm(parts["correction"], dim=1))
             residual_norm_vals.append(torch.linalg.norm(parts["residual"], dim=1))
+            gate_consistency_vals.append(torch.linalg.norm(parts["gate_consistency_residual"], dim=1))
+            gate_antisym_vals.append(parts["gate_antisym_frob"].reshape(-1))
         cond = torch.cat(cond_ess_vals)
         eig = torch.cat(raw_eig_vals)
         corr = torch.cat(corr_norm_vals)
         resid = torch.cat(residual_norm_vals)
+        gate_consistency = torch.cat(gate_consistency_vals)
+        gate_antisym = torch.cat(gate_antisym_vals)
         clipped = (eig < 0.0) | (eig > 1.0)
+        gate_policy = canonical_ratio_gate_policy(getattr(cfg, "ratio_gate_policy", "native"))
         return {
+            "ratio_gate_policy": gate_policy,
             "ratio_target_cond_ess_min": safe_float(cond.min()),
             "ratio_target_cond_ess_median": safe_float(torch.median(cond)),
             "ratio_target_cond_ess_mean": safe_float(cond.mean()),
             "ratio_gate_raw_eig_min": safe_float(eig.min()),
             "ratio_gate_raw_eig_max": safe_float(eig.max()),
-            "ratio_gate_interval_clipped_frac": safe_float(clipped.to(eig.dtype).mean()),
+            "ratio_gate_interval_violation_frac": safe_float(clipped.to(eig.dtype).mean()),
+            "ratio_gate_projection_applied": bool(gate_policy == "project"),
+            "ratio_gate_interval_clipped_frac": (
+                safe_float(clipped.to(eig.dtype).mean()) if gate_policy == "project" else 0.0
+            ),
             "ratio_complement_correction_norm_mean": safe_float(corr.mean()),
             "ratio_density_residual_norm_mean": safe_float(resid.mean()),
+            "ratio_gate_carrier_consistency_residual_mean": safe_float(gate_consistency.mean()),
+            "ratio_gate_raw_antisym_frob_mean": safe_float(gate_antisym.mean()),
+        }
+
+
+class GatedBFlowRatioField:
+    """One-inner-round shared-statistic b-flow field.
+
+    The selected estimator supplies ``s_A`` and ``G_A`` while the correction is
+    ``(I-G_A)(b_pi-b_q)``.  The field is frozen only during one ODE integration;
+    the enclosing ratio iteration rebuilds it from every moved particle bank.
+    """
+
+    def __init__(
+        self,
+        bank: SNISScoreBank,
+        method: str,
+        endpoint_log_tilt: torch.Tensor,
+        complement_strength: float,
+    ):
+        self.bank = bank
+        self.method = str(method)
+        self.endpoint_log_tilt = endpoint_log_tilt.detach().to(
+            device=bank.device, dtype=bank.dtype
+        ).reshape(-1)
+        self.complement_strength = float(complement_strength)
+        if int(self.endpoint_log_tilt.numel()) != int(bank.N):
+            raise ValueError(
+                f"GatedBFlowRatioField tilt has {self.endpoint_log_tilt.numel()} labels "
+                f"for {bank.N} score anchors"
+            )
+
+    @torch.no_grad()
+    def estimate(self, y: torch.Tensor, t: float) -> torch.Tensor:
+        return self.bank.gated_bflow_score(
+            y,
+            float(t),
+            self.method,
+            self.endpoint_log_tilt,
+            self.complement_strength,
+        )
+
+    @torch.no_grad()
+    def estimate_and_divergence(
+        self,
+        y: torch.Tensor,
+        t: float,
+        cfg: Config,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the ratio field and a divergence estimate of that same field."""
+        return score_fn_hutchinson_divergence(self.estimate, y, float(t), cfg)
+
+    @torch.no_grad()
+    def probe_diagnostics(self, cfg: Config, n: int = 128, n_t: int = 5) -> Dict[str, float]:
+        n = min(max(int(n), 1), int(self.bank.N))
+        ids = torch.linspace(0, self.bank.N - 1, n, device=self.bank.device).round().long()
+        x0 = self.bank.x[ids]
+        t_min, t_max = effective_time_bounds(cfg)
+        if canonical_time_schedule(cfg.time_schedule) == "log_linear":
+            ts = torch.exp(torch.linspace(
+                math.log(t_min), math.log(t_max), max(int(n_t), 2),
+                device=self.bank.device, dtype=self.bank.dtype,
+            ))
+        else:
+            ts = torch.linspace(
+                t_min, t_max, max(int(n_t), 2),
+                device=self.bank.device, dtype=self.bank.dtype,
+            )
+        cond_ess_vals: List[torch.Tensor] = []
+        raw_eig_vals: List[torch.Tensor] = []
+        corr_norm_vals: List[torch.Tensor] = []
+        residual_norm_vals: List[torch.Tensor] = []
+        gate_consistency_vals: List[torch.Tensor] = []
+        gate_antisym_vals: List[torch.Tensor] = []
+        for tt in ts:
+            alpha, gamma = alpha_gamma(tt, device=self.bank.device, dtype=self.bank.dtype)
+            # Deterministic probe locations avoid adding a second source of
+            # Monte Carlo variation to the method comparison.
+            y = alpha * x0
+            parts = self.bank.gated_bflow_components_chunk(
+                y,
+                float(tt.item()),
+                self.method,
+                self.endpoint_log_tilt,
+                self.complement_strength,
+            )
+            cond_ess_vals.append(parts["target_cond_ess"].reshape(-1))
+            raw_eig_vals.append(parts["raw_gate_eigs"].reshape(-1))
+            corr_norm_vals.append(torch.linalg.norm(parts["correction"], dim=1))
+            residual_norm_vals.append(torch.linalg.norm(parts["residual"], dim=1))
+            gate_consistency_vals.append(torch.linalg.norm(parts["gate_consistency_residual"], dim=1))
+            gate_antisym_vals.append(parts["gate_antisym_frob"].reshape(-1))
+        cond = torch.cat(cond_ess_vals)
+        eig = torch.cat(raw_eig_vals)
+        corr = torch.cat(corr_norm_vals)
+        resid = torch.cat(residual_norm_vals)
+        gate_consistency = torch.cat(gate_consistency_vals)
+        gate_antisym = torch.cat(gate_antisym_vals)
+        clipped = (eig < 0.0) | (eig > 1.0)
+        gate_policy = canonical_ratio_gate_policy(getattr(cfg, "ratio_gate_policy", "native"))
+        return {
+            "ratio_gate_policy": gate_policy,
+            "ratio_target_cond_ess_min": safe_float(cond.min()),
+            "ratio_target_cond_ess_median": safe_float(torch.median(cond)),
+            "ratio_target_cond_ess_mean": safe_float(cond.mean()),
+            "ratio_gate_raw_eig_min": safe_float(eig.min()),
+            "ratio_gate_raw_eig_max": safe_float(eig.max()),
+            "ratio_gate_interval_violation_frac": safe_float(clipped.to(eig.dtype).mean()),
+            "ratio_gate_projection_applied": bool(gate_policy == "project"),
+            "ratio_gate_interval_clipped_frac": (
+                safe_float(clipped.to(eig.dtype).mean()) if gate_policy == "project" else 0.0
+            ),
+            "ratio_complement_correction_norm_mean": safe_float(corr.mean()),
+            "ratio_density_residual_norm_mean": safe_float(resid.mean()),
+            "ratio_bflow_residual_norm_mean": safe_float(resid.mean()),
+            "ratio_gate_carrier_consistency_residual_mean": safe_float(gate_consistency.mean()),
+            "ratio_gate_raw_antisym_frob_mean": safe_float(gate_antisym.mean()),
         }
 
 
@@ -3313,6 +3728,140 @@ def score_fn_hutchinson_divergence(
         torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0),
         torch.nan_to_num(div, nan=0.0, posinf=0.0, neginf=0.0),
     )
+
+
+@torch.no_grad()
+def reverse_ou_heun_probability_flow_certified(
+    target,
+    score_div_fn: Callable[[torch.Tensor, float], Tuple[torch.Tensor, torch.Tensor]],
+    cfg: Config,
+    generator: torch.Generator,
+    n_samples: int,
+    steps: int,
+    phase_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float | str | bool]]:
+    """Generate a PF endpoint and its incoming Liouville density together.
+
+    The same frozen field, time grid, predictor/corrector evaluations, and
+    divergence rule drive both particle motion and the log-density certificate.
+    This is the discrete implementation of the incoming-certificate principle:
+    the field built from q_{k-1} generates and certifies q_k.  No endpoint-field
+    rebuild or TSC assumption is used.
+
+    In strict mode, final denoising and clipping are rejected because they mutate
+    the generated law without a Jacobian correction.  score_clip, sample_clip,
+    and pf_div_clip are treated as audit thresholds rather than transformations.
+    """
+    device, dtype, d = target.device, target.dtype, int(target.d)
+    n_steps = int(steps)
+    if n_steps < 1:
+        raise ValueError(f"certified PF steps must be >=1; got {steps}")
+    if bool(getattr(cfg, "final_denoise", False)):
+        raise ValueError(
+            "final_denoise changes the endpoint after the Liouville flow and invalidates its density certificate. "
+            "Disable --final_denoise for certified alternating runs."
+        )
+
+    y = torch.randn((int(n_samples), d), device=device, dtype=dtype, generator=generator)
+    logq = standard_normal_logprob(y)
+    ts = make_time_grid(cfg, n_steps, direction="reverse", device=device, dtype=dtype)
+    ts_stats = time_grid_step_stats(ts)
+    max_abs_score = 0.0
+    max_abs_div = 0.0
+    max_abs_state = safe_float(y.abs().max())
+    fail = False
+    fail_reason = ""
+    strict = bool(getattr(cfg, "certified_flow_strict", True))
+    score_threshold = float(getattr(cfg, "certified_score_abort", 0.0) or 0.0)
+    state_threshold = float(getattr(cfg, "certified_state_abort", 0.0) or 0.0)
+    div_threshold = float(getattr(cfg, "certified_div_abort", 0.0) or 0.0)
+
+    for i in range(n_steps):
+        tc = float(ts[i].item())
+        tn = float(ts[i + 1].item())
+        dt = tn - tc
+        s1, div1 = score_div_fn(y, tc)
+        s1 = torch.nan_to_num(s1, nan=float("nan"), posinf=float("nan"), neginf=float("nan"))
+        div1 = torch.nan_to_num(div1, nan=float("nan"), posinf=float("nan"), neginf=float("nan"))
+        max_abs_score = max(max_abs_score, safe_float(torch.nan_to_num(s1.abs(), nan=0.0).max()))
+        max_abs_div = max(max_abs_div, safe_float(torch.nan_to_num(div1.abs(), nan=0.0).max()))
+        if not bool(torch.isfinite(s1).all().item()) or not bool(torch.isfinite(div1).all().item()):
+            fail, fail_reason = True, "nonfinite score/divergence at certified PF predictor"
+            break
+        if strict and score_threshold > 0.0 and safe_float(torch.linalg.norm(s1, dim=1).max()) > score_threshold:
+            fail, fail_reason = True, f"score norm exceeded certified_score_abort={score_threshold:.6g} at predictor t={tc:.6g}"
+            break
+        if strict and div_threshold > 0.0 and safe_float(div1.abs().max()) > div_threshold:
+            fail, fail_reason = True, f"|divergence| exceeded certified_div_abort={div_threshold:.6g} at predictor t={tc:.6g}"
+            break
+
+        v1 = -y - s1
+        a1 = float(d) + div1
+        y_pred = y + dt * v1
+        logq_pred = logq + dt * a1
+        s2, div2 = score_div_fn(y_pred, tn)
+        s2 = torch.nan_to_num(s2, nan=float("nan"), posinf=float("nan"), neginf=float("nan"))
+        div2 = torch.nan_to_num(div2, nan=float("nan"), posinf=float("nan"), neginf=float("nan"))
+        max_abs_score = max(max_abs_score, safe_float(torch.nan_to_num(s2.abs(), nan=0.0).max()))
+        max_abs_div = max(max_abs_div, safe_float(torch.nan_to_num(div2.abs(), nan=0.0).max()))
+        if not bool(torch.isfinite(s2).all().item()) or not bool(torch.isfinite(div2).all().item()):
+            fail, fail_reason = True, "nonfinite score/divergence at certified PF corrector"
+            break
+        if strict and score_threshold > 0.0 and safe_float(torch.linalg.norm(s2, dim=1).max()) > score_threshold:
+            fail, fail_reason = True, f"score norm exceeded certified_score_abort={score_threshold:.6g} at corrector t={tn:.6g}"
+            break
+        if strict and div_threshold > 0.0 and safe_float(div2.abs().max()) > div_threshold:
+            fail, fail_reason = True, f"|divergence| exceeded certified_div_abort={div_threshold:.6g} at corrector t={tn:.6g}"
+            break
+
+        v2 = -y_pred - s2
+        a2 = float(d) + div2
+        y = y + 0.5 * dt * (v1 + v2)
+        logq = logq + 0.5 * dt * (a1 + a2)
+        max_abs_state = max(max_abs_state, safe_float(y.abs().max()))
+        finite = torch.isfinite(y).all() and torch.isfinite(logq).all()
+        if not bool(finite):
+            fail, fail_reason = True, "nonfinite state/log-density in certified PF flow"
+            break
+        if strict and state_threshold > 0.0 and safe_float(y.abs().max()) > state_threshold:
+            fail, fail_reason = True, f"state magnitude exceeded certified_state_abort={state_threshold:.6g} after step {i + 1}"
+            break
+
+    if fail and strict:
+        raise RuntimeError(f"{phase_name}: {fail_reason}")
+    t_min, t_max = effective_time_bounds(cfg)
+    info: Dict[str, float | str | bool] = {
+        "failed": bool(fail),
+        "fail_reason": str(fail_reason),
+        "max_abs_score": float(max_abs_score),
+        "sampler_t_min": float(t_min),
+        "sampler_t_max": float(t_max),
+        "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
+        "pf_method": str(phase_name),
+        "pf_divergence_mode": "same-field-on-generation-path",
+        "pf_divergence_effective": "same-field-on-generation-path",
+        "pf_skipped": False,
+        "pf_failed_frac": 1.0 if fail else 0.0,
+        "pf_fail_reason": str(fail_reason),
+        "pf_steps": int(n_steps),
+        "pf_t_min": float(t_min),
+        "pf_t_max": float(t_max),
+        "pf_time_schedule": canonical_time_schedule(cfg.time_schedule),
+        "pf_dt_min": float(ts_stats["dt_min"]),
+        "pf_dt_max": float(ts_stats["dt_max"]),
+        "pf_dt_sum": float(ts_stats["dt_sum"]),
+        "pf_max_abs_div": float(max_abs_div),
+        "pf_max_abs_score": float(max_abs_score),
+        "pf_max_abs_state": float(max_abs_state),
+        "pf_logq_mean": safe_float(logq.mean()),
+        "pf_logq_std": safe_float(logq.std(unbiased=False)),
+        "pf_logq_min": safe_float(logq.min()),
+        "pf_logq_max": safe_float(logq.max()),
+        "certificate_provenance": "incoming-generating-field",
+        "certificate_same_particles_and_field": True,
+        "certificate_postflow_mutation": False,
+    }
+    return y.detach(), logq.detach(), info
 
 
 @torch.no_grad()
@@ -4702,26 +5251,137 @@ def blank_calibration_info(reason: str = "skipped") -> Dict[str, float | str]:
 
 
 def canonical_ratio_reference_mode(value: str) -> str:
-    """Normalize the PF-ratio reference-bank convention."""
-    key = str(value or "endpoint").strip().lower().replace("_", "-").replace(" ", "-")
+    """Normalize endpoint-density provenance for the first ratio labels."""
+    key = str(value or "incoming").strip().lower().replace("_", "-").replace(" ", "-")
     aliases = {
+        "incoming": "incoming",
+        "certificate": "incoming",
+        "incoming-certificate": "incoming",
+        "generator": "incoming",
+        "generating": "incoming",
+        "source": "incoming",
+        "pre-endpoint": "incoming",
+        "exact-induced": "incoming",
         "endpoint": "endpoint",
         "settled": "endpoint",
         "final": "endpoint",
         "fixed-point": "endpoint",
         "fixedpoint": "endpoint",
         "tsc": "endpoint",
-        "generator": "generator",
-        "generating": "generator",
-        "source": "generator",
-        "pre-endpoint": "generator",
-        "old": "generator",
-        "legacy": "generator",
-        "exact-induced": "generator",
+        "old": "endpoint",
+        "legacy": "endpoint",
     }
     if key not in aliases:
-        raise ValueError(f"Unknown ratio_reference_mode={value!r}; use endpoint or generator")
+        raise ValueError(f"Unknown ratio_reference_mode={value!r}; use incoming or endpoint")
     return aliases[key]
+
+
+def canonical_transport_dynamics(value: str, *, correction_enabled: bool) -> str:
+    """Resolve transport dynamics, enforcing density-certificate consistency."""
+    key = str(value or "auto").strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "auto": "auto",
+        "pf": "probability-flow",
+        "pflow": "probability-flow",
+        "probability-flow": "probability-flow",
+        "probabilityflow": "probability-flow",
+        "ode": "probability-flow",
+        "reverse-sde": "reverse-sde",
+        "sde": "reverse-sde",
+        "stochastic": "reverse-sde",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown transport_dynamics={value!r}; use auto, probability_flow, or reverse_sde"
+        )
+    mode = aliases[key]
+    if mode == "auto":
+        return "probability-flow" if correction_enabled else "reverse-sde"
+    if correction_enabled and mode == "reverse-sde":
+        raise ValueError(
+            "A ratio/weight correction requires a density certificate for the actual transport endpoint. "
+            "The reverse SDE endpoint is not certified by the probability-flow Liouville density. "
+            "Use --transport_dynamics probability_flow (or auto)."
+        )
+    return mode
+
+
+def canonical_ratio_gate_policy(value: str) -> str:
+    key = str(value or "native").strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "native": "native",
+        "literal": "native",
+        "raw": "native",
+        "project": "project",
+        "projected": "project",
+        "admissible": "project",
+        "soft-channel": "project",
+    }
+    if key not in aliases:
+        raise ValueError(f"Unknown ratio_gate_policy={value!r}; use native or project")
+    return aliases[key]
+
+
+def canonical_ratio_tilt_policy(value: str) -> str:
+    """Normalize finite-bank endpoint-label handling for the ratio flow."""
+    key = str(value or "exact").strip().lower().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "exact": "exact",
+        "raw": "exact",
+        "untempered": "exact",
+        "certificate": "exact",
+        "stabilized": "stabilized",
+        "stabilised": "stabilized",
+        "guarded": "stabilized",
+        "tempered": "stabilized",
+        "legacy": "stabilized",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown ratio_tilt_policy={value!r}; use exact or stabilized"
+        )
+    return aliases[key]
+
+
+def prepare_ratio_flow_tilt(
+    raw_rho: torch.Tensor, cfg: Config
+) -> Tuple[torch.Tensor, Dict[str, float | bool | str]]:
+    """Prepare ratio-flow endpoint labels without silently changing the algorithm.
+
+    ``exact`` keeps the certificate-consistent labels log pi-log q up to the
+    irrelevant common additive constant.  ``stabilized`` applies the legacy
+    beta/clipping/ESS guard and is therefore a deliberately tempered algorithm.
+    """
+    policy = canonical_ratio_tilt_policy(getattr(cfg, "ratio_tilt_policy", "exact"))
+    if policy == "stabilized":
+        rho, info = finalize_density_ratio_weights(raw_rho, cfg)
+        return rho, {"ratio_tilt_policy": policy, **info}
+
+    raw = raw_rho.detach()
+    if not bool(torch.isfinite(raw).all().item()):
+        raise RuntimeError(
+            "ratio_tilt_policy=exact requires finite log pi-log q labels; "
+            "use the stabilized policy only if deliberate regularization is intended"
+        )
+    rho = raw - (torch.logsumexp(raw, dim=0) - math.log(max(int(raw.numel()), 1)))
+    ess, ess_frac = log_weight_ess(rho)
+    return rho, {
+        "ratio_tilt_policy": policy,
+        "rho_beta_target": 1.0,
+        "rho_beta_eff": 1.0,
+        "rho_adapted_for_ess": False,
+        "rho_clip_effective": False,
+        "rho_ess": float(ess),
+        "rho_ess_frac": float(ess_frac),
+        "rho_mean": safe_float(rho.mean()),
+        "rho_std": safe_float(rho.std(unbiased=False)),
+        "rho_min": safe_float(rho.min()),
+        "rho_max": safe_float(rho.max()),
+        "rho_raw_mean": safe_float(raw.mean()),
+        "rho_raw_std": safe_float(raw.std(unbiased=False)),
+        "rho_raw_min": safe_float(raw.min()),
+        "rho_raw_max": safe_float(raw.max()),
+    }
 
 
 def canonical_ratio_method(value: str) -> str:
@@ -4736,10 +5396,19 @@ def canonical_ratio_method(value: str) -> str:
         "gated-pf": "gated-pflow",
         "iglfgi": "gated-pflow",
         "complement-pflow": "gated-pflow",
+        "gated-bflow": "gated-bflow",
+        "gated-bf": "gated-bflow",
+        "bflow": "gated-bflow",
+        "complement-bflow": "gated-bflow",
+        "shared-bflow": "gated-bflow",
     }
     if key not in aliases:
-        raise ValueError(f"Unknown ratio method {value!r}; use raw-w or gated-pflow")
+        raise ValueError(f"Unknown ratio method {value!r}; use raw-w, gated-pflow, or gated-bflow")
     return aliases[key]
+
+
+def is_moved_ratio_flow(value: str) -> bool:
+    return canonical_ratio_method(value) in {"gated-pflow", "gated-bflow"}
 
 
 def method_label(
@@ -4753,7 +5422,7 @@ def method_label(
     n = int(transport_repeats)
     prefix = str(transport_method) if n == 1 else f"{transport_method}-{n}"
     ratio = canonical_ratio_method(ratio_method)
-    if ratio == "gated-pflow":
+    if is_moved_ratio_flow(ratio):
         return f"{prefix}_{pf_method}_{ratio}-{int(ratio_rounds)}"
     return f"{prefix}_{pf_method}_{ratio}"
 
@@ -4795,20 +5464,20 @@ def run_gated_pflow_ratio_node(
     Dict[str, object],
     Dict[str, object],
 ]:
-    """Apply one or more complement-gated PF ratio transports.
+    """Apply one or more refreshed legacy complement p-flow ratio transports.
 
-    Each inner round freezes an LFGI carrier on the current unweighted bank,
-    forms endpoint density-ratio labels from the reconstructed current density,
-    and runs a reverse deterministic probability flow.  The moved endpoint
-    density is reconstructed through the complete gated score field before a
-    subsequent inner round.  Thus ``ratio_rounds>1`` is experimental but is not
-    implemented as repeated resampling from a stale field.
+    Each inner round rebuilds the selected Method-2 carrier and native gate on
+    the current unweighted particle bank, forms the density-tilted target score
+    ``b_pi``, and integrates
+    ``s_method + lambda(I-G_method)(b_pi-s_method)``.  The moved endpoint and
+    its incoming certificate define the next inner round, so repeated p-flow
+    rounds are unfrozen at the iteration level.
     """
     n_rounds = int(ratio_rounds)
     if n_rounds < 1:
         raise ValueError(f"gated-pflow ratio rounds must be >=1; got {ratio_rounds}")
     if canonical_score_method_key(pf_method) == "none":
-        raise ValueError("gated-pflow requires a non-none LFGI ratio/PF score method")
+        raise ValueError("gated-pflow requires a non-none ratio/PF score estimator with a defined gate")
 
     pool_n = proposal_pool_size(cfg)
     current_pool = starting_pool[:pool_n].detach().clone()
@@ -4816,7 +5485,7 @@ def run_gated_pflow_ratio_node(
     final_eval = current_pool
     last_logpi = target.log_prob(current_pool, t=0.0).detach()
     last_raw_rho = last_logpi - current_logq
-    last_rho, last_rho_info = finalize_density_ratio_weights(last_raw_rho, cfg)
+    last_rho, last_rho_info = prepare_ratio_flow_tilt(last_raw_rho, cfg)
     last_pf_info: Dict[str, object] = {}
     inner_infos: List[Dict[str, object]] = []
     total_start = time.time()
@@ -4824,7 +5493,7 @@ def run_gated_pflow_ratio_node(
     for inner in range(1, n_rounds + 1):
         logpi = target.log_prob(current_pool, t=0.0).detach()
         raw_rho = logpi - current_logq
-        effective_tilt, rho_info = finalize_density_ratio_weights(raw_rho, cfg)
+        effective_tilt, rho_info = prepare_ratio_flow_tilt(raw_rho, cfg)
 
         zero = torch.zeros((current_pool.shape[0],), device=current_pool.device, dtype=current_pool.dtype)
         score_refs, score_rho0, gate_refs, gate_rho0, split_info = split_score_gate_banks(
@@ -4858,26 +5527,20 @@ def run_gated_pflow_ratio_node(
             int(cfg.seed + 880_000 + 10_000 * int(outer_round) + 101 * inner),
             target.device,
         )
-        moved_all, flow_info = reverse_ou_heun_probability_flow(
+        moved_all, moved_logq_all, flow_info = reverse_ou_heun_probability_flow_certified(
             target,
-            field.estimate,
+            lambda x, t, field=field: field.estimate_and_divergence(x, t, cfg),
             cfg,
             generator=flow_gen,
             n_samples=generate_n,
             steps=int(cfg.pf_steps),
-            final_denoise=cfg.final_denoise,
+            phase_name=f"ratio:{pf_method}:inner{inner}",
         )
         moved_pool = moved_all[:pool_n].detach()
+        moved_logq = moved_logq_all[:pool_n].detach()
         final_eval = moved_all[:int(cfg.n_samples)].detach()
-
-        density_t0 = time.time()
-        moved_logq, moved_pf_info = pf_logprob_score_fn(
-            field.estimate,
-            moved_pool,
-            cfg,
-            method_name=f"{pf_method}:gated-pflow",
-        )
-        density_elapsed = time.time() - density_t0
+        moved_pf_info = dict(flow_info)
+        density_elapsed = 0.0
         probe_info = field.probe_diagnostics(cfg)
         movement_gen = make_generator(
             int(cfg.seed + 881_000 + 10_000 * int(outer_round) + 101 * inner),
@@ -4896,6 +5559,15 @@ def run_gated_pflow_ratio_node(
             "ratio_raw_log_ratio_mean": safe_float(raw_rho.mean()),
             "ratio_raw_log_ratio_std": safe_float(raw_rho.std(unbiased=False)),
             "ratio_density_reconstruction_sec": float(density_elapsed),
+            # The current q_k coordinates rebuild the carrier/gate/tilt, while
+            # q_k's log density is the incoming certificate emitted by the
+            # realized field built from q_{k-1}.  The raw previous bank need not
+            # remain in memory once that realized certificate has been carried.
+            "ratio_input_particles_refreshed": True,
+            "ratio_carrier_gate_refreshed": True,
+            "ratio_density_tilt_refreshed": True,
+            "ratio_density_certificate_uses_previous_realized_field": True,
+            "ratio_density_certificate_reference_round": int(inner - 1),
             **rho_info,
             **flow_info,
             **{f"ratio_output_{k}": v for k, v in moved_pf_info.items()},
@@ -4915,9 +5587,196 @@ def run_gated_pflow_ratio_node(
     output_zero_rho = torch.zeros((current_pool.shape[0],), device=current_pool.device, dtype=current_pool.dtype)
     aggregate = {
         "ratio_method": "gated-pflow",
+        "ratio_score_method": str(pf_method),
+        "ratio_gate_source": "estimator-native",
+        "ratio_refresh_mode": "current-particles-every-inner-round",
         "ratio_rounds": int(n_rounds),
         "ratio_rounds_requested": int(n_rounds),
         "ratio_complement_strength": float(cfg.lambda_guard),
+        "ratio_tilt_policy": canonical_ratio_tilt_policy(getattr(cfg, "ratio_tilt_policy", "exact")),
+        "ratio_inner_summary_json": json.dumps(inner_infos),
+        "ratio_total_elapsed_sec": float(time.time() - total_start),
+        "ratio_returns_unweighted_particles": True,
+        **(inner_infos[-1] if inner_infos else {}),
+    }
+    metric_gen = make_generator(
+        int(cfg.seed + 882_000 + 10_000 * int(outer_round)), target.device
+    )
+    ratio_metrics = compute_metrics(target, final_eval, truth, None, cfg, metric_gen)
+    return (
+        current_pool,
+        output_zero_rho,
+        final_eval,
+        current_logq,
+        aggregate,
+        last_pf_info,
+        last_rho_info,
+        {
+            "logpi": last_logpi,
+            "raw_rho": last_raw_rho,
+            "effective_tilt": last_rho,
+            "metrics": ratio_metrics,
+        },
+    )
+
+
+@torch.no_grad()
+def run_gated_bflow_ratio_node(
+    *,
+    starting_pool: torch.Tensor,
+    starting_logq: torch.Tensor,
+    pf_method: str,
+    ratio_rounds: int,
+    target,
+    truth: torch.Tensor,
+    cfg: Config,
+    outer_round: int,
+    pi_gate_refs: Optional[torch.Tensor],
+    pi_gate_rho: Optional[torch.Tensor],
+    n_gate_refs: Optional[torch.Tensor],
+    n_gate_rho: Optional[torch.Tensor],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Dict[str, object],
+    Dict[str, object],
+    Dict[str, object],
+    Dict[str, object],
+]:
+    """Apply one or more refreshed shared-statistic b-flow ratio transports.
+
+    Each inner round rebuilds the selected Method-2 carrier and native gate on
+    the current unweighted particle bank, rebuilds the canonical untilted and
+    density-tilted Tweedie statistics ``b_q`` and ``b_pi``, and integrates
+    ``s_method + lambda(I-G_method)(b_pi-b_q)``.  The moved endpoint and its
+    incoming certificate define the next inner round, so repeated b-flow rounds
+    are unfrozen at the iteration level.
+    """
+    n_rounds = int(ratio_rounds)
+    if n_rounds < 1:
+        raise ValueError(f"gated-bflow ratio rounds must be >=1; got {ratio_rounds}")
+    if canonical_score_method_key(pf_method) == "none":
+        raise ValueError("gated-bflow requires a non-none ratio/PF score estimator with a defined gate")
+
+    pool_n = proposal_pool_size(cfg)
+    current_pool = starting_pool[:pool_n].detach().clone()
+    current_logq = starting_logq[:pool_n].detach().clone()
+    final_eval = current_pool
+    last_logpi = target.log_prob(current_pool, t=0.0).detach()
+    last_raw_rho = last_logpi - current_logq
+    last_rho, last_rho_info = prepare_ratio_flow_tilt(last_raw_rho, cfg)
+    last_pf_info: Dict[str, object] = {}
+    inner_infos: List[Dict[str, object]] = []
+    total_start = time.time()
+
+    for inner in range(1, n_rounds + 1):
+        logpi = target.log_prob(current_pool, t=0.0).detach()
+        raw_rho = logpi - current_logq
+        effective_tilt, rho_info = prepare_ratio_flow_tilt(raw_rho, cfg)
+
+        zero = torch.zeros((current_pool.shape[0],), device=current_pool.device, dtype=current_pool.dtype)
+        score_refs, score_rho0, gate_refs, gate_rho0, split_info = split_score_gate_banks(
+            current_pool, zero, cfg
+        )
+        carrier_bank = SNISScoreBank(
+            target,
+            score_refs,
+            cfg,
+            log_ref_weights=score_rho0,
+            gate_anchors=gate_refs,
+            gate_log_ref_weights=gate_rho0,
+            pi_gate_anchors=pi_gate_refs,
+            pi_gate_log_ref_weights=pi_gate_rho,
+            n_gate_anchors=n_gate_refs,
+            n_gate_log_ref_weights=n_gate_rho,
+        )
+        score_tilt = score_bank_values_from_pool(effective_tilt, cfg)
+        field = GatedBFlowRatioField(
+            carrier_bank,
+            pf_method,
+            score_tilt,
+            complement_strength=float(cfg.lambda_guard),
+        )
+
+        # Only the final inner round needs the full evaluation cloud.  Earlier
+        # rounds generate exactly the bank required to define the next frozen
+        # carrier, avoiding a large amount of discarded work.
+        generate_n = max(int(cfg.n_samples), int(pool_n)) if inner == n_rounds else int(pool_n)
+        flow_gen = make_generator(
+            int(cfg.seed + 880_000 + 10_000 * int(outer_round) + 101 * inner),
+            target.device,
+        )
+        moved_all, moved_logq_all, flow_info = reverse_ou_heun_probability_flow_certified(
+            target,
+            lambda x, t, field=field: field.estimate_and_divergence(x, t, cfg),
+            cfg,
+            generator=flow_gen,
+            n_samples=generate_n,
+            steps=int(cfg.pf_steps),
+            phase_name=f"ratio:gated-bflow:{pf_method}:inner{inner}",
+        )
+        moved_pool = moved_all[:pool_n].detach()
+        moved_logq = moved_logq_all[:pool_n].detach()
+        final_eval = moved_all[:int(cfg.n_samples)].detach()
+        moved_pf_info = dict(flow_info)
+        density_elapsed = 0.0
+        probe_info = field.probe_diagnostics(cfg)
+        movement_gen = make_generator(
+            int(cfg.seed + 881_000 + 10_000 * int(outer_round) + 101 * inner),
+            target.device,
+        )
+        movement = adjacent_sample_discrepancy(moved_pool, current_pool, cfg, movement_gen)
+
+        inner_info = {
+            "ratio_inner_round": int(inner),
+            "ratio_inner_rounds_total": int(n_rounds),
+            "ratio_input_pool_n": int(current_pool.shape[0]),
+            "ratio_generated_n": int(moved_all.shape[0]),
+            "ratio_complement_strength": float(cfg.lambda_guard),
+            "ratio_input_logq_mean": safe_float(current_logq.mean()),
+            "ratio_input_logq_std": safe_float(current_logq.std(unbiased=False)),
+            "ratio_raw_log_ratio_mean": safe_float(raw_rho.mean()),
+            "ratio_raw_log_ratio_std": safe_float(raw_rho.std(unbiased=False)),
+            "ratio_density_reconstruction_sec": float(density_elapsed),
+            # The current q_k coordinates rebuild the carrier/gate/tilt, while
+            # q_k's log density is the incoming certificate emitted by the
+            # realized field built from q_{k-1}.  The raw previous bank need not
+            # remain in memory once that realized certificate has been carried.
+            "ratio_input_particles_refreshed": True,
+            "ratio_carrier_gate_refreshed": True,
+            "ratio_density_tilt_refreshed": True,
+            "ratio_density_certificate_uses_previous_realized_field": True,
+            "ratio_density_certificate_reference_round": int(inner - 1),
+            **rho_info,
+            **flow_info,
+            **{f"ratio_output_{k}": v for k, v in moved_pf_info.items()},
+            **probe_info,
+            **{f"ratio_map_{k}": v for k, v in movement.items()},
+        }
+        inner_infos.append(inner_info)
+
+        current_pool = moved_pool
+        current_logq = moved_logq.detach()
+        last_logpi = logpi
+        last_raw_rho = raw_rho
+        last_rho = effective_tilt
+        last_rho_info = rho_info
+        last_pf_info = moved_pf_info
+
+    output_zero_rho = torch.zeros((current_pool.shape[0],), device=current_pool.device, dtype=current_pool.dtype)
+    aggregate = {
+        "ratio_method": "gated-bflow",
+        "ratio_score_method": str(pf_method),
+        "ratio_gate_source": "estimator-native",
+        "ratio_field_definition": "s_method + lambda*(I-G_method)*(b_pi-b_q)",
+        "ratio_b_vectors": "canonical-current-bank-untilted-and-density-tilted-tweedie",
+        "ratio_refresh_mode": "current-particles-every-inner-round",
+        "ratio_rounds": int(n_rounds),
+        "ratio_rounds_requested": int(n_rounds),
+        "ratio_complement_strength": float(cfg.lambda_guard),
+        "ratio_tilt_policy": canonical_ratio_tilt_policy(getattr(cfg, "ratio_tilt_policy", "exact")),
         "ratio_inner_summary_json": json.dumps(inner_infos),
         "ratio_total_elapsed_sec": float(time.time() - total_start),
         "ratio_returns_unweighted_particles": True,
@@ -4960,20 +5819,40 @@ def run_family(
 ) -> Tuple[List[torch.Tensor], List[Dict[str, object]], List[Dict[str, object]]]:
     """Run one estimator family.
 
-    Each outer round consists of ``transport_repeats`` uncorrected S-steps,
+    Each outer round consists of ``transport_repeats`` current-particle steps,
     followed by either the legacy raw importance-weight node or one or more
-    complement-gated probability-flow ratio rounds.  The second score method is
-    used both for endpoint PF density reconstruction and as the frozen LFGI
-    carrier/gate in gated-pflow.
+    refreshed complement-gated p-flow or b-flow ratio rounds.  The transport
+    field that actually generates the endpoint also emits its incoming density
+    certificate.  The second score method supplies the refreshed ratio carrier/gate modality; b-flow additionally uses the canonical b_q/b_pi pair on that same current score bank.  Transport substeps consume the particles produced by
+    the preceding substep; ratio rounds do the same with their moved particles.
     """
     transport_repeats = int(transport_repeats)
     if transport_repeats < 1:
         raise ValueError(f"transport_repeats must be >=1; got {transport_repeats}")
-    ratio_reference_mode = canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint"))
+    ratio_reference_mode = canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "incoming"))
     ratio_method = canonical_ratio_method(ratio_method)
     ratio_rounds = int(ratio_rounds)
-    if ratio_method == "gated-pflow" and ratio_rounds < 1:
-        raise ValueError(f"ratio_rounds must be >=1 for gated-pflow; got {ratio_rounds}")
+    if is_moved_ratio_flow(ratio_method) and ratio_rounds < 1:
+        raise ValueError(f"ratio_rounds must be >=1 for {ratio_method}; got {ratio_rounds}")
+    correction_enabled = (
+        not bool(getattr(cfg, "force_no_likelihood_correction", False))
+        and canonical_score_method_key(pf_method) != "none"
+    )
+    transport_dynamics = canonical_transport_dynamics(
+        getattr(cfg, "transport_dynamics", "auto"),
+        correction_enabled=correction_enabled,
+    )
+    if correction_enabled and ratio_reference_mode == "endpoint":
+        if not bool(getattr(cfg, "allow_legacy_endpoint_certificate", False)):
+            raise ValueError(
+                "ratio_reference_mode=endpoint rebuilds an outgoing field at the new particles and is not a valid "
+                "density certificate away from TSC. Use --ratio_reference_mode incoming. To run the legacy "
+                "TSC-only diagnostic deliberately, also set --allow_legacy_endpoint_certificate."
+            )
+        print(
+            f"WARNING [{family}]: using the explicitly enabled legacy endpoint/outgoing density; this is valid only at TSC.",
+            flush=True,
+        )
     method_name = method_label(transport_method, transport_repeats, pf_method, ratio_method, ratio_rounds)
 
     # pi-LFGI and LFGI-N keep q-derived score signals but estimate the
@@ -5005,6 +5884,16 @@ def run_family(
 
     current_pool = init_refs.detach().clone()
     current_rho = init_rho.detach().clone()
+    initial_mode = canonical_initial_reference_mode(getattr(cfg, "initial_reference_mode", "prior"))
+    if initial_mode == "prior":
+        current_logq_certificate = standard_normal_logprob(current_pool).detach()
+    elif initial_mode == "target":
+        # An additive normalization constant is irrelevant to self-normalized
+        # ratio weights.  Analytic GMM targets are normalized; energy-based
+        # targets may provide log density only up to that common constant.
+        current_logq_certificate = target.log_prob(current_pool, t=0.0).detach()
+    else:
+        raise RuntimeError(f"Unhandled initial reference mode {initial_mode!r}")
     # Ratio-mode comparisons should begin from the same settled transport
     # realization whenever their transport specification is the same.  Do not
     # let the display family (which contains the ratio mode/round count) alter
@@ -5035,6 +5924,7 @@ def run_family(
         # iterations, so they receive zero ratio weights.
         transport_pool = current_pool.detach()
         transport_rho = current_rho.detach()
+        transport_logq = current_logq_certificate.detach()
         samples_all: Optional[torch.Tensor] = None
         samples_eval: Optional[torch.Tensor] = None
         sampler_info: Dict[str, object] = {}
@@ -5065,7 +5955,16 @@ def run_family(
             gen = make_generator(int(cfg.seed + 10_000 * r + 701 * m + transport_seed_offset), target.device)
 
             if str(transport_method).lower() == "none":
+                if correction_enabled:
+                    _ess, _ess_frac = log_weight_ess(transport_rho)
+                    if math.isfinite(_ess_frac) and _ess_frac < 1.0 - 1.0e-10:
+                        raise ValueError(
+                            "transport_method=none cannot carry a nonuniform weighted empirical law into a certified ratio step: "
+                            "the stored proposal-density certificate belongs to the unweighted coordinate law. "
+                            "Use a transport map, resample with an explicit density model, or disable the subsequent ratio node."
+                        )
                 step_samples_all = transport_pool[:next_pool_n].detach()
+                step_logq_all = transport_logq[:next_pool_n].detach()
                 if int(cfg.n_samples) <= int(step_samples_all.shape[0]):
                     step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
                 else:
@@ -5079,7 +5978,41 @@ def run_family(
                     "sampler_t_min": float(effective_time_bounds(cfg)[0]),
                     "sampler_t_max": float(effective_time_bounds(cfg)[1]),
                     "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
+                    "transport_dynamics": "identity",
+                    "transport_density_certificate_source": "carried-current-certificate",
                 }
+            elif transport_dynamics == "probability-flow":
+                score_div_fn_step = lambda y, t, bank=bank, method=transport_method: bank_score_and_divergence(
+                    bank, y, t, method, cfg
+                )
+                step_samples_all, step_logq_all, step_sampler_info = reverse_ou_heun_probability_flow_certified(
+                    target,
+                    score_div_fn_step,
+                    cfg,
+                    generator=gen,
+                    n_samples=generate_n,
+                    steps=int(cfg.n_steps),
+                    phase_name=f"transport:{transport_method}:outer{r}:substep{m}",
+                )
+                step_sampler_info.update({
+                    "transport_dynamics": "probability-flow",
+                    "generated_n": int(step_samples_all.shape[0]),
+                    "transport_density_certificate_source": "incoming-generating-field",
+                })
+                if m == transport_repeats and cfg.eval_final_denoise:
+                    # Evaluation-only denoising does not feed the ratio node or
+                    # overwrite the certified proposal law.
+                    score_fn_step = lambda y, t, bank=bank, method=transport_method: bank.estimate(y, t, method)
+                    step_samples_eval, _ = reverse_ou_heun_sde(
+                        target,
+                        score_fn_step,
+                        cfg,
+                        generator=make_generator(int(cfg.seed + 999_000 + 10_000 * r + 701 * m + transport_seed_offset), target.device),
+                        n_samples=int(cfg.n_samples),
+                        final_denoise=True,
+                    )
+                else:
+                    step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
             else:
                 score_fn_step = lambda y, t, bank=bank, method=transport_method: bank.estimate(y, t, method)
                 step_samples_all, step_sampler_info = reverse_ou_heun_sde(
@@ -5090,6 +6023,14 @@ def run_family(
                     n_samples=generate_n,
                     final_denoise=cfg.final_denoise,
                 )
+                step_logq_all = torch.full(
+                    (step_samples_all.shape[0],),
+                    float("nan"),
+                    device=step_samples_all.device,
+                    dtype=step_samples_all.dtype,
+                )
+                step_sampler_info["transport_dynamics"] = "reverse-sde"
+                step_sampler_info["transport_density_certificate_source"] = "unavailable-for-sde-endpoint"
                 step_sampler_info["generated_n"] = int(step_samples_all.shape[0])
                 if m == transport_repeats and cfg.eval_final_denoise:
                     step_samples_eval, _ = reverse_ou_heun_sde(
@@ -5104,6 +6045,7 @@ def run_family(
                     step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
 
             next_pool = step_samples_all[:next_pool_n].detach()
+            next_logq_certificate = step_logq_all[:next_pool_n].detach()
             zero_next_rho = torch.zeros((next_pool.shape[0],), device=next_pool.device, dtype=next_pool.dtype)
             next_score_refs0, next_score_rho0, next_gate_refs0, next_gate_rho0, next_split_info0 = split_score_gate_banks(
                 next_pool, zero_next_rho, cfg
@@ -5152,6 +6094,12 @@ def run_family(
                 "transport_substep_sampler_max_abs_score": safe_float(step_sampler_info.get("max_abs_score", float("nan"))),
                 "transport_substep_delta_pf": safe_float(step_conv.get("delta_pf", float("nan"))),
                 "transport_substep_delta_pf_target": safe_float(step_conv.get("delta_pf_target", float("nan"))),
+                "transport_substep_updates_current_particles": True,
+                "transport_substep_density_certificate_incoming": bool(
+                    str(step_sampler_info.get("transport_density_certificate_source", "")) == "incoming-generating-field"
+                ),
+                "transport_substep_input_pool_n": int(transport_pool.shape[0]),
+                "transport_substep_output_pool_n": int(next_pool.shape[0]),
             })
 
             # Final-substep objects are used for metrics, convergence reporting,
@@ -5168,17 +6116,18 @@ def run_family(
             sampler_info = step_sampler_info
             last_convergence_info = step_conv
 
-            # Intermediate transport rounds are deliberately unweighted.
-            transport_pool = next_pool
-            transport_rho = zero_next_rho
+            # Intermediate transport rounds are deliberately unweighted and
+            # genuinely refreshed: the next estimator is built from the actual
+            # particles produced by this transport substep.
+            transport_pool = next_pool.detach().clone()
+            transport_rho = zero_next_rho.detach().clone()
+            transport_logq = next_logq_certificate.detach().clone()
 
         assert samples_all is not None and samples_eval is not None
         assert endpoint_bank is not None and generator_bank is not None
         assert endpoint_score_refs is not None and endpoint_score_rho0 is not None
         assert endpoint_gate_refs is not None and endpoint_gate_rho0 is not None
         assert endpoint_split_info is not None
-        samples_by_round.append(samples_eval.detach())
-
         # Report score quality for the settled endpoint reference rather than the
         # pre-final generator bank.  This is the object the new TSC workflow uses
         # for ratio evaluation by default.
@@ -5191,7 +6140,7 @@ def run_family(
         adjacent_gen = make_generator(int(cfg.seed + 330_000 + 10_000 * r + transport_seed_offset), target.device)
         adjacent_metrics = adjacent_sample_discrepancy(samples_eval, previous_samples_for_adj, cfg, adjacent_gen)
         row = {
-            "kind": "sample",
+            "kind": "transport_output",
             "family": family,
             "method": method_name,
             "transport_method": transport_method,
@@ -5225,36 +6174,40 @@ def run_family(
             "sampler_time_schedule": str(sampler_info.get("sampler_time_schedule", canonical_time_schedule(cfg.time_schedule))),
             "generated_n": int(sampler_info.get("generated_n", samples_all.shape[0])),
             "elapsed_sec_so_far": float(time.time() - round_t0),
+            "fisher_rmse_method": str(transport_method),
+            "fisher_rmse_state": "post-transport-current-law",
             **metrics,
             **adjacent_metrics,
         }
         metric_rows.append(row)
-        previous_samples_for_adj = samples_eval.detach()
 
-        # Ratio step on the settled endpoint proposal pool.  The second score
-        # method first reconstructs q(x), giving the endpoint density tilt.  The
-        # raw-w node carries those weights as before.  The gated-pflow node also
-        # uses the same score method as its frozen q-LFGI carrier/gate and returns
-        # a moved, unweighted particle bank.
+        # Ratio step on the transport endpoint.  The density in the labels is
+        # the incoming certificate emitted by the field that generated this
+        # endpoint.  The second score method supplies only the current ratio
+        # carrier/gate modality.
         final_pool = samples_all[:next_pool_n].detach()
+        final_transport_logq = transport_logq[:next_pool_n].detach()
         pf_t0 = time.time()
         logpi = target.log_prob(final_pool, t=0.0)
         skip_likelihood_correction = bool(getattr(cfg, "force_no_likelihood_correction", False)) or str(pf_method).lower() == "none"
         ratio_info: Dict[str, object] = {
             "ratio_method": ratio_method,
-            "ratio_rounds": int(ratio_rounds if ratio_method == "gated-pflow" else 0),
+            "ratio_rounds": int(ratio_rounds if is_moved_ratio_flow(ratio_method) else 0),
             "ratio_rounds_requested": int(ratio_rounds),
             "ratio_returns_unweighted_particles": False,
         }
         ratio_eval_samples: Optional[torch.Tensor] = None
+        next_logq_certificate: torch.Tensor
+        gated_payload: Optional[Dict[str, object]] = None
         if skip_likelihood_correction:
-            logq = torch.full_like(logpi, float("nan"))
+            logq = final_transport_logq
             raw_rho = torch.zeros_like(logpi)
             skip_reason = "force_no_likelihood_correction" if bool(getattr(cfg, "force_no_likelihood_correction", False)) else "pf_method_none"
             pf_info = blank_pf_info(pf_method, reason=skip_reason)
             calib_info = blank_calibration_info(reason=skip_reason)
             ratio_bank_source = "none"
             next_pool_out = final_pool
+            next_logq_certificate = final_transport_logq
             next_rho = torch.zeros_like(raw_rho)
             rho_info = finalize_density_ratio_weights(raw_rho, cfg)[1]
             ratio_info.update({
@@ -5262,9 +6215,23 @@ def run_family(
                 "ratio_skip_reason": skip_reason,
             })
         else:
-            correction_bank = endpoint_bank if ratio_reference_mode == "endpoint" else generator_bank
-            ratio_bank_source = ratio_reference_mode
-            logq, pf_info = pf_logprob_bank(correction_bank, final_pool, pf_method, cfg)
+            if ratio_reference_mode == "incoming":
+                ratio_bank_source = "incoming_transport_certificate"
+                logq = final_transport_logq
+                pf_info = dict(sampler_info)
+                pf_info.update({
+                    "pf_method": str(transport_method),
+                    "pf_divergence_effective": "same-field-on-generation-path",
+                    "certificate_provenance": "incoming-generating-field",
+                })
+            else:
+                # Legacy TSC-only diagnostic.  If q is genuinely transport-TSC,
+                # rebuilding the transport estimator at q and evaluating its
+                # outgoing PF density can certify q.  Away from TSC this is not
+                # the current density and should not be used for production.
+                ratio_bank_source = "endpoint_outgoing_tsc_only"
+                logq, pf_info = pf_logprob_bank(endpoint_bank, final_pool, transport_method, cfg)
+                pf_info["certificate_provenance"] = "endpoint-outgoing-tsc-only"
             raw_rho = logpi - logq
             next_score_start = int(effective_gate_n(cfg)) if endpoint_split_info["bank_coupling"] == "independent" else 0
             score_raw_rho = raw_rho[next_score_start:next_score_start + int(cfg.n_ref)]
@@ -5272,6 +6239,7 @@ def run_family(
             calib_info = likelihood_correction_calibration(target, endpoint_score_refs, score_logq, score_raw_rho, cfg)
             if ratio_method == "raw-w":
                 next_pool_out = final_pool
+                next_logq_certificate = logq.detach()
                 next_rho, rho_info = finalize_density_ratio_weights(raw_rho, cfg)
                 ratio_info.update({
                     "ratio_skipped": False,
@@ -5284,7 +6252,7 @@ def run_family(
                     next_pool_out,
                     next_rho,
                     ratio_eval_samples,
-                    _ratio_output_logq,
+                    ratio_output_logq,
                     gated_info,
                     gated_output_pf_info,
                     rho_info,
@@ -5303,33 +6271,136 @@ def run_family(
                     n_gate_refs=n_gate_refs,
                     n_gate_rho=n_gate_rho,
                 )
+                next_logq_certificate = ratio_output_logq.detach()
                 ratio_info.update(gated_info)
                 ratio_info.update({f"ratio_final_{k}": v for k, v in gated_output_pf_info.items()})
                 # Preserve the initial settled-q tilt in the ordinary R-step
                 # columns.  Inner-round details, including refreshed tilts, are
                 # retained in ratio_inner_summary_json.
-                if ratio_eval_samples is not None:
-                    metric_rows.append({
-                        "kind": "ratio_output",
-                        "family": family,
-                        "method": method_name,
-                        "transport_method": transport_method,
-                        "transport_repeats": int(transport_repeats),
-                        "pf_method": pf_method,
-                        "correction_method": pf_method,
-                        "ratio_method": ratio_method,
-                        "ratio_rounds": int(ratio_rounds),
-                        "round": int(r),
-                        **gated_payload["metrics"],
-                    })
+            elif ratio_method == "gated-bflow":
+                (
+                    next_pool_out,
+                    next_rho,
+                    ratio_eval_samples,
+                    ratio_output_logq,
+                    gated_info,
+                    gated_output_pf_info,
+                    rho_info,
+                    gated_payload,
+                ) = run_gated_bflow_ratio_node(
+                    starting_pool=final_pool,
+                    starting_logq=logq,
+                    pf_method=pf_method,
+                    ratio_rounds=ratio_rounds,
+                    target=target,
+                    truth=truth,
+                    cfg=cfg,
+                    outer_round=r,
+                    pi_gate_refs=pi_gate_refs,
+                    pi_gate_rho=pi_gate_rho,
+                    n_gate_refs=n_gate_refs,
+                    n_gate_rho=n_gate_rho,
+                )
+                next_logq_certificate = ratio_output_logq.detach()
+                ratio_info.update(gated_info)
+                ratio_info.update({f"ratio_final_{k}": v for k, v in gated_output_pf_info.items()})
+                # The b-flow runner refreshes b_q, b_pi, the method-2 carrier,
+                # and the method-2 gate from every moved current-law bank.
             else:
                 raise RuntimeError(f"Unhandled ratio_method={ratio_method!r}")
         pf_elapsed = time.time() - pf_t0
 
-        # Re-split the actual next-round particle measure.  raw-w keeps the
-        # settled coordinates and nonuniform weights; gated-pflow returns moved
-        # coordinates with zero carried weights.
-        next_score_refs, next_score_rho, next_gate_refs, next_gate_rho, next_split_info = split_score_gate_banks(next_pool_out, next_rho, cfg)
+        # Re-split the actual next-round particle law before computing full-cycle
+        # diagnostics.  This law -- not the pre-ratio transport endpoint -- is
+        # the state consumed by the next outer transport half-step.
+        next_score_refs, next_score_rho, next_gate_refs, next_gate_rho, next_split_info = split_score_gate_banks(
+            next_pool_out, next_rho, cfg
+        )
+
+        # The primary round sample is the full-cycle output, not the pre-ratio
+        # transport checkpoint.  Moved ratio flows already provide an unweighted
+        # evaluation cloud.  For raw endpoint weighting, draw an evaluation cloud
+        # from the carried weighted law so sample metrics and plots represent the
+        # actual state passed to the next round.
+        if ratio_eval_samples is not None:
+            cycle_samples = ratio_eval_samples
+            cycle_sample_source = "moved-ratio-output"
+        elif ratio_method == "raw-w" and not skip_likelihood_correction:
+            cycle_sample_gen = make_generator(
+                int(cfg.seed + 332_000 + 10_000 * r + transport_seed_offset), target.device
+            )
+            cycle_samples = weighted_resample(
+                next_score_refs, next_score_rho, int(cfg.n_samples), cycle_sample_gen
+            )
+            cycle_sample_source = "weighted-current-law-resample"
+        else:
+            cycle_samples = samples_eval
+            cycle_sample_source = "transport-output"
+
+        if gated_payload is not None:
+            cycle_metrics = dict(gated_payload["metrics"])
+        elif ratio_method == "raw-w" and not skip_likelihood_correction:
+            # The old implementation inherited pre-ratio sample metrics here,
+            # even though the state carried into the next round was weighted.
+            # Recompute sample-quality metrics on the weighted-law resample.
+            cycle_metric_gen = make_generator(
+                int(cfg.seed + 333_000 + 10_000 * r + transport_seed_offset), target.device
+            )
+            cycle_metrics = compute_metrics(target, cycle_samples, truth, None, cfg, cycle_metric_gen)
+        else:
+            cycle_metrics = dict(metrics)
+
+        # FisherRMSE is a score-of-the-current-law diagnostic.  The moved ratio
+        # runners intentionally computed their sample metrics with score_fn=None,
+        # which made FisherRMSE identically NaN for every gated-pflow/bflow row.
+        # Rebuild the estimator on the actual post-ratio bank and evaluate the
+        # transport-side score family, since that is the score rule consumed by
+        # the next T half-step.  This keeps the metric comparable when Method 2
+        # differs (e.g. LFGI transport with a Tweedie ratio carrier).
+        if canonical_score_method_key(transport_method) == "none":
+            cycle_fisher = float("nan")
+            cycle_fisher_status = "transport-method-none"
+        else:
+            cycle_bank = SNISScoreBank(
+                target,
+                next_score_refs,
+                cfg,
+                log_ref_weights=next_score_rho,
+                gate_anchors=next_gate_refs,
+                gate_log_ref_weights=next_gate_rho,
+                pi_gate_anchors=pi_gate_refs,
+                pi_gate_log_ref_weights=pi_gate_rho,
+                n_gate_anchors=n_gate_refs,
+                n_gate_log_ref_weights=n_gate_rho,
+            )
+            cycle_fisher_fn = lambda y, t, bank=cycle_bank, method=transport_method: bank.estimate(y, t, method)
+            cycle_fisher_gen = make_generator(
+                int(cfg.seed + 334_000 + 10_000 * r + transport_seed_offset), target.device
+            )
+            cycle_fisher = fisher_rmse(target, cycle_fisher_fn, cfg, cycle_fisher_gen)
+            cycle_fisher_status = "post-ratio-current-law"
+        cycle_metrics["fisher_rmse"] = float(cycle_fisher)
+        cycle_metrics["fisher_rmse_method"] = str(transport_method)
+        cycle_metrics["fisher_rmse_state"] = cycle_fisher_status
+        cycle_metrics["cycle_sample_source"] = cycle_sample_source
+
+        cycle_adj_gen = make_generator(
+            int(cfg.seed + 331_000 + 10_000 * r + transport_seed_offset), target.device
+        )
+        cycle_adjacent = adjacent_sample_discrepancy(
+            cycle_samples, previous_samples_for_adj, cfg, cycle_adj_gen
+        )
+        cycle_row = dict(row)
+        cycle_row["kind"] = "sample"
+        cycle_row["cycle_includes_ratio"] = bool(not skip_likelihood_correction)
+        cycle_row["cycle_ratio_returns_unweighted_particles"] = bool(
+            ratio_info.get("ratio_returns_unweighted_particles", False)
+        )
+        cycle_row.update(cycle_metrics)
+        cycle_row.update(cycle_adjacent)
+        metric_rows.append(cycle_row)
+        samples_by_round.append(cycle_samples.detach())
+        previous_samples_for_adj = cycle_samples.detach()
         mode_before = mode_mass_l1(target, next_score_refs)
         w = torch.exp(next_score_rho - torch.max(next_score_rho))
         w = w / torch.clamp(w.sum(), min=1.0e-30)
@@ -5351,9 +6422,14 @@ def run_family(
             "pf_method": pf_method,
             "correction_method": pf_method,
             "ratio_method": ratio_method,
-            "ratio_rounds": int(ratio_rounds if ratio_method == "gated-pflow" else 0),
+            "ratio_rounds": int(ratio_rounds if is_moved_ratio_flow(ratio_method) else 0),
             "ratio_reference_mode": ratio_reference_mode,
             "ratio_bank_source": ratio_bank_source,
+            "transport_dynamics_effective": transport_dynamics,
+            "density_certificate_provenance": str(pf_info.get("certificate_provenance", "unknown")),
+            "density_certificate_uses_transport_method": bool(ratio_reference_mode == "incoming"),
+            "density_certificate_transport_method": str(transport_method),
+            "ratio_carrier_method": str(pf_method),
             "round": int(r),
             "r_step_ref_n": int(next_score_refs.shape[0]),
             "r_step_gate_n": int(next_gate_refs.shape[0]),
@@ -5381,16 +6457,26 @@ def run_family(
             **ratio_info,
             **(endpoint_bank.mp_leaf_info if any(str(m).lower().replace("_", "-") in {"leaf-lfgi", "mp-leaf-lfgi", "leaf-ce-hlsi", "mp-leaf-ce-hlsi", "leaf-ce-lfgi"} for m in (transport_method, pf_method)) else {}),
             **rho_info,
+            # Reassert stable method columns after nested PF/ratio diagnostics,
+            # whose internal phase labels also use a ``pf_method`` key.
+            "pf_method": str(pf_method),
+            "correction_method": str(pf_method),
+            "ratio_carrier_method": str(pf_method),
+            "density_flow_phase": str(pf_info.get("pf_method", "unknown")),
+            "ratio_final_flow_phase": str(
+                ratio_info.get("pf_method", ratio_info.get("ratio_output_pf_method", "none"))
+            ),
         })
 
         current_pool = next_pool_out.detach()
         current_rho = next_rho.detach()
+        current_logq_certificate = next_logq_certificate.detach()
         print(
-            f"[{family} | S={transport_method}x{transport_repeats}, PF={pf_method}, ratio={ratio_method}x{ratio_rounds if ratio_method == 'gated-pflow' else 1}, ratio_ref={ratio_reference_mode}] "
+            f"[{family} | S={transport_method}x{transport_repeats}, PF={pf_method}, ratio={ratio_method}x{ratio_rounds if is_moved_ratio_flow(ratio_method) else 1}, ratio_ref={ratio_reference_mode}] "
             f"round {r}/{cfg.n_rounds}: "
-            f"MMD={metrics['mmd']:.4g}, KSD={metrics['ksd']:.4g}, SW2={metrics['sw2']:.4g}, "
-            f"SKS={metrics['sliced_ks']:.4g}, NLL={metrics['nll']:.4g}, "
-            f"FisherRMSE={metrics['fisher_rmse']:.4g}, adjMMD={adjacent_metrics['adjacent_sample_mmd']:.4g}, "
+            f"MMD={cycle_metrics['mmd']:.4g}, KSD={cycle_metrics['ksd']:.4g}, SW2={cycle_metrics['sw2']:.4g}, "
+            f"SKS={cycle_metrics['sliced_ks']:.4g}, NLL={cycle_metrics['nll']:.4g}, "
+            f"FisherRMSE={cycle_metrics['fisher_rmse']:.4g}, adjMMD={cycle_adjacent['adjacent_sample_mmd']:.4g}, "
             f"DeltaPF={convergence_info.get('delta_pf', float('nan')):.4g}, DeltaPF_pi={convergence_info.get('delta_pf_target', float('nan')):.4g}, "
             f"PFEpMMD={convergence_info.get('delta_pf_endpoint_mmd', float('nan')):.4g}, "
             f"rhoESS={rho_info['rho_ess_frac']:.3f}, bank={next_split_info['bank_coupling']} "
@@ -5476,6 +6562,15 @@ def _estimator_alias_table() -> Dict[str, Tuple[str, str]]:
         "mp_leaf_ce_hlsi": ("Leaf-LFGI", "mp-leaf-lfgi"),
         "tweedie": ("Tweedie", "tweedie"),
         "twd": ("Tweedie", "tweedie"),
+        "tsi": ("TSI", "tsi"),
+        "target-score": ("TSI", "tsi"),
+        "target_score": ("TSI", "tsi"),
+        "target-side-information": ("TSI", "tsi"),
+        "target_side_information": ("TSI", "tsi"),
+        "target-side-score": ("TSI", "tsi"),
+        "target_side_score": ("TSI", "tsi"),
+        "identity-gate": ("TSI", "tsi"),
+        "identity_gate": ("TSI", "tsi"),
         "none": ("None", "none"),
         "nome": ("None", "none"),
         "no-op": ("None", "none"),
@@ -5577,7 +6672,7 @@ def _parse_score_pair_token(token: str) -> Tuple[str, str, str, int]:
     valid = ", ".join(sorted(_estimator_alias_table().keys()) + ["all", "hybrids"])
     raise ValueError(
         f"Unknown transport/PF-score token {token!r}. Use atomic aliases or transport_pf-score "
-        f"tokens like blend_lfgi, lfgi_none, os-lfgi_none, lfgi_os-lfgi, pi-lfgi_none, lfgi-N_none, none_lfgi, tweedie_lfgi, or the "
+        f"tokens like blend_lfgi, lfgi_none, os-lfgi_none, lfgi_os-lfgi, pi-lfgi_none, lfgi-N_none, none_lfgi, tweedie_lfgi, tsi_tsi, or the "
         f"multi-transport form lfgi-2_lfgi. Valid estimator aliases: {valid}"
     )
 
@@ -5587,9 +6682,9 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int, str, int]:
 
     Canonical form::
 
-        <score method 1>-<int 1>_<score method 2>_<ratio method>-<int 2>
+        <transport estimator>-<transport repeats>_<ratio estimator>_<ratio method>-<ratio rounds>
 
-    ``raw-w`` accepts and ignores an optional final integer.  For backward
+    ``raw-w`` accepts and ignores an optional final integer; both moved-flow nodes use it.  For backward
     compatibility, a token with no explicit ratio suffix is interpreted as the
     old transport/PF pair followed by ``raw-w``.
     """
@@ -5598,11 +6693,11 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int, str, int]:
     raw = str(token).strip().lower()
     if not raw:
         raise ValueError("empty method token")
-    # Match only the two supported ratio modes at the right edge.  The prefix
+    # Match the supported ratio modes at the right edge.  The prefix
     # is then delegated to the existing alias-aware pair parser, so estimator
     # names containing underscores remain unambiguous.
     m = re.match(
-        r"^(.*)_(gated[-_]pflow|raw[-_]w)(?:-([0-9]+)|_([0-9]+))?$",
+        r"^(.*)_(gated[-_](?:pflow|bflow)|raw[-_]w)(?:-([0-9]+)|_([0-9]+))?$",
         raw,
     )
     if m is None:
@@ -5617,15 +6712,23 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int, str, int]:
         fam, transport, pf_method, repeats = _parse_score_pair_token(prefix)
         ratio_method = canonical_ratio_method(ratio_raw)
         ratio_rounds = int(rounds_raw) if rounds_raw is not None else 1
+        if ratio_method == "gated-bflow" and canonical_score_method_key(pf_method) == "none":
+            raise ValueError(
+                f"gated-bflow requires a non-none method-2 carrier/gate in {token!r}"
+            )
         if ratio_rounds < 1:
             raise ValueError(f"ratio round count must be >=1 in {token!r}")
-        if ratio_method == "gated-pflow" and rounds_raw is None:
+        if is_moved_ratio_flow(ratio_method) and rounds_raw is None:
             # Defaulting to one is convenient and unambiguous, while the
             # displayed label still records the effective count.
             ratio_rounds = 1
-    ratio_disp = "GatedPFlow" if ratio_method == "gated-pflow" else "Raw-W"
+    ratio_disp = {
+        "gated-pflow": "GatedPFlow",
+        "gated-bflow": "GatedBFlow",
+        "raw-w": "Raw-W",
+    }[ratio_method]
     family = f"{fam}->{ratio_disp}"
-    if ratio_method == "gated-pflow":
+    if is_moved_ratio_flow(ratio_method):
         family = f"{family}x{ratio_rounds}"
     return family, transport, pf_method, repeats, ratio_method, ratio_rounds
 
@@ -5638,11 +6741,17 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int, str, i
     """
     raw = str(methods or "hybrids").strip().lower()
     if raw in {"all", "default", "*"}:
-        keys = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie"]
+        keys = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie", "tsi"]
     elif raw in {"hybrid", "hybrids", "blend-lfgi-hybrids", "lfgi-blend-hybrids"}:
         keys = ["blend_blend", "blend_lfgi", "lfgi_blend", "lfgi_lfgi"]
+    elif raw in {"alternating", "strict-alternation", "strict_alternation", "gated-grid", "ratio-grid", "gate-grid", "gate-comparison"}:
+        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie", "tsi"]
+        keys = [f"{a}_{a}_gated-pflow-1" for a in atoms]
+    elif raw in {"bflow-alternating", "bflow-grid", "shared-bflow-grid", "gated-bflow-grid"}:
+        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie", "tsi"]
+        keys = [f"{a}_{a}_gated-bflow-1" for a in atoms]
     elif raw in {"grid", "full-grid", "fullgrid", "full", "allpairs", "all-pairs"}:
-        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie", "none"]
+        atoms = ["blend", "matrix_blend", "unif_blend", "unif_matrix_blend", "lfgi", "os-lfgi", "pi-lfgi", "lfgi-N", "leaf-lfgi", "tweedie", "tsi", "none"]
         keys = [f"{a}_{b}" for a in atoms for b in atoms]
     else:
         keys = [k.strip() for k in raw.replace(";", ",").split(",") if k.strip()]
@@ -5657,7 +6766,7 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int, str, i
     if not out:
         raise ValueError(
             "No methods selected. Example: --methods "
-            "lfgi-2_lfgi_gated-pflow-1,lfgi-2_lfgi_gated-pflow-2,lfgi-2_lfgi_raw-w"
+            "lfgi_lfgi_gated-bflow-1,lfgi_lfgi_gated-pflow-1 or --methods bflow-alternating"
         )
     return out
 
@@ -5830,6 +6939,62 @@ def make_target(cfg: Config, device: torch.device, dtype: torch.dtype):
         "spiral, double_well, lj13_2d, or dw4_16d.".format(cfg.target)
     )
 
+def validate_certified_positive_resolvent_configuration(
+    method_specs: List[Tuple[str, str, str, int, str, int]],
+    cfg: Config,
+) -> None:
+    """Reject a known-invalid certified PF gate regularization.
+
+    With raw observed information, the LFGI denominator
+        alpha^2 I + gamma Hbar(y,t)
+    can cross zero on nonconvex targets.  Inverting first and then hard-flooring
+    the resulting gate eigenvalues makes G(y,t) jump across that pole.  A
+    Hutchinson finite difference then correctly reports an enormous/divergent
+    derivative; clipping that derivative would no longer certify the generated
+    law.  Use a PSD curvature surrogate or MP-leaf precision completion instead.
+    """
+    correction_enabled = any(
+        (str(ratio_mode).lower() != "raw-w") or (str(pf_method).lower() != "none")
+        for _fam, _tm, pf_method, _rep, ratio_mode, _rr in method_specs
+    )
+    dynamics = canonical_transport_dynamics(
+        getattr(cfg, "transport_dynamics", "auto"),
+        correction_enabled=correction_enabled,
+    )
+    if dynamics != "probability-flow":
+        return
+    if str(getattr(cfg, "curvature_mode", "raw")).strip().lower() != "raw":
+        return
+    if not math.isfinite(float(getattr(cfg, "gate_min_eval", -float("inf")))):
+        return
+    risky = []
+    for family, transport_method, pf_method, _rep, ratio_mode, _rr in method_specs:
+        if is_raw_lfgi_resolvent_method(transport_method) or (
+            is_moved_ratio_flow(ratio_mode) and is_raw_lfgi_resolvent_method(pf_method)
+        ):
+            risky.append(family)
+    if not risky:
+        return
+    if bool(getattr(cfg, "allow_raw_lfgi_hard_projection_certified", False)):
+        print(
+            "WARNING: allowing raw LFGI with hard post-resolvent gate projection in a certified PF run. "
+            "The field may be discontinuous at resolvent poles and its Liouville density may be unreliable.",
+            flush=True,
+        )
+        return
+    names = ", ".join(risky)
+    raise ValueError(
+        "Certified PF rejected raw LFGI plus finite gate_min_eval for: " + names + ". "
+        "On a nonconvex target the raw localized observed-information resolvent can cross zero; "
+        "inverting it and then hard-flooring the gate creates a discontinuous field, so the PF "
+        "divergence is not an ordinary bounded function. This was previously hidden by divergence "
+        "clipping. Use the recommended stable configuration `--curvature_mode psd "
+        "--gate_min_eval=-inf`, or use the MP-leaf estimator (`mp-leaf-lfgi`) with "
+        "`--gate_min_eval=-inf`. The legacy behavior can be forced with "
+        "`--allow_raw_lfgi_hard_projection_certified`, but its density certificate should not be trusted."
+    )
+
+
 def run(cfg: Config) -> None:
     ensure_dir(cfg.outdir)
     device = torch.device(cfg.device)
@@ -5846,7 +7011,8 @@ def run(cfg: Config) -> None:
     cfg.d = int(target.d)
     if math.isfinite(float(getattr(cfg, "gate_min_eval", -float("inf")))) and str(cfg.pf_divergence).lower() in {"auto", "analytic_ce", "analytic"}:
         print(
-            "Finite gate_min_eval activates spectral gate projection; PF divergence will use Hutchinson finite differences.",
+            "Finite gate_min_eval changes the score field by hard spectral gate projection; "
+            "analytic LFGI divergence no longer applies and the fallback is Hutchinson finite differences.",
             flush=True,
         )
     config_dict = asdict(cfg)
@@ -5859,7 +7025,9 @@ def run(cfg: Config) -> None:
         "effective_t_min": float(effective_time_bounds(cfg)[0]),
         "effective_t_max": float(effective_time_bounds(cfg)[1]),
         "effective_time_schedule": canonical_time_schedule(cfg.time_schedule),
-        "effective_ratio_reference_mode": canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint")),
+        "effective_ratio_reference_mode": canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "incoming")),
+        "effective_ratio_gate_policy": canonical_ratio_gate_policy(getattr(cfg, "ratio_gate_policy", "native")),
+        "effective_ratio_tilt_policy": canonical_ratio_tilt_policy(getattr(cfg, "ratio_tilt_policy", "exact")),
         "proposal_pool_n": int(proposal_pool_size(cfg)),
         "target_moment_mean_norm": target.moment_mean_norm,
         "target_moment_cov_frob_err": target.moment_cov_frob_err,
@@ -5924,9 +7092,10 @@ def run(cfg: Config) -> None:
             (f"{fam.split('->')[0]}->None", tm, "none", rep, "raw-w", 1)
             for fam, tm, _pm, rep, _rm, _rr in method_specs
         ]
+    validate_certified_positive_resolvent_configuration(method_specs, cfg)
     print(
         "Selected methods: " + ", ".join([
-            f"{fam} (S={tm}x{rep}, PF={pm}, ratio={rm}x{rr if rm == 'gated-pflow' else 1})"
+            f"{fam} (S={tm}x{rep}, PF={pm}, ratio={rm}x{rr if is_moved_ratio_flow(rm) else 1})"
             for fam, tm, pm, rep, rm, rr in method_specs
         ]),
         flush=True,
@@ -5935,7 +7104,7 @@ def run(cfg: Config) -> None:
         print(
             f"\n=== Running method: {family} "
             f"(S={transport_method}x{transport_repeats}, PF={pf_method}, "
-            f"ratio={ratio_method}x{ratio_rounds if ratio_method == 'gated-pflow' else 1}) ===",
+            f"ratio={ratio_method}x{ratio_rounds if is_moved_ratio_flow(ratio_method) else 1}) ===",
             flush=True,
         )
         samples_by_round, rows, stages = run_family(
@@ -5984,6 +7153,10 @@ def parse_args() -> Config:
             p.add_argument(arg, type=float, default=default_value)
         else:
             p.add_argument(arg, type=str, default=default_value)
+    # Backward-compatible readable aliases.  The certificate-consistent script
+    # enables ratio flow by default; --force_no_likelihood_correction disables it.
+    p.add_argument("--enable_likelihood_correction", dest="force_no_likelihood_correction", action="store_false")
+    p.add_argument("--enable_ratio_flow", dest="force_no_likelihood_correction", action="store_false")
     ns = p.parse_args()
 
     # Backward compatibility: old command lines used --t_start/--t_end.
@@ -5996,7 +7169,12 @@ def parse_args() -> Config:
     ns.t_start = float(ns.t_max)
     ns.t_end = float(ns.t_min)
     ns.time_schedule = canonical_time_schedule(ns.time_schedule)
-    ns.ratio_reference_mode = canonical_ratio_reference_mode(getattr(ns, "ratio_reference_mode", "endpoint"))
+    ns.ratio_reference_mode = canonical_ratio_reference_mode(getattr(ns, "ratio_reference_mode", "incoming"))
+    ns.ratio_gate_policy = canonical_ratio_gate_policy(getattr(ns, "ratio_gate_policy", "native"))
+    ns.ratio_tilt_policy = canonical_ratio_tilt_policy(getattr(ns, "ratio_tilt_policy", "exact"))
+    # Validate spelling here; the correction-dependent auto resolution occurs
+    # inside each family after the method token is known.
+    _ = canonical_transport_dynamics(getattr(ns, "transport_dynamics", "auto"), correction_enabled=False)
 
     cfg = Config(**vars(ns))
     # Fail fast for invalid interval/schedule.
