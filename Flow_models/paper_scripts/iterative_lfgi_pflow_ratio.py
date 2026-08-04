@@ -3,14 +3,14 @@
 """
 iterative_transport_bflow_ratio_fisher_v7.py
 
-Certificate-consistent refreshed alternating transport and ratio-flow test bench.
+Refreshed alternating transport and ratio-flow test bench with reverse-SDE transport.
 
-The default run applies one LFGI transport probability flow followed by one
-LFGI-complement ratio probability flow per outer cycle.  Every half-step
-rebuilds its estimator from the particles produced by the preceding half-step.
-Each generated bank carries the incoming Liouville log-density certificate
-emitted by the same realized field that generated it, so endpoint ratio labels
-remain valid away from transport self-consistency.
+The transport block uses the same reverse OU Heun SDE as iterative_lfgi.py.
+Likelihood factors at the transport endpoint are reconstructed in the same way
+as iterative_lfgi.py: build the selected ratio-score estimator on the endpoint
+(or legacy generator bank) and integrate its frozen probability-flow density.
+The newer ratio-node, diagnostics, plotting, and refreshed-bank machinery are
+otherwise retained.
 
 Supported targets include the normalized stiff 8D misaligned GMM, the fixed
 stiff 3D GMM, Neal's funnel, stiff analytic 2D targets, and molecular LJ/DW
@@ -68,7 +68,7 @@ python iterative_transport_bflow_ratio_fisher_v7.py \
   --n_rounds 6 --n_steps 150 --pf_steps 64 \
   --t_min 0.005 --t_max 3.0 \
   --methods lfgi_lfgi_gated-bflow-1 \
-  --ratio_reference_mode incoming \
+  --ratio_reference_mode endpoint \
   --ratio_tilt_policy exact --lambda_guard 1
 
 Transport-only theorem diagnostics remain available with
@@ -230,8 +230,8 @@ class Config:
     # ratio-round count.  ``gated-pflow`` retains the previous residual
     # s_A+(I-G_A)(b^pi-s_A), while ``gated-bflow`` implements the shared-statistic
     # complement s_A+(I-G_A)(b^pi-b^q).  The first score method generates the
-    # transport endpoint and therefore supplies its incoming density certificate.
-    # The second score method supplies the refreshed ratio carrier and native
+    # transport endpoint by reverse SDE.  The second score method is used to
+    # reconstruct the endpoint likelihood factors and supplies the refreshed ratio carrier and native
     # gate.  The b^q and b^pi vectors are the canonical untilted and density-tilted
     # Tweedie conditional statistics on that same current score bank; they do not
     # introduce a separate estimator choice.  Each inner ratio round refreshes all
@@ -243,14 +243,13 @@ class Config:
     #   hybrids     = four blend/lfgi pairs
     #   grid/full   = full transport/correction grid over blend, matrix_blend, unif_blend, unif_matrix_blend, lfgi, os-lfgi, pi-lfgi, lfgi-N, leaf-lfgi, tweedie, none
     methods: str = "lfgi_lfgi_gated-pflow-1"
-    # Density provenance for the first ratio labels after a transport block.
-    # incoming (default) uses the field that actually generated the endpoint and
-    # is valid away from TSC.  endpoint is a legacy outgoing-field diagnostic and
-    # is only justified at transport TSC.
-    ratio_reference_mode: str = "incoming"
-    # auto uses certified probability flow whenever a ratio/weight correction is
-    # enabled and preserves the legacy reverse SDE only for no-correction tests.
-    transport_dynamics: str = "auto"  # auto, probability_flow, reverse_sde
+    # Frozen bank used for the post-transport log-q reconstruction, matching
+    # iterative_lfgi.py.  endpoint (default) rebuilds the ratio estimator on the
+    # final endpoint cloud; generator uses the bank that produced that endpoint.
+    ratio_reference_mode: str = "endpoint"
+    # Retained for CLI compatibility.  This variant always uses reverse SDE for
+    # transport; probability-flow transport is rejected.
+    transport_dynamics: str = "reverse_sde"  # retained for CLI compatibility; transport is always reverse SDE
     # Native uses the literal estimator gate and literal I-G.  Project first
     # projects to 0<=G<=I and rebuilds a gate-consistent carrier.
     ratio_gate_policy: str = "native"  # native or project
@@ -5251,17 +5250,15 @@ def blank_calibration_info(reason: str = "skipped") -> Dict[str, float | str]:
 
 
 def canonical_ratio_reference_mode(value: str) -> str:
-    """Normalize endpoint-density provenance for the first ratio labels."""
-    key = str(value or "incoming").strip().lower().replace("_", "-").replace(" ", "-")
+    """Normalize the frozen-bank convention used to reconstruct endpoint log q.
+
+    ``endpoint`` builds the ratio-score estimator on the final transport
+    endpoint bank.  ``generator`` uses the bank that generated that endpoint.
+    This matches iterative_lfgi.py.  ``incoming`` is accepted as a backward-
+    compatible alias for ``generator`` but no Liouville certificate is carried.
+    """
+    key = str(value or "endpoint").strip().lower().replace("_", "-").replace(" ", "-")
     aliases = {
-        "incoming": "incoming",
-        "certificate": "incoming",
-        "incoming-certificate": "incoming",
-        "generator": "incoming",
-        "generating": "incoming",
-        "source": "incoming",
-        "pre-endpoint": "incoming",
-        "exact-induced": "incoming",
         "endpoint": "endpoint",
         "settled": "endpoint",
         "final": "endpoint",
@@ -5270,40 +5267,42 @@ def canonical_ratio_reference_mode(value: str) -> str:
         "tsc": "endpoint",
         "old": "endpoint",
         "legacy": "endpoint",
+        "generator": "generator",
+        "generating": "generator",
+        "source": "generator",
+        "pre-endpoint": "generator",
+        "exact-induced": "generator",
+        "incoming": "generator",
+        "certificate": "generator",
+        "incoming-certificate": "generator",
     }
     if key not in aliases:
-        raise ValueError(f"Unknown ratio_reference_mode={value!r}; use incoming or endpoint")
+        raise ValueError(f"Unknown ratio_reference_mode={value!r}; use endpoint or generator")
     return aliases[key]
 
 
 def canonical_transport_dynamics(value: str, *, correction_enabled: bool) -> str:
-    """Resolve transport dynamics, enforcing density-certificate consistency."""
-    key = str(value or "auto").strip().lower().replace("_", "-").replace(" ", "-")
+    """Normalize the retained CLI flag; transport is always reverse SDE.
+
+    Probability-flow transport and its generation-time density certificate were
+    removed to restore the runtime profile of iterative_lfgi.py.  Endpoint log q
+    is reconstructed afterward by ``pf_logprob_bank``.
+    """
+    key = str(value or "reverse_sde").strip().lower().replace("_", "-").replace(" ", "-")
     aliases = {
-        "auto": "auto",
-        "pf": "probability-flow",
-        "pflow": "probability-flow",
-        "probability-flow": "probability-flow",
-        "probabilityflow": "probability-flow",
-        "ode": "probability-flow",
+        "auto": "reverse-sde",
         "reverse-sde": "reverse-sde",
         "sde": "reverse-sde",
         "stochastic": "reverse-sde",
     }
+    if key in {"pf", "pflow", "probability-flow", "probabilityflow", "ode"}:
+        raise ValueError(
+            "Probability-flow transport has been removed from this variant. "
+            "Use reverse-SDE transport; endpoint likelihood factors are reconstructed afterward."
+        )
     if key not in aliases:
-        raise ValueError(
-            f"Unknown transport_dynamics={value!r}; use auto, probability_flow, or reverse_sde"
-        )
-    mode = aliases[key]
-    if mode == "auto":
-        return "probability-flow" if correction_enabled else "reverse-sde"
-    if correction_enabled and mode == "reverse-sde":
-        raise ValueError(
-            "A ratio/weight correction requires a density certificate for the actual transport endpoint. "
-            "The reverse SDE endpoint is not certified by the probability-flow Liouville density. "
-            "Use --transport_dynamics probability_flow (or auto)."
-        )
-    return mode
+        raise ValueError(f"Unknown transport_dynamics={value!r}; use auto or reverse_sde")
+    return aliases[key]
 
 
 def canonical_ratio_gate_policy(value: str) -> str:
@@ -5829,7 +5828,7 @@ def run_family(
     transport_repeats = int(transport_repeats)
     if transport_repeats < 1:
         raise ValueError(f"transport_repeats must be >=1; got {transport_repeats}")
-    ratio_reference_mode = canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "incoming"))
+    ratio_reference_mode = canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint"))
     ratio_method = canonical_ratio_method(ratio_method)
     ratio_rounds = int(ratio_rounds)
     if is_moved_ratio_flow(ratio_method) and ratio_rounds < 1:
@@ -5838,21 +5837,13 @@ def run_family(
         not bool(getattr(cfg, "force_no_likelihood_correction", False))
         and canonical_score_method_key(pf_method) != "none"
     )
+    # This variant deliberately restores iterative_lfgi.py transport semantics:
+    # reverse SDE for particle generation, followed by a separate frozen-field
+    # PF density reconstruction for the likelihood factors.
     transport_dynamics = canonical_transport_dynamics(
-        getattr(cfg, "transport_dynamics", "auto"),
+        getattr(cfg, "transport_dynamics", "reverse_sde"),
         correction_enabled=correction_enabled,
     )
-    if correction_enabled and ratio_reference_mode == "endpoint":
-        if not bool(getattr(cfg, "allow_legacy_endpoint_certificate", False)):
-            raise ValueError(
-                "ratio_reference_mode=endpoint rebuilds an outgoing field at the new particles and is not a valid "
-                "density certificate away from TSC. Use --ratio_reference_mode incoming. To run the legacy "
-                "TSC-only diagnostic deliberately, also set --allow_legacy_endpoint_certificate."
-            )
-        print(
-            f"WARNING [{family}]: using the explicitly enabled legacy endpoint/outgoing density; this is valid only at TSC.",
-            flush=True,
-        )
     method_name = method_label(transport_method, transport_repeats, pf_method, ratio_method, ratio_rounds)
 
     # pi-LFGI and LFGI-N keep q-derived score signals but estimate the
@@ -5884,16 +5875,6 @@ def run_family(
 
     current_pool = init_refs.detach().clone()
     current_rho = init_rho.detach().clone()
-    initial_mode = canonical_initial_reference_mode(getattr(cfg, "initial_reference_mode", "prior"))
-    if initial_mode == "prior":
-        current_logq_certificate = standard_normal_logprob(current_pool).detach()
-    elif initial_mode == "target":
-        # An additive normalization constant is irrelevant to self-normalized
-        # ratio weights.  Analytic GMM targets are normalized; energy-based
-        # targets may provide log density only up to that common constant.
-        current_logq_certificate = target.log_prob(current_pool, t=0.0).detach()
-    else:
-        raise RuntimeError(f"Unhandled initial reference mode {initial_mode!r}")
     # Ratio-mode comparisons should begin from the same settled transport
     # realization whenever their transport specification is the same.  Do not
     # let the display family (which contains the ratio mode/round count) alter
@@ -5924,7 +5905,6 @@ def run_family(
         # iterations, so they receive zero ratio weights.
         transport_pool = current_pool.detach()
         transport_rho = current_rho.detach()
-        transport_logq = current_logq_certificate.detach()
         samples_all: Optional[torch.Tensor] = None
         samples_eval: Optional[torch.Tensor] = None
         sampler_info: Dict[str, object] = {}
@@ -5955,16 +5935,7 @@ def run_family(
             gen = make_generator(int(cfg.seed + 10_000 * r + 701 * m + transport_seed_offset), target.device)
 
             if str(transport_method).lower() == "none":
-                if correction_enabled:
-                    _ess, _ess_frac = log_weight_ess(transport_rho)
-                    if math.isfinite(_ess_frac) and _ess_frac < 1.0 - 1.0e-10:
-                        raise ValueError(
-                            "transport_method=none cannot carry a nonuniform weighted empirical law into a certified ratio step: "
-                            "the stored proposal-density certificate belongs to the unweighted coordinate law. "
-                            "Use a transport map, resample with an explicit density model, or disable the subsequent ratio node."
-                        )
                 step_samples_all = transport_pool[:next_pool_n].detach()
-                step_logq_all = transport_logq[:next_pool_n].detach()
                 if int(cfg.n_samples) <= int(step_samples_all.shape[0]):
                     step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
                 else:
@@ -5979,40 +5950,8 @@ def run_family(
                     "sampler_t_max": float(effective_time_bounds(cfg)[1]),
                     "sampler_time_schedule": canonical_time_schedule(cfg.time_schedule),
                     "transport_dynamics": "identity",
-                    "transport_density_certificate_source": "carried-current-certificate",
+                    "transport_density_certificate_source": "none; endpoint density reconstructed separately",
                 }
-            elif transport_dynamics == "probability-flow":
-                score_div_fn_step = lambda y, t, bank=bank, method=transport_method: bank_score_and_divergence(
-                    bank, y, t, method, cfg
-                )
-                step_samples_all, step_logq_all, step_sampler_info = reverse_ou_heun_probability_flow_certified(
-                    target,
-                    score_div_fn_step,
-                    cfg,
-                    generator=gen,
-                    n_samples=generate_n,
-                    steps=int(cfg.n_steps),
-                    phase_name=f"transport:{transport_method}:outer{r}:substep{m}",
-                )
-                step_sampler_info.update({
-                    "transport_dynamics": "probability-flow",
-                    "generated_n": int(step_samples_all.shape[0]),
-                    "transport_density_certificate_source": "incoming-generating-field",
-                })
-                if m == transport_repeats and cfg.eval_final_denoise:
-                    # Evaluation-only denoising does not feed the ratio node or
-                    # overwrite the certified proposal law.
-                    score_fn_step = lambda y, t, bank=bank, method=transport_method: bank.estimate(y, t, method)
-                    step_samples_eval, _ = reverse_ou_heun_sde(
-                        target,
-                        score_fn_step,
-                        cfg,
-                        generator=make_generator(int(cfg.seed + 999_000 + 10_000 * r + 701 * m + transport_seed_offset), target.device),
-                        n_samples=int(cfg.n_samples),
-                        final_denoise=True,
-                    )
-                else:
-                    step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
             else:
                 score_fn_step = lambda y, t, bank=bank, method=transport_method: bank.estimate(y, t, method)
                 step_samples_all, step_sampler_info = reverse_ou_heun_sde(
@@ -6023,14 +5962,8 @@ def run_family(
                     n_samples=generate_n,
                     final_denoise=cfg.final_denoise,
                 )
-                step_logq_all = torch.full(
-                    (step_samples_all.shape[0],),
-                    float("nan"),
-                    device=step_samples_all.device,
-                    dtype=step_samples_all.dtype,
-                )
                 step_sampler_info["transport_dynamics"] = "reverse-sde"
-                step_sampler_info["transport_density_certificate_source"] = "unavailable-for-sde-endpoint"
+                step_sampler_info["transport_density_certificate_source"] = "none; endpoint density reconstructed separately"
                 step_sampler_info["generated_n"] = int(step_samples_all.shape[0])
                 if m == transport_repeats and cfg.eval_final_denoise:
                     step_samples_eval, _ = reverse_ou_heun_sde(
@@ -6045,7 +5978,6 @@ def run_family(
                     step_samples_eval = step_samples_all[:int(cfg.n_samples)].detach()
 
             next_pool = step_samples_all[:next_pool_n].detach()
-            next_logq_certificate = step_logq_all[:next_pool_n].detach()
             zero_next_rho = torch.zeros((next_pool.shape[0],), device=next_pool.device, dtype=next_pool.dtype)
             next_score_refs0, next_score_rho0, next_gate_refs0, next_gate_rho0, next_split_info0 = split_score_gate_banks(
                 next_pool, zero_next_rho, cfg
@@ -6121,7 +6053,6 @@ def run_family(
             # particles produced by this transport substep.
             transport_pool = next_pool.detach().clone()
             transport_rho = zero_next_rho.detach().clone()
-            transport_logq = next_logq_certificate.detach().clone()
 
         assert samples_all is not None and samples_eval is not None
         assert endpoint_bank is not None and generator_bank is not None
@@ -6181,12 +6112,12 @@ def run_family(
         }
         metric_rows.append(row)
 
-        # Ratio step on the transport endpoint.  The density in the labels is
-        # the incoming certificate emitted by the field that generated this
-        # endpoint.  The second score method supplies only the current ratio
-        # carrier/gate modality.
+        # Ratio step on the reverse-SDE transport endpoint.  Match
+        # iterative_lfgi.py exactly for the likelihood factors: build the
+        # selected PF/ratio estimator on either the endpoint bank (default) or
+        # the bank that generated the endpoint, then reconstruct log q with the
+        # frozen-field probability-flow density integral.
         final_pool = samples_all[:next_pool_n].detach()
-        final_transport_logq = transport_logq[:next_pool_n].detach()
         pf_t0 = time.time()
         logpi = target.log_prob(final_pool, t=0.0)
         skip_likelihood_correction = bool(getattr(cfg, "force_no_likelihood_correction", False)) or str(pf_method).lower() == "none"
@@ -6197,17 +6128,15 @@ def run_family(
             "ratio_returns_unweighted_particles": False,
         }
         ratio_eval_samples: Optional[torch.Tensor] = None
-        next_logq_certificate: torch.Tensor
         gated_payload: Optional[Dict[str, object]] = None
         if skip_likelihood_correction:
-            logq = final_transport_logq
+            logq = torch.full_like(logpi, float("nan"))
             raw_rho = torch.zeros_like(logpi)
             skip_reason = "force_no_likelihood_correction" if bool(getattr(cfg, "force_no_likelihood_correction", False)) else "pf_method_none"
             pf_info = blank_pf_info(pf_method, reason=skip_reason)
             calib_info = blank_calibration_info(reason=skip_reason)
             ratio_bank_source = "none"
             next_pool_out = final_pool
-            next_logq_certificate = final_transport_logq
             next_rho = torch.zeros_like(raw_rho)
             rho_info = finalize_density_ratio_weights(raw_rho, cfg)[1]
             ratio_info.update({
@@ -6215,23 +6144,10 @@ def run_family(
                 "ratio_skip_reason": skip_reason,
             })
         else:
-            if ratio_reference_mode == "incoming":
-                ratio_bank_source = "incoming_transport_certificate"
-                logq = final_transport_logq
-                pf_info = dict(sampler_info)
-                pf_info.update({
-                    "pf_method": str(transport_method),
-                    "pf_divergence_effective": "same-field-on-generation-path",
-                    "certificate_provenance": "incoming-generating-field",
-                })
-            else:
-                # Legacy TSC-only diagnostic.  If q is genuinely transport-TSC,
-                # rebuilding the transport estimator at q and evaluating its
-                # outgoing PF density can certify q.  Away from TSC this is not
-                # the current density and should not be used for production.
-                ratio_bank_source = "endpoint_outgoing_tsc_only"
-                logq, pf_info = pf_logprob_bank(endpoint_bank, final_pool, transport_method, cfg)
-                pf_info["certificate_provenance"] = "endpoint-outgoing-tsc-only"
+            correction_bank = endpoint_bank if ratio_reference_mode == "endpoint" else generator_bank
+            ratio_bank_source = ratio_reference_mode
+            logq, pf_info = pf_logprob_bank(correction_bank, final_pool, pf_method, cfg)
+            pf_info["certificate_provenance"] = f"legacy-frozen-{ratio_reference_mode}-field-reconstruction"
             raw_rho = logpi - logq
             next_score_start = int(effective_gate_n(cfg)) if endpoint_split_info["bank_coupling"] == "independent" else 0
             score_raw_rho = raw_rho[next_score_start:next_score_start + int(cfg.n_ref)]
@@ -6239,7 +6155,6 @@ def run_family(
             calib_info = likelihood_correction_calibration(target, endpoint_score_refs, score_logq, score_raw_rho, cfg)
             if ratio_method == "raw-w":
                 next_pool_out = final_pool
-                next_logq_certificate = logq.detach()
                 next_rho, rho_info = finalize_density_ratio_weights(raw_rho, cfg)
                 ratio_info.update({
                     "ratio_skipped": False,
@@ -6252,7 +6167,7 @@ def run_family(
                     next_pool_out,
                     next_rho,
                     ratio_eval_samples,
-                    ratio_output_logq,
+                    _ratio_output_logq,
                     gated_info,
                     gated_output_pf_info,
                     rho_info,
@@ -6271,18 +6186,14 @@ def run_family(
                     n_gate_refs=n_gate_refs,
                     n_gate_rho=n_gate_rho,
                 )
-                next_logq_certificate = ratio_output_logq.detach()
                 ratio_info.update(gated_info)
                 ratio_info.update({f"ratio_final_{k}": v for k, v in gated_output_pf_info.items()})
-                # Preserve the initial settled-q tilt in the ordinary R-step
-                # columns.  Inner-round details, including refreshed tilts, are
-                # retained in ratio_inner_summary_json.
             elif ratio_method == "gated-bflow":
                 (
                     next_pool_out,
                     next_rho,
                     ratio_eval_samples,
-                    ratio_output_logq,
+                    _ratio_output_logq,
                     gated_info,
                     gated_output_pf_info,
                     rho_info,
@@ -6301,11 +6212,8 @@ def run_family(
                     n_gate_refs=n_gate_refs,
                     n_gate_rho=n_gate_rho,
                 )
-                next_logq_certificate = ratio_output_logq.detach()
                 ratio_info.update(gated_info)
                 ratio_info.update({f"ratio_final_{k}": v for k, v in gated_output_pf_info.items()})
-                # The b-flow runner refreshes b_q, b_pi, the method-2 carrier,
-                # and the method-2 gate from every moved current-law bank.
             else:
                 raise RuntimeError(f"Unhandled ratio_method={ratio_method!r}")
         pf_elapsed = time.time() - pf_t0
@@ -6426,9 +6334,10 @@ def run_family(
             "ratio_reference_mode": ratio_reference_mode,
             "ratio_bank_source": ratio_bank_source,
             "transport_dynamics_effective": transport_dynamics,
-            "density_certificate_provenance": str(pf_info.get("certificate_provenance", "unknown")),
-            "density_certificate_uses_transport_method": bool(ratio_reference_mode == "incoming"),
-            "density_certificate_transport_method": str(transport_method),
+            "density_certificate_provenance": str(pf_info.get("certificate_provenance", "legacy-frozen-field-reconstruction")),
+            "density_certificate_uses_transport_method": False,
+            "density_certificate_transport_method": "none",
+            "likelihood_reconstruction_method": str(pf_method),
             "ratio_carrier_method": str(pf_method),
             "round": int(r),
             "r_step_ref_n": int(next_score_refs.shape[0]),
@@ -6470,7 +6379,6 @@ def run_family(
 
         current_pool = next_pool_out.detach()
         current_rho = next_rho.detach()
-        current_logq_certificate = next_logq_certificate.detach()
         print(
             f"[{family} | S={transport_method}x{transport_repeats}, PF={pf_method}, ratio={ratio_method}x{ratio_rounds if is_moved_ratio_flow(ratio_method) else 1}, ratio_ref={ratio_reference_mode}] "
             f"round {r}/{cfg.n_rounds}: "
@@ -7025,7 +6933,7 @@ def run(cfg: Config) -> None:
         "effective_t_min": float(effective_time_bounds(cfg)[0]),
         "effective_t_max": float(effective_time_bounds(cfg)[1]),
         "effective_time_schedule": canonical_time_schedule(cfg.time_schedule),
-        "effective_ratio_reference_mode": canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "incoming")),
+        "effective_ratio_reference_mode": canonical_ratio_reference_mode(getattr(cfg, "ratio_reference_mode", "endpoint")),
         "effective_ratio_gate_policy": canonical_ratio_gate_policy(getattr(cfg, "ratio_gate_policy", "native")),
         "effective_ratio_tilt_policy": canonical_ratio_tilt_policy(getattr(cfg, "ratio_tilt_policy", "exact")),
         "proposal_pool_n": int(proposal_pool_size(cfg)),
@@ -7169,7 +7077,7 @@ def parse_args() -> Config:
     ns.t_start = float(ns.t_max)
     ns.t_end = float(ns.t_min)
     ns.time_schedule = canonical_time_schedule(ns.time_schedule)
-    ns.ratio_reference_mode = canonical_ratio_reference_mode(getattr(ns, "ratio_reference_mode", "incoming"))
+    ns.ratio_reference_mode = canonical_ratio_reference_mode(getattr(ns, "ratio_reference_mode", "endpoint"))
     ns.ratio_gate_policy = canonical_ratio_gate_policy(getattr(ns, "ratio_gate_policy", "native"))
     ns.ratio_tilt_policy = canonical_ratio_tilt_policy(getattr(ns, "ratio_tilt_policy", "exact"))
     # Validate spelling here; the correction-dependent auto resolution occurs
