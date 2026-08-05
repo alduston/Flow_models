@@ -51,6 +51,12 @@ DEFAULT_N_GEN = 500
 HESS_MIN = 1e-6
 HESS_MAX = 1e8
 CURVATURE_RIDGE = 1e-6
+# A downstream softmax is stable in log space, but ratio weights are also
+# exposed to callers and may be exponentiated there.  Keep every finalized
+# log tilt inside the finite float64 exponent range even when user clipping is
+# disabled or set to an excessively large value.
+MAX_SAFE_RATIO_LOG_TILT = 700.0
+MAX_SAFE_RATIO_PRECENTER_CLIP = 0.5 * MAX_SAFE_RATIO_LOG_TILT
 
 RUN_TIMESTAMP = None
 RUN_RESULTS_ROOT = 'run_results'
@@ -855,9 +861,47 @@ class ScoreField:
         logw0 = tensors['logw']
         diff = y[:, None, :] - alpha * x[None, :, :]
         logits = -0.5 * torch.sum(diff * diff, dim=-1) / gamma + logw0[None, :]
-        logits = logits - torch.max(logits, dim=1, keepdim=True).values
-        weights = torch.exp(logits)
-        weights = weights / torch.clamp(weights.sum(dim=1, keepdim=True), min=1e-300)
+
+        # Very remote flow states can overflow their squared distances, making
+        # every conditional log importance weight -inf.  A conventional
+        # subtract-max softmax then evaluates -inf - -inf and returns NaN.
+        # Ignore isolated non-finite logits, share mass between any +inf ties,
+        # and fall back to the unconditional bank law only for wholly unusable
+        # rows.  The fallback is preferable to poisoning the complete batch.
+        finite = torch.isfinite(logits)
+        posinf = torch.isposinf(logits)
+        has_finite = finite.any(dim=1, keepdim=True)
+        has_posinf = posinf.any(dim=1, keepdim=True)
+
+        neg_inf = torch.full_like(logits, -torch.inf)
+        finite_logits = torch.where(finite, logits, neg_inf)
+        row_max = torch.max(finite_logits, dim=1, keepdim=True).values
+        centered = torch.where(finite, finite_logits - row_max, neg_inf)
+        regular_mass = torch.nan_to_num(
+            torch.exp(centered), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        regular_weights = regular_mass / torch.clamp(
+            regular_mass.sum(dim=1, keepdim=True), min=1e-300
+        )
+        posinf_weights = posinf.to(dtype=logits.dtype) / torch.clamp(
+            posinf.sum(dim=1, keepdim=True).to(dtype=logits.dtype), min=1.0
+        )
+
+        base_logits = torch.nan_to_num(
+            logw0, nan=0.0,
+            posinf=MAX_SAFE_RATIO_LOG_TILT,
+            neginf=-MAX_SAFE_RATIO_LOG_TILT,
+        )
+        base_logits = base_logits - torch.max(base_logits)
+        base_mass = torch.exp(base_logits)
+        base_weights = base_mass / torch.clamp(base_mass.sum(), min=1e-300)
+        fallback_weights = base_weights[None, :].expand_as(logits)
+
+        weights = torch.where(
+            has_posinf,
+            posinf_weights,
+            torch.where(has_finite, regular_weights, fallback_weights),
+        )
         b = (alpha * x[None, :, :] - y[:, None, :]) / gamma
         c = s0[None, :, :] / alpha
         return weights, b, c, alpha, gamma
@@ -1345,8 +1389,19 @@ def estimate_logq_probability_flow(X0, source_score_field, *, t_min=10 ** (-2.5)
         )
         outputs.append((log_terminal + div_accum).detach().cpu())
     logq = torch.cat(outputs, dim=0)
-    if not bool(torch.isfinite(logq).all().item()):
-        raise FloatingPointError('Probability-flow density reconstruction produced non-finite log q.')
+    logq_nonfinite = _nonfinite_tensor_counts(logq)
+    if logq_nonfinite['nonfinite_count']:
+        warnings.warn(
+            'Probability-flow density reconstruction produced '
+            f"{logq_nonfinite['nonfinite_count']} non-finite log q value(s) "
+            f"(NaN={logq_nonfinite['nan_count']}, "
+            f"+inf={logq_nonfinite['posinf_count']}, "
+            f"-inf={logq_nonfinite['neginf_count']}). The ratio finalizer will "
+            'preserve infinite ordering, neutralize NaNs, and apply its finite '
+            'log-weight guard.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
     diagnostics = {
         'density_divergence_requested': divergence_mode,
         'density_divergence_effective': '+'.join(sorted(effective_modes)),
@@ -1354,25 +1409,183 @@ def estimate_logq_probability_flow(X0, source_score_field, *, t_min=10 ** (-2.5)
         'density_batch_size': batch_size,
         'density_t_min': t_min,
         'density_t_max': t_max,
+        'density_logq_finite_fraction': logq_nonfinite['finite_fraction'],
+        'density_logq_nonfinite_count': logq_nonfinite['nonfinite_count'],
+        'density_logq_nan_count': logq_nonfinite['nan_count'],
+        'density_logq_posinf_count': logq_nonfinite['posinf_count'],
+        'density_logq_neginf_count': logq_nonfinite['neginf_count'],
     }
     if return_diagnostics:
         return logq, diagnostics
     return logq
 
 
-def _finalize_ratio_log_tilt(raw_log_ratio, *, temperature=1.0, clip=20.0):
-    """Keep the previous ratio-weight centering, temperature, and clipping."""
+def _nonfinite_tensor_counts(values):
+    """Return scalar diagnostics without reducing over non-finite values."""
+    values = torch.as_tensor(values, dtype=torch.float64).detach().cpu().reshape(-1)
+    count = int(values.numel())
+    finite_count = int(torch.isfinite(values).sum().item())
+    nan_count = int(torch.isnan(values).sum().item())
+    posinf_count = int(torch.isposinf(values).sum().item())
+    neginf_count = int(torch.isneginf(values).sum().item())
+    return {
+        'count': count,
+        'finite_count': finite_count,
+        'nonfinite_count': count - finite_count,
+        'nan_count': nan_count,
+        'posinf_count': posinf_count,
+        'neginf_count': neginf_count,
+        'finite_fraction': finite_count / float(count) if count else float('nan'),
+    }
+
+
+def _finite_tensor_stats(values):
+    """Stable diagnostics for tensors that may contain infinities or huge values."""
+    values = torch.as_tensor(values, dtype=torch.float64).detach().cpu().reshape(-1)
+    counts = _nonfinite_tensor_counts(values)
+    finite = values[torch.isfinite(values)]
+    if finite.numel() == 0:
+        return {
+            **counts,
+            'mean': float('nan'),
+            'std': float('nan'),
+            'min': float('nan'),
+            'max': float('nan'),
+        }
+
+    # Scaling first avoids overflow in sums and squared deviations when finite
+    # inputs happen to lie close to the float64 extrema.
+    scale = float(torch.max(torch.abs(finite)).item())
+    if scale == 0.0:
+        mean = 0.0
+        std = 0.0
+    else:
+        normalized = finite / scale
+        mean = float(normalized.mean().item()) * scale
+        std = float(normalized.std(unbiased=False).item()) * scale
+        max_float = torch.finfo(torch.float64).max
+        if not math.isfinite(mean):
+            mean = math.copysign(max_float, mean)
+        if not math.isfinite(std):
+            std = max_float
+    return {
+        **counts,
+        'mean': mean,
+        'std': std,
+        'min': float(finite.min().item()),
+        'max': float(finite.max().item()),
+    }
+
+
+def _finalize_ratio_log_tilt(raw_log_ratio, *, temperature=1.0, clip=20.0,
+                             return_diagnostics=False):
+    """Produce finite centered log weights from possibly overflowing ratios.
+
+    Finite ratios retain their ordering.  ``+/-inf`` values saturate at the
+    corresponding boundary, NaNs receive the neutral (median) correction, and
+    a wholly unusable batch falls back to uniform weights.  Clipping is done
+    before centering, so neither a raw mean nor a raw difference can overflow.
+    """
     raw = torch.as_tensor(raw_log_ratio, dtype=torch.float64).detach().cpu().reshape(-1)
-    if not bool(torch.isfinite(raw).all().item()):
-        raise ValueError('Raw endpoint log ratios must be finite.')
-    logw = raw - torch.mean(raw)
-    logw = float(temperature) * logw
-    if clip is not None:
-        clip = float(clip)
-        if clip > 0.0 and math.isfinite(clip):
-            median = torch.median(logw)
-            logw = torch.clamp(logw, median - clip, median + clip)
-    return (logw - torch.mean(logw)).contiguous()
+    temperature = float(temperature)
+    if not math.isfinite(temperature):
+        raise ValueError('ratio temperature must be finite.')
+
+    user_clip = None if clip is None else float(clip)
+    user_clip_active = (
+        user_clip is not None and math.isfinite(user_clip) and user_clip > 0.0
+    )
+    effective_clip = (
+        min(user_clip, MAX_SAFE_RATIO_PRECENTER_CLIP)
+        if user_clip_active else MAX_SAFE_RATIO_PRECENTER_CLIP
+    )
+    counts = _nonfinite_tensor_counts(raw)
+    guard_applied = bool(
+        counts['nonfinite_count']
+        or not user_clip_active
+        or user_clip > MAX_SAFE_RATIO_PRECENTER_CLIP
+    )
+    uniform_fallback = False
+
+    if raw.numel() == 0:
+        logw = raw.clone()
+    elif counts['finite_count'] == 0:
+        logw = torch.zeros_like(raw)
+        uniform_fallback = True
+        warnings.warn(
+            'All endpoint log ratios were non-finite; using uniform ratio weights '
+            'for this node.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    elif temperature == 0.0:
+        logw = torch.zeros_like(raw)
+    else:
+        if counts['nonfinite_count']:
+            warnings.warn(
+                f"Endpoint ratios contained {counts['nonfinite_count']} non-finite "
+                f"value(s) (NaN={counts['nan_count']}, "
+                f"+inf={counts['posinf_count']}, "
+                f"-inf={counts['neginf_count']}); saturating infinities and assigning "
+                'NaNs the neutral correction.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        finite_mask = torch.isfinite(raw)
+        finite_values = raw[finite_mask]
+        location = (
+            torch.median(finite_values)
+            if temperature > 0.0 else -torch.median(-finite_values)
+        )
+        abs_temperature = abs(temperature)
+        max_float = torch.finfo(torch.float64).max
+        if abs_temperature <= effective_clip / max_float:
+            raw_span = max_float
+        else:
+            raw_span = min(effective_clip / abs_temperature, max_float)
+
+        # A finite subtraction can itself overflow for opposite float64
+        # extrema.  Its +/-inf sign is meaningful here, so saturate it at the
+        # pre-temperature span just like an explicit infinite ratio.
+        delta = raw - location
+        delta = torch.where(torch.isnan(raw), torch.zeros_like(delta), delta)
+        delta = torch.where(torch.isposinf(raw), torch.full_like(delta, raw_span), delta)
+        delta = torch.where(torch.isneginf(raw), torch.full_like(delta, -raw_span), delta)
+        delta = torch.nan_to_num(
+            delta, nan=0.0, posinf=raw_span, neginf=-raw_span
+        ).clamp(min=-raw_span, max=raw_span)
+        logw = torch.nan_to_num(
+            temperature * delta,
+            nan=0.0,
+            posinf=effective_clip,
+            neginf=-effective_clip,
+        ).clamp(min=-effective_clip, max=effective_clip)
+        logw = logw - torch.mean(logw)
+
+    # The pre-centering cap guarantees this final clamp is inactive in normal
+    # arithmetic; retain it as a last line of defence against platform-specific
+    # overflow/rounding behaviour.
+    logw = torch.nan_to_num(
+        logw,
+        nan=0.0,
+        posinf=MAX_SAFE_RATIO_LOG_TILT,
+        neginf=-MAX_SAFE_RATIO_LOG_TILT,
+    ).clamp(min=-MAX_SAFE_RATIO_LOG_TILT, max=MAX_SAFE_RATIO_LOG_TILT)
+
+    diagnostics = {
+        'ratio_raw_finite_fraction': counts['finite_fraction'],
+        'ratio_raw_nonfinite_count': counts['nonfinite_count'],
+        'ratio_raw_nan_count': counts['nan_count'],
+        'ratio_raw_posinf_count': counts['posinf_count'],
+        'ratio_raw_neginf_count': counts['neginf_count'],
+        'ratio_overflow_guard_applied': guard_applied,
+        'ratio_uniform_fallback': uniform_fallback,
+        'ratio_effective_log_weight_clip': effective_clip,
+    }
+    logw = logw.contiguous()
+    if return_diagnostics:
+        return logw, diagnostics
+    return logw
 
 
 _CONFIG_KEYS = {
@@ -1709,19 +1922,24 @@ def run_single_sampler_config(label, config, prior_model, lik_model, *, states,
     )
     logpi = _selection_target_log_density(selection)
     raw_log_ratio = logpi - logq
-    log_tilt = _finalize_ratio_log_tilt(
+    log_tilt, ratio_guard_info = _finalize_ratio_log_tilt(
         raw_log_ratio,
         temperature=cfg['ratio_temperature'],
         clip=cfg['ratio_log_weight_clip'],
+        return_diagnostics=True,
     )
+    logq_stats = _finite_tensor_stats(logq)
+    raw_ratio_stats = _finite_tensor_stats(raw_log_ratio)
     ess = global_log_weight_ess(log_tilt)
     run_info.update(density_info)
+    run_info.update(ratio_guard_info)
     run_info.update({
         'density_certificate_source': 'frozen_generating_field',
         'ratio_carrier_source': 'settled_endpoint_bank',
-        'ratio_logq_mean': float(logq.mean().item()),
-        'ratio_logq_std': float(logq.std(unbiased=False).item()),
-        'ratio_raw_log_weight_std': float(raw_log_ratio.std(unbiased=False).item()),
+        'ratio_logq_mean': logq_stats['mean'],
+        'ratio_logq_std': logq_stats['std'],
+        'ratio_raw_log_weight_mean': raw_ratio_stats['mean'],
+        'ratio_raw_log_weight_std': raw_ratio_stats['std'],
         'ratio_log_weight_mean': float(log_tilt.mean().item()),
         'ratio_log_weight_std': float(log_tilt.std(unbiased=False).item()),
         'ratio_log_weight_min': float(log_tilt.min().item()),
