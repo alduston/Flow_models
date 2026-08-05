@@ -12,9 +12,10 @@ as iterative_lfgi.py: build the selected ratio-score estimator on the endpoint
 The newer ratio-node, diagnostics, plotting, and refreshed-bank machinery are
 otherwise retained.
 
-Supported targets include the normalized stiff 8D misaligned GMM, the fixed
-stiff 3D GMM, Neal's funnel, stiff analytic 2D targets, and molecular LJ/DW
-examples.  Supported gate families include local scalar/matrix Blend, uniform
+Supported targets include the normalized stiff 8D misaligned GMM, a dedicated
+rank-3-in-16D singular GMM importance-weight stress test, the fixed stiff 3D
+GMM, Neal's funnel, stiff analytic 2D targets, and molecular LJ/DW examples.
+Supported gate families include local scalar/matrix Blend, uniform
 scalar/matrix Blend, LFGI variants, Tweedie (G=0), and TSI (G=I).
 
 Method syntax
@@ -28,10 +29,18 @@ The two moved-particle ratio nodes are retained side by side:
   ``s_R=s_A+lambda(I-G_A)(b_t^pi-s_A)``.
 * ``gated-bflow`` (shared-statistic complement):
   ``s_R=s_A+lambda(I-G_A)(b_t^pi-b_t^q)``.
+* ``raw-bflow`` (ungated shared-statistic b-residual control):
+  ``s_R=s_A+lambda(b_t^pi-b_t^q)``.
+* ``completed-bflow`` (finite-bank shared-LFGI completion):
+  ``s_R=s_A+lambda[(I-G_A)(b_t^pi-b_t^q)+G_A(c_t^pi-c_t^q)]``.
+  For a gate-consistent carrier and ``lambda=1`` this is exactly
+  ``b_t^pi+G_A(c_t^pi-b_t^pi)`` at the particle-estimator level.
 
 For example, strict refreshed LFGI b-flow alternation is
-``lfgi_lfgi_gated-bflow-1``.  With Tweedie as the ratio estimator, both
-flow definitions reduce to the full tilted Tweedie/Doob score because
+``lfgi_lfgi_gated-bflow-1``.  The raw-flow control is
+``lfgi_lfgi_raw-bflow-1``.  The completed shared-LFGI control is
+``lfgi_lfgi_completed-bflow-1``.  With Tweedie as the ratio estimator, all
+gated flow definitions reduce to the full tilted Tweedie/Doob score because
 ``s_A=b_t^q`` and ``G_A=0``.
 
 Algorithmic invariants
@@ -113,8 +122,9 @@ class Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "float64"
 
-    # Target selector.  In addition to the original GMM/funnel/molecular
-    # targets, the script includes stiff two-dimensional non-Gaussian toys:
+    # Target selector.  gmm_16 is the dedicated rank-3-in-16D singular-GMM
+    # ratio-degeneracy stress test.  In addition to the original GMM/funnel/
+    # molecular targets, the script includes stiff two-dimensional toys:
     # banana, sine, ring, rings, spiral, and double_well.
     target: str = "misaligned_gmm"
 
@@ -229,7 +239,11 @@ class Config:
     # fixed-coordinate importance-weight correction and ignores the optional
     # ratio-round count.  ``gated-pflow`` retains the previous residual
     # s_A+(I-G_A)(b^pi-s_A), while ``gated-bflow`` implements the shared-statistic
-    # complement s_A+(I-G_A)(b^pi-b^q).  The first score method generates the
+    # complement s_A+(I-G_A)(b^pi-b^q).  ``raw-bflow`` uses the identical b-flow
+    # carrier, tilt, particles, and integration but replaces I-G_A by I.
+    # ``completed-bflow`` restores the finite-bank cancellation term on the same
+    # carrier: s_A+(I-G_A)(b^pi-b^q)+G_A(c^pi-c^q).  The
+    # first score method generates the
     # transport endpoint by reverse SDE.  The second score method is used to
     # reconstruct the endpoint likelihood factors and supplies the refreshed ratio carrier and native
     # gate.  The b^q and b^pi vectors are the canonical untilted and density-tilted
@@ -341,9 +355,12 @@ class Config:
     mp_leaf_floor: float = 0.0
     mp_leaf_tol: float = 1.0e-12
     weight_temp: float = 1.0
-    # Complement strength for either moved-particle ratio node.
+    # Correction strength for every moved-particle ratio node.
     # gated-pflow: s_R = s_A + lambda_guard (I-G_A)(b_pi-s_A).
     # gated-bflow: s_R = s_A + lambda_guard (I-G_A)(b_pi-b_q).
+    # raw-bflow:       s_R = s_A + lambda_guard (b_pi-b_q).
+    # completed-bflow: s_R = s_A + lambda_guard * [
+    #                       (I-G_A)(b_pi-b_q) + G_A(c_pi-c_q)].
     # The name is retained to match the requested command-line interface.
     lambda_guard: float = 1.0
     eval_chunk: int = 512
@@ -2791,6 +2808,7 @@ class SNISScoreBank:
             "gate_consistency_residual": torch.nan_to_num(consistency_residual, nan=0.0, posinf=0.0, neginf=0.0),
             "conditional_weights": w,
             "particle_tweedie_signals": b,
+            "particle_target_signals": c,
         }
 
     def gated_pflow_components_chunk(
@@ -2877,8 +2895,10 @@ class SNISScoreBank:
         method: str,
         endpoint_log_tilt: torch.Tensor,
         complement_strength: float,
+        apply_gate_filter: bool = True,
+        restore_cancellation: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """Evaluate the shared-statistic complement b-flow ratio score.
+        """Evaluate gated, raw, or completed shared-statistic b-flow scores.
 
         The selected estimator supplies the current-law carrier ``s_A`` and its
         native gate ``G_A``.  The OU Tweedie statistic is evaluated twice on the
@@ -2888,9 +2908,24 @@ class SNISScoreBank:
             b_pi = E_q[exp(r(X)) beta_t(X;y) | Y_t=y]
                    / E_q[exp(r(X)) | Y_t=y].
 
-        The field is
+        The gated field is
 
             s_R = s_A + lambda (I-G_A) (b_pi-b_q).
+
+        With ``apply_gate_filter=False`` the same carrier, conditional kernels,
+        endpoint labels, and particle bank instead give the raw-flow control
+
+            s_R = s_A + lambda (b_pi-b_q).
+
+        With ``restore_cancellation=True`` the same coupled particle statistics
+        restore the finite-bank cancellation term:
+
+            s_R = s_A + lambda[(I-G_A)(b_pi-b_q) + G_A(c_pi-c_q)].
+
+        For a gate-consistent carrier and lambda=1 this is algebraically identical,
+        query by query and sample by sample, to
+
+            b_pi + G_A(c_pi-b_pi).
 
         There is no independent estimator modality for ``b_q`` or ``b_pi``:
         they are the canonical untilted/tilted Tweedie conditionals.  ``method``
@@ -2909,8 +2944,10 @@ class SNISScoreBank:
         native = self.estimator_gate_components_chunk(y, t, method)
         wq = native["conditional_weights"]
         b_particles = native["particle_tweedie_signals"]
+        c_particles = native["particle_target_signals"]
         s_q_method = native["carrier_score"]
         b_q = native["base_score"]
+        c_q = native["target_signal_score"]
         G_comp = native["gate"]
 
         # The same endpoint labels and OU kernel tilt the current q fiber to the
@@ -2919,25 +2956,50 @@ class SNISScoreBank:
         target_logits = torch.log(torch.clamp(wq, min=1.0e-300)) + log_tilt[None, :]
         wpi = torch.softmax(target_logits, dim=1)
         b_pi = torch.sum(wpi[:, :, None] * b_particles, dim=1)
+        c_pi = torch.sum(wpi[:, :, None] * c_particles, dim=1)
 
         b_residual = b_pi - b_q
-        complement = torch.eye(self.d, device=y.device, dtype=y.dtype)[None, :, :] - G_comp
-        correction = torch.einsum("bij,bj->bi", complement, b_residual)
+        c_residual = c_pi - c_q
+        eye = torch.eye(self.d, device=y.device, dtype=y.dtype)[None, :, :]
+        ratio_filter = eye - G_comp if bool(apply_gate_filter) else eye.expand(y.shape[0], -1, -1)
+        b_correction = torch.einsum("bij,bj->bi", ratio_filter, b_residual)
+        cancellation_correction = (
+            torch.einsum("bij,bj->bi", G_comp, c_residual)
+            if bool(restore_cancellation)
+            else torch.zeros_like(b_correction)
+        )
+        correction = b_correction + cancellation_correction
         score = s_q_method + strength * correction
+
+        # Direct finite-bank tilted-LFGI representation.  At strength=1 this
+        # agrees with the completed shared representation whenever the carrier
+        # is gate-consistent (ordinary LFGI/Blend/Tweedie/TSI cases).
+        direct_full_score = b_pi + torch.einsum("bij,bj->bi", G_comp, c_pi - b_pi)
+        completed_identity_residual = score - direct_full_score
         cond_ess = 1.0 / torch.clamp(torch.sum(wpi * wpi, dim=1), min=1.0e-30)
         return {
             "score": torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0),
             "s_q": torch.nan_to_num(s_q_method, nan=0.0, posinf=0.0, neginf=0.0),
             "b_q": torch.nan_to_num(b_q, nan=0.0, posinf=0.0, neginf=0.0),
             "b_pi": torch.nan_to_num(b_pi, nan=0.0, posinf=0.0, neginf=0.0),
+            "c_q": torch.nan_to_num(c_q, nan=0.0, posinf=0.0, neginf=0.0),
+            "c_pi": torch.nan_to_num(c_pi, nan=0.0, posinf=0.0, neginf=0.0),
             # Keep the common diagnostic key used by the ratio-field probes.
             "s_pi_dens": torch.nan_to_num(b_pi, nan=0.0, posinf=0.0, neginf=0.0),
             "gate": G_comp,
+            "ratio_filter": ratio_filter,
             "raw_gate_eigs": native["raw_gate_eigs"],
             "gate_antisym_frob": native["gate_antisym_frob"],
             "gate_consistency_residual": native["gate_consistency_residual"],
             "residual": torch.nan_to_num(b_residual, nan=0.0, posinf=0.0, neginf=0.0),
+            "b_residual": torch.nan_to_num(b_residual, nan=0.0, posinf=0.0, neginf=0.0),
+            "c_residual": torch.nan_to_num(c_residual, nan=0.0, posinf=0.0, neginf=0.0),
+            "b_correction": torch.nan_to_num(b_correction, nan=0.0, posinf=0.0, neginf=0.0),
+            "cancellation_correction": torch.nan_to_num(cancellation_correction, nan=0.0, posinf=0.0, neginf=0.0),
             "correction": torch.nan_to_num(correction, nan=0.0, posinf=0.0, neginf=0.0),
+            "direct_full_score": torch.nan_to_num(direct_full_score, nan=0.0, posinf=0.0, neginf=0.0),
+            "completed_identity_residual": torch.nan_to_num(completed_identity_residual, nan=0.0, posinf=0.0, neginf=0.0),
+            "restore_cancellation": bool(restore_cancellation),
             "target_cond_ess": torch.nan_to_num(cond_ess, nan=0.0, posinf=0.0, neginf=0.0),
         }
 
@@ -2949,12 +3011,16 @@ class SNISScoreBank:
         method: str,
         endpoint_log_tilt: torch.Tensor,
         complement_strength: float,
+        apply_gate_filter: bool = True,
+        restore_cancellation: bool = False,
     ) -> torch.Tensor:
         outs: List[torch.Tensor] = []
         chunk = max(int(self.cfg.eval_chunk), 1)
         for start in range(0, y.shape[0], chunk):
             parts = self.gated_bflow_components_chunk(
-                y[start:start + chunk], t, method, endpoint_log_tilt, complement_strength
+                y[start:start + chunk], t, method, endpoint_log_tilt,
+                complement_strength, apply_gate_filter=apply_gate_filter,
+                restore_cancellation=restore_cancellation,
             )
             outs.append(parts["score"])
         return torch.cat(outs, dim=0)
@@ -3515,11 +3581,13 @@ class GatedPFlowRatioField:
 
 
 class GatedBFlowRatioField:
-    """One-inner-round shared-statistic b-flow field.
+    """One-inner-round gated, raw, or completed shared-statistic b-flow field.
 
-    The selected estimator supplies ``s_A`` and ``G_A`` while the correction is
-    ``(I-G_A)(b_pi-b_q)``.  The field is frozen only during one ODE integration;
-    the enclosing ratio iteration rebuilds it from every moved particle bank.
+    The selected estimator supplies ``s_A`` and ``G_A``.  The correction is
+    ``(I-G_A)(b_pi-b_q)``, the raw ``b_pi-b_q`` control, or the completed
+    ``(I-G_A)(b_pi-b_q)+G_A(c_pi-c_q)`` shared-LFGI correction.  The field is
+    frozen only during one ODE integration; the enclosing ratio iteration
+    rebuilds it from every moved particle bank.
     """
 
     def __init__(
@@ -3528,6 +3596,8 @@ class GatedBFlowRatioField:
         method: str,
         endpoint_log_tilt: torch.Tensor,
         complement_strength: float,
+        apply_gate_filter: bool = True,
+        restore_cancellation: bool = False,
     ):
         self.bank = bank
         self.method = str(method)
@@ -3535,6 +3605,8 @@ class GatedBFlowRatioField:
             device=bank.device, dtype=bank.dtype
         ).reshape(-1)
         self.complement_strength = float(complement_strength)
+        self.apply_gate_filter = bool(apply_gate_filter)
+        self.restore_cancellation = bool(restore_cancellation)
         if int(self.endpoint_log_tilt.numel()) != int(bank.N):
             raise ValueError(
                 f"GatedBFlowRatioField tilt has {self.endpoint_log_tilt.numel()} labels "
@@ -3549,6 +3621,8 @@ class GatedBFlowRatioField:
             self.method,
             self.endpoint_log_tilt,
             self.complement_strength,
+            apply_gate_filter=self.apply_gate_filter,
+            restore_cancellation=self.restore_cancellation,
         )
 
     @torch.no_grad()
@@ -3583,6 +3657,8 @@ class GatedBFlowRatioField:
         residual_norm_vals: List[torch.Tensor] = []
         gate_consistency_vals: List[torch.Tensor] = []
         gate_antisym_vals: List[torch.Tensor] = []
+        cancellation_norm_vals: List[torch.Tensor] = []
+        identity_residual_vals: List[torch.Tensor] = []
         for tt in ts:
             alpha, gamma = alpha_gamma(tt, device=self.bank.device, dtype=self.bank.dtype)
             # Deterministic probe locations avoid adding a second source of
@@ -3594,6 +3670,8 @@ class GatedBFlowRatioField:
                 self.method,
                 self.endpoint_log_tilt,
                 self.complement_strength,
+                apply_gate_filter=self.apply_gate_filter,
+                restore_cancellation=self.restore_cancellation,
             )
             cond_ess_vals.append(parts["target_cond_ess"].reshape(-1))
             raw_eig_vals.append(parts["raw_gate_eigs"].reshape(-1))
@@ -3601,15 +3679,22 @@ class GatedBFlowRatioField:
             residual_norm_vals.append(torch.linalg.norm(parts["residual"], dim=1))
             gate_consistency_vals.append(torch.linalg.norm(parts["gate_consistency_residual"], dim=1))
             gate_antisym_vals.append(parts["gate_antisym_frob"].reshape(-1))
+            cancellation_norm_vals.append(torch.linalg.norm(parts["cancellation_correction"], dim=1))
+            identity_residual_vals.append(torch.linalg.norm(parts["completed_identity_residual"], dim=1))
         cond = torch.cat(cond_ess_vals)
         eig = torch.cat(raw_eig_vals)
         corr = torch.cat(corr_norm_vals)
         resid = torch.cat(residual_norm_vals)
         gate_consistency = torch.cat(gate_consistency_vals)
         gate_antisym = torch.cat(gate_antisym_vals)
+        cancellation_norm = torch.cat(cancellation_norm_vals)
+        identity_residual = torch.cat(identity_residual_vals)
         clipped = (eig < 0.0) | (eig > 1.0)
         gate_policy = canonical_ratio_gate_policy(getattr(cfg, "ratio_gate_policy", "native"))
         return {
+            "ratio_bflow_filter": "I-G+Gdc" if self.restore_cancellation else ("I-G" if self.apply_gate_filter else "I"),
+            "ratio_bflow_filter_applied": bool(self.apply_gate_filter),
+            "ratio_cancellation_restored": bool(self.restore_cancellation),
             "ratio_gate_policy": gate_policy,
             "ratio_target_cond_ess_min": safe_float(cond.min()),
             "ratio_target_cond_ess_median": safe_float(torch.median(cond)),
@@ -3624,6 +3709,9 @@ class GatedBFlowRatioField:
             "ratio_complement_correction_norm_mean": safe_float(corr.mean()),
             "ratio_density_residual_norm_mean": safe_float(resid.mean()),
             "ratio_bflow_residual_norm_mean": safe_float(resid.mean()),
+            "ratio_cancellation_correction_norm_mean": safe_float(cancellation_norm.mean()),
+            "ratio_completed_identity_residual_mean": safe_float(identity_residual.mean()),
+            "ratio_completed_identity_residual_max": safe_float(identity_residual.max()),
             "ratio_gate_carrier_consistency_residual_mean": safe_float(gate_consistency.mean()),
             "ratio_gate_raw_antisym_frob_mean": safe_float(gate_antisym.mean()),
         }
@@ -5400,14 +5488,29 @@ def canonical_ratio_method(value: str) -> str:
         "bflow": "gated-bflow",
         "complement-bflow": "gated-bflow",
         "shared-bflow": "gated-bflow",
+        "raw-bflow": "raw-bflow",
+        "raw-bf": "raw-bflow",
+        "ungated-bflow": "raw-bflow",
+        "ungated-bf": "raw-bflow",
+        "full-bflow": "raw-bflow",
+        "doob-bflow": "raw-bflow",
+        "completed-bflow": "completed-bflow",
+        "completed-bf": "completed-bflow",
+        "complete-bflow": "completed-bflow",
+        "full-lfgi-bflow": "completed-bflow",
+        "tilted-lfgi-bflow": "completed-bflow",
+        "shared-full-bflow": "completed-bflow",
     }
     if key not in aliases:
-        raise ValueError(f"Unknown ratio method {value!r}; use raw-w, gated-pflow, or gated-bflow")
+        raise ValueError(
+            f"Unknown ratio method {value!r}; use raw-w, gated-pflow, "
+            "gated-bflow, raw-bflow, or completed-bflow"
+        )
     return aliases[key]
 
 
 def is_moved_ratio_flow(value: str) -> bool:
-    return canonical_ratio_method(value) in {"gated-pflow", "gated-bflow"}
+    return canonical_ratio_method(value) in {"gated-pflow", "gated-bflow", "raw-bflow", "completed-bflow"}
 
 
 def method_label(
@@ -5625,6 +5728,7 @@ def run_gated_bflow_ratio_node(
     starting_pool: torch.Tensor,
     starting_logq: torch.Tensor,
     pf_method: str,
+    ratio_method: str,
     ratio_rounds: int,
     target,
     truth: torch.Tensor,
@@ -5644,20 +5748,31 @@ def run_gated_bflow_ratio_node(
     Dict[str, object],
     Dict[str, object],
 ]:
-    """Apply one or more refreshed shared-statistic b-flow ratio transports.
+    """Apply refreshed gated, raw, or completed b-flow ratio transports.
 
     Each inner round rebuilds the selected Method-2 carrier and native gate on
-    the current unweighted particle bank, rebuilds the canonical untilted and
-    density-tilted Tweedie statistics ``b_q`` and ``b_pi``, and integrates
-    ``s_method + lambda(I-G_method)(b_pi-b_q)``.  The moved endpoint and its
-    incoming certificate define the next inner round, so repeated b-flow rounds
-    are unfrozen at the iteration level.
+    the current unweighted particle bank, together with coupled untilted/tilted
+    Tweedie and target-score statistics ``b_q,b_pi,c_q,c_pi``.  The gated mode
+    uses ``s_method + lambda(I-G_method)(b_pi-b_q)``; the raw control uses
+    ``s_method + lambda(b_pi-b_q)``; completed-bflow additionally restores
+    ``lambda G_method(c_pi-c_q)``.  The moved endpoint and its incoming
+    certificate define the next inner round, so repeated b-flow rounds are
+    unfrozen at the iteration level.
     """
+    ratio_method = canonical_ratio_method(ratio_method)
+    if ratio_method not in {"gated-bflow", "raw-bflow", "completed-bflow"}:
+        raise ValueError(
+            f"b-flow runner requires gated-bflow, raw-bflow, or completed-bflow; got {ratio_method!r}"
+        )
+    apply_gate_filter = ratio_method in {"gated-bflow", "completed-bflow"}
+    restore_cancellation = ratio_method == "completed-bflow"
     n_rounds = int(ratio_rounds)
     if n_rounds < 1:
-        raise ValueError(f"gated-bflow ratio rounds must be >=1; got {ratio_rounds}")
+        raise ValueError(f"{ratio_method} ratio rounds must be >=1; got {ratio_rounds}")
     if canonical_score_method_key(pf_method) == "none":
-        raise ValueError("gated-bflow requires a non-none ratio/PF score estimator with a defined gate")
+        raise ValueError(
+            f"{ratio_method} requires a non-none ratio/PF score estimator with a defined carrier"
+        )
 
     pool_n = proposal_pool_size(cfg)
     current_pool = starting_pool[:pool_n].detach().clone()
@@ -5697,6 +5812,8 @@ def run_gated_bflow_ratio_node(
             pf_method,
             score_tilt,
             complement_strength=float(cfg.lambda_guard),
+            apply_gate_filter=apply_gate_filter,
+            restore_cancellation=restore_cancellation,
         )
 
         # Only the final inner round needs the full evaluation cloud.  Earlier
@@ -5714,7 +5831,7 @@ def run_gated_bflow_ratio_node(
             generator=flow_gen,
             n_samples=generate_n,
             steps=int(cfg.pf_steps),
-            phase_name=f"ratio:gated-bflow:{pf_method}:inner{inner}",
+            phase_name=f"ratio:{ratio_method}:{pf_method}:inner{inner}",
         )
         moved_pool = moved_all[:pool_n].detach()
         moved_logq = moved_logq_all[:pool_n].detach()
@@ -5734,6 +5851,9 @@ def run_gated_bflow_ratio_node(
             "ratio_input_pool_n": int(current_pool.shape[0]),
             "ratio_generated_n": int(moved_all.shape[0]),
             "ratio_complement_strength": float(cfg.lambda_guard),
+            "ratio_bflow_filter": "I-G+Gdc" if restore_cancellation else ("I-G" if apply_gate_filter else "I"),
+            "ratio_bflow_filter_applied": bool(apply_gate_filter),
+            "ratio_cancellation_restored": bool(restore_cancellation),
             "ratio_input_logq_mean": safe_float(current_logq.mean()),
             "ratio_input_logq_std": safe_float(current_logq.std(unbiased=False)),
             "ratio_raw_log_ratio_mean": safe_float(raw_rho.mean()),
@@ -5766,11 +5886,27 @@ def run_gated_bflow_ratio_node(
 
     output_zero_rho = torch.zeros((current_pool.shape[0],), device=current_pool.device, dtype=current_pool.dtype)
     aggregate = {
-        "ratio_method": "gated-bflow",
+        "ratio_method": ratio_method,
         "ratio_score_method": str(pf_method),
-        "ratio_gate_source": "estimator-native",
-        "ratio_field_definition": "s_method + lambda*(I-G_method)*(b_pi-b_q)",
+        "ratio_gate_source": (
+            "estimator-native-complement-plus-cancellation"
+            if restore_cancellation else (
+                "estimator-native-complement" if apply_gate_filter
+                else "identity-filter; estimator-native-gate-used-only-by-carrier"
+            )
+        ),
+        "ratio_bflow_filter": "I-G+Gdc" if restore_cancellation else ("I-G" if apply_gate_filter else "I"),
+        "ratio_bflow_filter_applied": bool(apply_gate_filter),
+        "ratio_cancellation_restored": bool(restore_cancellation),
+        "ratio_field_definition": (
+            "s_method + lambda*((I-G_method)*(b_pi-b_q) + G_method*(c_pi-c_q))"
+            if restore_cancellation else (
+                "s_method + lambda*(I-G_method)*(b_pi-b_q)" if apply_gate_filter
+                else "s_method + lambda*(b_pi-b_q)"
+            )
+        ),
         "ratio_b_vectors": "canonical-current-bank-untilted-and-density-tilted-tweedie",
+        "ratio_c_vectors": "canonical-current-bank-untilted-and-density-tilted-target-score",
         "ratio_refresh_mode": "current-particles-every-inner-round",
         "ratio_rounds": int(n_rounds),
         "ratio_rounds_requested": int(n_rounds),
@@ -5820,7 +5956,7 @@ def run_family(
 
     Each outer round consists of ``transport_repeats`` current-particle steps,
     followed by either the legacy raw importance-weight node or one or more
-    refreshed complement-gated p-flow or b-flow ratio rounds.  The transport
+    refreshed gated-p-flow, gated-b-flow, or raw-b-flow ratio rounds.  The transport
     field that actually generates the endpoint also emits its incoming density
     certificate.  The second score method supplies the refreshed ratio carrier/gate modality; b-flow additionally uses the canonical b_q/b_pi pair on that same current score bank.  Transport substeps consume the particles produced by
     the preceding substep; ratio rounds do the same with their moved particles.
@@ -6155,12 +6291,19 @@ def run_family(
             calib_info = likelihood_correction_calibration(target, endpoint_score_refs, score_logq, score_raw_rho, cfg)
             if ratio_method == "raw-w":
                 next_pool_out = final_pool
-                next_rho, rho_info = finalize_density_ratio_weights(raw_rho, cfg)
+                # Keep the raw-weight arm on the same endpoint-label policy as
+                # both flow arms.  Under ratio_tilt_policy=exact this is the
+                # literal centered log(pi/q), with no clipping, tempering, or
+                # ESS floor; stabilized retains the legacy guarded behavior.
+                next_rho, rho_info = prepare_ratio_flow_tilt(raw_rho, cfg)
                 ratio_info.update({
                     "ratio_skipped": False,
                     "ratio_returns_unweighted_particles": False,
                     "ratio_rounds": 0,
                     "ratio_rounds_ignored_for_raw_w": int(ratio_rounds),
+                    "ratio_tilt_policy": canonical_ratio_tilt_policy(
+                        getattr(cfg, "ratio_tilt_policy", "exact")
+                    ),
                 })
             elif ratio_method == "gated-pflow":
                 (
@@ -6188,7 +6331,7 @@ def run_family(
                 )
                 ratio_info.update(gated_info)
                 ratio_info.update({f"ratio_final_{k}": v for k, v in gated_output_pf_info.items()})
-            elif ratio_method == "gated-bflow":
+            elif ratio_method in {"gated-bflow", "raw-bflow", "completed-bflow"}:
                 (
                     next_pool_out,
                     next_rho,
@@ -6202,6 +6345,7 @@ def run_family(
                     starting_pool=final_pool,
                     starting_logq=logq,
                     pf_method=pf_method,
+                    ratio_method=ratio_method,
                     ratio_rounds=ratio_rounds,
                     target=target,
                     truth=truth,
@@ -6592,7 +6736,7 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int, str, int]:
 
         <transport estimator>-<transport repeats>_<ratio estimator>_<ratio method>-<ratio rounds>
 
-    ``raw-w`` accepts and ignores an optional final integer; both moved-flow nodes use it.  For backward
+    ``raw-w`` accepts and ignores an optional final integer; all moved-flow nodes use it.  For backward
     compatibility, a token with no explicit ratio suffix is interpreted as the
     old transport/PF pair followed by ``raw-w``.
     """
@@ -6605,7 +6749,7 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int, str, int]:
     # is then delegated to the existing alias-aware pair parser, so estimator
     # names containing underscores remain unambiguous.
     m = re.match(
-        r"^(.*)_(gated[-_](?:pflow|bflow)|raw[-_]w)(?:-([0-9]+)|_([0-9]+))?$",
+        r"^(.*)_((?:gated|raw|completed|full[-_]lfgi|tilted[-_]lfgi)[-_](?:pflow|bflow)|raw[-_]w)(?:-([0-9]+)|_([0-9]+))?$",
         raw,
     )
     if m is None:
@@ -6620,9 +6764,9 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int, str, int]:
         fam, transport, pf_method, repeats = _parse_score_pair_token(prefix)
         ratio_method = canonical_ratio_method(ratio_raw)
         ratio_rounds = int(rounds_raw) if rounds_raw is not None else 1
-        if ratio_method == "gated-bflow" and canonical_score_method_key(pf_method) == "none":
+        if ratio_method in {"gated-bflow", "raw-bflow", "completed-bflow"} and canonical_score_method_key(pf_method) == "none":
             raise ValueError(
-                f"gated-bflow requires a non-none method-2 carrier/gate in {token!r}"
+                f"{ratio_method} requires a non-none method-2 carrier/gate in {token!r}"
             )
         if ratio_rounds < 1:
             raise ValueError(f"ratio round count must be >=1 in {token!r}")
@@ -6633,6 +6777,8 @@ def _parse_method_token(token: str) -> Tuple[str, str, str, int, str, int]:
     ratio_disp = {
         "gated-pflow": "GatedPFlow",
         "gated-bflow": "GatedBFlow",
+        "raw-bflow": "RawBFlow",
+        "completed-bflow": "CompletedBFlow",
         "raw-w": "Raw-W",
     }[ratio_method]
     family = f"{fam}->{ratio_disp}"
@@ -6674,7 +6820,9 @@ def selected_method_specs(methods: str) -> List[Tuple[str, str, str, int, str, i
     if not out:
         raise ValueError(
             "No methods selected. Example: --methods "
-            "lfgi_lfgi_gated-bflow-1,lfgi_lfgi_gated-pflow-1 or --methods bflow-alternating"
+            "lfgi_lfgi_gated-bflow-1,lfgi_lfgi_completed-bflow-1,"
+            "lfgi_lfgi_raw-bflow-1,lfgi_lfgi_raw-w "
+            "or --methods bflow-alternating"
         )
     return out
 
@@ -6687,6 +6835,39 @@ def make_target(cfg: Config, device: torch.device, dtype: torch.dtype):
             device=device,
             dtype=dtype,
         )
+    if key in {"gmm_16", "gmm16", "singular_gmm16", "singular_gmm_16", "rank3_gmm16"}:
+        # Dedicated finite-bank stress target: every component has only three
+        # appreciable local covariance directions in ambient dimension 16.
+        # The component subspaces are independently rotated, then the full
+        # mixture is whitened.  Consequently N(0,I) has the correct global
+        # moments but extremely poor local overlap with the thin component
+        # tubes—the intended importance-weight/conditional-ESS failure mode.
+        target = MisalignedSubspaceGMM(
+            d=16,
+            rank=3,
+            n_components=8,
+            seed=cfg.target_seed,
+            radius=cfg.radius,
+            sigma_perp=cfg.sigma_perp,
+            jitter=cfg.jitter,
+            normalize=cfg.normalize_target,
+            device=device,
+            dtype=dtype,
+        )
+        target.name = "gmm_16"
+        target.target_info = lambda target=target: {
+            "target_name": "gmm_16",
+            "target_type": "singular_subspace_gmm_stress",
+            "target_dim": int(target.d),
+            "gmm_rank": int(target.rank),
+            "gmm_n_components": int(target.K),
+            "gmm_sigma_perp": float(target.sigma_perp),
+            "gmm_radius": float(target.radius),
+            "gmm_jitter": float(target.jitter),
+            "gmm_normalized": bool(target.normalized),
+            "stress_comparison": "gated-bflow_vs_completed-bflow_vs_raw-bflow_vs_raw-w",
+        }
+        return target
     if key in {"misaligned_gmm", "gmm", "gmm8", "misaligned8d", "current", "current8d"}:
         target = MisalignedSubspaceGMM(
             d=cfg.d,
@@ -6843,7 +7024,7 @@ def make_target(cfg: Config, device: torch.device, dtype: torch.dtype):
         )
 
     raise ValueError(
-        "Unknown --target {!r}. Use stiff_misaligned_gmm3d, misaligned_gmm, funnel_d10, banana, sine, ring, rings, "
+        "Unknown --target {!r}. Use stiff_misaligned_gmm3d, misaligned_gmm, gmm_16, funnel_d10, banana, sine, ring, rings, "
         "spiral, double_well, lj13_2d, or dw4_16d.".format(cfg.target)
     )
 
