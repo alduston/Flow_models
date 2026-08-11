@@ -37,6 +37,102 @@ DATASET_INFO = {
 
 
 # ---------------------------------------------------------------------------
+# Dataset-dependent experiment presets
+# ---------------------------------------------------------------------------
+#
+# CIFAR/GCIFAR use the canonical CSEM golden capacity.
+# MNIST-family datasets use the earlier compact grayscale setup:
+#   4 latent channels, base_ch=32, DiT 192 x 8, batch 128.
+#
+# These presets intentionally change capacity/batch/LR/training-length defaults,
+# NOT the scientific scale-anchor comparison.  In every preset:
+#   baseline = GroupNorm mean + canonical weak normal KL/stiffness terms
+#   terminal = no GroupNorm + terminal K_T, with stiffness disabled
+#
+DATASET_PRESETS = {
+    "cifar_golden": {
+        "batch_size": 256,
+        "latent_channels": 8,
+        "cond_emb_dim": 32,
+        "dit_patch_size": 1,
+        "dit_hidden_dim": 384,
+        "dit_depth": 12,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        "base_ch": 64,
+        "num_res_blocks": 2,
+        "decoder_attn_half": True,
+        "latent_proj_depth": 2,
+        "encoder_attn_half": True,
+        "decoder_extra_block": True,
+        "conv3x3_proj": True,
+        "use_tanh_out": False,
+        "clamp_logvar": True,
+        "attn_zero_init": False,
+        "lr_vae": 2.5e-4,
+        "lr_ldm": 1.0e-4,
+        "lr_refine": 1.5e-5,
+        "epochs": 800,
+        "refine_epochs": 100,
+        "lr_schedule_epochs": 800,
+        "eval_every": 100,
+        "eval_samples": 10000,
+    },
+    "mnist_small": {
+        "batch_size": 128,
+        "latent_channels": 4,
+        "cond_emb_dim": 32,
+        "dit_patch_size": 1,
+        "dit_hidden_dim": 192,
+        "dit_depth": 8,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        "base_ch": 32,
+        "num_res_blocks": 2,
+        "decoder_attn_half": True,
+        "latent_proj_depth": 2,
+        "encoder_attn_half": True,
+        "decoder_extra_block": True,
+        "conv3x3_proj": True,
+        "use_tanh_out": False,
+        "clamp_logvar": True,
+        "attn_zero_init": False,
+        "lr_vae": 5.0e-4,
+        "lr_ldm": 2.0e-4,
+        "lr_refine": 1.0e-5,
+        "epochs": 450,
+        "refine_epochs": 0,
+        # Small-target runs are treated as complete runs rather than prefixes
+        # of the 800-epoch CIFAR trajectory.
+        "lr_schedule_epochs": None,
+        "eval_every": 25,
+        "eval_samples": 2000,
+    },
+}
+
+DATASET_TO_PRESET = {
+    "CIFAR": "cifar_golden",
+    "GCIFAR": "cifar_golden",
+    "MNIST": "mnist_small",
+    "FMNIST": "mnist_small",
+    "EMNIST": "mnist_small",
+    "KMNIST": "mnist_small",
+}
+
+
+def resolve_model_preset(dataset: str, requested: str = "auto") -> tuple[str, dict]:
+    if requested == "auto":
+        name = DATASET_TO_PRESET[dataset]
+    else:
+        name = requested
+    if name not in DATASET_PRESETS:
+        raise ValueError(f"Unknown model preset {name!r}")
+    return name, dict(DATASET_PRESETS[name])
+
+
+# ---------------------------------------------------------------------------
 # Imports & Checks
 # ---------------------------------------------------------------------------
 try:
@@ -4142,6 +4238,8 @@ def train_vae_cotrained_cond(cfg):
     loss_records = []
     eval_records = []
 
+    mechanism_diagnostics = bool(cfg.get("mechanism_diagnostics", False))
+
     print("--> Starting Dual Co-training...")
     for ep in range(cfg["epochs_vae"]):
         epoch_t0 = time.perf_counter()
@@ -4181,7 +4279,8 @@ def train_vae_cotrained_cond(cfg):
             # Reparameterize z0 from encoder
             z0 = vae.reparameterize(mu, logvar)
 
-            if len(mu_stats) < 5: mu_stats.append(mu.detach())
+            if mechanism_diagnostics and len(mu_stats) < 5:
+                mu_stats.append(mu.detach())
 
             # --- Time / forward process (BEFORE decode) ---
             if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
@@ -4263,11 +4362,16 @@ def train_vae_cotrained_cond(cfg):
             else:
                 raise ValueError(f"Unknown kl_reg_type: {reg_type}")
 
-            # Mechanism diagnostics are computed for BOTH arms, irrespective of
-            # which regularizer enters the loss.
-            terminal_kl_diag = terminal_component_kl_from_schedule(mu, logvar, ou_sched)
-            latent_mu_sq_diag = mu.pow(2).mean()
-            posterior_var_diag = var_0.mean()
+            # Optional mechanism-only diagnostics. Disabled for the CIFAR
+            # golden comparison to avoid extra work in the hot training loop.
+            if mechanism_diagnostics:
+                terminal_kl_diag = terminal_component_kl_from_schedule(mu, logvar, ou_sched)
+                latent_mu_sq_diag = mu.pow(2).mean()
+                posterior_var_diag = var_0.mean()
+            else:
+                terminal_kl_diag = torch.tensor(0.0, device=device)
+                latent_mu_sq_diag = torch.tensor(0.0, device=device)
+                posterior_var_diag = torch.tensor(0.0, device=device)
 
             # --- Compute score losses ---
             cos_w = float(cfg.get("cosine_w", 1.0))
@@ -4481,19 +4585,27 @@ def train_vae_cotrained_cond(cfg):
         epoch_sec = time.perf_counter() - epoch_t0
         remaining = cfg["epochs_vae"] - (ep + 1)
         eta_min = (remaining * epoch_sec) / 60.0
-        print(
-            f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
-            f"Rec: {epoch_metrics['recon']:.4f} | KL(loss): {epoch_metrics['kl']:.4f} | "
-            f"K_T(diag): {epoch_metrics['terminal_kl']:.5f} | "
-            f"latent_rms: {epoch_metrics['latent_rms']:.4f} | "
-            f"post_var: {epoch_metrics['posterior_var']:.5f} | "
-            f"Perc: {epoch_metrics['perc']:.4f} | "
-            f"GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | "
-            f"{epoch_sec:.1f}s/ep | arm ETA~{eta_min:.1f}m"
-        )
-
-        if len(mu_stats) > 0:
-            log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
+        if mechanism_diagnostics:
+            print(
+                f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+                f"Rec: {epoch_metrics['recon']:.4f} | KL(loss): {epoch_metrics['kl']:.4f} | "
+                f"K_T(diag): {epoch_metrics['terminal_kl']:.5f} | "
+                f"latent_rms: {epoch_metrics['latent_rms']:.4f} | "
+                f"post_var: {epoch_metrics['posterior_var']:.5f} | "
+                f"Perc: {epoch_metrics['perc']:.4f} | "
+                f"GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | "
+                f"{epoch_sec:.1f}s/ep | arm ETA~{eta_min:.1f}m"
+            )
+            if len(mu_stats) > 0:
+                log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
+        else:
+            print(
+                f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+                f"Rec: {epoch_metrics['recon']:.4f} | KL(loss): {epoch_metrics['kl']:.4f} | "
+                f"Perc: {epoch_metrics['perc']:.4f} | "
+                f"GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | "
+                f"{epoch_sec:.1f}s/ep | arm ETA~{eta_min:.1f}m"
+            )
 
         # --- Step cosine LR schedulers ---
         sched_joint.step()
@@ -4578,15 +4690,29 @@ def train_vae_cotrained_cond(cfg):
         for p in vae.parameters():
             p.requires_grad = False
 
-        opt_lsi_refine = optim.AdamW(unet_lsi.parameters(), lr=lr_refine, weight_decay=1e-4, betas=(0.9, float(cfg.get("adam_beta2", 0.95))))
-        opt_control_refine = optim.AdamW(unet_control.parameters(), lr=lr_refine, weight_decay=1e-4, betas=(0.9, float(cfg.get("adam_beta2", 0.95))))
+        opt_lsi_refine = optim.AdamW(
+            unet_lsi.parameters(), lr=lr_refine, weight_decay=1e-4,
+            betas=(0.9, float(cfg.get("adam_beta2", 0.95)))
+        )
+        opt_control_refine = (
+            optim.AdamW(
+                unet_control.parameters(), lr=lr_refine, weight_decay=1e-4,
+                betas=(0.9, float(cfg.get("adam_beta2", 0.95)))
+            )
+            if train_tracking_head else None
+        )
 
         # --- Cosine LR Schedulers (refine phase) ---
         sched_lsi_refine = CosineAnnealingLR(opt_lsi_refine, T_max=epochs_refine, eta_min=1e-7)
-        sched_control_refine = CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=1e-7)
+        sched_control_refine = (
+            CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=1e-7)
+            if opt_control_refine is not None else None
+        )
 
         for ep in range(epochs_refine):
-            unet_lsi.train(); unet_control.train()
+            unet_lsi.train()
+            if train_tracking_head:
+                unet_control.train()
             metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control", "aux_lam", "aux_nu"]}
 
             for x, y in tqdm(train_l, desc=f"Refine Ep {ep+1}", leave=False):
@@ -4678,26 +4804,28 @@ def train_vae_cotrained_cond(cfg):
                     for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
                         p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
-                # --- Control (eps baseline) ---
-                eps_target_control = noise
-                if cfg.get("train_on_mu", False):
-                    eps_pred_control = unet_control(z_mu_t, t, y_in)
-                else:
-                    eps_pred_control = unet_control(z_t, t, y_in)
+                score_loss_control = torch.tensor(0.0, device=device)
+                if train_tracking_head:
+                    # --- Control (eps baseline) ---
+                    eps_target_control = noise
+                    if cfg.get("train_on_mu", False):
+                        eps_pred_control = unet_control(z_mu_t, t, y_in)
+                    else:
+                        eps_pred_control = unet_control(z_t, t, y_in)
 
-                loss_mse_ctrl = F.mse_loss(eps_pred_control, eps_target_control)
-                loss_cos_ctrl = (1.0 - F.cosine_similarity(eps_pred_control.flatten(1), eps_target_control.flatten(1), dim=1)).mean()
-                score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
+                    loss_mse_ctrl = F.mse_loss(eps_pred_control, eps_target_control)
+                    loss_cos_ctrl = (1.0 - F.cosine_similarity(eps_pred_control.flatten(1), eps_target_control.flatten(1), dim=1)).mean()
+                    score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
 
-                opt_control_refine.zero_grad()
-                score_loss_control.backward()
-                nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
-                opt_control_refine.step()
+                    opt_control_refine.zero_grad()
+                    score_loss_control.backward()
+                    nn.utils.clip_grad_norm_(unet_control.parameters(), 1.0)
+                    opt_control_refine.step()
 
-                # --- EMA Update (Control) ---
-                with torch.no_grad():
-                    for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
-                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    # --- EMA Update (Control) ---
+                    with torch.no_grad():
+                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
 
                 metrics_refine["score_lsi"] += score_loss_lsi.item()
                 metrics_refine["score_control"] += score_loss_control.item()
@@ -4726,7 +4854,8 @@ def train_vae_cotrained_cond(cfg):
 
             # --- Step cosine LR schedulers ---
             sched_lsi_refine.step()
-            sched_control_refine.step()
+            if sched_control_refine is not None:
+                sched_control_refine.step()
 
             if (ep + 1) % eval_freq_refine == 0:
                 # For refine phase:
@@ -4760,33 +4889,35 @@ def train_vae_cotrained_cond(cfg):
                     results_lsi["tag"] = "LSI_Diff_Refine"
                     eval_records.append(results_lsi)
 
-                results_ctrl = evaluate_current_state(
-                        ldm_epoch,
-                        "Ctrl_Diff_Refine",
-                        vae,
-                        unet_control_ema,
-                        test_l,
-                        cfg,
-                        device,
-                        lpips_fn,
-                        fixed_noise_bank=fixed_noise_bank,
-                        fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
-                        fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
-                        fixed_sw2_theta=fixed_sw2_theta,
-                        results_dir=results_dir,
-                        fid_model=fid_model,
-                        use_lenet_fid=use_lenet_fid,
-                )
-                if results_ctrl is not None:
-                    results_ctrl["epoch"] = ldm_epoch
-                    results_ctrl["stage"] = "refine"
-                    results_ctrl["tag"] = "Ctrl_Diff_Refine"
-                    eval_records.append(results_ctrl)
+                if train_tracking_head:
+                    results_ctrl = evaluate_current_state(
+                            ldm_epoch,
+                            "Ctrl_Diff_Refine",
+                            vae,
+                            unet_control_ema,
+                            test_l,
+                            cfg,
+                            device,
+                            lpips_fn,
+                            fixed_noise_bank=fixed_noise_bank,
+                            fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
+                            fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
+                            fixed_sw2_theta=fixed_sw2_theta,
+                            results_dir=results_dir,
+                            fid_model=fid_model,
+                            use_lenet_fid=use_lenet_fid,
+                    )
+                    if results_ctrl is not None:
+                        results_ctrl["epoch"] = ldm_epoch
+                        results_ctrl["stage"] = "refine"
+                        results_ctrl["tag"] = "Ctrl_Diff_Refine"
+                        eval_records.append(results_ctrl)
 
     # --- Save Checkpoints ---
     save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
     save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
-    save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
+    if train_tracking_head:
+        save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
 
     # --- Create DataFrames ---
     loss_df = pd.DataFrame(loss_records)
@@ -5081,10 +5212,11 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
     combined_loss.to_csv(
         os.path.join(combined_dir, "combined_loss_history.csv"), index=False
     )
-    save_scale_anchor_mechanism_plots(
-        combined_loss,
-        os.path.join(master_results_dir, "mechanism_plots"),
-    )
+    if bool(cfg_norm.get("mechanism_diagnostics", False)):
+        save_scale_anchor_mechanism_plots(
+            combined_loss,
+            os.path.join(master_results_dir, "mechanism_plots"),
+        )
 
     eval_norm_save = eval_norm.copy()
     eval_norm_save["scale_anchor"] = "current_scale_norm"
@@ -5120,28 +5252,30 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
 
 # --- END NEW FUNCTIONS ---
 def main():
-    """
-    Main function that runs co-trained vs independent comparison experiment.
-
-    Comparison setup:
-    - Co-trained: 200 cotrain epochs + 50 refine epochs = 250 LDM training epochs
-    - Independent: 50 VAE-only epochs + 250 refine epochs = 250 LDM training epochs
-
-    Both experiments have the same total LDM training epochs for fair comparison.
-    X-axis on plots = "LDM Training Epoch" (1-250 for both)
-    """
-
     parser = argparse.ArgumentParser(
         description=(
-            "Run the canonical CSEM co-training recipe as a paired comparison "
-            "between its current latent scale normalization and a terminal-T KL anchor."
+            "Paired CSEM scale-anchor comparison with automatic dataset-dependent "
+            "capacity presets: CIFAR uses the golden CSEM setup; MNIST-family "
+            "datasets use the compact grayscale setup."
         )
     )
     parser.add_argument(
         "--dataset",
-        default="MNIST",
+        default="CIFAR",
         choices=list(DATASET_INFO.keys()),
-        help="Dataset for both paired runs. Default: MNIST.",
+        help=(
+            "Dataset for both paired runs. Architecture/batch/LR defaults are "
+            "selected automatically from the dataset."
+        ),
+    )
+    parser.add_argument(
+        "--model-preset",
+        choices=["auto", "cifar_golden", "mnist_small"],
+        default="auto",
+        help=(
+            "Model/training preset. 'auto' maps CIFAR/GCIFAR -> cifar_golden "
+            "and MNIST/FMNIST/EMNIST/KMNIST -> mnist_small."
+        ),
     )
     parser.add_argument(
         "--terminal-kl-w",
@@ -5149,32 +5283,65 @@ def main():
         default=1.0,
         help=(
             "Weight multiplying K_T in the terminal-KL arm only. "
-            "The scale-normalized baseline keeps the canonical script's kl_w unchanged."
+            "The scale-normalized baseline keeps its canonical weak KL unchanged."
         ),
     )
     parser.add_argument(
         "--master-results-dir",
-        default="run_results_mnist_scale_norm_vs_terminal_kl_fast",
+        default=None,
+        help=(
+            "Output root. Default is derived from dataset, e.g. "
+            "run_results_fmnist_scale_norm_vs_terminal_kl."
+        ),
     )
+
+    # None means: take the natural value from the selected dataset preset.
     parser.add_argument(
         "--epochs",
         type=int,
-        default=30,
-        help="Joint co-training epochs per arm in mechanism mode (default: 30).",
+        default=None,
+        help="Joint co-training epochs per arm. Default comes from the dataset preset.",
+    )
+    parser.add_argument(
+        "--refine-epochs",
+        type=int,
+        default=None,
+        help="Frozen-VAE CSEM refinement epochs per arm. Default comes from the dataset preset.",
+    )
+    parser.add_argument(
+        "--lr-vae",
+        type=float,
+        default=None,
+        help="Override VAE/encoder-decoder AdamW LR; otherwise use preset default.",
+    )
+    parser.add_argument(
+        "--lr-ldm",
+        type=float,
+        default=None,
+        help=(
+            "Override base CSEM/DiT AdamW LR; otherwise use preset default. "
+            "The co-trained LSI head uses lr_ldm / score_w_vae."
+        ),
+    )
+    parser.add_argument(
+        "--lr-refine",
+        type=float,
+        default=None,
+        help="Override frozen-VAE refinement LR; otherwise use preset default.",
     )
     parser.add_argument(
         "--eval-samples",
         type=int,
-        default=2000,
-        help="Maximum test examples used in each evaluation.",
+        default=None,
+        help="Maximum test examples per evaluation; otherwise use preset default.",
     )
     parser.add_argument(
         "--eval-every",
         type=int,
-        default=0,
+        default=None,
         help=(
-            "Evaluate every N co-training epochs. "
-            "0 (default) means evaluate only at the final epoch."
+            "Evaluate every N co-training epochs. 0 means final epoch only. "
+            "If omitted, use preset default."
         ),
     )
     parser.add_argument(
@@ -5182,26 +5349,54 @@ def main():
         choices=["terminal_kl", "norm"],
         default="terminal_kl",
         help=(
-            "Which paired branch runs first. "
-            "'terminal_kl' = no scale normalization + terminal-T KL; "
-            "'norm' = canonical latent normalization branch."
+            "Which paired branch runs first. 'terminal_kl' = no scale normalization "
+            "+ terminal-T KL; 'norm' = scale-normalized baseline."
         ),
     )
     parser.add_argument(
         "--full-golden",
         action="store_true",
         help=(
-            "Restore the original 800 cotrain + 100 refine schedule, control-head "
-            "tracking, full 10k evaluation, and exact oracle diagnostics."
+            "Legacy reporting switch: force 800+100 schedule, full evaluation, "
+            "and visualization density. Architecture still follows --model-preset. "
+            "Control/oracle diagnostics remain disabled."
         ),
     )
     args = parser.parse_args()
-    if args.epochs < 1:
+
+    preset_name, preset = resolve_model_preset(args.dataset, args.model_preset)
+
+    epochs = int(args.epochs if args.epochs is not None else preset["epochs"])
+    refine_epochs = int(
+        args.refine_epochs if args.refine_epochs is not None else preset["refine_epochs"]
+    )
+    lr_vae = float(args.lr_vae if args.lr_vae is not None else preset["lr_vae"])
+    lr_ldm = float(args.lr_ldm if args.lr_ldm is not None else preset["lr_ldm"])
+    lr_refine = float(
+        args.lr_refine if args.lr_refine is not None else preset["lr_refine"]
+    )
+    eval_samples = int(
+        args.eval_samples if args.eval_samples is not None else preset["eval_samples"]
+    )
+    eval_every = int(
+        args.eval_every if args.eval_every is not None else preset["eval_every"]
+    )
+    master_results_dir = (
+        args.master_results_dir
+        if args.master_results_dir is not None
+        else f"run_results_{args.dataset.lower()}_scale_norm_vs_terminal_kl"
+    )
+
+    if epochs < 1:
         raise ValueError("--epochs must be >= 1")
-    if args.eval_samples < 2:
+    if refine_epochs < 0:
+        raise ValueError("--refine-epochs must be >= 0")
+    if eval_samples < 2:
         raise ValueError("--eval-samples must be >= 2")
-    if args.eval_every < 0:
+    if eval_every < 0:
         raise ValueError("--eval-every must be >= 0")
+    if lr_vae <= 0 or lr_ldm <= 0 or lr_refine <= 0:
+        raise ValueError("Resolved learning rates must all be > 0")
 
     # Backend-only acceleration: model, losses, optimizer, and data are unchanged.
     if torch.cuda.is_available():
@@ -5212,56 +5407,61 @@ def main():
         except Exception:
             pass
 
-    # === SHARED CONFIG (base settings for both experiments) ===
+    # For small targets, by default let the cosine schedule span the requested run.
+    # CIFAR keeps the canonical golden 800-epoch scheduler horizon.
+    preset_lr_horizon = preset.get("lr_schedule_epochs", None)
+    lr_schedule_epochs = (
+        int(preset_lr_horizon)
+        if preset_lr_horizon is not None
+        else int(epochs)
+    )
+
+    # === SHARED CONFIG (same scientific objective in both arms) ===
     cfg_shared = {
-        # --- Dataset ---
+        # --- Dataset / capacity preset ---
         "dataset": args.dataset,
-        "batch_size": 256,
+        "batch_size": int(preset["batch_size"]),
         "num_workers": 2,
 
         # --- Model Architecture ---
-        "latent_channels": 8,
-        "cond_emb_dim": 32,
+        "latent_channels": int(preset["latent_channels"]),
+        "cond_emb_dim": int(preset["cond_emb_dim"]),
 
-        # --- DiT / Transformer settings (LightningDiT-style) ---
-        "dit_patch_size": 1,        # patch_size=1 => 8x8 latents -> 64 tokens
-        "dit_hidden_dim": 384,
-        "dit_depth": 12,
-        "dit_num_heads": 6,
-        "dit_mlp_ratio": 4.0,
-        "dit_dropout": 0.0,
+        # --- DiT / Transformer settings ---
+        "dit_patch_size": int(preset["dit_patch_size"]),
+        "dit_hidden_dim": int(preset["dit_hidden_dim"]),
+        "dit_depth": int(preset["dit_depth"]),
+        "dit_num_heads": int(preset["dit_num_heads"]),
+        "dit_mlp_ratio": float(preset["dit_mlp_ratio"]),
+        "dit_dropout": float(preset["dit_dropout"]),
 
         # --- Optimizer ---
         "adam_beta2": 0.95,
 
-        # --- Flow-matching loss ---
+        # --- CSEM score loss ---
         "cosine_w": 0.0,
-
-        # --- Aux gauge-fix losses for factored DiT head ---
         "aux_head_w": 0.0025,
 
-        # --- Auxiliary encoder noise channels (0 disables) ---
+        # --- Encoder architecture ---
         "aux_d": 0,
-        # --- Encoder architecture (v1 knobs, unchanged) ---
-        "base_ch": 64,
-        "num_res_blocks": 2,
-        "decoder_attn_half": True,
-        "latent_proj_depth": 2,
-        # --- v2 architectural improvements ---
-        "encoder_attn_half": True,       # [4] attention at 16×16 in encoder
-        "decoder_extra_block": True,     # [3] +1 ResBlock per decoder stage
-        "conv3x3_proj": True,            # [1,2] 3×3 latent proj + decoder input
-        "use_tanh_out": False,           # [5] raw output, no tanh saturation
-        "clamp_logvar": True,            # [6] clamp logvar to [-30, 20]
-        "attn_zero_init": False,         # [7] standard init on VAE attention
+        "base_ch": int(preset["base_ch"]),
+        "num_res_blocks": int(preset["num_res_blocks"]),
+        "decoder_attn_half": bool(preset["decoder_attn_half"]),
+        "latent_proj_depth": int(preset["latent_proj_depth"]),
+        "encoder_attn_half": bool(preset["encoder_attn_half"]),
+        "decoder_extra_block": bool(preset["decoder_extra_block"]),
+        "conv3x3_proj": bool(preset["conv3x3_proj"]),
+        "use_tanh_out": bool(preset["use_tanh_out"]),
+        "clamp_logvar": bool(preset["clamp_logvar"]),
+        "attn_zero_init": bool(preset["attn_zero_init"]),
 
         # --- Learning Rates ---
-        "lr_vae": 2.5e-4,
-        "lr_ldm": 1e-4,
+        "lr_vae": lr_vae,
+        "lr_ldm": lr_ldm,
 
-        # --- KL and perceptual weights ---
+        # --- Baseline KL and ordinary image-space objectives ---
         "kl_w": 1e-6,
-        "perc_w": .85,
+        "perc_w": 0.85,
 
         # --- PatchGAN discriminator ---
         "gan_w": 0.0025,
@@ -5271,14 +5471,16 @@ def main():
         "lr_disc": 1e-4,
 
         # --- Diffusion Settings ---
-        "time_schedule": "log_t",     # "flow", "log_t", "log_snr", or "cosine"
+        # Kept common across presets so the scale-anchor experiment changes
+        # capacity, not the forward process.
+        "time_schedule": "log_t",
         "use_ddim_times": True,
         "t_min": 3e-5,
         "t_max": 1.5,
         "num_train_timesteps": 1000,
         "train_on_mu": False,
 
-        # --- Cosine VP schedule settings (only used when time_schedule="cosine") ---
+        # --- Cosine VP schedule settings (inactive for log_t) ---
         "cosine_t_min": 2e-4,
         "cosine_t_max": 0.9999,
         "cosine_s": 0.008,
@@ -5289,16 +5491,19 @@ def main():
         "eval_class_labels": [],
 
         # --- Evaluation & Logging ---
+        # Directly useful metrics retained; expensive auxiliary oracle/control
+        # diagnostics and mechanism-only per-batch diagnostics remain off.
         "use_fixed_eval_banks": True,
-        "sw2_n_projections": 256,
+        "sw2_n_projections": 1000,
         "ema_decay": 0.9997,
-        "eval_max_samples": int(args.eval_samples),
-        "eval_lsi_gap_samples": 512,
-        "eval_lsi_gap_time_points": 20,
+        "eval_max_samples": eval_samples,
+        "eval_lsi_gap_samples": min(2500, eval_samples),
+        "eval_lsi_gap_time_points": 50,
         "eval_oracle": False,
-        "kid_num_subsets": 20,
-        "kid_subset_size": 500,
+        "kid_num_subsets": 100,
+        "kid_subset_size": min(1000, eval_samples),
         "generate_visualizations": False,
+        "mechanism_diagnostics": False,
 
         # --- Misc ---
         "seed": 42,
@@ -5306,153 +5511,124 @@ def main():
         "ckpt_dir": "checkpoints",
 
         # --- Comparison Output ---
-        "master_results_dir": args.master_results_dir,
+        "master_results_dir": master_results_dir,
+        "model_preset": preset_name,
     }
 
-    # === CO-TRAINED CONFIG ===
-    # 200 cotrain epochs (VAE + LDM joint) + 50 refine epochs = 250 LDM epochs total
-    cfg_cotrain = cfg_shared.copy()
-    cfg_cotrain.update({
-        # Training schedule.
-        # Mechanism mode is a prefix of the golden 800-epoch trajectory:
-        # training stops early, but the cosine LR scheduler still uses T_max=800.
-        "epochs_vae": int(args.epochs),
-        "epochs_refine": 0,
-        "lr_schedule_epochs": 800,
-        "lr_refine": 1.5e-5,
+    # === SCALE-NORMALIZED BASELINE ===
+    cfg_norm = cfg_shared.copy()
+    cfg_norm.update({
+        "epochs_vae": epochs,
+        "epochs_refine": refine_epochs,
+        "lr_schedule_epochs": lr_schedule_epochs,
+        "lr_refine": lr_refine,
 
-        # Score head gaussian factored param
         "factored_head": True,
-
-        # Co-training specific settings
-        "freeze_score_in_cotrain": False,  # Normal co-training
+        "freeze_score_in_cotrain": False,
         "cotrain_head": "lsi",
+
+        # Scale treatment: same baseline logic as the golden script.
         "use_latent_norm": True,
         "use_cond_encoder": False,
         "kl_reg_type": "normal",
         "score_w_vae": 0.6,
         "stiff_w": 1e-6,
         "score_w": 1.0,
-        # The control/Tweedie network is a diagnostic passenger for cotrain_head=lsi.
-        # Disable its extra forward/backward in the mechanism run.
         "train_tracking_head": False,
 
-        # Time-dependent decoder (TDD)
+        # Time-dependent decoder
         "time_cond_decoder": True,
         "dec_time_emb_dim": 128,
-        "decode_time": None,             # Decode at this t; defaults to t_min if None
+        "decode_time": None,
 
-        # Evaluation cadence. 0 => final epoch only.
-        "eval_freq_cotrain": (
-            int(args.eval_every) if int(args.eval_every) > 0 else int(args.epochs)
+        "eval_freq_cotrain": eval_every if eval_every > 0 else epochs,
+        "eval_freq_refine": (
+            eval_every if eval_every > 0 else max(1, refine_epochs)
         ),
-        "eval_freq_refine": 999999,
-    })
-
-    # === INDEPENDENT CONFIG ===
-    # 50 VAE-only epochs (no eval) + 250 refine epochs = 250 LDM epochs total
-    cfg_indep = cfg_shared.copy()
-    cfg_indep.update({
-        # Training schedule
-        "epochs_vae": 500,           # VAE-only pretraining (no LDM)
-        "epochs_refine": 900,       # LDM training on frozen VAE
-        "lr_refine": 5e-4,
-        "cfg_label_dropout": 0.1,
-        "t_min": 3e-4,
-
-        # Score head gaussian factored param
-        "factored_head": False,
-
-        # Independent mode settings
-        "freeze_score_in_cotrain": True,   # Freeze score nets during VAE training
-        "score_w_vae": 0.0,                # No score gradient (redundant but explicit)
-        "stiff_w": 0.0,                    # No stiffness penalty
-        "use_latent_norm": False,          # Standard VAE (no GroupNorm on mu)
-        "use_cond_encoder": False,         # No conditional encoder
-        "kl_reg_type": "normal",           # Standard KL to N(0,I)
-        "kl_w": 1e-3,
-        "cotrain_head": "lsi",             # Doesn't matter when frozen
-        "score_w": 1.0,
-
-        # Time-dependent decoder (TDD) — disabled for independent baseline
-        "time_cond_decoder": False,
-        "w_decode_time": 0.0,
-
-        # Eval frequency (no eval during VAE phase, eval during refine)
-        "eval_freq_cotrain": 999999,  # Effectively never (VAE phase has no LDM)
-        "eval_freq_refine": 100,       # Eval every 10 epochs during refine
     })
 
     if args.full_golden:
-        # Exact heavy benchmark schedule from the canonical script.
-        cfg_cotrain.update({
+        cfg_norm.update({
             "epochs_vae": 800,
             "epochs_refine": 100,
             "lr_schedule_epochs": 800,
-            "train_tracking_head": True,
+            "lr_refine": 1.5e-5,
             "eval_freq_cotrain": 100,
             "eval_freq_refine": 100,
             "eval_max_samples": None,
             "eval_lsi_gap_samples": 2500,
             "eval_lsi_gap_time_points": 50,
-            "eval_oracle": True,
+            "eval_oracle": False,
             "sw2_n_projections": 1000,
             "kid_num_subsets": 100,
             "kid_subset_size": 1000,
             "generate_visualizations": True,
+            "mechanism_diagnostics": False,
+            "train_tracking_head": False,
         })
 
     # === TERMINAL-T KL ARM ===
-    # Clone the canonical co-training setup and change ONLY the scale anchor:
-    #   - remove output GroupNorm on encoder mean
-    #   - evaluate component KL at the fixed terminal diffusion time T
-    #   - use the dedicated terminal KL coefficient supplied on the CLI
-    cfg_terminal = cfg_cotrain.copy()
+    # Same network/preset/objective as baseline except the representation-scale
+    # treatment itself:
+    #   - no GroupNorm on encoder mean
+    #   - terminal component KL K_T instead of the baseline normal KL
+    #   - no stiffness penalty
+    cfg_terminal = cfg_norm.copy()
     cfg_terminal.update({
         "use_latent_norm": False,
         "kl_reg_type": "terminal",
         "kl_w": float(args.terminal_kl_w),
+        "stiff_w": 0.0,
     })
 
-    # Both arms use the requested dataset and the same output root.
-    cfg_cotrain["dataset"] = args.dataset
-    cfg_terminal["dataset"] = args.dataset
-    cfg_cotrain["master_results_dir"] = args.master_results_dir
-    cfg_terminal["master_results_dir"] = args.master_results_dir
-    cfg_cotrain["first_arm"] = args.first_arm
+    cfg_norm["first_arm"] = args.first_arm
     cfg_terminal["first_arm"] = args.first_arm
 
     print("=" * 78)
-    print("=== CANONICAL CSEM: SCALE NORMALIZATION vs TERMINAL-T KL ===")
+    print("=== CSEM: SCALE NORMALIZATION vs TERMINAL-T KL ===")
     print("=" * 78)
     print(f"Dataset: {args.dataset}")
+    print(f"Resolved preset: {preset_name}")
     print(
-        f"Protocol: {'FULL GOLDEN' if args.full_golden else 'FAST MECHANISM'} | "
-        f"first_arm={args.first_arm} | "
-        f"cotrain_epochs={cfg_cotrain['epochs_vae']} | "
-        f"refine_epochs={cfg_cotrain['epochs_refine']} | "
-        f"tracking_head={cfg_cotrain.get('train_tracking_head')} | "
-        f"eval_samples={cfg_cotrain.get('eval_max_samples')} | "
-        f"eval_every={cfg_cotrain.get('eval_freq_cotrain')} | "
-        f"oracle_eval={cfg_cotrain.get('eval_oracle')}"
+        f"Architecture: latent_ch={cfg_norm['latent_channels']} | "
+        f"VAE base_ch={cfg_norm['base_ch']} | "
+        f"DiT={cfg_norm['dit_hidden_dim']}x{cfg_norm['dit_depth']} "
+        f"heads={cfg_norm['dit_num_heads']} | batch={cfg_norm['batch_size']}"
     )
     print(
-        "Core recipe preserved: VAE/DiT architecture, CSEM loss, LPIPS, TDD, "
-        "PatchGAN, optimizer/LRs, EMA, diffusion schedule, batch size, and seed."
+        f"Training: first_arm={args.first_arm} | "
+        f"cotrain={cfg_norm['epochs_vae']} | refine={cfg_norm['epochs_refine']} | "
+        f"LR horizon={cfg_norm['lr_schedule_epochs']} | "
+        f"eval_every={cfg_norm['eval_freq_cotrain']} | "
+        f"eval_samples={cfg_norm.get('eval_max_samples')}"
     )
+    effective_score_lr = (
+        cfg_norm["lr_ldm"] / cfg_norm["score_w_vae"]
+        if cfg_norm.get("score_w_vae", 0.0) > 0 else 0.0
+    )
+    print(
+        f"LRs: VAE={cfg_norm['lr_vae']:.3g} | "
+        f"LDM base={cfg_norm['lr_ldm']:.3g} | "
+        f"effective joint LSI={effective_score_lr:.3g} | "
+        f"refine={cfg_norm['lr_refine']:.3g}"
+    )
+    print("Auxiliary control/oracle/mechanism diagnostics: OFF")
+
     print("\nArm A -- terminal-time KL:")
     print(f"  use_latent_norm = {cfg_terminal['use_latent_norm']}")
     print(f"  kl_reg_type     = {cfg_terminal['kl_reg_type']}")
     print(f"  kl_w            = {cfg_terminal['kl_w']}")
+    print(f"  stiff_w         = {cfg_terminal['stiff_w']}  (disabled)")
     print(f"  terminal T      = t_max = {cfg_terminal['t_max']}")
-    print("\nArm B -- current script, unchanged scale treatment:")
-    print(f"  use_latent_norm = {cfg_cotrain['use_latent_norm']}")
-    print(f"  kl_reg_type     = {cfg_cotrain['kl_reg_type']}")
-    print(f"  kl_w            = {cfg_cotrain['kl_w']}")
-    print("\nEverything else is inherited from the same canonical co-training config.")
+
+    print("\nArm B -- scale-normalized baseline:")
+    print(f"  use_latent_norm = {cfg_norm['use_latent_norm']}")
+    print(f"  kl_reg_type     = {cfg_norm['kl_reg_type']}")
+    print(f"  kl_w            = {cfg_norm['kl_w']}")
+    print(f"  stiff_w         = {cfg_norm['stiff_w']}")
     print("=" * 78)
 
-    results = run_scale_anchor_comparison(cfg_cotrain, cfg_terminal)
+    results = run_scale_anchor_comparison(cfg_norm, cfg_terminal)
 
     print("\n" + "=" * 78)
     print("FINAL SUMMARY")
