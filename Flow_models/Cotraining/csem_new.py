@@ -50,6 +50,7 @@ DATASET_INFO = {
 #   terminal = no GroupNorm + terminal K_T, with stiffness disabled
 #
 DATASET_PRESETS = {
+    # Canonical csem_golden.py configuration for RGB CIFAR.
     "cifar_golden": {
         "batch_size": 256,
         "latent_channels": 8,
@@ -78,7 +79,15 @@ DATASET_PRESETS = {
         "lr_schedule_epochs": 800,
         "eval_every": 100,
         "eval_samples": 10000,
+        "time_schedule": "log_t",
+        "use_ddim_times": True,
+        "t_min": 3.0e-5,
+        "t_max": 1.5,
+        "num_train_timesteps": 1000,
+        "decode_time": None,
     },
+
+    # Compact grayscale preset used for MNIST/KMNIST/EMNIST.
     "mnist_small": {
         "batch_size": 128,
         "latent_channels": 4,
@@ -104,11 +113,79 @@ DATASET_PRESETS = {
         "lr_refine": 1.0e-5,
         "epochs": 450,
         "refine_epochs": 0,
-        # Small-target runs are treated as complete runs rather than prefixes
-        # of the 800-epoch CIFAR trajectory.
         "lr_schedule_epochs": None,
         "eval_every": 25,
         "eval_samples": 2000,
+        "time_schedule": "log_t",
+        "use_ddim_times": True,
+        "t_min": 3.0e-5,
+        "t_max": 1.5,
+        "num_train_timesteps": 1000,
+        "decode_time": None,
+    },
+
+    # FashionMNIST preset extracted from the earlier good-FID FMNIST run.
+    #
+    # IMPORTANT: that successful run did NOT use a larger network than the
+    # compact preset: it used latent_channels=4, base_ch=32, and DiT 192x8.
+    # We therefore port the compatible architecture / optimizer / diffusion
+    # choices exactly rather than attributing the FID difference to capacity.
+    #
+    # Deliberately NOT ported from the historical script:
+    #   - temporal KL / alternate KL weights
+    #   - diversity/divergence losses
+    #   - frontier/adaptive-time sampling
+    #   - frontier-weighted LPIPS/GAN
+    #   - class-conditioned decoder
+    #   - any additional experimental regularizers
+    #
+    # The scale-normalized and terminal-KL arms below remain the ones described
+    # in the current CSEM report.
+    "fmnist_reference": {
+        "batch_size": 128,
+        "latent_channels": 4,
+        "cond_emb_dim": 32,
+        "dit_patch_size": 1,
+        "dit_hidden_dim": 192,
+        "dit_depth": 8,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        "base_ch": 32,
+        "num_res_blocks": 2,
+        "decoder_attn_half": True,
+        "latent_proj_depth": 2,
+        "encoder_attn_half": True,
+        "decoder_extra_block": True,
+        "conv3x3_proj": True,
+        "use_tanh_out": False,
+        "clamp_logvar": True,
+        "attn_zero_init": False,
+
+        # Optimizer values from the historical good-FID FMNIST run.
+        "lr_vae": 5.0e-4,
+        "lr_ldm": 2.0e-4,
+        "lr_refine": 1.0e-5,
+
+        # Preserve the requested current FMNIST mechanism-run length as the
+        # natural preset default.  The historical run itself used 800+100;
+        # --epochs/--refine-epochs can still override these values.
+        "epochs": 450,
+        "refine_epochs": 0,
+        "lr_schedule_epochs": None,
+        "eval_every": 25,
+        "eval_samples": 2000,
+
+        # Compatible forward-process settings from the good-FID script.
+        "time_schedule": "log_t",
+        "use_ddim_times": True,
+        "t_min": 2.0e-5,
+        "t_max": 2.0,
+        "num_train_timesteps": 1000,
+
+        # Historical TDD evaluation/readout time; training still uses the
+        # current CSEM/TDD reconstruction path.
+        "decode_time": 1.0e-4,
     },
 }
 
@@ -116,7 +193,7 @@ DATASET_TO_PRESET = {
     "CIFAR": "cifar_golden",
     "GCIFAR": "cifar_golden",
     "MNIST": "mnist_small",
-    "FMNIST": "mnist_small",
+    "FMNIST": "fmnist_reference",
     "EMNIST": "mnist_small",
     "KMNIST": "mnist_small",
 }
@@ -4247,7 +4324,9 @@ def train_vae_cotrained_cond(cfg):
         metrics = {
             k: 0.0 for k in [
                 "loss", "recon", "kl", "terminal_kl", "latent_mu_sq",
-                "posterior_var", "score_lsi", "score_control", "aux_lam",
+                "latent_rms_median", "posterior_var", "posterior_var_median",
+                "posterior_std", "logvar_median",
+                "score_lsi", "score_control", "aux_lam",
                 "aux_nu", "perc", "stiff", "gan_d", "gan_g", "tdd"
             ]
         }
@@ -4362,16 +4441,34 @@ def train_vae_cotrained_cond(cfg):
             else:
                 raise ValueError(f"Unknown kl_reg_type: {reg_type}")
 
-            # Optional mechanism-only diagnostics. Disabled for the CIFAR
-            # golden comparison to avoid extra work in the hot training loop.
-            if mechanism_diagnostics:
-                terminal_kl_diag = terminal_component_kl_from_schedule(mu, logvar, ou_sched)
-                latent_mu_sq_diag = mu.pow(2).mean()
-                posterior_var_diag = var_0.mean()
-            else:
-                terminal_kl_diag = torch.tensor(0.0, device=device)
-                latent_mu_sq_diag = torch.tensor(0.0, device=device)
-                posterior_var_diag = torch.tensor(0.0, device=device)
+            # --- Representation/scale diagnostics (ALWAYS logged for BOTH arms) ---
+            # These are diagnostics only: detach them so the baseline and
+            # terminal objectives are completely unaffected.
+            with torch.no_grad():
+                if reg_type in ("terminal", "terminal_kl", "terminal-time"):
+                    # Avoid recomputing K_T in the active terminal arm.
+                    terminal_kl_diag = kl.detach()
+                else:
+                    terminal_kl_diag = terminal_component_kl_from_schedule(
+                        mu.detach(), logvar.detach(), ou_sched
+                    )
+
+                mu_det = mu.detach()
+                var_det = var_0.detach()
+                logvar_det = logvar.detach()
+
+                latent_mu_sq_diag = mu_det.pow(2).mean()
+
+                # Robust latent-center scale: per-sample RMS across the complete
+                # latent tensor, then median across the minibatch.
+                per_sample_mu_rms = mu_det.flatten(1).pow(2).mean(dim=1).sqrt()
+                latent_rms_median_diag = per_sample_mu_rms.median()
+
+                # Posterior variance scale and robust median.
+                posterior_var_diag = var_det.mean()
+                posterior_var_median_diag = var_det.median()
+                posterior_std_diag = var_det.sqrt().mean()
+                logvar_median_diag = logvar_det.median()
 
             # --- Compute score losses ---
             cos_w = float(cfg.get("cosine_w", 1.0))
@@ -4548,7 +4645,11 @@ def train_vae_cotrained_cond(cfg):
             metrics["kl"] += kl.item()
             metrics["terminal_kl"] += terminal_kl_diag.item()
             metrics["latent_mu_sq"] += latent_mu_sq_diag.item()
+            metrics["latent_rms_median"] += latent_rms_median_diag.item()
             metrics["posterior_var"] += posterior_var_diag.item()
+            metrics["posterior_var_median"] += posterior_var_median_diag.item()
+            metrics["posterior_std"] += posterior_std_diag.item()
+            metrics["logvar_median"] += logvar_median_diag.item()
             metrics["score_lsi"] += score_loss_lsi.item()
             metrics["score_control"] += score_loss_control.item()
             metrics["aux_lam"] += aux_loss_lam.item()
@@ -4569,7 +4670,11 @@ def train_vae_cotrained_cond(cfg):
             "kl": metrics["kl"] / n_batches,
             "terminal_kl": metrics["terminal_kl"] / n_batches,
             "latent_rms": math.sqrt(max(metrics["latent_mu_sq"] / n_batches, 0.0)),
+            "latent_rms_median": metrics["latent_rms_median"] / n_batches,
             "posterior_var": metrics["posterior_var"] / n_batches,
+            "posterior_var_median": metrics["posterior_var_median"] / n_batches,
+            "posterior_std": metrics["posterior_std"] / n_batches,
+            "logvar_median": metrics["logvar_median"] / n_batches,
             "score_lsi": metrics["score_lsi"] / n_batches,
             "score_control": metrics["score_control"] / n_batches,
             "aux_lam": metrics["aux_lam"] / n_batches,
@@ -4585,27 +4690,22 @@ def train_vae_cotrained_cond(cfg):
         epoch_sec = time.perf_counter() - epoch_t0
         remaining = cfg["epochs_vae"] - (ep + 1)
         eta_min = (remaining * epoch_sec) / 60.0
-        if mechanism_diagnostics:
-            print(
-                f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
-                f"Rec: {epoch_metrics['recon']:.4f} | KL(loss): {epoch_metrics['kl']:.4f} | "
-                f"K_T(diag): {epoch_metrics['terminal_kl']:.5f} | "
-                f"latent_rms: {epoch_metrics['latent_rms']:.4f} | "
-                f"post_var: {epoch_metrics['posterior_var']:.5f} | "
-                f"Perc: {epoch_metrics['perc']:.4f} | "
-                f"GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | "
-                f"{epoch_sec:.1f}s/ep | arm ETA~{eta_min:.1f}m"
-            )
-            if len(mu_stats) > 0:
-                log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
-        else:
-            print(
-                f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
-                f"Rec: {epoch_metrics['recon']:.4f} | KL(loss): {epoch_metrics['kl']:.4f} | "
-                f"Perc: {epoch_metrics['perc']:.4f} | "
-                f"GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | "
-                f"{epoch_sec:.1f}s/ep | arm ETA~{eta_min:.1f}m"
-            )
+        print(
+            f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+            f"Rec: {epoch_metrics['recon']:.4f} | KL(loss): {epoch_metrics['kl']:.5f} | "
+            f"K_T: {epoch_metrics['terminal_kl']:.5f} | "
+            f"mu_rms: {epoch_metrics['latent_rms']:.4f} | "
+            f"mu_rms_med: {epoch_metrics['latent_rms_median']:.4f} | "
+            f"post_var_mean: {epoch_metrics['posterior_var']:.5f} | "
+            f"post_var_med: {epoch_metrics['posterior_var_median']:.5f} | "
+            f"post_std_mean: {epoch_metrics['posterior_std']:.5f} | "
+            f"logvar_med: {epoch_metrics['logvar_median']:.4f} | "
+            f"Perc: {epoch_metrics['perc']:.4f} | "
+            f"GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | "
+            f"{epoch_sec:.1f}s/ep | arm ETA~{eta_min:.1f}m"
+        )
+        if mechanism_diagnostics and len(mu_stats) > 0:
+            log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
 
         # --- Step cosine LR schedulers ---
         sched_joint.step()
@@ -5072,8 +5172,11 @@ def save_scale_anchor_mechanism_plots(combined_loss: pd.DataFrame, out_dir: str)
 
     for metric, ylabel, filename in [
         ("latent_rms", "latent RMS of encoder mean", "latent_rms_vs_epoch.png"),
+        ("latent_rms_median", "median per-sample latent RMS", "latent_rms_median_vs_epoch.png"),
         ("terminal_kl", "terminal component KL K_T", "terminal_kl_vs_epoch.png"),
         ("posterior_var", "mean posterior variance", "posterior_var_vs_epoch.png"),
+        ("posterior_var_median", "median posterior variance", "posterior_var_median_vs_epoch.png"),
+        ("posterior_std", "mean posterior standard deviation", "posterior_std_vs_epoch.png"),
         ("score_lsi", "CSEM / LSI score loss", "csem_loss_vs_epoch.png"),
         ("recon", "reconstruction MSE", "reconstruction_vs_epoch.png"),
     ]:
@@ -5270,11 +5373,11 @@ def main():
     )
     parser.add_argument(
         "--model-preset",
-        choices=["auto", "cifar_golden", "mnist_small"],
+        choices=["auto", "cifar_golden", "mnist_small", "fmnist_reference"],
         default="auto",
         help=(
-            "Model/training preset. 'auto' maps CIFAR/GCIFAR -> cifar_golden "
-            "and MNIST/FMNIST/EMNIST/KMNIST -> mnist_small."
+            "Model/training preset. 'auto' maps CIFAR/GCIFAR -> cifar_golden, "
+            "FMNIST -> fmnist_reference, and MNIST/EMNIST/KMNIST -> mnist_small."
         ),
     )
     parser.add_argument(
@@ -5471,13 +5574,13 @@ def main():
         "lr_disc": 1e-4,
 
         # --- Diffusion Settings ---
-        # Kept common across presets so the scale-anchor experiment changes
-        # capacity, not the forward process.
-        "time_schedule": "log_t",
-        "use_ddim_times": True,
-        "t_min": 3e-5,
-        "t_max": 1.5,
-        "num_train_timesteps": 1000,
+        # Dataset preset can choose the historically validated forward horizon;
+        # both scale-anchor arms always share the exact same schedule.
+        "time_schedule": str(preset.get("time_schedule", "log_t")),
+        "use_ddim_times": bool(preset.get("use_ddim_times", True)),
+        "t_min": float(preset.get("t_min", 3e-5)),
+        "t_max": float(preset.get("t_max", 1.5)),
+        "num_train_timesteps": int(preset.get("num_train_timesteps", 1000)),
         "train_on_mu": False,
 
         # --- Cosine VP schedule settings (inactive for log_t) ---
@@ -5539,7 +5642,7 @@ def main():
         # Time-dependent decoder
         "time_cond_decoder": True,
         "dec_time_emb_dim": 128,
-        "decode_time": None,
+        "decode_time": preset.get("decode_time", None),
 
         "eval_freq_cotrain": eval_every if eval_every > 0 else epochs,
         "eval_freq_refine": (
@@ -5612,7 +5715,13 @@ def main():
         f"effective joint LSI={effective_score_lr:.3g} | "
         f"refine={cfg_norm['lr_refine']:.3g}"
     )
-    print("Auxiliary control/oracle/mechanism diagnostics: OFF")
+    print(
+        f"Diffusion: {cfg_norm['time_schedule']} | "
+        f"t_min={cfg_norm['t_min']:.3g} | t_max={cfg_norm['t_max']:.3g} | "
+        f"decode_time={cfg_norm.get('decode_time')}"
+    )
+    print("Auxiliary control/oracle diagnostics: OFF")
+    print("Per-epoch K_T / latent-scale / posterior-variance diagnostics: ON (both arms)")
 
     print("\nArm A -- terminal-time KL:")
     print(f"  use_latent_norm = {cfg_terminal['use_latent_norm']}")
