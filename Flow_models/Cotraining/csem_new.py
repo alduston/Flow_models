@@ -657,7 +657,7 @@ def log_latent_stats(name, z):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# LeNet Feature Extractor for FID (non-FMNIST datasets)
+# Bespoke target-classifier feature extractor for FID/KID
 # ---------------------------------------------------------------------------
 
 class LeNetFeatureExtractor(nn.Module):
@@ -736,9 +736,38 @@ def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, 
     return model
 
 
-def get_fid_model(dataset_key, train_loader, num_classes, device, ckpt_dir="checkpoints"):
-    """Get appropriate FID model: Inception for FMNIST/GCIFAR/CIFAR, LeNet for others."""
-    if dataset_key in ("FMNIST", "GCIFAR", "CIFAR"):
+AUTO_BESPOKE_FID_DATASETS = frozenset(("MNIST", "EMNIST", "KMNIST"))
+
+
+def resolve_bespoke_fid_classifier(
+    dataset_key: str,
+    requested: bool | None,
+) -> bool:
+    """Resolve the requested FID feature extractor.
+
+    ``None`` preserves the historical automatic behavior: use a classifier
+    trained on the target dataset for MNIST/EMNIST/KMNIST, and ImageNet
+    Inception features for FMNIST/GCIFAR/CIFAR. ``True`` or ``False`` forces
+    the same choice for any supported target dataset.
+    """
+    if requested is None:
+        return dataset_key in AUTO_BESPOKE_FID_DATASETS
+    return bool(requested)
+
+
+def get_fid_model(
+    dataset_key,
+    train_loader,
+    num_classes,
+    device,
+    ckpt_dir="checkpoints",
+    use_bespoke_classifier: bool | None = None,
+):
+    """Select ImageNet Inception or a classifier trained on the target dataset."""
+    use_bespoke_classifier = resolve_bespoke_fid_classifier(
+        dataset_key, use_bespoke_classifier
+    )
+    if not use_bespoke_classifier:
         print(f"--> Using Inception features for FID ({dataset_key})")
         return None, False
 
@@ -748,7 +777,7 @@ def get_fid_model(dataset_key, train_loader, num_classes, device, ckpt_dir="chec
     # For datasets that get padded (28->32), use 32 for the classifier
     effective_img_size = 32 if img_size == 28 else img_size
 
-    print(f"--> Training LeNet classifier for FID ({dataset_key})")
+    print(f"--> Using bespoke target classifier features for FID ({dataset_key})")
     checkpoint_path = os.path.join(ckpt_dir, f"fid_classifier_{dataset_key.lower()}.pt")
     model = train_fid_classifier(train_loader, num_classes, device, epochs=10, checkpoint_path=checkpoint_path, img_size=effective_img_size, img_channels=img_channels)
     return model, True
@@ -4167,12 +4196,20 @@ def train_vae_cotrained_cond(cfg):
     cfg["img_channels"] = img_channels    # store for later use
     latent_spatial = effective_img_size // 4  # latent H=W after 2 stride-2 downsamples
 
-    # Get FID model (Inception for FMNIST/GCIFAR, LeNet for others).
-    # In paired mechanism runs the classifier checkpoint is shared, so MNIST's
-    # 10-epoch LeNet is trained once instead of once per arm.
+    # Get the selected FID feature extractor. In paired mechanism runs a
+    # bespoke classifier checkpoint is shared, so it is trained exactly once
+    # on real target data and then reused unchanged by the second arm.
     fid_ckpt_dir = cfg.get("fid_ckpt_dir", cfg["ckpt_dir"])
     fid_model, use_lenet_fid = get_fid_model(
-        dataset_key, train_l, num_classes, device, fid_ckpt_dir
+        dataset_key,
+        train_l,
+        num_classes,
+        device,
+        fid_ckpt_dir,
+        use_bespoke_classifier=cfg.get("use_bespoke_fid_classifier", None),
+    )
+    cfg["resolved_fid_feature_extractor"] = (
+        "bespoke_target_classifier" if use_lenet_fid else "imagenet_inception"
     )
 
     # Make the actual VAE/DiT initialization independent of whether the
@@ -5464,6 +5501,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--bespoke-fid-classifier",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use features from a classifier trained on the selected target "
+            "dataset for FID/KID. Use --no-bespoke-fid-classifier to force "
+            "ImageNet Inception features. If omitted, auto mode preserves the "
+            "legacy choice: bespoke for MNIST/EMNIST/KMNIST and Inception for "
+            "FMNIST/GCIFAR/CIFAR."
+        ),
+    )
+    parser.add_argument(
         "--master-results-dir",
         default=None,
         help=(
@@ -5564,6 +5613,9 @@ def main():
         else preset.get("t_max", 1.5)
     )
     cfg_strength = float(args.cfg_strength)
+    use_bespoke_fid_classifier = resolve_bespoke_fid_classifier(
+        args.dataset, args.bespoke_fid_classifier
+    )
     t_min = float(preset.get("t_min", 3e-5))
     master_results_dir = (
         args.master_results_dir
@@ -5700,6 +5752,7 @@ def main():
         "eval_oracle": False,
         "kid_num_subsets": 100,
         "kid_subset_size": min(1000, eval_samples),
+        "use_bespoke_fid_classifier": use_bespoke_fid_classifier,
         "generate_visualizations": False,
         "mechanism_diagnostics": False,
 
@@ -5820,6 +5873,14 @@ def main():
         f"decode_time={cfg_norm.get('decode_time')}"
     )
     print(f"CFG evaluation strength: {cfg_norm['cfg_eval_scale']:g}")
+    print(
+        "FID/KID feature extractor: "
+        + (
+            "bespoke target classifier"
+            if cfg_norm["use_bespoke_fid_classifier"]
+            else "ImageNet Inception"
+        )
+    )
     print("Auxiliary control/oracle diagnostics: OFF")
     print("Per-epoch K_T / latent-scale / posterior-variance diagnostics: ON (both arms)")
 
