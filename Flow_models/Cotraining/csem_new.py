@@ -309,6 +309,45 @@ def get_ou_params(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return alpha, sigma
 
 
+TERMINAL_KL_REG_TYPES = frozenset(("terminal", "terminal_kl", "terminal-time"))
+
+
+def validate_terminal_time_contract(
+    cfg: Dict[str, Any],
+    schedule: Dict[str, torch.Tensor] | None = None,
+) -> float:
+    """Enforce one shared OU endpoint for K_T and reverse initialization.
+
+    ``T_terminal`` is the user-facing name, while legacy training and sampler
+    code consume ``t_max``.  In a terminal-KL run they must denote the same
+    time.  If a schedule is supplied, its terminal grid point must agree too.
+    """
+    t_max = float(cfg.get("t_max", 2.0))
+    T_terminal = float(cfg.get("T_terminal", t_max))
+    reg_type = str(cfg.get("kl_reg_type", "mod")).lower()
+
+    if reg_type not in TERMINAL_KL_REG_TYPES:
+        return T_terminal
+
+    if not math.isfinite(T_terminal) or T_terminal <= 0.0:
+        raise ValueError(f"Terminal-KL mode requires finite T_terminal > 0, got {T_terminal}")
+    if not math.isclose(T_terminal, t_max, rel_tol=1e-9, abs_tol=1e-12):
+        raise ValueError(
+            "Terminal-KL time mismatch: T_terminal controls K_T while t_max "
+            f"controls reverse-sampling initialization; got {T_terminal} != {t_max}."
+        )
+
+    if schedule is not None:
+        schedule_T = float(schedule["times"][-1].detach().cpu().item())
+        if not math.isclose(T_terminal, schedule_T, rel_tol=1e-6, abs_tol=1e-7):
+            raise ValueError(
+                "Terminal-KL schedule mismatch: configured T_terminal="
+                f"{T_terminal}, but the diffusion schedule ends at {schedule_T}."
+            )
+
+    return T_terminal
+
+
 
 def terminal_component_kl_from_schedule(
     mu: torch.Tensor,
@@ -1072,7 +1111,7 @@ def compute_mse_gap(
     encoder_mus, encoder_logvars : Tensor [N, C, H, W]
         Precomputed encoder outputs over the evaluation dataset (CPU).
     cfg : dict
-        Experiment configuration (needs time_schedule, t_min, t_max, num_train_timesteps, …).
+        Experiment configuration (needs time_schedule, t_min, t_max, num_train_timesteps, â€¦).
     device : torch.device
     labels : Tensor [N] or None
         Class labels; passed to both score_net and oracle_model.
@@ -1081,13 +1120,13 @@ def compute_mse_gap(
         How many data points to average over.
     batch_size : int
     space : ``"eps"`` | ``"score"``
-        ``"eps"``   – plain MSE in eps-prediction space (default).
-        ``"score"`` – divides each term by sigma(t)^2 so that the comparison
+        ``"eps"``   â€“ plain MSE in eps-prediction space (default).
+        ``"score"`` â€“ divides each term by sigma(t)^2 so that the comparison
                       is in score space  (score = -eps / sigma).
 
     Returns
     -------
-    float  – the averaged MSE gap.
+    float  â€“ the averaged MSE gap.
     """
     if score_net is None or oracle_model is None:
         return 0.0
@@ -1204,29 +1243,29 @@ def compute_mse_gap(
     return total_mse / total_count if total_count > 0 else 0.0
 
 
-# ── VAE ───────────────────────────────────────────────────────────────
+# â”€â”€ VAE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 """
 Refactored VAE with LDM-aligned architectural improvements.
 
 Changes vs previous version (all gated by flags, defaults reproduce old behaviour):
-  1. conv3x3_proj=True  : GN→SiLU→3×3 combined mu+logvar projection (encoder)
-                          + 3×3 decoder input conv (replaces 1×1)
+  1. conv3x3_proj=True  : GNâ†’SiLUâ†’3Ã—3 combined mu+logvar projection (encoder)
+                          + 3Ã—3 decoder input conv (replaces 1Ã—1)
   2. decoder_extra_block : +1 VAEResBlock per decoder stage (LDM asymmetry)
-  3. encoder_attn_half   : attention at half-res (16×16) in encoder
+  3. encoder_attn_half   : attention at half-res (16Ã—16) in encoder
   4. use_tanh_out=False  : raw decoder output (no tanh saturation)
   5. clamp_logvar=True   : clamp logvar to [-30, 20]
   6. attn_zero_init=False: standard init on VAE attention proj (faster learning)
 """
 
-# ── VAEAttentionBlock (updated: optional zero-init) ──────────────────────
+# â”€â”€ VAEAttentionBlock (updated: optional zero-init) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class VAEAttentionBlock(nn.Module):
     """
     Multi-head self-attention with optional zero-init on output projection.
 
-    zero_init=True  (default): proj starts as no-op — good for score nets.
-    zero_init=False           : standard init — faster attention learning in VAEs.
+    zero_init=True  (default): proj starts as no-op â€” good for score nets.
+    zero_init=False           : standard init â€” faster attention learning in VAEs.
     """
     def __init__(self, ch: int, num_heads: int = 4, zero_init: bool = True):
         super().__init__()
@@ -1265,7 +1304,7 @@ class VAEAttentionBlock(nn.Module):
         return x + self.proj(out)
 
 
-# ── VAEResBlock (unchanged) ───────────────────────────────────────────
+# â”€â”€ VAEResBlock (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class VAEResBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -1279,7 +1318,7 @@ class VAEResBlock(nn.Module):
 
 class VAE(nn.Module):
     """
-    Convolutional VAE with two stride-2 downsamples (img_size → img_size/4 latent).
+    Convolutional VAE with two stride-2 downsamples (img_size â†’ img_size/4 latent).
 
     Backward-compatible: every NEW parameter's default reproduces the prior
     architecture exactly.
@@ -1313,7 +1352,7 @@ class VAE(nn.Module):
         # --- v2 architectural knobs (defaults = v1 behaviour) ---
         encoder_attn_half: bool = False,     # [4] attention at half-res in encoder
         decoder_extra_block: bool = False,   # [3] +1 ResBlock per decoder stage
-        conv3x3_proj: bool = False,          # [1,2] 3×3 latent projection + decoder input
+        conv3x3_proj: bool = False,          # [1,2] 3Ã—3 latent projection + decoder input
         use_tanh_out: bool = True,           # [5] False = raw output, no tanh
         clamp_logvar: bool = False,          # [6] clamp logvar to [-30, 20]
         attn_zero_init: bool = True,         # [7] False = standard init on VAE attn
@@ -1357,17 +1396,17 @@ class VAE(nn.Module):
         # ================================================================
         self.enc_conv_in = nn.Conv2d(img_channels, ch1, 3, 1, 1)
 
-        # Stage 0 — full-res → half-res
+        # Stage 0 â€” full-res â†’ half-res
         enc_stage0 = [VAEResBlock(ch1, ch1) for _ in range(num_res_blocks)]
         enc_stage0.append(nn.Conv2d(ch1, ch2, 3, 2, 1))           # stride-2 down
 
-        # Stage 1 — half-res → quarter-res
+        # Stage 1 â€” half-res â†’ quarter-res
         enc_stage1: list[nn.Module] = [VAEResBlock(ch2, ch2) for _ in range(num_res_blocks)]
         if encoder_attn_half:                                       # [4] NEW
             enc_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
         enc_stage1.append(nn.Conv2d(ch2, ch4, 3, 2, 1))           # stride-2 down
 
-        # Stage 2 — bottleneck (quarter-res, with attention)
+        # Stage 2 â€” bottleneck (quarter-res, with attention)
         enc_stage2: list[nn.Module] = [VAEResBlock(ch4, ch4)]
         enc_stage2.append(VAEAttentionBlock(ch4, zero_init=azero))
         for _ in range(num_res_blocks):
@@ -1391,7 +1430,7 @@ class VAE(nn.Module):
             self.y_emb = None
             self.cond_proj = None
 
-        # ---- latent projection (enc_out_ch → latent_channels) -----------
+        # ---- latent projection (enc_out_ch â†’ latent_channels) -----------
         if latent_proj_depth >= 2:
             self.enc_pre_proj = VAEResBlock(enc_out_ch, enc_out_ch)
         else:
@@ -1400,14 +1439,14 @@ class VAE(nn.Module):
         proj_in_ch = enc_out_ch + self.aux_d
 
         if self.conv3x3_proj:
-            # [1] NEW: terminal norm → activation → 3×3 combined mu+logvar
+            # [1] NEW: terminal norm â†’ activation â†’ 3Ã—3 combined mu+logvar
             self.enc_norm_out = make_group_norm(proj_in_ch)
             self.enc_conv_out = nn.Conv2d(proj_in_ch, 2 * latent_channels, 3, 1, 1)
             # no separate mu / logvar convs
             self.mu = None
             self.logvar = None
         else:
-            # legacy: separate 1×1 convs
+            # legacy: separate 1Ã—1 convs
             self.enc_norm_out = None
             self.enc_conv_out = None
             self.mu = nn.Conv2d(proj_in_ch, latent_channels, 1)
@@ -1430,7 +1469,7 @@ class VAE(nn.Module):
         #  DECODER
         # ================================================================
 
-        # ---- latent back-projection (latent_channels → ch4) -------------
+        # ---- latent back-projection (latent_channels â†’ ch4) -------------
         dec_in_ks = 3 if self.conv3x3_proj else 1                  # [2] NEW
         if latent_proj_depth >= 2:
             self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
@@ -1442,13 +1481,13 @@ class VAE(nn.Module):
         # number of ResBlocks per decoder stage
         dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
 
-        # Stage 0 — bottleneck (quarter-res, with attention)
+        # Stage 0 â€” bottleneck (quarter-res, with attention)
         dec_stage0: list[nn.Module] = [VAEResBlock(ch4, ch4)]
         dec_stage0.append(VAEAttentionBlock(ch4, zero_init=azero))
         for _ in range(dec_nrb):
             dec_stage0.append(VAEResBlock(ch4, ch4))
 
-        # Stage 1 — quarter-res → half-res
+        # Stage 1 â€” quarter-res â†’ half-res
         dec_stage1: list[nn.Module] = [
             nn.Upsample(scale_factor=2),
             nn.Conv2d(ch4, ch2, 3, 1, 1),
@@ -1458,7 +1497,7 @@ class VAE(nn.Module):
         if decoder_attn_half:
             dec_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
 
-        # Stage 2 — half-res → full-res
+        # Stage 2 â€” half-res â†’ full-res
         dec_stage2: list[nn.Module] = [
             nn.Upsample(scale_factor=2),
             nn.Conv2d(ch2, ch1, 3, 1, 1),
@@ -1477,12 +1516,12 @@ class VAE(nn.Module):
         )
 
         # ================================================================
-        #  TIME-DEPENDENT DECODER (TDD) — optional FiLM conditioning
+        #  TIME-DEPENDENT DECODER (TDD) â€” optional FiLM conditioning
         # ================================================================
         self.time_cond_decoder = time_cond_decoder
         if time_cond_decoder:
             self.dec_time_emb_dim = dec_time_emb_dim
-            # Sinusoidal embedding → MLP (same pattern as score network)
+            # Sinusoidal embedding â†’ MLP (same pattern as score network)
             self.dec_time_mlp = nn.Sequential(
                 nn.Linear(dec_time_emb_dim, 4 * dec_time_emb_dim),
                 nn.SiLU(),
@@ -1501,7 +1540,7 @@ class VAE(nn.Module):
                 self.dec_film_layers.append(film)
 
     # -----------------------------------------------------------------
-    #  encode / decode / forward  — signatures IDENTICAL to before
+    #  encode / decode / forward  â€” signatures IDENTICAL to before
     # -----------------------------------------------------------------
 
     def encode(self, x: torch.Tensor, y: torch.Tensor | None = None):
@@ -1529,14 +1568,14 @@ class VAE(nn.Module):
             w = torch.randn(B, self.aux_d, H, W, device=h.device, dtype=h.dtype)
             h = torch.cat([h, w], dim=1)
 
-        # ── latent projection ──
+        # â”€â”€ latent projection â”€â”€
         if self.conv3x3_proj:
-            # [1] combined: GN → SiLU → 3×3 → split
+            # [1] combined: GN â†’ SiLU â†’ 3Ã—3 â†’ split
             h = F.silu(self.enc_norm_out(h))
             moments = self.enc_conv_out(h)
             mu, logvar = moments.chunk(2, dim=1)
         else:
-            # legacy: separate 1×1 convs
+            # legacy: separate 1Ã—1 convs
             mu = self.mu(h)
             logvar = self.logvar(h)
 
@@ -1795,14 +1834,14 @@ class ResBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DiT (Diffusion Transformer) — drop-in replacement for UNetModel
+# DiT (Diffusion Transformer) â€” drop-in replacement for UNetModel
 # ---------------------------------------------------------------------------
 # Same forward API:  forward(x, t, y) -> eps_pred
 #   x: [B, C, H, W]  latent tensor
 #   t: [B]            continuous time scalars
-#   y: [B] | None     class labels (None → null/unconditional token)
+#   y: [B] | None     class labels (None â†’ null/unconditional token)
 #
-# Architecture:  patchify → transformer blocks with adaLN-Zero → unpatchify
+# Architecture:  patchify â†’ transformer blocks with adaLN-Zero â†’ unpatchify
 # Reference: Peebles & Xie, "Scalable Diffusion Models with Transformers" (2023)
 # ---------------------------------------------------------------------------
 
@@ -1905,7 +1944,7 @@ class DiTModel(nn.Module):
     - patchify -> transformer blocks with adaLN-Zero -> unpatchify
     - RMSNorm + SwiGLU (LightningDiT-style)
     - fixed 2D sin-cos positional embeddings
-    - outputs an eps prediction ε̂(z_t, t)
+    - outputs an eps prediction ÎµÌ‚(z_t, t)
 
     Forward signature stays: forward(x, t, y) -> [B,C,H,W]
     """
@@ -1980,11 +2019,11 @@ class DiTModel(nn.Module):
 
         patch_out_dim = self.in_channels * self.patch_size * self.patch_size
         if self.factored_head:
-            # Factored Natural-Parameter head (λ, ν):
-            #   prec_proj  -> predicts log(λ), where λ = σₜ · diag(Σₜ(x)⁻¹)
-            #   nu_proj    -> predicts ν = λ ⊙ μₜ  (precision-weighted mean)
-            #   output  ε̂ = λ ⊙ zₜ − ν
-            # The aggregate score is always s*(z,t) = -Λ_eff z + ν_eff,
+            # Factored Natural-Parameter head (Î», Î½):
+            #   prec_proj  -> predicts log(Î»), where Î» = Ïƒâ‚œ Â· diag(Î£â‚œ(x)â»Â¹)
+            #   nu_proj    -> predicts Î½ = Î» âŠ™ Î¼â‚œ  (precision-weighted mean)
+            #   output  ÎµÌ‚ = Î» âŠ™ zâ‚œ âˆ’ Î½
+            # The aggregate score is always s*(z,t) = -Î›_eff z + Î½_eff,
             # so this is the exact functional form with no approximation.
             self.nu_proj   = nn.Linear(self.hidden_dim, patch_out_dim)
             self.prec_proj = nn.Linear(self.hidden_dim, patch_out_dim)
@@ -2040,7 +2079,7 @@ class DiTModel(nn.Module):
             nn.init.zeros_(self.nu_proj.weight)
             nn.init.zeros_(self.nu_proj.bias)
             nn.init.zeros_(self.prec_proj.weight)
-            # Bias init: exp(-4) ≈ 0.018, so initial ε ≈ 0.018·zₜ
+            # Bias init: exp(-4) â‰ˆ 0.018, so initial Îµ â‰ˆ 0.018Â·zâ‚œ
             # (near-zero output at init while keeping grad alive to both heads)
             nn.init.constant_(self.prec_proj.bias, -4.0)
         else:
@@ -2056,11 +2095,11 @@ class DiTModel(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None, *, return_components: bool = False, detach_components: bool = False):
-        """Return eps prediction ε̂(z_t, t).
+        """Return eps prediction ÎµÌ‚(z_t, t).
 
         When factored_head=True the prediction uses natural parameters:
-            ε̂ = λ ⊙ z_t − ν
-        where λ = σₜ·Σₜ⁻¹ (diagonal precision) and ν = λ⊙μₜ.
+            ÎµÌ‚ = Î» âŠ™ z_t âˆ’ Î½
+        where Î» = Ïƒâ‚œÂ·Î£â‚œâ»Â¹ (diagonal precision) and Î½ = Î»âŠ™Î¼â‚œ.
 
         If return_components=True and factored_head=True, returns (eps, lam, nu).
         If detach_components=True, (lam, nu) are computed from detached trunk tokens
@@ -2097,7 +2136,7 @@ class DiTModel(nn.Module):
         tokens = self.final_norm(tokens) * (1.0 + gamma) + beta
 
         if self.factored_head:
-            # Natural-parameter form: ε̂ = λ ⊙ zₜ − ν
+            # Natural-parameter form: ÎµÌ‚ = Î» âŠ™ zâ‚œ âˆ’ Î½
             nu_hat  = self.unpatchify(self.nu_proj(tokens), H_tok, W_tok)
             log_lam = self.unpatchify(self.prec_proj(tokens), H_tok, W_tok)
             log_lam = log_lam.clamp(-20.0, 20.0)
@@ -2130,7 +2169,7 @@ UNetModel = DiTModel
 # ----------------------------------------------------------------------
 # DiT default config notes:
 #   DiTModel(hidden_dim=384, depth=8, num_heads=6, patch_size=2)
-#   operates on 8×8 latents → 16 tokens; ~4.3M params.
+#   operates on 8Ã—8 latents â†’ 16 tokens; ~4.3M params.
 #   For larger latents or more capacity, increase hidden_dim/depth.
 # ----------------------------------------------------------------------
 
@@ -2169,11 +2208,11 @@ class UniversalSampler:
         if self.schedule_type == "cosine":
             a, s, _ = get_cosine_params(t_vec, cosine_s=self.cosine_s)
             return a, s
-        # log_t or log_snr — both use OU params
+        # log_t or log_snr â€” both use OU params
         return get_ou_params(t_vec)
 
     def _get_beta(self, t_vec: torch.Tensor) -> torch.Tensor:
-        """Return instantaneous beta(t) — only meaningful for cosine VP."""
+        """Return instantaneous beta(t) â€” only meaningful for cosine VP."""
         if self.schedule_type == "cosine":
             _, _, b = get_cosine_params(t_vec, cosine_s=self.cosine_s)
             return b
@@ -2616,12 +2655,12 @@ class OracleScoreModel:
 
     Parameters
     ----------
-    all_mu : Tensor [N, C, H, W]   – encoder means (CPU)
-    all_logvar : Tensor [N, C, H, W] – encoder log-variances (CPU)
-    all_labels : Tensor [N]         – integer class labels (CPU)
-    cfg : dict                      – experiment config (needs time_schedule, t_min, t_max, …)
+    all_mu : Tensor [N, C, H, W]   â€“ encoder means (CPU)
+    all_logvar : Tensor [N, C, H, W] â€“ encoder log-variances (CPU)
+    all_labels : Tensor [N]         â€“ integer class labels (CPU)
+    cfg : dict                      â€“ experiment config (needs time_schedule, t_min, t_max, â€¦)
     device : torch.device
-    ref_chunk_size : int            – how many Gaussian components to load on GPU at once
+    ref_chunk_size : int            â€“ how many Gaussian components to load on GPU at once
     """
 
     def __init__(
@@ -2641,8 +2680,8 @@ class OracleScoreModel:
         self.num_classes = cfg.get("num_classes", None)
         self.null_label = self.num_classes if self.num_classes is not None else None
 
-        # Pre-load ALL reference data on GPU (≈ 2 × N × D × 4 bytes).
-        # For N=60k, D=512 this is ~240 MB — comfortably fits on any modern GPU.
+        # Pre-load ALL reference data on GPU (â‰ˆ 2 Ã— N Ã— D Ã— 4 bytes).
+        # For N=60k, D=512 this is ~240 MB â€” comfortably fits on any modern GPU.
         self.all_mu_flat = all_mu.reshape(self.N, -1).float().to(device)          # [N, D]
         self.all_var_flat = torch.exp(
             all_logvar.reshape(self.N, -1).float()
@@ -2691,8 +2730,8 @@ class OracleScoreModel:
         ----------
         z_t : [B, C, H, W]
         t   : [B]  (assumed constant across batch)
-        label_filter : [B] int labels – if given, restrict the sum per query to
-                       reference points whose label matches.  ``None`` → unconditional.
+        label_filter : [B] int labels â€“ if given, restrict the sum per query to
+                       reference points whose label matches.  ``None`` â†’ unconditional.
 
         Returns
         -------
@@ -2720,7 +2759,7 @@ class OracleScoreModel:
         log_var_sum = torch.log(var_t).sum(dim=1)                 # [N]
         mu_sq_over_var_sum = (mu_t * mu_over_var).sum(dim=1)      # [N]
 
-        # log p(z_t | x_i) ∝ -0.5 [log|Σ_t| + z^2·(1/v) - 2 z·(μ/v) + μ^2/v]
+        # log p(z_t | x_i) âˆ -0.5 [log|Î£_t| + z^2Â·(1/v) - 2 zÂ·(Î¼/v) + Î¼^2/v]
         all_log_w = -0.5 * (
             log_var_sum.unsqueeze(0)                              # [1, N]
             + (z_flat * z_flat) @ one_over_var.T                  # [B, N]
@@ -2753,8 +2792,8 @@ class OracleScoreModel:
     ) -> torch.Tensor:
         """Forward call matching DiTModel interface.
 
-        * ``y is None``  → unconditional oracle score (sum over all components).
-        * ``y`` given     → class-conditional oracle score (sum over matching labels).
+        * ``y is None``  â†’ unconditional oracle score (sum over all components).
+        * ``y`` given     â†’ class-conditional oracle score (sum over matching labels).
         """
         return self._compute_eps(z_t, t, label_filter=y)
 
@@ -2782,6 +2821,10 @@ def evaluate_current_state(
       - cfg['eval_class_labels']: list[int] (e.g. [2] to evaluate the '2' class)
       - cfg['cfg_eval_scale']: float (e.g. 3.0)
     """
+
+    # In terminal-KL mode, fail before sampling if K_T and the sampler endpoint
+    # have somehow been configured independently.
+    validate_terminal_time_contract(cfg)
 
     print(f"\n--- Evaluation: {prefix} @ Ep {epoch_idx} ---")
     vae.eval()
@@ -4086,6 +4129,9 @@ def train_vae_cotrained_cond(cfg):
     - Generates visualization suite after training completes
     - Saves all results to run_results directory
     """
+    # Validate before setup_run_results_dir wipes/recreates any prior output.
+    validate_terminal_time_contract(cfg)
+
     # --- Setup Results Directory ---
     results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"),
                                    wipe=True, preserve_checkpoints=True)
@@ -4103,6 +4149,7 @@ def train_vae_cotrained_cond(cfg):
 
     # --- Unified discrete schedule (log_t / log_snr / cosine depending on cfg) ---
     ou_sched = make_schedule(cfg, device)
+    validate_terminal_time_contract(cfg, ou_sched)
     T = int(ou_sched["T"].item())
     noise_sched = ou_sched
     print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
@@ -5390,6 +5437,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--T-terminal", "--T_terminal", "--t-terminal",
+        dest="T_terminal",
+        type=float,
+        default=None,
+        help=(
+            "Shared terminal diffusion time. This sets the score-training horizon, "
+            "the time used by K_T, and the Gaussian reverse-sampling initialization "
+            "time. If omitted, use the selected dataset preset's t_max."
+        ),
+    )
+    parser.add_argument(
         "--master-results-dir",
         default=None,
         help=(
@@ -5484,6 +5542,12 @@ def main():
     eval_every = int(
         args.eval_every if args.eval_every is not None else preset["eval_every"]
     )
+    T_terminal = float(
+        args.T_terminal
+        if args.T_terminal is not None
+        else preset.get("t_max", 1.5)
+    )
+    t_min = float(preset.get("t_min", 3e-5))
     master_results_dir = (
         args.master_results_dir
         if args.master_results_dir is not None
@@ -5498,6 +5562,11 @@ def main():
         raise ValueError("--eval-samples must be >= 2")
     if eval_every < 0:
         raise ValueError("--eval-every must be >= 0")
+    if not math.isfinite(T_terminal) or T_terminal <= t_min:
+        raise ValueError(
+            "--T-terminal must be finite and greater than the preset t_min; "
+            f"got T_terminal={T_terminal}, t_min={t_min}"
+        )
     if lr_vae <= 0 or lr_ldm <= 0 or lr_refine <= 0:
         raise ValueError("Resolved learning rates must all be > 0")
 
@@ -5578,8 +5647,11 @@ def main():
         # both scale-anchor arms always share the exact same schedule.
         "time_schedule": str(preset.get("time_schedule", "log_t")),
         "use_ddim_times": bool(preset.get("use_ddim_times", True)),
-        "t_min": float(preset.get("t_min", 3e-5)),
-        "t_max": float(preset.get("t_max", 1.5)),
+        "t_min": t_min,
+        # Single source of truth for the terminal-KL endpoint. Legacy schedule
+        # and sampler code read t_max; validation above/below forbids divergence.
+        "T_terminal": T_terminal,
+        "t_max": T_terminal,
         "num_train_timesteps": int(preset.get("num_train_timesteps", 1000)),
         "train_on_mu": False,
 
@@ -5717,7 +5789,8 @@ def main():
     )
     print(
         f"Diffusion: {cfg_norm['time_schedule']} | "
-        f"t_min={cfg_norm['t_min']:.3g} | t_max={cfg_norm['t_max']:.3g} | "
+        f"t_min={cfg_norm['t_min']:.3g} | "
+        f"T_terminal=t_max={cfg_norm['T_terminal']:.3g} | "
         f"decode_time={cfg_norm.get('decode_time')}"
     )
     print("Auxiliary control/oracle diagnostics: OFF")
@@ -5728,7 +5801,10 @@ def main():
     print(f"  kl_reg_type     = {cfg_terminal['kl_reg_type']}")
     print(f"  kl_w            = {cfg_terminal['kl_w']}")
     print(f"  stiff_w         = {cfg_terminal['stiff_w']}  (disabled)")
-    print(f"  terminal T      = t_max = {cfg_terminal['t_max']}")
+    print(
+        f"  terminal T      = T_terminal = t_max = "
+        f"{cfg_terminal['T_terminal']}"
+    )
 
     print("\nArm B -- scale-normalized baseline:")
     print(f"  use_latent_norm = {cfg_norm['use_latent_norm']}")
