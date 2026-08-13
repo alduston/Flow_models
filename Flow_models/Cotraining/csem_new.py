@@ -309,6 +309,143 @@ def get_ou_params(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return alpha, sigma
 
 
+SCORE_TIME_WEIGHTING_CHOICES = ("unweighted-eps", "canonical")
+
+
+def validate_score_time_weighting(
+    cfg: Dict[str, Any],
+    schedule: Dict[str, torch.Tensor],
+) -> str:
+    """Validate the requested score-loss measure.
+
+    ``canonical`` denotes the physical-OU-time CSEM objective
+
+        integral E[||s_theta - s_component||^2] dt
+
+    on the configured interval.  Since the network predicts epsilon rather
+    than score, the per-time integrand is ||eps_theta-eps_component||^2/sigma^2.
+    The sampling-density correction is applied separately by
+    :func:`score_time_importance_weights`.
+    """
+    mode = str(cfg.get("score_time_weighting", "unweighted-eps")).lower()
+    if mode not in SCORE_TIME_WEIGHTING_CHOICES:
+        raise ValueError(
+            f"Unknown score_time_weighting={mode!r}; expected one of "
+            f"{SCORE_TIME_WEIGHTING_CHOICES}."
+        )
+
+    if mode == "canonical":
+        schedule_type = str(schedule.get("schedule_type", "")).lower()
+        if schedule_type not in ("log_t", "log_snr"):
+            raise ValueError(
+                "Canonical physical-time CSEM weighting is implemented for the "
+                "OU schedules ('log_t' or 'log_snr') only; got "
+                f"time_schedule={schedule_type!r}."
+            )
+        if int(schedule["times"].numel()) < 2:
+            raise ValueError("Canonical quadrature requires at least two time points.")
+        if float(cfg.get("cosine_w", 0.0)) != 0.0:
+            raise ValueError(
+                "Canonical CSEM weighting requires cosine_w=0: an added cosine "
+                "loss is not part of the exact physical-time identity."
+            )
+
+    return mode
+
+
+def _trapezoid_node_widths(times: torch.Tensor) -> torch.Tensor:
+    """Return positive trapezoidal quadrature widths for an ascending grid."""
+    if times.ndim != 1 or times.numel() < 2:
+        raise ValueError("Time grid must be one-dimensional with at least two points.")
+    gaps = times[1:] - times[:-1]
+    if not bool(torch.all(gaps > 0)):
+        raise ValueError("Canonical score quadrature requires a strictly ascending time grid.")
+
+    widths = torch.empty_like(times)
+    widths[0] = 0.5 * gaps[0]
+    widths[-1] = 0.5 * gaps[-1]
+    if times.numel() > 2:
+        widths[1:-1] = 0.5 * (times[2:] - times[:-2])
+    return widths
+
+
+def score_time_importance_weights(
+    *,
+    t: torch.Tensor,
+    sigma: torch.Tensor,
+    cfg: Dict[str, Any],
+    schedule: Dict[str, torch.Tensor],
+    t_idx: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return one score-loss weight per sampled example.
+
+    ``unweighted-eps`` exactly preserves the historical objective: plain
+    epsilon-MSE under the configured time sampler.  With the comparison
+    presets this means uniform sampling of indices on a log-spaced OU-time
+    grid, i.e. an approximately log-uniform time measure.
+
+    ``canonical`` is an unbiased Monte Carlo estimator (up to trapezoidal
+    discretization when ``t_idx`` is supplied) of
+
+        integral_[t_min,T] E[||eps_theta-eps_target||^2 / sigma_t^2] dt,
+
+    which is the physical-time score loss required by the CSEM information
+    identity for the OU process used here.  The weights are intentionally not
+    normalized to mean one: their absolute scale is part of that identity.
+    """
+    mode = str(cfg.get("score_time_weighting", "unweighted-eps")).lower()
+    batch_size = int(t.numel())
+    if mode == "unweighted-eps":
+        return torch.ones(batch_size, device=t.device, dtype=t.dtype)
+    if mode != "canonical":
+        raise ValueError(
+            f"Unknown score_time_weighting={mode!r}; expected one of "
+            f"{SCORE_TIME_WEIGHTING_CHOICES}."
+        )
+
+    if t_idx is not None:
+        # t_idx is uniform on {0,...,N-1}.  Multiplication by N converts the
+        # trapezoidal node masses into importance weights under that proposal.
+        times = schedule["times"].to(device=t.device, dtype=t.dtype)
+        sigma_grid = schedule["sigma"].to(device=t.device, dtype=t.dtype)
+        node_masses = _trapezoid_node_widths(times) / sigma_grid.square().clamp_min(1e-12)
+        return float(times.numel()) * node_masses.gather(0, t_idx)
+
+    # The continuous OU path samples q(t)=1/[t log(T/t_min)].  Therefore
+    # (dt/q-proposal correction)/sigma^2 = t log(T/t_min)/sigma^2.
+    t_min = float(cfg["t_min"])
+    t_max = float(cfg["t_max"])
+    log_range = math.log(t_max / t_min)
+    sigma_per_example = sigma.reshape(batch_size, -1)[:, 0]
+    return (
+        log_range
+        * t.reshape(-1)
+        / sigma_per_example.square().clamp_min(1e-12)
+    )
+
+
+def weighted_score_prediction_losses(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    time_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return time-weighted epsilon MSE and cosine losses.
+
+    Unit weights reproduce ``F.mse_loss`` and the historical mean cosine loss.
+    The cosine term is kept for legacy configurations; canonical validation
+    requires its configured coefficient to be zero.
+    """
+    weights = time_weights.to(device=prediction.device, dtype=prediction.dtype)
+    mse_per_example = (prediction - target).square().flatten(1).mean(dim=1)
+    cosine_per_example = 1.0 - F.cosine_similarity(
+        prediction.flatten(1), target.flatten(1), dim=1
+    )
+    return (
+        (weights * mse_per_example).mean(),
+        (weights * cosine_per_example).mean(),
+    )
+
+
 TERMINAL_KL_REG_TYPES = frozenset(("terminal", "terminal_kl", "terminal-time"))
 
 
@@ -1140,7 +1277,7 @@ def compute_mse_gap(
     encoder_mus, encoder_logvars : Tensor [N, C, H, W]
         Precomputed encoder outputs over the evaluation dataset (CPU).
     cfg : dict
-        Experiment configuration (needs time_schedule, t_min, t_max, num_train_timesteps, …).
+        Experiment configuration (needs time_schedule, t_min, t_max, num_train_timesteps, â€¦).
     device : torch.device
     labels : Tensor [N] or None
         Class labels; passed to both score_net and oracle_model.
@@ -1149,13 +1286,13 @@ def compute_mse_gap(
         How many data points to average over.
     batch_size : int
     space : ``"eps"`` | ``"score"``
-        ``"eps"``   – plain MSE in eps-prediction space (default).
-        ``"score"`` – divides each term by sigma(t)^2 so that the comparison
+        ``"eps"``   â€“ plain MSE in eps-prediction space (default).
+        ``"score"`` â€“ divides each term by sigma(t)^2 so that the comparison
                       is in score space  (score = -eps / sigma).
 
     Returns
     -------
-    float  – the averaged MSE gap.
+    float  â€“ the averaged MSE gap.
     """
     if score_net is None or oracle_model is None:
         return 0.0
@@ -1272,29 +1409,29 @@ def compute_mse_gap(
     return total_mse / total_count if total_count > 0 else 0.0
 
 
-# ── VAE ───────────────────────────────────────────────────────────────
+# â”€â”€ VAE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 """
 Refactored VAE with LDM-aligned architectural improvements.
 
 Changes vs previous version (all gated by flags, defaults reproduce old behaviour):
-  1. conv3x3_proj=True  : GN→SiLU→3×3 combined mu+logvar projection (encoder)
-                          + 3×3 decoder input conv (replaces 1×1)
+  1. conv3x3_proj=True  : GNâ†’SiLUâ†’3Ã—3 combined mu+logvar projection (encoder)
+                          + 3Ã—3 decoder input conv (replaces 1Ã—1)
   2. decoder_extra_block : +1 VAEResBlock per decoder stage (LDM asymmetry)
-  3. encoder_attn_half   : attention at half-res (16×16) in encoder
+  3. encoder_attn_half   : attention at half-res (16Ã—16) in encoder
   4. use_tanh_out=False  : raw decoder output (no tanh saturation)
   5. clamp_logvar=True   : clamp logvar to [-30, 20]
   6. attn_zero_init=False: standard init on VAE attention proj (faster learning)
 """
 
-# ── VAEAttentionBlock (updated: optional zero-init) ──────────────────────
+# â”€â”€ VAEAttentionBlock (updated: optional zero-init) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class VAEAttentionBlock(nn.Module):
     """
     Multi-head self-attention with optional zero-init on output projection.
 
-    zero_init=True  (default): proj starts as no-op — good for score nets.
-    zero_init=False           : standard init — faster attention learning in VAEs.
+    zero_init=True  (default): proj starts as no-op â€” good for score nets.
+    zero_init=False           : standard init â€” faster attention learning in VAEs.
     """
     def __init__(self, ch: int, num_heads: int = 4, zero_init: bool = True):
         super().__init__()
@@ -1333,7 +1470,7 @@ class VAEAttentionBlock(nn.Module):
         return x + self.proj(out)
 
 
-# ── VAEResBlock (unchanged) ───────────────────────────────────────────
+# â”€â”€ VAEResBlock (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class VAEResBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -1347,7 +1484,7 @@ class VAEResBlock(nn.Module):
 
 class VAE(nn.Module):
     """
-    Convolutional VAE with two stride-2 downsamples (img_size → img_size/4 latent).
+    Convolutional VAE with two stride-2 downsamples (img_size â†’ img_size/4 latent).
 
     Backward-compatible: every NEW parameter's default reproduces the prior
     architecture exactly.
@@ -1381,7 +1518,7 @@ class VAE(nn.Module):
         # --- v2 architectural knobs (defaults = v1 behaviour) ---
         encoder_attn_half: bool = False,     # [4] attention at half-res in encoder
         decoder_extra_block: bool = False,   # [3] +1 ResBlock per decoder stage
-        conv3x3_proj: bool = False,          # [1,2] 3×3 latent projection + decoder input
+        conv3x3_proj: bool = False,          # [1,2] 3Ã—3 latent projection + decoder input
         use_tanh_out: bool = True,           # [5] False = raw output, no tanh
         clamp_logvar: bool = False,          # [6] clamp logvar to [-30, 20]
         attn_zero_init: bool = True,         # [7] False = standard init on VAE attn
@@ -1425,17 +1562,17 @@ class VAE(nn.Module):
         # ================================================================
         self.enc_conv_in = nn.Conv2d(img_channels, ch1, 3, 1, 1)
 
-        # Stage 0 — full-res → half-res
+        # Stage 0 â€” full-res â†’ half-res
         enc_stage0 = [VAEResBlock(ch1, ch1) for _ in range(num_res_blocks)]
         enc_stage0.append(nn.Conv2d(ch1, ch2, 3, 2, 1))           # stride-2 down
 
-        # Stage 1 — half-res → quarter-res
+        # Stage 1 â€” half-res â†’ quarter-res
         enc_stage1: list[nn.Module] = [VAEResBlock(ch2, ch2) for _ in range(num_res_blocks)]
         if encoder_attn_half:                                       # [4] NEW
             enc_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
         enc_stage1.append(nn.Conv2d(ch2, ch4, 3, 2, 1))           # stride-2 down
 
-        # Stage 2 — bottleneck (quarter-res, with attention)
+        # Stage 2 â€” bottleneck (quarter-res, with attention)
         enc_stage2: list[nn.Module] = [VAEResBlock(ch4, ch4)]
         enc_stage2.append(VAEAttentionBlock(ch4, zero_init=azero))
         for _ in range(num_res_blocks):
@@ -1459,7 +1596,7 @@ class VAE(nn.Module):
             self.y_emb = None
             self.cond_proj = None
 
-        # ---- latent projection (enc_out_ch → latent_channels) -----------
+        # ---- latent projection (enc_out_ch â†’ latent_channels) -----------
         if latent_proj_depth >= 2:
             self.enc_pre_proj = VAEResBlock(enc_out_ch, enc_out_ch)
         else:
@@ -1468,14 +1605,14 @@ class VAE(nn.Module):
         proj_in_ch = enc_out_ch + self.aux_d
 
         if self.conv3x3_proj:
-            # [1] NEW: terminal norm → activation → 3×3 combined mu+logvar
+            # [1] NEW: terminal norm â†’ activation â†’ 3Ã—3 combined mu+logvar
             self.enc_norm_out = make_group_norm(proj_in_ch)
             self.enc_conv_out = nn.Conv2d(proj_in_ch, 2 * latent_channels, 3, 1, 1)
             # no separate mu / logvar convs
             self.mu = None
             self.logvar = None
         else:
-            # legacy: separate 1×1 convs
+            # legacy: separate 1Ã—1 convs
             self.enc_norm_out = None
             self.enc_conv_out = None
             self.mu = nn.Conv2d(proj_in_ch, latent_channels, 1)
@@ -1498,7 +1635,7 @@ class VAE(nn.Module):
         #  DECODER
         # ================================================================
 
-        # ---- latent back-projection (latent_channels → ch4) -------------
+        # ---- latent back-projection (latent_channels â†’ ch4) -------------
         dec_in_ks = 3 if self.conv3x3_proj else 1                  # [2] NEW
         if latent_proj_depth >= 2:
             self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
@@ -1510,13 +1647,13 @@ class VAE(nn.Module):
         # number of ResBlocks per decoder stage
         dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
 
-        # Stage 0 — bottleneck (quarter-res, with attention)
+        # Stage 0 â€” bottleneck (quarter-res, with attention)
         dec_stage0: list[nn.Module] = [VAEResBlock(ch4, ch4)]
         dec_stage0.append(VAEAttentionBlock(ch4, zero_init=azero))
         for _ in range(dec_nrb):
             dec_stage0.append(VAEResBlock(ch4, ch4))
 
-        # Stage 1 — quarter-res → half-res
+        # Stage 1 â€” quarter-res â†’ half-res
         dec_stage1: list[nn.Module] = [
             nn.Upsample(scale_factor=2),
             nn.Conv2d(ch4, ch2, 3, 1, 1),
@@ -1526,7 +1663,7 @@ class VAE(nn.Module):
         if decoder_attn_half:
             dec_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
 
-        # Stage 2 — half-res → full-res
+        # Stage 2 â€” half-res â†’ full-res
         dec_stage2: list[nn.Module] = [
             nn.Upsample(scale_factor=2),
             nn.Conv2d(ch2, ch1, 3, 1, 1),
@@ -1545,12 +1682,12 @@ class VAE(nn.Module):
         )
 
         # ================================================================
-        #  TIME-DEPENDENT DECODER (TDD) — optional FiLM conditioning
+        #  TIME-DEPENDENT DECODER (TDD) â€” optional FiLM conditioning
         # ================================================================
         self.time_cond_decoder = time_cond_decoder
         if time_cond_decoder:
             self.dec_time_emb_dim = dec_time_emb_dim
-            # Sinusoidal embedding → MLP (same pattern as score network)
+            # Sinusoidal embedding â†’ MLP (same pattern as score network)
             self.dec_time_mlp = nn.Sequential(
                 nn.Linear(dec_time_emb_dim, 4 * dec_time_emb_dim),
                 nn.SiLU(),
@@ -1569,7 +1706,7 @@ class VAE(nn.Module):
                 self.dec_film_layers.append(film)
 
     # -----------------------------------------------------------------
-    #  encode / decode / forward  — signatures IDENTICAL to before
+    #  encode / decode / forward  â€” signatures IDENTICAL to before
     # -----------------------------------------------------------------
 
     def encode(self, x: torch.Tensor, y: torch.Tensor | None = None):
@@ -1597,14 +1734,14 @@ class VAE(nn.Module):
             w = torch.randn(B, self.aux_d, H, W, device=h.device, dtype=h.dtype)
             h = torch.cat([h, w], dim=1)
 
-        # ── latent projection ──
+        # â”€â”€ latent projection â”€â”€
         if self.conv3x3_proj:
-            # [1] combined: GN → SiLU → 3×3 → split
+            # [1] combined: GN â†’ SiLU â†’ 3Ã—3 â†’ split
             h = F.silu(self.enc_norm_out(h))
             moments = self.enc_conv_out(h)
             mu, logvar = moments.chunk(2, dim=1)
         else:
-            # legacy: separate 1×1 convs
+            # legacy: separate 1Ã—1 convs
             mu = self.mu(h)
             logvar = self.logvar(h)
 
@@ -1863,14 +2000,14 @@ class ResBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DiT (Diffusion Transformer) — drop-in replacement for UNetModel
+# DiT (Diffusion Transformer) â€” drop-in replacement for UNetModel
 # ---------------------------------------------------------------------------
 # Same forward API:  forward(x, t, y) -> eps_pred
 #   x: [B, C, H, W]  latent tensor
 #   t: [B]            continuous time scalars
-#   y: [B] | None     class labels (None → null/unconditional token)
+#   y: [B] | None     class labels (None â†’ null/unconditional token)
 #
-# Architecture:  patchify → transformer blocks with adaLN-Zero → unpatchify
+# Architecture:  patchify â†’ transformer blocks with adaLN-Zero â†’ unpatchify
 # Reference: Peebles & Xie, "Scalable Diffusion Models with Transformers" (2023)
 # ---------------------------------------------------------------------------
 
@@ -1973,7 +2110,7 @@ class DiTModel(nn.Module):
     - patchify -> transformer blocks with adaLN-Zero -> unpatchify
     - RMSNorm + SwiGLU (LightningDiT-style)
     - fixed 2D sin-cos positional embeddings
-    - outputs an eps prediction ε̂(z_t, t)
+    - outputs an eps prediction ÎµÌ‚(z_t, t)
 
     Forward signature stays: forward(x, t, y) -> [B,C,H,W]
     """
@@ -2048,11 +2185,11 @@ class DiTModel(nn.Module):
 
         patch_out_dim = self.in_channels * self.patch_size * self.patch_size
         if self.factored_head:
-            # Factored Natural-Parameter head (λ, ν):
-            #   prec_proj  -> predicts log(λ), where λ = σₜ · diag(Σₜ(x)⁻¹)
-            #   nu_proj    -> predicts ν = λ ⊙ μₜ  (precision-weighted mean)
-            #   output  ε̂ = λ ⊙ zₜ − ν
-            # The aggregate score is always s*(z,t) = -Λ_eff z + ν_eff,
+            # Factored Natural-Parameter head (Î», Î½):
+            #   prec_proj  -> predicts log(Î»), where Î» = Ïƒâ‚œ Â· diag(Î£â‚œ(x)â»Â¹)
+            #   nu_proj    -> predicts Î½ = Î» âŠ™ Î¼â‚œ  (precision-weighted mean)
+            #   output  ÎµÌ‚ = Î» âŠ™ zâ‚œ âˆ’ Î½
+            # The aggregate score is always s*(z,t) = -Î›_eff z + Î½_eff,
             # so this is the exact functional form with no approximation.
             self.nu_proj   = nn.Linear(self.hidden_dim, patch_out_dim)
             self.prec_proj = nn.Linear(self.hidden_dim, patch_out_dim)
@@ -2108,7 +2245,7 @@ class DiTModel(nn.Module):
             nn.init.zeros_(self.nu_proj.weight)
             nn.init.zeros_(self.nu_proj.bias)
             nn.init.zeros_(self.prec_proj.weight)
-            # Bias init: exp(-4) ≈ 0.018, so initial ε ≈ 0.018·zₜ
+            # Bias init: exp(-4) â‰ˆ 0.018, so initial Îµ â‰ˆ 0.018Â·zâ‚œ
             # (near-zero output at init while keeping grad alive to both heads)
             nn.init.constant_(self.prec_proj.bias, -4.0)
         else:
@@ -2124,11 +2261,11 @@ class DiTModel(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None, *, return_components: bool = False, detach_components: bool = False):
-        """Return eps prediction ε̂(z_t, t).
+        """Return eps prediction ÎµÌ‚(z_t, t).
 
         When factored_head=True the prediction uses natural parameters:
-            ε̂ = λ ⊙ z_t − ν
-        where λ = σₜ·Σₜ⁻¹ (diagonal precision) and ν = λ⊙μₜ.
+            ÎµÌ‚ = Î» âŠ™ z_t âˆ’ Î½
+        where Î» = Ïƒâ‚œÂ·Î£â‚œâ»Â¹ (diagonal precision) and Î½ = Î»âŠ™Î¼â‚œ.
 
         If return_components=True and factored_head=True, returns (eps, lam, nu).
         If detach_components=True, (lam, nu) are computed from detached trunk tokens
@@ -2165,7 +2302,7 @@ class DiTModel(nn.Module):
         tokens = self.final_norm(tokens) * (1.0 + gamma) + beta
 
         if self.factored_head:
-            # Natural-parameter form: ε̂ = λ ⊙ zₜ − ν
+            # Natural-parameter form: ÎµÌ‚ = Î» âŠ™ zâ‚œ âˆ’ Î½
             nu_hat  = self.unpatchify(self.nu_proj(tokens), H_tok, W_tok)
             log_lam = self.unpatchify(self.prec_proj(tokens), H_tok, W_tok)
             log_lam = log_lam.clamp(-20.0, 20.0)
@@ -2198,7 +2335,7 @@ UNetModel = DiTModel
 # ----------------------------------------------------------------------
 # DiT default config notes:
 #   DiTModel(hidden_dim=384, depth=8, num_heads=6, patch_size=2)
-#   operates on 8×8 latents → 16 tokens; ~4.3M params.
+#   operates on 8Ã—8 latents â†’ 16 tokens; ~4.3M params.
 #   For larger latents or more capacity, increase hidden_dim/depth.
 # ----------------------------------------------------------------------
 
@@ -2237,11 +2374,11 @@ class UniversalSampler:
         if self.schedule_type == "cosine":
             a, s, _ = get_cosine_params(t_vec, cosine_s=self.cosine_s)
             return a, s
-        # log_t or log_snr — both use OU params
+        # log_t or log_snr â€” both use OU params
         return get_ou_params(t_vec)
 
     def _get_beta(self, t_vec: torch.Tensor) -> torch.Tensor:
-        """Return instantaneous beta(t) — only meaningful for cosine VP."""
+        """Return instantaneous beta(t) â€” only meaningful for cosine VP."""
         if self.schedule_type == "cosine":
             _, _, b = get_cosine_params(t_vec, cosine_s=self.cosine_s)
             return b
@@ -2684,12 +2821,12 @@ class OracleScoreModel:
 
     Parameters
     ----------
-    all_mu : Tensor [N, C, H, W]   – encoder means (CPU)
-    all_logvar : Tensor [N, C, H, W] – encoder log-variances (CPU)
-    all_labels : Tensor [N]         – integer class labels (CPU)
-    cfg : dict                      – experiment config (needs time_schedule, t_min, t_max, …)
+    all_mu : Tensor [N, C, H, W]   â€“ encoder means (CPU)
+    all_logvar : Tensor [N, C, H, W] â€“ encoder log-variances (CPU)
+    all_labels : Tensor [N]         â€“ integer class labels (CPU)
+    cfg : dict                      â€“ experiment config (needs time_schedule, t_min, t_max, â€¦)
     device : torch.device
-    ref_chunk_size : int            – how many Gaussian components to load on GPU at once
+    ref_chunk_size : int            â€“ how many Gaussian components to load on GPU at once
     """
 
     def __init__(
@@ -2709,8 +2846,8 @@ class OracleScoreModel:
         self.num_classes = cfg.get("num_classes", None)
         self.null_label = self.num_classes if self.num_classes is not None else None
 
-        # Pre-load ALL reference data on GPU (≈ 2 × N × D × 4 bytes).
-        # For N=60k, D=512 this is ~240 MB — comfortably fits on any modern GPU.
+        # Pre-load ALL reference data on GPU (â‰ˆ 2 Ã— N Ã— D Ã— 4 bytes).
+        # For N=60k, D=512 this is ~240 MB â€” comfortably fits on any modern GPU.
         self.all_mu_flat = all_mu.reshape(self.N, -1).float().to(device)          # [N, D]
         self.all_var_flat = torch.exp(
             all_logvar.reshape(self.N, -1).float()
@@ -2759,8 +2896,8 @@ class OracleScoreModel:
         ----------
         z_t : [B, C, H, W]
         t   : [B]  (assumed constant across batch)
-        label_filter : [B] int labels – if given, restrict the sum per query to
-                       reference points whose label matches.  ``None`` → unconditional.
+        label_filter : [B] int labels â€“ if given, restrict the sum per query to
+                       reference points whose label matches.  ``None`` â†’ unconditional.
 
         Returns
         -------
@@ -2788,7 +2925,7 @@ class OracleScoreModel:
         log_var_sum = torch.log(var_t).sum(dim=1)                 # [N]
         mu_sq_over_var_sum = (mu_t * mu_over_var).sum(dim=1)      # [N]
 
-        # log p(z_t | x_i) ∝ -0.5 [log|Σ_t| + z^2·(1/v) - 2 z·(μ/v) + μ^2/v]
+        # log p(z_t | x_i) âˆ -0.5 [log|Î£_t| + z^2Â·(1/v) - 2 zÂ·(Î¼/v) + Î¼^2/v]
         all_log_w = -0.5 * (
             log_var_sum.unsqueeze(0)                              # [1, N]
             + (z_flat * z_flat) @ one_over_var.T                  # [B, N]
@@ -2821,8 +2958,8 @@ class OracleScoreModel:
     ) -> torch.Tensor:
         """Forward call matching DiTModel interface.
 
-        * ``y is None``  → unconditional oracle score (sum over all components).
-        * ``y`` given     → class-conditional oracle score (sum over matching labels).
+        * ``y is None``  â†’ unconditional oracle score (sum over all components).
+        * ``y`` given     â†’ class-conditional oracle score (sum over matching labels).
         """
         return self._compute_eps(z_t, t, label_filter=y)
 
@@ -4179,9 +4316,11 @@ def train_vae_cotrained_cond(cfg):
     # --- Unified discrete schedule (log_t / log_snr / cosine depending on cfg) ---
     ou_sched = make_schedule(cfg, device)
     validate_terminal_time_contract(cfg, ou_sched)
+    score_time_weighting = validate_score_time_weighting(cfg, ou_sched)
     T = int(ou_sched["T"].item())
     noise_sched = ou_sched
     print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
+    print(f"--> Score time weighting: {score_time_weighting}")
 
     dataset_key = cfg.get("dataset", "FMNIST")
     train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
@@ -4446,6 +4585,7 @@ def train_vae_cotrained_cond(cfg):
                 mu_stats.append(mu.detach())
 
             # --- Time / forward process (BEFORE decode) ---
+            t_idx = None
             if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
                 t = sample_logit_normal_times(B, cfg["t_min"], cfg["t_max"], device)
                 alpha, sigma = get_flow_params(t.view(B, 1, 1, 1))
@@ -4560,6 +4700,13 @@ def train_vae_cotrained_cond(cfg):
             eps_target_lsi = sigma * resid  # E[eps | z_t, x]
             # Control head predicts the sampled eps directly.
             eps_target_control = noise
+            score_time_weights = score_time_importance_weights(
+                t=t,
+                sigma=sigma,
+                cfg=cfg,
+                schedule=ou_sched,
+                t_idx=t_idx,
+            )
 
             if freeze_score_in_cotrain:
                 score_loss_lsi = torch.tensor(0.0, device=device)
@@ -4583,8 +4730,9 @@ def train_vae_cotrained_cond(cfg):
                     aux_loss_lam = torch.tensor(0.0, device=device)
                     aux_loss_nu  = torch.tensor(0.0, device=device)
 
-                loss_mse_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-                loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
+                loss_mse_lsi, loss_cos_lsi = weighted_score_prediction_losses(
+                    eps_pred_lsi, eps_target_lsi, score_time_weights
+                )
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
                     #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
@@ -4595,14 +4743,9 @@ def train_vae_cotrained_cond(cfg):
                         eps_pred_control = unet_control(z_mu_t, t, y_in)
                     else:
                         eps_pred_control = unet_control(z_t, t, y_in)
-                    loss_mse_ctrl = F.mse_loss(eps_pred_control, eps_target_control)
-                    loss_cos_ctrl = (
-                        1.0 - F.cosine_similarity(
-                            eps_pred_control.flatten(1),
-                            eps_target_control.flatten(1),
-                            dim=1,
-                        )
-                    ).mean()
+                    loss_mse_ctrl, loss_cos_ctrl = weighted_score_prediction_losses(
+                        eps_pred_control, eps_target_control, score_time_weights
+                    )
                     score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
                 else:
                     score_loss_control = torch.tensor(0.0, device=device)
@@ -4678,8 +4821,11 @@ def train_vae_cotrained_cond(cfg):
                         # Control head tracks the velocity baseline
                         x_in = z_mu_t_detached if cfg.get("train_on_mu", False) else z_t_detached
                         eps_pred_control_tracking = unet_control(x_in, t, y_in)
-                        loss_mse = F.mse_loss(eps_pred_control_tracking, eps_target_control_det)
-                        loss_cos = (1.0 - F.cosine_similarity(eps_pred_control_tracking.flatten(1), eps_target_control_det.flatten(1), dim=1)).mean()
+                        loss_mse, loss_cos = weighted_score_prediction_losses(
+                            eps_pred_control_tracking,
+                            eps_target_control_det,
+                            score_time_weights,
+                        )
                         tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
                     else:
                         # LSI head tracks the CSEM velocity target
@@ -4699,8 +4845,11 @@ def train_vae_cotrained_cond(cfg):
                             aux_loss_lam_tr = torch.tensor(0.0, device=device)
                             aux_loss_nu_tr  = torch.tensor(0.0, device=device)
 
-                        loss_mse = F.mse_loss(eps_pred_lsi_tracking, eps_target_lsi_det)
-                        loss_cos = (1.0 - F.cosine_similarity(eps_pred_lsi_tracking.flatten(1), eps_target_lsi_det.flatten(1), dim=1)).mean()
+                        loss_mse, loss_cos = weighted_score_prediction_losses(
+                            eps_pred_lsi_tracking,
+                            eps_target_lsi_det,
+                            score_time_weights,
+                        )
                         tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
                         if use_factored:
                             #tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
@@ -4920,6 +5069,7 @@ def train_vae_cotrained_cond(cfg):
                     z0 = vae.reparameterize(mu, logvar)
 
                 # --- Time / forward process ---
+                t_idx = None
                 if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
                     t = sample_logit_normal_times(B, cfg["t_min"], cfg["t_max"], device)
                     alpha, sigma = get_flow_params(t.view(B, 1, 1, 1))
@@ -4954,6 +5104,13 @@ def train_vae_cotrained_cond(cfg):
 
                 resid = (z_t - mu_t) / (var_t + 1e-8)
                 eps_target_lsi = sigma * resid  # E[eps | z_t, x]
+                score_time_weights = score_time_importance_weights(
+                    t=t,
+                    sigma=sigma,
+                    cfg=cfg,
+                    schedule=ou_sched,
+                    t_idx=t_idx,
+                )
 
                 use_factored = bool(getattr(unet_lsi, "factored_head", False))
                 if use_factored:
@@ -4971,8 +5128,9 @@ def train_vae_cotrained_cond(cfg):
                     aux_loss_lam = torch.tensor(0.0, device=device)
                     aux_loss_nu  = torch.tensor(0.0, device=device)
 
-                loss_mse_lsi = F.mse_loss(eps_pred_lsi, eps_target_lsi)
-                loss_cos_lsi = (1.0 - F.cosine_similarity(eps_pred_lsi.flatten(1), eps_target_lsi.flatten(1), dim=1)).mean()
+                loss_mse_lsi, loss_cos_lsi = weighted_score_prediction_losses(
+                    eps_pred_lsi, eps_target_lsi, score_time_weights
+                )
                 score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
                 if use_factored:
                     #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
@@ -4997,8 +5155,9 @@ def train_vae_cotrained_cond(cfg):
                     else:
                         eps_pred_control = unet_control(z_t, t, y_in)
 
-                    loss_mse_ctrl = F.mse_loss(eps_pred_control, eps_target_control)
-                    loss_cos_ctrl = (1.0 - F.cosine_similarity(eps_pred_control.flatten(1), eps_target_control.flatten(1), dim=1)).mean()
+                    loss_mse_ctrl, loss_cos_ctrl = weighted_score_prediction_losses(
+                        eps_pred_control, eps_target_control, score_time_weights
+                    )
                     score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
 
                     opt_control_refine.zero_grad()
@@ -5281,26 +5440,57 @@ def save_scale_anchor_mechanism_plots(combined_loss: pd.DataFrame, out_dir: str)
 
 
 
-def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
-    """
-    Run the canonical CSEM co-training recipe twice:
+SCALE_ANCHOR_ARMS = ("terminal_kl", "norm")
 
-      1) SCALE_NORM:
-         GroupNorm on the encoder mean, with both the KL and stiffness
-         penalties disabled (use_latent_norm=True, kl_w=stiff_w=0).
 
-      2) TERMINAL_KL:
-         same recipe, but remove the output mean GroupNorm and replace the
-         scale regularizer by K_T = E_x KL(q_phi,T(.|x) || N(0,I)).
+def parse_arms_arg(value: str) -> Tuple[str, ...]:
+    """Parse an ordered, comma-separated nonempty subset of scale-anchor arms."""
+    arms = tuple(part.strip().lower() for part in value.split(",") if part.strip())
+    if not arms:
+        raise argparse.ArgumentTypeError(
+            "--arms must contain at least one arm: terminal_kl or norm"
+        )
 
-    The paired configs share the same model/optimizer/diffusion/decoder/GAN/
-    CFG/EMA training recipe.  The fast mechanism protocol only removes work
-    that does not feed back into the CSEM representation objective: long-run
-    epochs/refinement, the detached tracking head, and heavy oracle evaluation.
+    unknown = [arm for arm in arms if arm not in SCALE_ANCHOR_ARMS]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            "unknown arm(s) "
+            + ", ".join(repr(arm) for arm in unknown)
+            + "; expected a comma-separated subset of terminal_kl,norm"
+        )
+
+    duplicates = [arm for i, arm in enumerate(arms) if arm in arms[:i]]
+    if duplicates:
+        raise argparse.ArgumentTypeError(
+            "--arms may not repeat an arm; duplicate(s): "
+            + ", ".join(sorted(set(duplicates)))
+        )
+    return arms
+
+
+def run_scale_anchor_comparison(cfg_norm, cfg_terminal, arms):
+    """Run exactly the requested scale-anchor arms, in the requested order.
+
+    ``terminal_kl`` removes encoder-mean GroupNorm and uses
+    K_T = E_x KL(q_phi,T(.|x) || N(0,I)). ``norm`` uses encoder-mean
+    GroupNorm with both the KL and stiffness penalties disabled. When both are
+    selected, their model/optimizer/diffusion/decoder/GAN/CFG/EMA recipes remain
+    identical apart from the intended scale-fixing mechanism.
     """
     print("=" * 78)
-    print("CSEM SCALE ANCHOR COMPARISON: GROUPNORM-ONLY vs TERMINAL-T KL")
+    print("CSEM SCALE-ANCHOR RUN")
     print("=" * 78)
+
+    arms = tuple(arms)
+    if not arms:
+        raise ValueError("At least one scale-anchor arm must be selected.")
+    unknown = [arm for arm in arms if arm not in SCALE_ANCHOR_ARMS]
+    if unknown or len(set(arms)) != len(arms):
+        raise ValueError(
+            f"Invalid ordered arms {arms!r}; expected a nonrepeating subset of "
+            f"{SCALE_ANCHOR_ARMS!r}."
+        )
+    print("Selected arm order: " + " -> ".join(arms))
 
     if float(cfg_norm.get("kl_w", 0.0)) != 0.0 or float(cfg_norm.get("stiff_w", 0.0)) != 0.0:
         raise ValueError(
@@ -5322,120 +5512,102 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
     cfg_norm["fid_ckpt_dir"] = shared_fid_ckpt_dir
     cfg_terminal["fid_ckpt_dir"] = shared_fid_ckpt_dir
 
-    # Branch order is configurable so users can choose which expensive arm
-    # consumes the node first.  Both arms still reset to the same seed.
-    first_arm = str(cfg_norm.get("first_arm", "terminal_kl")).lower()
+    arm_specs = {
+        "terminal_kl": {
+            "cfg": cfg_terminal,
+            "title": "NO LATENT SCALE NORMALIZATION + TERMINAL-T KL",
+            "results_subdir": "run_terminal_kl",
+            "scale_anchor": "terminal_T_KL",
+        },
+        "norm": {
+            "cfg": cfg_norm,
+            "title": "SCALE NORMALIZATION ONLY (KL/STIFFNESS DISABLED)",
+            "results_subdir": "run_scale_norm",
+            "scale_anchor": "scale_norm_only",
+        },
+    }
 
-    if first_arm == "terminal_kl":
+    loss_by_arm = {}
+    eval_by_arm = {}
+    for arm_index, arm in enumerate(arms, start=1):
+        spec = arm_specs[arm]
+        cfg = spec["cfg"]
         print("\n" + "=" * 78)
-        print("ARM 1: NO LATENT SCALE NORMALIZATION + TERMINAL-T KL")
+        print(f"ARM {arm_index}/{len(arms)} [{arm}]: {spec['title']}")
         print("=" * 78)
-        print(
-            f"dataset={cfg_terminal['dataset']} | "
-            f"use_latent_norm={cfg_terminal.get('use_latent_norm')} | "
-            f"kl_reg_type={cfg_terminal.get('kl_reg_type')} | "
-            f"kl_w={cfg_terminal.get('kl_w')} | "
-            f"T=t_max={cfg_terminal.get('t_max')}"
+        status = (
+            f"dataset={cfg['dataset']} | "
+            f"use_latent_norm={cfg.get('use_latent_norm')} | "
+            f"kl_reg_type={cfg.get('kl_reg_type')} | "
+            f"kl_w={cfg.get('kl_w')}"
         )
-        cfg_terminal["results_dir"] = os.path.join(
-            master_results_dir, "run_terminal_kl"
-        )
-        seed_everything(int(cfg_terminal["seed"]))
-        loss_terminal, eval_terminal = train_vae_cotrained_cond(cfg_terminal)
+        if arm == "terminal_kl":
+            status += f" | T=t_max={cfg.get('t_max')}"
+        print(status)
 
-        print("\n" + "=" * 78)
-        print("ARM 2: SCALE NORMALIZATION ONLY (KL/STIFFNESS DISABLED)")
-        print("=" * 78)
-        print(
-            f"dataset={cfg_norm['dataset']} | "
-            f"use_latent_norm={cfg_norm.get('use_latent_norm')} | "
-            f"kl_reg_type={cfg_norm.get('kl_reg_type')} | "
-            f"kl_w={cfg_norm.get('kl_w')}"
+        cfg["results_dir"] = os.path.join(
+            master_results_dir, spec["results_subdir"]
         )
-        cfg_norm["results_dir"] = os.path.join(master_results_dir, "run_scale_norm")
-        seed_everything(int(cfg_norm["seed"]))
-        loss_norm, eval_norm = train_vae_cotrained_cond(cfg_norm)
+        # Keep checkpoints inside the selected arm's result tree. This is
+        # essential when independent T-sweep jobs run concurrently from the
+        # same working directory.
+        cfg["ckpt_dir"] = os.path.join(cfg["results_dir"], "checkpoints")
+        # Every selected arm starts from the same RNG state, preserving paired
+        # comparability independently of selection and order.
+        seed_everything(int(cfg["seed"]))
+        loss_by_arm[arm], eval_by_arm[arm] = train_vae_cotrained_cond(cfg)
 
-    elif first_arm == "norm":
-        print("\n" + "=" * 78)
-        print("ARM 1: SCALE NORMALIZATION ONLY (KL/STIFFNESS DISABLED)")
-        print("=" * 78)
-        print(
-            f"dataset={cfg_norm['dataset']} | "
-            f"use_latent_norm={cfg_norm.get('use_latent_norm')} | "
-            f"kl_reg_type={cfg_norm.get('kl_reg_type')} | "
-            f"kl_w={cfg_norm.get('kl_w')}"
-        )
-        cfg_norm["results_dir"] = os.path.join(master_results_dir, "run_scale_norm")
-        seed_everything(int(cfg_norm["seed"]))
-        loss_norm, eval_norm = train_vae_cotrained_cond(cfg_norm)
-
-        print("\n" + "=" * 78)
-        print("ARM 2: NO LATENT SCALE NORMALIZATION + TERMINAL-T KL")
-        print("=" * 78)
-        print(
-            f"dataset={cfg_terminal['dataset']} | "
-            f"use_latent_norm={cfg_terminal.get('use_latent_norm')} | "
-            f"kl_reg_type={cfg_terminal.get('kl_reg_type')} | "
-            f"kl_w={cfg_terminal.get('kl_w')} | "
-            f"T=t_max={cfg_terminal.get('t_max')}"
-        )
-        cfg_terminal["results_dir"] = os.path.join(
-            master_results_dir, "run_terminal_kl"
-        )
-        seed_everything(int(cfg_terminal["seed"]))
-        loss_terminal, eval_terminal = train_vae_cotrained_cond(cfg_terminal)
-
-    else:
-        raise ValueError(
-            f"Unknown first_arm={first_arm!r}; expected 'terminal_kl' or 'norm'."
-        )
-
-    # ---- Save paired tables ---------------------------------------------
+    # ---- Save selected-arm tables ---------------------------------------
     combined_dir = os.path.join(master_results_dir, "combined_dataframes")
     os.makedirs(combined_dir, exist_ok=True)
 
-    loss_norm_save = loss_norm.copy()
-    loss_norm_save["scale_anchor"] = "scale_norm_only"
-    loss_terminal_save = loss_terminal.copy()
-    loss_terminal_save["scale_anchor"] = "terminal_T_KL"
-    combined_loss = pd.concat(
-        [loss_terminal_save, loss_norm_save], ignore_index=True
-    )
+    loss_frames = []
+    eval_frames = []
+    for arm in arms:
+        loss_frame = loss_by_arm[arm].copy()
+        loss_frame["scale_anchor"] = arm_specs[arm]["scale_anchor"]
+        loss_frames.append(loss_frame)
+
+        eval_frame = eval_by_arm[arm].copy()
+        eval_frame["scale_anchor"] = arm_specs[arm]["scale_anchor"]
+        eval_frames.append(eval_frame)
+
+    combined_loss = pd.concat(loss_frames, ignore_index=True)
     combined_loss.to_csv(
         os.path.join(combined_dir, "combined_loss_history.csv"), index=False
     )
-    if bool(cfg_norm.get("mechanism_diagnostics", False)):
+    if any(
+        bool(arm_specs[arm]["cfg"].get("mechanism_diagnostics", False))
+        for arm in arms
+    ):
         save_scale_anchor_mechanism_plots(
             combined_loss,
             os.path.join(master_results_dir, "mechanism_plots"),
         )
 
-    eval_norm_save = eval_norm.copy()
-    eval_norm_save["scale_anchor"] = "scale_norm_only"
-    eval_terminal_save = eval_terminal.copy()
-    eval_terminal_save["scale_anchor"] = "terminal_T_KL"
-    combined_eval = pd.concat(
-        [eval_terminal_save, eval_norm_save], ignore_index=True
-    )
+    combined_eval = pd.concat(eval_frames, ignore_index=True)
     combined_eval.to_csv(
         os.path.join(combined_dir, "combined_eval_metrics.csv"), index=False
     )
 
     zip_path = zip_results_dir(master_results_dir)
     print("\n" + "=" * 78)
-    print("SCALE ANCHOR COMPARISON COMPLETE")
+    print("CSEM SCALE-ANCHOR RUN COMPLETE")
     print("=" * 78)
-    print(f"Scale norm only:    {master_results_dir}/run_scale_norm/")
-    print(f"Terminal-T KL:      {master_results_dir}/run_terminal_kl/")
+    for arm in arms:
+        print(
+            f"{arm:16s} {master_results_dir}/"
+            f"{arm_specs[arm]['results_subdir']}/"
+        )
     print(f"Combined tables:    {master_results_dir}/combined_dataframes/")
     print(f"Zip:                {zip_path}")
 
     return {
-        "loss_norm": loss_norm,
-        "eval_norm": eval_norm,
-        "loss_terminal": loss_terminal,
-        "eval_terminal": eval_terminal,
+        "arms": arms,
+        "loss_norm": loss_by_arm.get("norm", pd.DataFrame()),
+        "eval_norm": eval_by_arm.get("norm", pd.DataFrame()),
+        "loss_terminal": loss_by_arm.get("terminal_kl", pd.DataFrame()),
+        "eval_terminal": eval_by_arm.get("terminal_kl", pd.DataFrame()),
         "combined_loss": combined_loss,
         "combined_eval": combined_eval,
         "master_results_dir": master_results_dir,
@@ -5447,7 +5619,7 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Paired CSEM scale-anchor comparison with automatic dataset-dependent "
+            "Selectable CSEM scale-anchor runs with automatic dataset-dependent "
             "capacity presets: CIFAR uses the golden CSEM setup; MNIST-family "
             "datasets use the compact grayscale setup."
         )
@@ -5457,7 +5629,7 @@ def main():
         default="CIFAR",
         choices=list(DATASET_INFO.keys()),
         help=(
-            "Dataset for both paired runs. Architecture/batch/LR defaults are "
+            "Dataset for every selected arm. Architecture/batch/LR defaults are "
             "selected automatically from the dataset."
         ),
     )
@@ -5480,6 +5652,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--csem-w", "--csem-loss-w",
+        dest="csem_w",
+        type=float,
+        default=0.6,
+        help=(
+            "Weight multiplying the joint CSEM loss in every selected arm. "
+            "Default: 0.6 (the script's previous hard-coded value). For the exact "
+            "canonical CSEM + K_T coefficient identity, set this equal to "
+            "--terminal-kl-w."
+        ),
+    )
+    parser.add_argument(
         "--T-terminal", "--T_terminal", "--t-terminal",
         dest="T_terminal",
         type=float,
@@ -5488,6 +5672,18 @@ def main():
             "Shared terminal diffusion time. This sets the score-training horizon, "
             "the time used by K_T, and the Gaussian reverse-sampling initialization "
             "time. If omitted, use the selected dataset preset's t_max."
+        ),
+    )
+    parser.add_argument(
+        "--score-time-weighting", "--time-weighting",
+        choices=list(SCORE_TIME_WEIGHTING_CHOICES),
+        default="unweighted-eps",
+        help=(
+            "Score-loss measure. 'unweighted-eps' preserves the current objective: "
+            "plain epsilon-MSE under the sampled time distribution (approximately "
+            "log-uniform time for the comparison presets). 'canonical' applies both "
+            "the epsilon-to-score factor 1/sigma(t)^2 and the proposal/quadrature "
+            "correction needed to approximate the physical-OU-time integral."
         ),
     )
     parser.add_argument(
@@ -5516,8 +5712,8 @@ def main():
         "--master-results-dir",
         default=None,
         help=(
-            "Output root. Default is derived from dataset, e.g. "
-            "run_results_fmnist_scale_norm_vs_terminal_kl."
+            "Output root. The default is derived from the dataset and ordered "
+            "arm list, e.g. run_results_fmnist_terminal_kl."
         ),
     )
 
@@ -5546,7 +5742,8 @@ def main():
         default=None,
         help=(
             "Override base CSEM/DiT AdamW LR; otherwise use preset default. "
-            "The co-trained LSI head uses lr_ldm / score_w_vae."
+            "The co-trained LSI head preserves the existing optimizer convention "
+            "and uses lr_ldm / csem_w when csem_w > 0."
         ),
     )
     parser.add_argument(
@@ -5571,12 +5768,14 @@ def main():
         ),
     )
     parser.add_argument(
-        "--first-arm",
-        choices=["terminal_kl", "norm"],
-        default="terminal_kl",
+        "--arms",
+        type=parse_arms_arg,
+        default=parse_arms_arg("terminal_kl,norm"),
+        metavar="ARM[,ARM...]",
         help=(
-            "Which paired branch runs first. 'terminal_kl' = no scale normalization "
-            "+ terminal-T KL; 'norm' = scale-normalized baseline."
+            "Ordered nonrepeating subset of branches to run. Valid examples: "
+            "--arms terminal_kl, --arms norm, or --arms norm,terminal_kl. "
+            "Default: terminal_kl,norm."
         ),
     )
     parser.add_argument(
@@ -5589,6 +5788,7 @@ def main():
         ),
     )
     args = parser.parse_args()
+    arms = tuple(args.arms)
 
     preset_name, preset = resolve_model_preset(args.dataset, args.model_preset)
 
@@ -5612,6 +5812,7 @@ def main():
         if args.T_terminal is not None
         else preset.get("t_max", 1.5)
     )
+    csem_w = float(args.csem_w)
     cfg_strength = float(args.cfg_strength)
     use_bespoke_fid_classifier = resolve_bespoke_fid_classifier(
         args.dataset, args.bespoke_fid_classifier
@@ -5620,7 +5821,7 @@ def main():
     master_results_dir = (
         args.master_results_dir
         if args.master_results_dir is not None
-        else f"run_results_{args.dataset.lower()}_scale_norm_vs_terminal_kl"
+        else f"run_results_{args.dataset.lower()}_{'_then_'.join(arms)}"
     )
 
     if epochs < 1:
@@ -5639,6 +5840,10 @@ def main():
     if not math.isfinite(cfg_strength) or cfg_strength < 0.0:
         raise ValueError(
             f"--cfg-strength must be finite and nonnegative, got {cfg_strength}"
+        )
+    if not math.isfinite(csem_w) or csem_w < 0.0:
+        raise ValueError(
+            f"--csem-w must be finite and nonnegative, got {csem_w}"
         )
     if lr_vae <= 0 or lr_ldm <= 0 or lr_refine <= 0:
         raise ValueError("Resolved learning rates must all be > 0")
@@ -5686,6 +5891,8 @@ def main():
         # --- CSEM score loss ---
         "cosine_w": 0.0,
         "aux_head_w": 0.0025,
+        # Shared coefficient on the joint CSEM term in both comparison arms.
+        "score_w_vae": csem_w,
 
         # --- Encoder architecture ---
         "aux_d": 0,
@@ -5728,6 +5935,7 @@ def main():
         "T_terminal": T_terminal,
         "t_max": T_terminal,
         "num_train_timesteps": int(preset.get("num_train_timesteps", 1000)),
+        "score_time_weighting": args.score_time_weighting,
         "train_on_mu": False,
 
         # --- Cosine VP schedule settings (inactive for log_t) ---
@@ -5785,7 +5993,6 @@ def main():
         "use_cond_encoder": False,
         "kl_reg_type": "normal",
         "kl_w": 0.0,
-        "score_w_vae": 0.6,
         "stiff_w": 0.0,
         "score_w": 1.0,
         "train_tracking_head": False,
@@ -5835,11 +6042,11 @@ def main():
         "stiff_w": 0.0,
     })
 
-    cfg_norm["first_arm"] = args.first_arm
-    cfg_terminal["first_arm"] = args.first_arm
+    cfg_norm["arms"] = arms
+    cfg_terminal["arms"] = arms
 
     print("=" * 78)
-    print("=== CSEM: SCALE NORMALIZATION vs TERMINAL-T KL ===")
+    print("=== CSEM: SELECTED SCALE-ANCHOR ARMS ===")
     print("=" * 78)
     print(f"Dataset: {args.dataset}")
     print(f"Resolved preset: {preset_name}")
@@ -5850,20 +6057,20 @@ def main():
         f"heads={cfg_norm['dit_num_heads']} | batch={cfg_norm['batch_size']}"
     )
     print(
-        f"Training: first_arm={args.first_arm} | "
+        f"Training: arms={','.join(arms)} | "
         f"cotrain={cfg_norm['epochs_vae']} | refine={cfg_norm['epochs_refine']} | "
         f"LR horizon={cfg_norm['lr_schedule_epochs']} | "
         f"eval_every={cfg_norm['eval_freq_cotrain']} | "
         f"eval_samples={cfg_norm.get('eval_max_samples')}"
     )
-    effective_score_lr = (
+    joint_score_param_lr = (
         cfg_norm["lr_ldm"] / cfg_norm["score_w_vae"]
         if cfg_norm.get("score_w_vae", 0.0) > 0 else 0.0
     )
     print(
         f"LRs: VAE={cfg_norm['lr_vae']:.3g} | "
         f"LDM base={cfg_norm['lr_ldm']:.3g} | "
-        f"effective joint LSI={effective_score_lr:.3g} | "
+        f"joint LSI param-group={joint_score_param_lr:.3g} | "
         f"refine={cfg_norm['lr_refine']:.3g}"
     )
     print(
@@ -5872,6 +6079,26 @@ def main():
         f"T_terminal=t_max={cfg_norm['T_terminal']:.3g} | "
         f"decode_time={cfg_norm.get('decode_time')}"
     )
+    print(f"Score time weighting: {cfg_norm['score_time_weighting']}")
+    print(
+        f"Objective weights: csem_w={cfg_norm['score_w_vae']:g} | "
+        f"terminal_kl_w={cfg_terminal['kl_w']:g}"
+    )
+    if (
+        cfg_norm["score_time_weighting"] == "canonical"
+        and not math.isclose(
+            float(cfg_norm["score_w_vae"]),
+            float(cfg_terminal["kl_w"]),
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    ):
+        print(
+            "NOTE: canonical selects the theorem's physical time measure, but "
+            "the exact CSEM + K_T coefficient identity also requires "
+            "csem_w == terminal_kl_w; resolved values are "
+            f"{cfg_norm['score_w_vae']:g} and {cfg_terminal['kl_w']:g}."
+        )
     print(f"CFG evaluation strength: {cfg_norm['cfg_eval_scale']:g}")
     print(
         "FID/KID feature extractor: "
@@ -5882,26 +6109,30 @@ def main():
         )
     )
     print("Auxiliary control/oracle diagnostics: OFF")
-    print("Per-epoch K_T / latent-scale / posterior-variance diagnostics: ON (both arms)")
+    print("Per-epoch K_T / latent-scale / posterior-variance diagnostics: ON")
 
-    print("\nArm A -- terminal-time KL:")
-    print(f"  use_latent_norm = {cfg_terminal['use_latent_norm']}")
-    print(f"  kl_reg_type     = {cfg_terminal['kl_reg_type']}")
-    print(f"  kl_w            = {cfg_terminal['kl_w']}")
-    print(f"  stiff_w         = {cfg_terminal['stiff_w']}  (disabled)")
-    print(
-        f"  terminal T      = T_terminal = t_max = "
-        f"{cfg_terminal['T_terminal']}"
-    )
+    if "terminal_kl" in arms:
+        print("\nSelected arm -- terminal-time KL:")
+        print(f"  use_latent_norm = {cfg_terminal['use_latent_norm']}")
+        print(f"  kl_reg_type     = {cfg_terminal['kl_reg_type']}")
+        print(f"  kl_w            = {cfg_terminal['kl_w']}")
+        print(f"  csem_w          = {cfg_terminal['score_w_vae']}  (shared)")
+        print(f"  stiff_w         = {cfg_terminal['stiff_w']}  (disabled)")
+        print(
+            f"  terminal T      = T_terminal = t_max = "
+            f"{cfg_terminal['T_terminal']}"
+        )
 
-    print("\nArm B -- scale normalization only:")
-    print(f"  use_latent_norm = {cfg_norm['use_latent_norm']}")
-    print(f"  kl_reg_type     = {cfg_norm['kl_reg_type']}")
-    print(f"  kl_w            = {cfg_norm['kl_w']}")
-    print(f"  stiff_w         = {cfg_norm['stiff_w']}")
+    if "norm" in arms:
+        print("\nSelected arm -- scale normalization only:")
+        print(f"  use_latent_norm = {cfg_norm['use_latent_norm']}")
+        print(f"  kl_reg_type     = {cfg_norm['kl_reg_type']}")
+        print(f"  kl_w            = {cfg_norm['kl_w']}")
+        print(f"  csem_w          = {cfg_norm['score_w_vae']}  (shared)")
+        print(f"  stiff_w         = {cfg_norm['stiff_w']}")
     print("=" * 78)
 
-    results = run_scale_anchor_comparison(cfg_norm, cfg_terminal)
+    results = run_scale_anchor_comparison(cfg_norm, cfg_terminal, arms)
 
     print("\n" + "=" * 78)
     print("FINAL SUMMARY")
@@ -5911,4 +6142,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
