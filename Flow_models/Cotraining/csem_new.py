@@ -46,7 +46,7 @@ DATASET_INFO = {
 #
 # These presets intentionally change capacity/batch/LR/training-length defaults,
 # NOT the scientific scale-anchor comparison.  In every preset:
-#   baseline = GroupNorm mean + canonical weak normal KL/stiffness terms
+#   baseline = GroupNorm mean only (KL and stiffness weights both zero)
 #   terminal = no GroupNorm + terminal K_T, with stiffness disabled
 #
 DATASET_PRESETS = {
@@ -5249,8 +5249,8 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
     Run the canonical CSEM co-training recipe twice:
 
       1) SCALE_NORM:
-         exactly the current co-training scale treatment
-         (use_latent_norm=True, kl_reg_type='normal', original kl_w).
+         GroupNorm on the encoder mean, with both the KL and stiffness
+         penalties disabled (use_latent_norm=True, kl_w=stiff_w=0).
 
       2) TERMINAL_KL:
          same recipe, but remove the output mean GroupNorm and replace the
@@ -5262,8 +5262,14 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
     epochs/refinement, the detached tracking head, and heavy oracle evaluation.
     """
     print("=" * 78)
-    print("CSEM SCALE ANCHOR COMPARISON: CURRENT NORMALIZATION vs TERMINAL-T KL")
+    print("CSEM SCALE ANCHOR COMPARISON: GROUPNORM-ONLY vs TERMINAL-T KL")
     print("=" * 78)
+
+    if float(cfg_norm.get("kl_w", 0.0)) != 0.0 or float(cfg_norm.get("stiff_w", 0.0)) != 0.0:
+        raise ValueError(
+            "The scale-normalization arm must be GroupNorm-only: "
+            f"got kl_w={cfg_norm.get('kl_w')} and stiff_w={cfg_norm.get('stiff_w')}."
+        )
 
     master_results_dir = cfg_norm.get(
         "master_results_dir", "run_results_terminal_kl_vs_scale_norm"
@@ -5301,7 +5307,7 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
         loss_terminal, eval_terminal = train_vae_cotrained_cond(cfg_terminal)
 
         print("\n" + "=" * 78)
-        print("ARM 2: CURRENT SCALE NORMALIZATION (canonical script setup)")
+        print("ARM 2: SCALE NORMALIZATION ONLY (KL/STIFFNESS DISABLED)")
         print("=" * 78)
         print(
             f"dataset={cfg_norm['dataset']} | "
@@ -5315,7 +5321,7 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
 
     elif first_arm == "norm":
         print("\n" + "=" * 78)
-        print("ARM 1: CURRENT SCALE NORMALIZATION (canonical script setup)")
+        print("ARM 1: SCALE NORMALIZATION ONLY (KL/STIFFNESS DISABLED)")
         print("=" * 78)
         print(
             f"dataset={cfg_norm['dataset']} | "
@@ -5353,7 +5359,7 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
     os.makedirs(combined_dir, exist_ok=True)
 
     loss_norm_save = loss_norm.copy()
-    loss_norm_save["scale_anchor"] = "current_scale_norm"
+    loss_norm_save["scale_anchor"] = "scale_norm_only"
     loss_terminal_save = loss_terminal.copy()
     loss_terminal_save["scale_anchor"] = "terminal_T_KL"
     combined_loss = pd.concat(
@@ -5369,7 +5375,7 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
         )
 
     eval_norm_save = eval_norm.copy()
-    eval_norm_save["scale_anchor"] = "current_scale_norm"
+    eval_norm_save["scale_anchor"] = "scale_norm_only"
     eval_terminal_save = eval_terminal.copy()
     eval_terminal_save["scale_anchor"] = "terminal_T_KL"
     combined_eval = pd.concat(
@@ -5383,7 +5389,7 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal):
     print("\n" + "=" * 78)
     print("SCALE ANCHOR COMPARISON COMPLETE")
     print("=" * 78)
-    print(f"Current scale norm: {master_results_dir}/run_scale_norm/")
+    print(f"Scale norm only:    {master_results_dir}/run_scale_norm/")
     print(f"Terminal-T KL:      {master_results_dir}/run_terminal_kl/")
     print(f"Combined tables:    {master_results_dir}/combined_dataframes/")
     print(f"Zip:                {zip_path}")
@@ -5433,7 +5439,7 @@ def main():
         default=1.0,
         help=(
             "Weight multiplying K_T in the terminal-KL arm only. "
-            "The scale-normalized baseline keeps its canonical weak KL unchanged."
+            "The scale-normalized arm always uses kl_w=0 and stiff_w=0."
         ),
     )
     parser.add_argument(
@@ -5646,8 +5652,10 @@ def main():
         "lr_vae": lr_vae,
         "lr_ldm": lr_ldm,
 
-        # --- Baseline KL and ordinary image-space objectives ---
-        "kl_w": 1e-6,
+        # --- Arm-specific KL weight and ordinary image-space objectives ---
+        # The scale-normalized arm keeps this at zero; the terminal arm
+        # overrides it below with --terminal-kl-w.
+        "kl_w": 0.0,
         "perc_w": 0.85,
 
         # --- PatchGAN discriminator ---
@@ -5717,12 +5725,15 @@ def main():
         "freeze_score_in_cotrain": False,
         "cotrain_head": "lsi",
 
-        # Scale treatment: same baseline logic as the golden script.
+        # Pure scale-normalization treatment: GroupNorm is the only active
+        # scale-fixing mechanism in this arm. kl_reg_type remains "normal"
+        # solely so the unweighted KL value can still be logged diagnostically.
         "use_latent_norm": True,
         "use_cond_encoder": False,
         "kl_reg_type": "normal",
+        "kl_w": 0.0,
         "score_w_vae": 0.6,
-        "stiff_w": 1e-6,
+        "stiff_w": 0.0,
         "score_w": 1.0,
         "train_tracking_head": False,
 
@@ -5761,7 +5772,7 @@ def main():
     # Same network/preset/objective as baseline except the representation-scale
     # treatment itself:
     #   - no GroupNorm on encoder mean
-    #   - terminal component KL K_T instead of the baseline normal KL
+    #   - terminal component KL K_T is active; baseline KL has zero weight
     #   - no stiffness penalty
     cfg_terminal = cfg_norm.copy()
     cfg_terminal.update({
@@ -5822,7 +5833,7 @@ def main():
         f"{cfg_terminal['T_terminal']}"
     )
 
-    print("\nArm B -- scale-normalized baseline:")
+    print("\nArm B -- scale normalization only:")
     print(f"  use_latent_norm = {cfg_norm['use_latent_norm']}")
     print(f"  kl_reg_type     = {cfg_norm['kl_reg_type']}")
     print(f"  kl_w            = {cfg_norm['kl_w']}")
