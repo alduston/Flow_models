@@ -1,0 +1,294 @@
+{
+  "schema_version": 1,
+  "sweep_name": "csem_fmnist_canonical_40ep_screen_20260815",
+  "trainer": "csem_canonical_sweep_train_20260815.py",
+  "worker": "run_csem40_bundle_20260815.py",
+  "default_basedir": "/work/10812/ald4435/frontera/Flow_models/Flow_models/Cotraining/fmnist_run1",
+  "notes": "Pairwise coverage is the default. It exercises every listed value and every pair of factor values, including the full CSEM-weight x terminal-KL-weight cross, without launching the 12,441,600-row literal Cartesian product. Use --strategy full --allow-large-sweep only if the full product is intentional.",
+  "fixed_args": {
+    "dataset": "FMNIST",
+    "model-preset": "fmnist_reference",
+    "score-time-weighting": "canonical",
+    "lr-vae": 0.0005,
+    "lr-ldm": 0.0002,
+    "lr-tracking-head": 0.00003,
+    "lr-refine": 0.00001,
+    "lr-disc": 0.00005,
+    "canonical-lr-scale": 1.0,
+    "adam-beta2": 0.95,
+    "seed": 42,
+    "disc-grad-clip": 5.0,
+    "grad-diagnostics-every": 200,
+    "time-diagnostic-bins": 4,
+    "logvar-max": 8.0,
+    "fail-on-nonfinite": true,
+    "epochs": 40,
+    "lr-schedule-epochs": 700,
+    "refine-epochs": 0,
+    "eval-every": 0,
+    "eval-samples": 2000,
+    "cfg-strength": 3.0,
+    "bespoke-fid-classifier": false,
+    "arms": "terminal_kl,norm"
+  },
+  "factors": [
+    {
+      "name": "csem_weight",
+      "values": [
+        {"label": "csem0p05", "args": {"csem-w": 0.05}},
+        {"label": "csem0p092", "args": {"csem-w": 0.092}},
+        {"label": "csem1over7", "args": {"csem-w": 0.14285714285714285}},
+        {"label": "csem0p25", "args": {"csem-w": 0.25}},
+        {"label": "csem0p50", "args": {"csem-w": 0.5}},
+        {"label": "csem1p00", "args": {"csem-w": 1.0}}
+      ]
+    },
+    {
+      "name": "terminal_kl_weight",
+      "values": [
+        {"label": "kt0", "args": {"terminal-kl-w": 0.0}},
+        {"label": "kt0p15", "args": {"terminal-kl-w": 0.15}},
+        {"label": "kt0p50", "args": {"terminal-kl-w": 0.5}},
+        {"label": "kt1p00", "args": {"terminal-kl-w": 1.0}},
+        {"label": "kt1p50", "args": {"terminal-kl-w": 1.5}}
+      ]
+    },
+    {
+      "name": "terminal_horizon",
+      "values": [
+        {"label": "T1p0", "args": {"T-terminal": 1.0}},
+        {"label": "T1p5", "args": {"T-terminal": 1.5}},
+        {"label": "T2p0", "args": {"T-terminal": 2.0}}
+      ]
+    },
+    {
+      "name": "encoder_lr",
+      "values": [
+        {"label": "enc5e5", "args": {"lr-encoder": 0.00005}},
+        {"label": "enc7p5e5", "args": {"lr-encoder": 0.000075}},
+        {"label": "enc1e4", "args": {"lr-encoder": 0.0001}},
+        {"label": "enc2e4", "args": {"lr-encoder": 0.0002}},
+        {"label": "enc5e4", "args": {"lr-encoder": 0.0005}}
+      ]
+    },
+    {
+      "name": "decoder_lr",
+      "values": [
+        {"label": "dec7p5e5", "args": {"lr-decoder": 0.000075}},
+        {"label": "dec2e4", "args": {"lr-decoder": 0.0002}},
+        {"label": "dec5e4", "args": {"lr-decoder": 0.0005}}
+      ]
+    },
+    {
+      "name": "score_lr",
+      "values": [
+        {"label": "score3e5", "args": {"lr-score-head": 0.00003}},
+        {"label": "score1e4", "args": {"lr-score-head": 0.0001}},
+        {"label": "score2e4", "args": {"lr-score-head": 0.0002}},
+        {"label": "score3p33e4", "args": {"lr-score-head": 0.0003333333333333333}}
+      ]
+    },
+    {
+      "name": "adam_beta2",
+      "values": [
+        {"label": "beta2_0p90", "args": {"adam-beta2": 0.9}},
+        {"label": "beta2_0p95", "args": {"adam-beta2": 0.95}},
+        {"label": "beta2_0p99", "args": {"adam-beta2": 0.99}},
+        {"label": "beta2_0p999", "args": {"adam-beta2": 0.999}}
+      ]
+    },
+    {
+      "name": "warmup",
+      "values": [
+        {"label": "warm0_ramp25", "args": {"encoder-score-warmup-epochs": 0, "encoder-warmup-mode": "detach-csem", "csem-ramp-epochs": 25}},
+        {"label": "freeze5_ramp20", "args": {"encoder-score-warmup-epochs": 5, "encoder-warmup-mode": "freeze-encoder", "csem-ramp-epochs": 20}},
+        {"label": "freeze10_ramp25", "args": {"encoder-score-warmup-epochs": 10, "encoder-warmup-mode": "freeze-encoder", "csem-ramp-epochs": 25}},
+        {"label": "detach10_ramp25", "args": {"encoder-score-warmup-epochs": 10, "encoder-warmup-mode": "detach-csem", "csem-ramp-epochs": 25}}
+      ]
+    },
+    {
+      "name": "tracking",
+      "values": [
+        {"label": "track0", "args": {"score-tracking-steps": 0, "score-tracking-every": 1}},
+        {"label": "track1_every2", "args": {"score-tracking-steps": 1, "score-tracking-every": 2}},
+        {"label": "track1_every1", "args": {"score-tracking-steps": 1, "score-tracking-every": 1}},
+        {"label": "track2_every1", "args": {"score-tracking-steps": 2, "score-tracking-every": 1}}
+      ]
+    },
+    {
+      "name": "logvar_floor",
+      "values": [
+        {"label": "lvmin12", "args": {"logvar-min": -12.0}},
+        {"label": "lvmin8", "args": {"logvar-min": -8.0}},
+        {"label": "lvmin6", "args": {"logvar-min": -6.0}}
+      ]
+    },
+    {
+      "name": "gradient_clip",
+      "values": [
+        {"label": "clip1_1_1", "args": {"vae-grad-clip": 1.0, "score-grad-clip": 1.0, "disc-grad-clip": 1.0}},
+        {"label": "clip5_1_1", "args": {"vae-grad-clip": 5.0, "score-grad-clip": 1.0, "disc-grad-clip": 1.0}},
+        {"label": "clip1_5_1", "args": {"vae-grad-clip": 1.0, "score-grad-clip": 5.0, "disc-grad-clip": 1.0}},
+        {"label": "clip5_5_5", "args": {"vae-grad-clip": 5.0, "score-grad-clip": 5.0, "disc-grad-clip": 5.0}}
+      ]
+    },
+    {
+      "name": "gan_policy",
+      "values": [
+        {"label": "gan_off", "args": {"gan-w": 0.0, "disc-start-epoch": 40}},
+        {"label": "gan_ep40", "args": {"gan-w": 0.0025, "disc-start-epoch": 40}},
+        {"label": "gan_ep25", "args": {"gan-w": 0.0025, "disc-start-epoch": 25}}
+      ]
+    }
+  ],
+  "explicit_runs": [
+    {
+      "label": "stable_reproduction",
+      "args": {
+        "T-terminal": 1.5,
+        "csem-w": 1.0,
+        "terminal-kl-w": 1.0,
+        "canonical-lr-scale": 0.15,
+        "lr-encoder": 0.000075,
+        "lr-decoder": 0.000075,
+        "lr-score-head": 0.00003,
+        "lr-tracking-head": 0.00003,
+        "encoder-score-warmup-epochs": 10,
+        "encoder-warmup-mode": "detach-csem",
+        "csem-ramp-epochs": 25,
+        "score-tracking-steps": 1,
+        "score-tracking-every": 2,
+        "logvar-min": -12.0,
+        "vae-grad-clip": 1.0,
+        "score-grad-clip": 1.0,
+        "disc-grad-clip": 1.0,
+        "gan-w": 0.0025,
+        "disc-start-epoch": 40
+      }
+    },
+    {
+      "label": "proposed_beta0p15_split_lr",
+      "args": {
+        "T-terminal": 1.5,
+        "csem-w": 0.15,
+        "terminal-kl-w": 0.15,
+        "lr-encoder": 0.000075,
+        "lr-decoder": 0.0005,
+        "lr-score-head": 0.0002,
+        "lr-tracking-head": 0.00003,
+        "encoder-score-warmup-epochs": 5,
+        "encoder-warmup-mode": "freeze-encoder",
+        "csem-ramp-epochs": 20,
+        "score-tracking-steps": 2,
+        "score-tracking-every": 1,
+        "logvar-min": -6.0,
+        "vae-grad-clip": 1.0,
+        "score-grad-clip": 1.0,
+        "gan-w": 0.0,
+        "disc-start-epoch": 40
+      }
+    },
+    {
+      "label": "canonical_beta1_full_speed",
+      "args": {
+        "T-terminal": 1.5,
+        "csem-w": 1.0,
+        "terminal-kl-w": 1.0,
+        "lr-encoder": 0.0005,
+        "lr-decoder": 0.0005,
+        "lr-score-head": 0.0003333333333333333,
+        "lr-tracking-head": 0.0002,
+        "encoder-score-warmup-epochs": 0,
+        "encoder-warmup-mode": "detach-csem",
+        "csem-ramp-epochs": 0,
+        "score-tracking-steps": 0,
+        "score-tracking-every": 1,
+        "logvar-min": -12.0,
+        "vae-grad-clip": 1.0,
+        "score-grad-clip": 1.0,
+        "gan-w": 0.0,
+        "disc-start-epoch": 40
+      }
+    },
+    {
+      "label": "historical_unweighted_control_T1p5",
+      "args": {
+        "score-time-weighting": "unweighted-eps",
+        "T-terminal": 1.5,
+        "csem-w": 0.6,
+        "terminal-kl-w": 1.5,
+        "lr-encoder": 0.0005,
+        "lr-decoder": 0.0005,
+        "lr-score-head": 0.0003333333333333333,
+        "lr-tracking-head": 0.0002,
+        "encoder-score-warmup-epochs": 0,
+        "encoder-warmup-mode": "detach-csem",
+        "csem-ramp-epochs": 0,
+        "score-tracking-steps": 0,
+        "score-tracking-every": 1,
+        "logvar-min": -12.0,
+        "vae-grad-clip": 1.0,
+        "score-grad-clip": 1.0,
+        "disc-grad-clip": 5.0,
+        "lr-disc": 0.0001,
+        "gan-w": 0.0025,
+        "disc-start-epoch": 25
+      }
+    },
+    {
+      "label": "csem_div7_no_head_lr_compensation",
+      "args": {
+        "T-terminal": 1.5,
+        "csem-w": 0.14285714285714285,
+        "terminal-kl-w": 1.0,
+        "lr-encoder": 0.000075,
+        "lr-decoder": 0.000075,
+        "lr-score-head": 0.00003,
+        "lr-tracking-head": 0.00003,
+        "encoder-score-warmup-epochs": 10,
+        "encoder-warmup-mode": "detach-csem",
+        "csem-ramp-epochs": 25,
+        "score-tracking-steps": 1,
+        "score-tracking-every": 2,
+        "logvar-min": -12.0,
+        "vae-grad-clip": 1.0,
+        "score-grad-clip": 1.0,
+        "disc-grad-clip": 1.0,
+        "gan-w": 0.0025,
+        "disc-start-epoch": 40
+      }
+    },
+    {
+      "label": "csem_div7_with_7x_head_lr_compensation",
+      "args": {
+        "T-terminal": 1.5,
+        "csem-w": 0.14285714285714285,
+        "terminal-kl-w": 1.0,
+        "lr-encoder": 0.000075,
+        "lr-decoder": 0.000075,
+        "lr-score-head": 0.00021,
+        "lr-tracking-head": 0.00003,
+        "encoder-score-warmup-epochs": 10,
+        "encoder-warmup-mode": "detach-csem",
+        "csem-ramp-epochs": 25,
+        "score-tracking-steps": 1,
+        "score-tracking-every": 2,
+        "logvar-min": -12.0,
+        "vae-grad-clip": 1.0,
+        "score-grad-clip": 1.0,
+        "disc-grad-clip": 1.0,
+        "gan-w": 0.0025,
+        "disc-start-epoch": 40
+      }
+    }
+  ],
+  "slurm": {
+    "partition": "gh",
+    "nodes": 1,
+    "tasks": 1,
+    "time": "06:00:00",
+    "mail_user": "alois.duston@utexas.edu",
+    "mail_type": "END,FAIL",
+    "runs_per_bundle": 2
+  }
+}

@@ -1,0 +1,7593 @@
+"""CSEM scale-anchor comparison with canonical-weighting stability controls.
+
+This revision keeps the canonical physical-time objective unchanged while
+making its optimization scale explicit and observable.  It adds independent
+VAE/score-head learning-rate and gradient-clipping controls, encoder-gradient
+warmup and ramping, detached same-head tracking
+updates, finite-value guards, and gradient/time-weight diagnostics.
+"""
+
+from __future__ import annotations
+from torch._higher_order_ops import out_dtype
+import math
+import argparse
+import csv
+import os
+import random
+import time
+import numpy as np
+from typing import Any, Dict, Tuple
+
+import torch
+from torch import nn, optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import torchvision
+from torchvision import transforms, utils as tv_utils
+
+import shutil
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from datetime import datetime
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Dataset Configuration
+# ---------------------------------------------------------------------------
+DATASET_INFO = {
+    "MNIST": {"class": torchvision.datasets.MNIST, "num_classes": 10, "img_size": 28, "img_channels": 1},
+    "FMNIST": {"class": torchvision.datasets.FashionMNIST, "num_classes": 10, "img_size": 28, "img_channels": 1},
+    "EMNIST": {"class": torchvision.datasets.EMNIST, "num_classes": 47, "split": "balanced", "img_size": 28, "img_channels": 1},
+    "KMNIST": {"class": torchvision.datasets.KMNIST, "num_classes": 10, "img_size": 28, "img_channels": 1},
+    "GCIFAR": {"class": torchvision.datasets.CIFAR10, "num_classes": 10, "img_size": 32, "img_channels": 1, "grayscale": True},
+    "CIFAR": {"class": torchvision.datasets.CIFAR10, "num_classes": 10, "img_size": 32, "img_channels": 3},
+}
+
+
+# ---------------------------------------------------------------------------
+# Dataset-dependent experiment presets
+# ---------------------------------------------------------------------------
+#
+# CIFAR/GCIFAR use the canonical CSEM golden capacity.
+# MNIST-family datasets use the earlier compact grayscale setup:
+#   4 latent channels, base_ch=32, DiT 192 x 8, batch 128.
+#
+# These presets intentionally change capacity/batch/LR/training-length defaults,
+# NOT the scientific scale-anchor comparison.  In every preset:
+#   baseline = GroupNorm mean only (KL and stiffness weights both zero)
+#   terminal = no GroupNorm + terminal K_T, with stiffness disabled
+#
+DATASET_PRESETS = {
+    # Canonical csem_golden.py configuration for RGB CIFAR.
+    "cifar_golden": {
+        "batch_size": 256,
+        "latent_channels": 8,
+        "cond_emb_dim": 32,
+        "dit_patch_size": 1,
+        "dit_hidden_dim": 384,
+        "dit_depth": 12,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        "base_ch": 64,
+        "num_res_blocks": 2,
+        "decoder_attn_half": True,
+        "latent_proj_depth": 2,
+        "encoder_attn_half": True,
+        "decoder_extra_block": True,
+        "conv3x3_proj": True,
+        "use_tanh_out": False,
+        "clamp_logvar": True,
+        "attn_zero_init": False,
+        "lr_vae": 2.5e-4,
+        "lr_ldm": 1.0e-4,
+        "lr_refine": 1.5e-5,
+        "epochs": 800,
+        "refine_epochs": 100,
+        "lr_schedule_epochs": 800,
+        "eval_every": 100,
+        "eval_samples": 10000,
+        "time_schedule": "log_t",
+        "use_ddim_times": True,
+        "t_min": 3.0e-5,
+        "t_max": 1.5,
+        "num_train_timesteps": 1000,
+        "decode_time": None,
+    },
+
+    # Compact grayscale preset used for MNIST/KMNIST/EMNIST.
+    "mnist_small": {
+        "batch_size": 128,
+        "latent_channels": 4,
+        "cond_emb_dim": 32,
+        "dit_patch_size": 1,
+        "dit_hidden_dim": 192,
+        "dit_depth": 8,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        "base_ch": 32,
+        "num_res_blocks": 2,
+        "decoder_attn_half": True,
+        "latent_proj_depth": 2,
+        "encoder_attn_half": True,
+        "decoder_extra_block": True,
+        "conv3x3_proj": True,
+        "use_tanh_out": False,
+        "clamp_logvar": True,
+        "attn_zero_init": False,
+        "lr_vae": 5.0e-4,
+        "lr_ldm": 2.0e-4,
+        "lr_refine": 1.0e-5,
+        "epochs": 450,
+        "refine_epochs": 0,
+        "lr_schedule_epochs": None,
+        "eval_every": 25,
+        "eval_samples": 2000,
+        "time_schedule": "log_t",
+        "use_ddim_times": True,
+        "t_min": 3.0e-5,
+        "t_max": 1.5,
+        "num_train_timesteps": 1000,
+        "decode_time": None,
+    },
+
+    # FashionMNIST preset extracted from the earlier good-FID FMNIST run.
+    #
+    # IMPORTANT: that successful run did NOT use a larger network than the
+    # compact preset: it used latent_channels=4, base_ch=32, and DiT 192x8.
+    # We therefore port the compatible architecture / optimizer / diffusion
+    # choices exactly rather than attributing the FID difference to capacity.
+    #
+    # Deliberately NOT ported from the historical script:
+    #   - temporal KL / alternate KL weights
+    #   - diversity/divergence losses
+    #   - frontier/adaptive-time sampling
+    #   - frontier-weighted LPIPS/GAN
+    #   - class-conditioned decoder
+    #   - any additional experimental regularizers
+    #
+    # The scale-normalized and terminal-KL arms below remain the ones described
+    # in the current CSEM report.
+    "fmnist_reference": {
+        "batch_size": 128,
+        "latent_channels": 4,
+        "cond_emb_dim": 32,
+        "dit_patch_size": 1,
+        "dit_hidden_dim": 192,
+        "dit_depth": 8,
+        "dit_num_heads": 6,
+        "dit_mlp_ratio": 4.0,
+        "dit_dropout": 0.0,
+        "base_ch": 32,
+        "num_res_blocks": 2,
+        "decoder_attn_half": True,
+        "latent_proj_depth": 2,
+        "encoder_attn_half": True,
+        "decoder_extra_block": True,
+        "conv3x3_proj": True,
+        "use_tanh_out": False,
+        "clamp_logvar": True,
+        "attn_zero_init": False,
+
+        # Optimizer values from the historical good-FID FMNIST run.
+        "lr_vae": 5.0e-4,
+        "lr_ldm": 2.0e-4,
+        "lr_refine": 1.0e-5,
+
+        # Preserve the requested current FMNIST mechanism-run length as the
+        # natural preset default.  The historical run itself used 800+100;
+        # --epochs/--refine-epochs can still override these values.
+        "epochs": 450,
+        "refine_epochs": 0,
+        "lr_schedule_epochs": None,
+        "eval_every": 25,
+        "eval_samples": 2000,
+
+        # Compatible forward-process settings from the good-FID script.
+        "time_schedule": "log_t",
+        "use_ddim_times": True,
+        "t_min": 2.0e-5,
+        "t_max": 2.0,
+        "num_train_timesteps": 1000,
+
+        # Historical TDD evaluation/readout time; training still uses the
+        # current CSEM/TDD reconstruction path.
+        "decode_time": 1.0e-4,
+    },
+}
+
+DATASET_TO_PRESET = {
+    "CIFAR": "cifar_golden",
+    "GCIFAR": "cifar_golden",
+    "MNIST": "mnist_small",
+    "FMNIST": "fmnist_reference",
+    "EMNIST": "mnist_small",
+    "KMNIST": "mnist_small",
+}
+
+
+def resolve_model_preset(dataset: str, requested: str = "auto") -> tuple[str, dict]:
+    if requested == "auto":
+        name = DATASET_TO_PRESET[dataset]
+    else:
+        name = requested
+    if name not in DATASET_PRESETS:
+        raise ValueError(f"Unknown model preset {name!r}")
+    return name, dict(DATASET_PRESETS[name])
+
+
+# ---------------------------------------------------------------------------
+# Imports & Checks
+# ---------------------------------------------------------------------------
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs): return iterable
+
+try:
+    import lpips
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("Warning: lpips not available, perceptual loss/metrics will be skipped")
+
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    TORCHMETRICS_AVAILABLE = True
+except ImportError:
+    TORCHMETRICS_AVAILABLE = False
+    print("Warning: torchmetrics not available, FID will be -1")
+
+# ---------------------------------------------------------------------------
+# Utils
+# ---------------------------------------------------------------------------
+
+def seed_everything(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def default_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def ensure_parent(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        ensure_dir(parent)
+
+def save_checkpoint(state: Dict[str, Any], path: str) -> None:
+    ensure_parent(path)
+    torch.save(state, path)
+
+import os
+import shutil
+from datetime import datetime
+
+def zip_results_dir(results_dir: str, zip_path: str | None = None) -> str:
+    """
+    Zips the entire results_dir into a .zip file.
+    Returns the path to the created zip.
+    """
+    results_dir = os.path.abspath(results_dir)
+
+    if zip_path is None:
+        parent = os.path.dirname(results_dir)
+        base = os.path.basename(results_dir.rstrip(os.sep))
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_path = os.path.join(parent, f"{base}_{stamp}.zip")
+    else:
+        zip_path = os.path.abspath(zip_path)
+        if not zip_path.endswith(".zip"):
+            zip_path += ".zip"
+
+    # shutil.make_archive wants a path without ".zip"
+    zip_base = zip_path[:-4]
+
+    # Create the zip. This includes everything under results_dir.
+    shutil.make_archive(zip_base, "zip", root_dir=results_dir)
+
+    return zip_path
+
+def make_group_norm(num_channels: int, num_groups: int = 16) -> nn.GroupNorm:
+    best = min(num_groups, num_channels)
+    while num_channels % best != 0 and best > 1:
+        best -= 1
+    return nn.GroupNorm(best, num_channels)
+
+# ---------------------------------------------------------------------------
+# Math Utilities
+# ---------------------------------------------------------------------------
+
+def sample_log_uniform_times(B: int, t_min: float, t_max: float, device: torch.device) -> torch.Tensor:
+    u = torch.rand(B, device=device)
+    log_t_min = math.log(t_min)
+    log_t_max = math.log(t_max)
+    return torch.exp(log_t_min + u * (log_t_max - log_t_min))
+
+def get_ou_params(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """OU process: alpha(t) = exp(-t), sigma(t) = sqrt(1 - exp(-2t))."""
+    alpha = torch.exp(-t)
+    sigma = torch.sqrt(1.0 - torch.exp(-2.0 * t) + 1e-8)
+    return alpha, sigma
+
+
+SCORE_TIME_WEIGHTING_CHOICES = ("unweighted-eps", "canonical")
+
+
+def validate_score_time_weighting(
+    cfg: Dict[str, Any],
+    schedule: Dict[str, torch.Tensor],
+) -> str:
+    """Validate the requested score-loss measure.
+
+    ``canonical`` denotes the physical-OU-time CSEM objective
+
+        integral E[||s_theta - s_component||^2] dt
+
+    on the configured interval.  Since the network predicts epsilon rather
+    than score, the per-time integrand is ||eps_theta-eps_component||^2/sigma^2.
+    The sampling-density correction is applied separately by
+    :func:`score_time_importance_weights`.
+    """
+    mode = str(cfg.get("score_time_weighting", "unweighted-eps")).lower()
+    if mode not in SCORE_TIME_WEIGHTING_CHOICES:
+        raise ValueError(
+            f"Unknown score_time_weighting={mode!r}; expected one of "
+            f"{SCORE_TIME_WEIGHTING_CHOICES}."
+        )
+
+    if mode == "canonical":
+        schedule_type = str(schedule.get("schedule_type", "")).lower()
+        if schedule_type not in ("log_t", "log_snr"):
+            raise ValueError(
+                "Canonical physical-time CSEM weighting is implemented for the "
+                "OU schedules ('log_t' or 'log_snr') only; got "
+                f"time_schedule={schedule_type!r}."
+            )
+        if int(schedule["times"].numel()) < 2:
+            raise ValueError("Canonical quadrature requires at least two time points.")
+        if float(cfg.get("cosine_w", 0.0)) != 0.0:
+            raise ValueError(
+                "Canonical CSEM weighting requires cosine_w=0: an added cosine "
+                "loss is not part of the exact physical-time identity."
+            )
+
+    return mode
+
+
+def _trapezoid_node_widths(times: torch.Tensor) -> torch.Tensor:
+    """Return positive trapezoidal quadrature widths for an ascending grid."""
+    if times.ndim != 1 or times.numel() < 2:
+        raise ValueError("Time grid must be one-dimensional with at least two points.")
+    gaps = times[1:] - times[:-1]
+    if not bool(torch.all(gaps > 0)):
+        raise ValueError("Canonical score quadrature requires a strictly ascending time grid.")
+
+    widths = torch.empty_like(times)
+    widths[0] = 0.5 * gaps[0]
+    widths[-1] = 0.5 * gaps[-1]
+    if times.numel() > 2:
+        widths[1:-1] = 0.5 * (times[2:] - times[:-2])
+    return widths
+
+
+def score_time_importance_weights(
+    *,
+    t: torch.Tensor,
+    sigma: torch.Tensor,
+    cfg: Dict[str, Any],
+    schedule: Dict[str, torch.Tensor],
+    t_idx: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return one score-loss weight per sampled example.
+
+    ``unweighted-eps`` exactly preserves the historical objective: plain
+    epsilon-MSE under the configured time sampler.  With the comparison
+    presets this means uniform sampling of indices on a log-spaced OU-time
+    grid, i.e. an approximately log-uniform time measure.
+
+    ``canonical`` is an unbiased Monte Carlo estimator (up to trapezoidal
+    discretization when ``t_idx`` is supplied) of
+
+        integral_[t_min,T] E[||eps_theta-eps_target||^2 / sigma_t^2] dt,
+
+    which is the physical-time score loss required by the CSEM information
+    identity for the OU process used here.  The weights are intentionally not
+    normalized to mean one: their absolute scale is part of that identity.
+    """
+    mode = str(cfg.get("score_time_weighting", "unweighted-eps")).lower()
+    batch_size = int(t.numel())
+    if mode == "unweighted-eps":
+        return torch.ones(batch_size, device=t.device, dtype=t.dtype)
+    if mode != "canonical":
+        raise ValueError(
+            f"Unknown score_time_weighting={mode!r}; expected one of "
+            f"{SCORE_TIME_WEIGHTING_CHOICES}."
+        )
+
+    if t_idx is not None:
+        # t_idx is uniform on {0,...,N-1}.  Multiplication by N converts the
+        # trapezoidal node masses into importance weights under that proposal.
+        times = schedule["times"].to(device=t.device, dtype=t.dtype)
+        sigma_grid = schedule["sigma"].to(device=t.device, dtype=t.dtype)
+        node_masses = _trapezoid_node_widths(times) / sigma_grid.square().clamp_min(1e-12)
+        return float(times.numel()) * node_masses.gather(0, t_idx)
+
+    # The continuous OU path samples q(t)=1/[t log(T/t_min)].  Therefore
+    # (dt/q-proposal correction)/sigma^2 = t log(T/t_min)/sigma^2.
+    t_min = float(cfg["t_min"])
+    t_max = float(cfg["t_max"])
+    log_range = math.log(t_max / t_min)
+    sigma_per_example = sigma.reshape(batch_size, -1)[:, 0]
+    return (
+        log_range
+        * t.reshape(-1)
+        / sigma_per_example.square().clamp_min(1e-12)
+    )
+
+
+def weighted_score_prediction_losses(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    time_weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return time-weighted epsilon MSE and cosine losses.
+
+    Unit weights reproduce ``F.mse_loss`` and the historical mean cosine loss.
+    The cosine term is kept for legacy configurations; canonical validation
+    requires its configured coefficient to be zero.
+    """
+    weights = time_weights.to(device=prediction.device, dtype=prediction.dtype)
+    mse_per_example = (prediction - target).square().flatten(1).mean(dim=1)
+    cosine_per_example = 1.0 - F.cosine_similarity(
+        prediction.flatten(1), target.flatten(1), dim=1
+    )
+    return (
+        (weights * mse_per_example).mean(),
+        (weights * cosine_per_example).mean(),
+    )
+
+
+def canonical_stability_weight_grid_summary(
+    schedule: Dict[str, torch.Tensor],
+) -> Dict[str, float]:
+    """Summarize canonical weights under uniform discrete-time sampling.
+
+    The training code samples schedule indices uniformly.  These statistics
+    therefore describe the exact proposal distribution seen by the optimizer,
+    including the absolute multiplier that is absent from the historical
+    unweighted-epsilon objective.
+    """
+    times = schedule["times"].detach().to(dtype=torch.float64)
+    sigma = schedule["sigma"].detach().to(dtype=torch.float64)
+    node_masses = _trapezoid_node_widths(times) / sigma.square().clamp_min(1e-18)
+    weights = float(times.numel()) * node_masses
+    mean = weights.mean()
+    mean_square = weights.square().mean()
+    rms = mean_square.sqrt()
+    variance = (mean_square - mean.square()).clamp_min(0.0)
+    cv = variance.sqrt() / mean.clamp_min(1e-18)
+    ess_fraction = mean.square() / mean_square.clamp_min(1e-18)
+    return {
+        "mean": float(mean.cpu().item()),
+        "rms": float(rms.cpu().item()),
+        "min": float(weights.min().cpu().item()),
+        "max": float(weights.max().cpu().item()),
+        "cv": float(cv.cpu().item()),
+        "ess_fraction": float(ess_fraction.cpu().item()),
+        "inverse_mean": float(mean.reciprocal().cpu().item()),
+    }
+
+
+def canonical_stability_gradient_l2_norm(
+    loss: torch.Tensor,
+    parameters: tuple[torch.nn.Parameter, ...],
+) -> float:
+    """Return an objective component's pre-aggregation gradient L2 norm."""
+    if not loss.requires_grad:
+        return 0.0
+    grads = torch.autograd.grad(
+        loss,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    squared_norm = None
+    for grad in grads:
+        if grad is None:
+            continue
+        contribution = grad.detach().float().square().sum()
+        squared_norm = contribution if squared_norm is None else squared_norm + contribution
+    if squared_norm is None:
+        return 0.0
+    return float(squared_norm.sqrt().cpu().item())
+
+
+def canonical_stability_gradient_pair_geometry(
+    first_loss: torch.Tensor,
+    second_loss: torch.Tensor,
+    parameters: tuple[torch.nn.Parameter, ...],
+) -> tuple[float, float, float, float]:
+    """Return two norms, cosine, and cancellation ratio for two gradients."""
+    first_grads = (
+        torch.autograd.grad(
+            first_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        if first_loss.requires_grad
+        else tuple(None for _ in parameters)
+    )
+    second_grads = (
+        torch.autograd.grad(
+            second_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        if second_loss.requires_grad
+        else tuple(None for _ in parameters)
+    )
+    reference_tensor = next(
+        (
+            grad
+            for grad in (*first_grads, *second_grads)
+            if grad is not None
+        ),
+        None,
+    )
+    if reference_tensor is None:
+        return 0.0, 0.0, 0.0, 0.0
+    first_square = torch.zeros((), device=reference_tensor.device, dtype=torch.float32)
+    second_square = torch.zeros_like(first_square)
+    dot_product = torch.zeros_like(first_square)
+    for first_grad, second_grad in zip(first_grads, second_grads):
+        if first_grad is not None:
+            first_square = first_square + first_grad.detach().float().square().sum()
+        if second_grad is not None:
+            second_square = second_square + second_grad.detach().float().square().sum()
+        if first_grad is not None and second_grad is not None:
+            dot_product = dot_product + (
+                first_grad.detach().float() * second_grad.detach().float()
+            ).sum()
+    first_norm = first_square.sqrt()
+    second_norm = second_square.sqrt()
+    norm_product = first_norm * second_norm
+    cosine = (
+        dot_product / norm_product.clamp_min(1e-18)
+        if bool(norm_product > 0.0)
+        else torch.zeros_like(dot_product)
+    )
+    combined_square = (first_square + second_square + 2.0 * dot_product).clamp_min(0.0)
+    cancellation_ratio = combined_square.sqrt() / (
+        first_norm + second_norm
+    ).clamp_min(1e-18)
+    return (
+        float(first_norm.cpu().item()),
+        float(second_norm.cpu().item()),
+        float(cosine.cpu().item()),
+        float(cancellation_ratio.cpu().item()),
+    )
+
+
+def canonical_stability_clip_group(
+    parameters: tuple[torch.nn.Parameter, ...],
+    max_norm: float,
+    *,
+    group_name: str,
+) -> tuple[float, float, float]:
+    """Clip one optimizer group and report pre-norm, multiplier, and hit flag."""
+    pre_norm_tensor = nn.utils.clip_grad_norm_(
+        parameters,
+        max_norm,
+        error_if_nonfinite=True,
+    )
+    pre_norm = float(pre_norm_tensor.detach().cpu().item())
+    if not math.isfinite(pre_norm):
+        raise FloatingPointError(f"Non-finite {group_name} gradient norm: {pre_norm}")
+    clip_multiplier = min(1.0, max_norm / (pre_norm + 1e-12))
+    return pre_norm, clip_multiplier, float(pre_norm > max_norm)
+
+
+def canonical_stability_parameter_l2_norm(
+    parameters: tuple[torch.nn.Parameter, ...],
+) -> float:
+    """Measure parameter scale without constructing one flattened tensor."""
+    with torch.no_grad():
+        squared_norm = None
+        for parameter in parameters:
+            contribution = parameter.detach().float().square().sum()
+            squared_norm = (
+                contribution
+                if squared_norm is None
+                else squared_norm + contribution
+            )
+        if squared_norm is None:
+            return 0.0
+        return float(squared_norm.sqrt().cpu().item())
+
+
+def canonical_stability_scale_gradient(
+    value: torch.Tensor,
+    multiplier: float,
+) -> torch.Tensor:
+    """Keep a tensor's forward value while scaling only its backward path."""
+    if multiplier <= 0.0:
+        return value.detach()
+    if multiplier >= 1.0:
+        return value
+    detached_value = value.detach()
+    return detached_value + multiplier * (value - detached_value)
+
+
+def canonical_stability_assert_finite(
+    named_tensors: Dict[str, torch.Tensor],
+    *,
+    context: str,
+) -> None:
+    """Fail at the first invalid batch with values useful for diagnosis."""
+    invalid = []
+    for name, value in named_tensors.items():
+        if not bool(torch.isfinite(value.detach()).all()):
+            invalid.append(name)
+    if invalid:
+        snapshot = ", ".join(
+            f"{name}={float(value.detach().float().mean().cpu().item()):.6g}"
+            for name, value in named_tensors.items()
+        )
+        raise FloatingPointError(
+            f"Non-finite tensor(s) {invalid} at {context}; batch snapshot: {snapshot}"
+        )
+
+
+TERMINAL_KL_REG_TYPES = frozenset(("terminal", "terminal_kl", "terminal-time"))
+
+
+def validate_terminal_time_contract(
+    cfg: Dict[str, Any],
+    schedule: Dict[str, torch.Tensor] | None = None,
+) -> float:
+    """Enforce one shared OU endpoint for K_T and reverse initialization.
+
+    ``T_terminal`` is the user-facing name, while legacy training and sampler
+    code consume ``t_max``.  In a terminal-KL run they must denote the same
+    time.  If a schedule is supplied, its terminal grid point must agree too.
+    """
+    t_max = float(cfg.get("t_max", 2.0))
+    T_terminal = float(cfg.get("T_terminal", t_max))
+    reg_type = str(cfg.get("kl_reg_type", "mod")).lower()
+
+    if reg_type not in TERMINAL_KL_REG_TYPES:
+        return T_terminal
+
+    if not math.isfinite(T_terminal) or T_terminal <= 0.0:
+        raise ValueError(f"Terminal-KL mode requires finite T_terminal > 0, got {T_terminal}")
+    if not math.isclose(T_terminal, t_max, rel_tol=1e-9, abs_tol=1e-12):
+        raise ValueError(
+            "Terminal-KL time mismatch: T_terminal controls K_T while t_max "
+            f"controls reverse-sampling initialization; got {T_terminal} != {t_max}."
+        )
+
+    if schedule is not None:
+        schedule_T = float(schedule["times"][-1].detach().cpu().item())
+        if not math.isclose(T_terminal, schedule_T, rel_tol=1e-6, abs_tol=1e-7):
+            raise ValueError(
+                "Terminal-KL schedule mismatch: configured T_terminal="
+                f"{T_terminal}, but the diffusion schedule ends at {schedule_T}."
+            )
+
+    return T_terminal
+
+
+
+def terminal_component_kl_from_schedule(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    schedule: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """E_x KL(q_T(z|x) || N(0,I)) at the terminal point of `schedule`.
+
+    Reduction convention intentionally matches the script's existing KL
+    regularizer: mean over batch and all latent coordinates.
+    """
+    var_0 = torch.exp(logvar)
+    alpha_T = schedule["alpha"][-1].to(device=mu.device, dtype=mu.dtype)
+    sigma_T = schedule["sigma"][-1].to(device=mu.device, dtype=mu.dtype)
+    alpha_T = alpha_T.view(1, *([1] * (mu.ndim - 1)))
+    sigma_T = sigma_T.view(1, *([1] * (mu.ndim - 1)))
+
+    mu_T = alpha_T * mu
+    var_T = (alpha_T ** 2) * var_0 + (sigma_T ** 2)
+    logvar_T = torch.log(var_T + 1e-8)
+    return -0.5 * torch.mean(1.0 + logvar_T - mu_T.pow(2) - var_T)
+
+
+def partition_vae_parameters(
+    vae: nn.Module,
+) -> tuple[tuple[nn.Parameter, ...], tuple[nn.Parameter, ...]]:
+    """Split VAE parameters into encoder and decoder optimizer groups.
+
+    Decoder modules in :class:`VAE` deliberately use the ``dec_`` prefix.
+    Everything else belongs to the encoder, including the mean/log-variance
+    projections and optional class-conditioning layers.  Validate the
+    partition so a future architecture edit cannot silently leave parameters
+    out of optimization.
+    """
+    encoder_parameters: list[nn.Parameter] = []
+    decoder_parameters: list[nn.Parameter] = []
+    for parameter_name, parameter in vae.named_parameters():
+        if parameter_name.startswith("dec_"):
+            decoder_parameters.append(parameter)
+        else:
+            encoder_parameters.append(parameter)
+
+    all_parameter_ids = {id(parameter) for parameter in vae.parameters()}
+    encoder_parameter_ids = {id(parameter) for parameter in encoder_parameters}
+    decoder_parameter_ids = {id(parameter) for parameter in decoder_parameters}
+    if not encoder_parameters or not decoder_parameters:
+        raise RuntimeError(
+            "VAE parameter partition must contain nonempty encoder and decoder groups."
+        )
+    if encoder_parameter_ids & decoder_parameter_ids:
+        raise RuntimeError("VAE encoder/decoder parameter groups overlap.")
+    if encoder_parameter_ids | decoder_parameter_ids != all_parameter_ids:
+        raise RuntimeError("VAE encoder/decoder parameter partition is incomplete.")
+    return tuple(encoder_parameters), tuple(decoder_parameters)
+
+
+
+# ---------------------------------------------------------------------------
+# Flow Matching (LightningDiT-style)
+# ---------------------------------------------------------------------------
+
+def sample_logit_normal_times(B: int, t_min: float, t_max: float, device: torch.device) -> torch.Tensor:
+    """Logit-normal time sampling on (t_min, t_max), where 0 <= t_min < t_max <= 1.
+
+    Sample u ~ N(0,1), set t01 = sigmoid(u), then affine-map to [t_min, t_max].
+    This concentrates mass around mid-times while still covering endpoints.
+    """
+    t_min = float(t_min); t_max = float(t_max)
+    if not (0.0 <= t_min < t_max <= 1.0):
+        raise ValueError(f"flow matching requires 0 <= t_min < t_max <= 1, got t_min={t_min}, t_max={t_max}")
+    u = torch.randn(B, device=device)
+    t01 = torch.sigmoid(u)
+    t = t_min + (t_max - t_min) * t01
+    return t.clamp(min=t_min, max=t_max)
+
+def get_flow_params(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Linear interpolant params: z_t = alpha(t) * z0 + sigma(t) * eps, with alpha=t and sigma=1-t."""
+    alpha = t
+    sigma = (1.0 - t).clamp_min(1e-8)
+    return alpha, sigma
+
+# ---------------------------------------------------------------------------
+# Log-SNR <-> OU time conversion
+# ---------------------------------------------------------------------------
+
+def ou_logsnr(t: torch.Tensor) -> torch.Tensor:
+    """log-SNR for the OU process: log(alpha^2 / sigma^2)."""
+    e2t = torch.exp(-2.0 * t)
+    return torch.log(e2t / (1.0 - e2t + 1e-12) + 1e-12)
+
+def ou_time_from_logsnr(lam: torch.Tensor) -> torch.Tensor:
+    """Invert log-SNR to OU time.
+
+    From lambda = log(e^{-2t} / (1 - e^{-2t})):
+      e^{-2t} = sigmoid(lambda)
+      t = -0.5 * log(sigmoid(lambda))
+    """
+    sig = torch.sigmoid(lam)
+    return -0.5 * torch.log(sig.clamp(1e-12, 1.0 - 1e-7))
+
+# ---------------------------------------------------------------------------
+# VP-Cosine schedule helpers (Nichol & Dhariwal, Improved DDPM)
+# ---------------------------------------------------------------------------
+
+def get_cosine_params(
+    t_frac: torch.Tensor, cosine_s: float = 0.008,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Given t_frac in (0, 1), return (alpha, sigma, beta) for the VP-cosine schedule.
+
+    alpha_bar(t) = cos^2(g(t)) / cos^2(g(0)),  g(t) = (t+s)/(1+s) * pi/2
+    alpha = sqrt(alpha_bar),  sigma = sqrt(1 - alpha_bar)
+    beta(t) = -d/dt log(alpha_bar) = 2 * tan(g(t)) * g'(t)
+    """
+    g = ((t_frac + cosine_s) / (1.0 + cosine_s)) * (math.pi / 2.0)
+    g0 = (cosine_s / (1.0 + cosine_s)) * (math.pi / 2.0)
+    alpha_bar = (torch.cos(g) / math.cos(g0)) ** 2
+    alpha_bar = alpha_bar.clamp(1e-8, 1.0)
+    alpha = torch.sqrt(alpha_bar)
+    sigma = torch.sqrt((1.0 - alpha_bar).clamp_min(1e-8))
+    g_prime = math.pi / (2.0 * (1.0 + cosine_s))
+    beta = (2.0 * torch.tan(g.clamp(max=math.pi / 2.0 - 1e-4)) * g_prime).clamp(max=20.0)
+    return alpha, sigma, beta
+
+
+# ---------------------------------------------------------------------------
+# Discrete schedule utilities (cosine/linear)
+# ---------------------------------------------------------------------------
+
+def extract_schedule(a: torch.Tensor, t_idx: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
+    """Extract 1D schedule values at indices t_idx and reshape for broadcast to x_shape."""
+    # a: [T], t_idx: [B] long
+    out = a.gather(0, t_idx).float()
+    return out.view(-1, *([1] * (len(x_shape) - 1)))
+
+def make_beta_schedule(
+    schedule: str,
+    num_timesteps: int,
+    beta_start: float = 1e-4,
+    beta_end: float = 2e-2,
+    cosine_s: float = 0.008,
+) -> torch.Tensor:
+    """Return betas[t] for a discrete VP/DDPM schedule (legacy helper)."""
+    schedule = str(schedule).lower()
+    if num_timesteps < 1:
+        raise ValueError("num_timesteps must be >= 1")
+    if schedule == "linear":
+        betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
+        return betas.clamp(1e-8, 0.999)
+    if schedule == "cosine":
+        steps = num_timesteps + 1
+        t = torch.linspace(0, num_timesteps, steps, dtype=torch.float32) / num_timesteps
+        alphas_cumprod = torch.cos(((t + cosine_s) / (1 + cosine_s)) * math.pi / 2) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return betas.clamp(1e-8, 0.999)
+    raise ValueError(f"Unknown noise_schedule: {schedule}")
+
+
+
+def make_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+    """Build a unified discrete schedule of T timesteps.
+
+    Config key ``time_schedule`` selects the grid type:
+      - "flow"    : linear flow-matching interpolant on [0,1] (alpha=t, sigma=1-t)
+      - "log_t"   : OU process, grid log-uniform in OU time  (legacy)
+      - "log_snr" : OU process, grid uniform in log-SNR
+      - "cosine"  : VP-cosine process (Nichol & Dhariwal), grid uniform in [0,1]
+
+    Returns dict with keys:
+        T, times, alpha, sigma, beta, schedule_type, cosine_s
+    """
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+    T = int(cfg.get("num_train_timesteps", 1000))
+
+    if stype in ("flow", "flow_matching"):
+        t_min = float(cfg.get("t_min", 1e-5))
+        t_max = float(cfg.get("t_max", 0.99999))
+        if not (0.0 <= t_min < t_max <= 1.0):
+            raise ValueError(f"flow matching requires 0 <= t_min < t_max <= 1, got t_min={t_min}, t_max={t_max}")
+
+        times = torch.linspace(t_min, t_max, T, device=device, dtype=torch.float32)
+        alpha = times.clone()
+        sigma = (1.0 - times).clamp_min(1e-8)
+        beta_arr = torch.zeros(T, device=device, dtype=torch.float32)
+
+        return {
+            "T": torch.tensor(T, device=device, dtype=torch.long),
+            "times": times, "alpha": alpha, "sigma": sigma, "beta": beta_arr,
+            "schedule_type": stype, "cosine_s": 0.0,
+        }
+
+    if stype in ("log_t", "log_snr"):
+        t_min = float(cfg.get("t_min", 2e-5))
+        t_max = float(cfg.get("t_max", 2.0))
+
+        if stype == "log_t":
+            times = torch.logspace(
+                math.log10(t_min), math.log10(t_max), T,
+                device=device, dtype=torch.float32,
+            )
+        else:
+            lam_max = ou_logsnr(torch.tensor(t_min, dtype=torch.float64)).item()
+            lam_min = ou_logsnr(torch.tensor(t_max, dtype=torch.float64)).item()
+            lam_grid = torch.linspace(lam_min, lam_max, T, device=device, dtype=torch.float64)
+            times = ou_time_from_logsnr(lam_grid).float()
+            times = times.flip(0).clamp(t_min, t_max)
+
+        a, s = get_ou_params(times.view(T, 1, 1, 1))
+        alpha = a.view(T).float()
+        sigma = s.view(T).float()
+        beta = torch.zeros(T, device=device, dtype=torch.float32)
+
+        return {
+            "T": torch.tensor(T, device=device, dtype=torch.long),
+            "times": times, "alpha": alpha, "sigma": sigma, "beta": beta,
+            "schedule_type": stype, "cosine_s": 0.0,
+        }
+
+    if stype == "cosine":
+        cosine_s = float(cfg.get("cosine_s", 0.008))
+        t_min_frac = float(cfg.get("cosine_t_min", 2e-4))
+        t_max_frac = float(cfg.get("cosine_t_max", 0.9999))
+
+        times = torch.linspace(t_min_frac, t_max_frac, T, device=device, dtype=torch.float32)
+        a, s, b = get_cosine_params(times.view(T, 1, 1, 1), cosine_s=cosine_s)
+        alpha = a.view(T).float()
+        sigma = s.view(T).float()
+        beta_arr = b.view(T).float()
+
+        return {
+            "T": torch.tensor(T, device=device, dtype=torch.long),
+            "times": times, "alpha": alpha, "sigma": sigma, "beta": beta_arr,
+            "schedule_type": stype, "cosine_s": cosine_s,
+        }
+
+    raise ValueError(f"Unknown time_schedule: {stype!r}. Expected 'flow', 'log_t', 'log_snr', or 'cosine'.")
+
+
+# Keep legacy alias
+def make_ou_schedule(cfg: Dict[str, Any], device: torch.device) -> Dict[str, torch.Tensor]:
+    cfg_copy = dict(cfg); cfg_copy["time_schedule"] = "log_t"
+    return make_schedule(cfg_copy, device)
+
+
+def t_idx_to_time(t_idx: torch.Tensor, cfg: Dict[str, Any], T: int) -> torch.Tensor:
+    """Map discrete indices t_idx in [0, T-1] to a continuous scalar used ONLY for time embedding."""
+    t_min = float(cfg.get("t_min", 2e-5))
+    t_max = float(cfg.get("t_max", 2.0))
+    if T <= 1:
+        return torch.full_like(t_idx.float(), t_max)
+    frac = t_idx.float() / float(T - 1)
+    return t_min + frac * (t_max - t_min)
+
+
+
+# ---------------------------------------------------------------------------
+# Metrics: SW2, MMD, FID, Diversity
+# ---------------------------------------------------------------------------
+
+def compute_sw2(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    n_projections: int = 1000,
+    theta: torch.Tensor | None = None,
+) -> float:
+    """Sliced Wasserstein-2 distance in latent space.
+
+    If `theta` is provided, it must be a fixed bank of unit-norm projection vectors with shape [D, n_projections]
+    (or [D, K] where K >= n_projections). This makes SW2 deterministic across eval calls.
+    """
+    x = x.detach().float()
+    y = y.detach().float()
+    device = x.device
+    N, D = x.shape
+
+    if theta is None:
+        # Random projections
+        theta = torch.randn(D, n_projections, device=device)
+        theta = theta / torch.norm(theta, dim=0, keepdim=True).clamp_min(1e-12)
+    else:
+        # Allow CPU or GPU theta; move to device and slice to requested projections.
+        theta = theta.to(device)
+        assert theta.dim() == 2 and theta.shape[0] == D, f"theta must have shape [D, K] with D={D}; got {tuple(theta.shape)}"
+        assert theta.shape[1] >= n_projections, f"theta has only {theta.shape[1]} projections; need >= {n_projections}"
+        theta = theta[:, :n_projections]
+
+    # Project
+    proj_x = x @ theta
+    proj_y = y @ theta
+
+    # Sort along sample axis
+    proj_x, _ = torch.sort(proj_x, dim=0)
+    proj_y, _ = torch.sort(proj_y, dim=0)
+
+    # Mean squared difference
+    w2 = torch.mean((proj_x - proj_y) ** 2)
+    return w2.item()
+
+# NOTE: MMD computation removed (we only use fixed sliced-W2 in evaluation).
+def compute_diversity(imgs: torch.Tensor, lpips_fn: Any) -> float:
+    """
+    Computes pairwise LPIPS diversity.
+    Higher = more diverse samples. Near 0 = mode collapse.
+    """
+    if lpips_fn is None: return 0.0
+
+    # Ensure we have enough images
+    N = imgs.shape[0]
+    if N < 2: return 0.0
+
+    # Shuffle
+    perm = torch.randperm(N)
+    imgs = imgs[perm]
+
+    # Split into two halves
+    half = N // 2
+    set1 = imgs[:half]
+    set2 = imgs[half:2*half]
+
+    # Adapt for LPIPS (Need 3 channels)
+    if set1.shape[1] == 1:
+        set1 = set1.repeat(1, 3, 1, 1)
+        set2 = set2.repeat(1, 3, 1, 1)
+
+    # Compute distance
+    with torch.no_grad():
+        dist = lpips_fn(set1, set2)
+
+    return dist.mean().item()
+
+def log_latent_stats(name, z):
+    with torch.no_grad():
+        mean_norm = z.mean(0).norm().item()
+        std_mean = z.std(0).mean().item()
+        max_val = z.abs().max().item()
+        print(f"  [{name}] Latent Stats | Mean Norm: {mean_norm:.4f} | Avg Std: {std_mean:.4f} | Max: {max_val:.4f}")
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Bespoke target-classifier feature extractor for FID/KID
+# ---------------------------------------------------------------------------
+
+class LeNetFeatureExtractor(nn.Module):
+    """
+    LeNet-style CNN classifier for FID feature extraction.
+    Feature dimension: 256 (penultimate layer)
+    """
+    def __init__(self, num_classes: int = 10, feature_dim: int = 256, img_size: int = 28, img_channels: int = 1):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.conv1 = nn.Conv2d(img_channels, 32, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(0.25)
+        # After 3 pooling layers: img_size -> img_size//2 -> img_size//4 -> img_size//8
+        # For img_size=28 (padded to 32): 32->16->8->4, so 4x4
+        # For img_size=32: 32->16->8->4, so 4x4
+        final_spatial = img_size // 8
+        self.fc1 = nn.Linear(128 * final_spatial * final_spatial, feature_dim)
+        self.bn_fc = nn.BatchNorm1d(feature_dim)
+        self.fc2 = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        features = self.extract_features(x)
+        return self.fc2(features)
+
+    def extract_features(self, x):
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        x = self.dropout(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.bn_fc(self.fc1(x)))
+        return x
+
+
+def train_fid_classifier(train_loader, num_classes, device, epochs=10, lr=1e-3, checkpoint_path=None, img_size=32, img_channels=1):
+    """Train LeNet classifier for FID feature extraction."""
+    model = LeNetFeatureExtractor(num_classes=num_classes, img_size=img_size, img_channels=img_channels).to(device)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"  Loading FID classifier from {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
+        model.eval()
+        return model
+
+    print(f"  Training FID classifier ({epochs} epochs)...")
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(epochs):
+        correct, total = 0, 0
+        for x, y in tqdm(train_loader, desc=f"  FID Clf Ep {epoch+1}/{epochs}", leave=False):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            _, predicted = logits.max(1)
+            total += y.size(0)
+            correct += predicted.eq(y).sum().item()
+        print(f"    Epoch {epoch+1}: Acc={100.*correct/total:.2f}%")
+
+    if checkpoint_path:
+        ensure_parent(checkpoint_path)
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"  Saved FID classifier to {checkpoint_path}")
+
+    model.eval()
+    return model
+
+
+AUTO_BESPOKE_FID_DATASETS = frozenset(("MNIST", "EMNIST", "KMNIST"))
+
+
+def resolve_bespoke_fid_classifier(
+    dataset_key: str,
+    requested: bool | None,
+) -> bool:
+    """Resolve the requested FID feature extractor.
+
+    ``None`` preserves the historical automatic behavior: use a classifier
+    trained on the target dataset for MNIST/EMNIST/KMNIST, and ImageNet
+    Inception features for FMNIST/GCIFAR/CIFAR. ``True`` or ``False`` forces
+    the same choice for any supported target dataset.
+    """
+    if requested is None:
+        return dataset_key in AUTO_BESPOKE_FID_DATASETS
+    return bool(requested)
+
+
+def get_fid_model(
+    dataset_key,
+    train_loader,
+    num_classes,
+    device,
+    ckpt_dir="checkpoints",
+    use_bespoke_classifier: bool | None = None,
+):
+    """Select ImageNet Inception or a classifier trained on the target dataset."""
+    use_bespoke_classifier = resolve_bespoke_fid_classifier(
+        dataset_key, use_bespoke_classifier
+    )
+    if not use_bespoke_classifier:
+        print(f"--> Using Inception features for FID ({dataset_key})")
+        return None, False
+
+    # Get img_size from dataset info (default 32 for padded 28x28 datasets)
+    img_size = DATASET_INFO.get(dataset_key, {}).get("img_size", 28)
+    img_channels = DATASET_INFO.get(dataset_key, {}).get("img_channels", 1)
+    # For datasets that get padded (28->32), use 32 for the classifier
+    effective_img_size = 32 if img_size == 28 else img_size
+
+    print(f"--> Using bespoke target classifier features for FID ({dataset_key})")
+    checkpoint_path = os.path.join(ckpt_dir, f"fid_classifier_{dataset_key.lower()}.pt")
+    model = train_fid_classifier(train_loader, num_classes, device, epochs=10, checkpoint_path=checkpoint_path, img_size=effective_img_size, img_channels=img_channels)
+    return model, True
+
+
+def extract_lenet_features(images, device, batch_size, lenet_model):
+    """Extract features using trained LeNet classifier."""
+    lenet_model.eval()
+    features_list = []
+    with torch.no_grad():
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size].to(device)
+            feat = lenet_model.extract_features(batch)
+            features_list.append(feat.cpu())
+    return torch.cat(features_list, 0), lenet_model
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# =============================================================================
+# Helper Functions for Evaluation Metrics
+# =============================================================================
+
+def extract_inception_features(images, device, batch_size=100, inception_model=None):
+    """
+    Extract Inception features for FID/KID computation.
+    Uses InceptionV3 with final FC layer removed to get 2048-dim features.
+
+    Args:
+        images: [N, C, H, W] tensor of images (in [-1, 1] range)
+        device: torch device
+        batch_size: batch size for feature extraction
+        inception_model: optional pre-loaded inception model (for reuse)
+
+    Returns:
+        features: [N, 2048] tensor of Inception features
+        inception_model: the loaded model (for reuse)
+    """
+    # Lazy load inception model
+    if inception_model is None:
+        from torchvision.models import inception_v3
+        inception_model = inception_v3(pretrained=True, transform_input=False)
+        inception_model.fc = torch.nn.Identity()  # Remove final FC layer
+        inception_model = inception_model.to(device)
+        inception_model.eval()
+
+    features_list = []
+
+    with torch.no_grad():
+        for i in range(0, len(images), batch_size):
+            batch = images[i:i + batch_size].to(device)
+
+            # Inception expects 3-channel images of size 299x299
+            if batch.shape[1] == 1:
+                batch = batch.repeat(1, 3, 1, 1)
+
+            # Resize to 299x299
+            batch = F.interpolate(batch, size=(299, 299), mode='bilinear', align_corners=False)
+
+            # Normalize to ImageNet stats (Inception expects [0, 1] input, we have [-1, 1])
+            batch = (batch + 1) / 2  # [-1, 1] -> [0, 1]
+            batch = (batch - torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)) / \
+                    torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+            feat = inception_model(batch)
+            features_list.append(feat.cpu())
+
+    return torch.cat(features_list, 0), inception_model
+
+
+def compute_fid_from_features(real_features, fake_features):
+    """
+    Compute FID from pre-extracted Inception features.
+
+    FID = ||mu_r - mu_f||^2 + Tr(Sigma_r + Sigma_f - 2*sqrt(Sigma_r @ Sigma_f))
+
+    Args:
+        real_features: [N, D] tensor of real image features
+        fake_features: [M, D] tensor of fake image features
+
+    Returns:
+        fid: scalar FID value
+    """
+    # Convert to numpy for numerical stability in matrix sqrt
+    real_features = real_features.cpu().numpy()
+    fake_features = fake_features.cpu().numpy()
+
+    mu_r = np.mean(real_features, axis=0)
+    mu_f = np.mean(fake_features, axis=0)
+
+    sigma_r = np.cov(real_features, rowvar=False)
+    sigma_f = np.cov(fake_features, rowvar=False)
+
+    # Compute sqrt(Sigma_r @ Sigma_f) via eigendecomposition
+    # covmean = scipy.linalg.sqrtm(sigma_r @ sigma_f)
+    from scipy import linalg
+
+    diff = mu_r - mu_f
+
+    # Product might be almost singular
+    covmean, _ = linalg.sqrtm(sigma_r @ sigma_f, disp=False)
+
+    # Numerical error might give slight imaginary component
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            m = np.max(np.abs(covmean.imag))
+            raise ValueError(f"Imaginary component {m}")
+        covmean = covmean.real
+
+    fid = diff @ diff + np.trace(sigma_r) + np.trace(sigma_f) - 2 * np.trace(covmean)
+
+    return float(fid)
+
+
+def compute_kid(real_features, fake_features, num_subsets=100, subset_size=1000):
+    """
+    Compute KID (Kernel Inception Distance) using polynomial kernel with subsampling.
+
+    Uses polynomial kernel: k(x, y) = (x^T y / d + 1)^3
+    KID = MMD^2 between real and fake Inception features
+
+    Args:
+        real_features: [N, D] tensor of real image features
+        fake_features: [M, D] tensor of fake image features
+        num_subsets: number of random subsets for averaging
+        subset_size: size of each subset
+
+    Returns:
+        kid_mean: mean KID across subsets
+    """
+    # Ensure tensors
+    if not isinstance(real_features, torch.Tensor):
+        real_features = torch.tensor(real_features)
+    if not isinstance(fake_features, torch.Tensor):
+        fake_features = torch.tensor(fake_features)
+
+    n_real = real_features.shape[0]
+    n_fake = fake_features.shape[0]
+    d = real_features.shape[1]
+
+    # Ensure we have enough samples
+    subset_size = min(subset_size, n_real, n_fake)
+
+    def polynomial_kernel(x, y):
+        # k(x, y) = (x^T y / d + 1)^3
+        return ((x @ y.T) / d + 1) ** 3
+
+    kid_values = []
+
+    for _ in range(num_subsets):
+        # Random subsets
+        real_idx = torch.randperm(n_real)[:subset_size]
+        fake_idx = torch.randperm(n_fake)[:subset_size]
+
+        real_subset = real_features[real_idx]
+        fake_subset = fake_features[fake_idx]
+
+        # Compute kernel matrices
+        k_rr = polynomial_kernel(real_subset, real_subset)
+        k_ff = polynomial_kernel(fake_subset, fake_subset)
+        k_rf = polynomial_kernel(real_subset, fake_subset)
+
+        # MMD^2 unbiased estimator
+        m = subset_size
+
+        # Remove diagonal for unbiased estimate
+        diag_rr = torch.diag(k_rr)
+        diag_ff = torch.diag(k_ff)
+
+        sum_rr = (k_rr.sum() - diag_rr.sum()) / (m * (m - 1))
+        sum_ff = (k_ff.sum() - diag_ff.sum()) / (m * (m - 1))
+        sum_rf = k_rf.mean()
+
+        mmd2 = sum_rr + sum_ff - 2 * sum_rf
+        kid_values.append(mmd2.item())
+
+    return np.mean(kid_values)
+
+
+
+def compute_lsi_gap(
+    score_net,
+    encoder_mus,
+    encoder_logvars,
+    cfg,
+    device,
+    labels: torch.Tensor | None = None,
+    num_classes: int | None = None,
+    num_samples: int = 5000,
+    num_time_points: int = 50,
+    batch_size: int = 128,
+):
+    """Compute your LSI-gap diagnostic.
+
+    - For OU/cosine schedules (legacy): assumes the score_net predicts eps.
+    - For flow-matching (time_schedule='flow'): assumes the score_net predicts eps directly.
+    """
+    if score_net is None:
+        return 0.0
+
+    score_net.eval()
+
+    n_data = encoder_mus.shape[0]
+    if labels is not None:
+        assert labels.shape[0] == n_data, "labels must align with encoder_mus/logvars"
+
+    num_samples = min(int(num_samples), int(n_data))
+    sample_indices = torch.randperm(n_data, device="cpu")[:num_samples]
+
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+
+    if stype in ("flow", "flow_matching"):
+        t_min = float(cfg.get("t_min", 1e-5))
+        t_max = float(cfg.get("t_max", 0.99999))
+        t_grid = torch.linspace(t_min, t_max, int(num_time_points), device=device, dtype=torch.float32)
+
+        total_lsi_gap = 0.0
+        total_count = 0
+
+        with torch.no_grad():
+            for i in range(0, num_samples, batch_size):
+                batch_indices = sample_indices[i:i + batch_size]
+                batch_mu = encoder_mus[batch_indices].to(device)
+                batch_logvar = encoder_logvars[batch_indices].to(device)
+
+                batch_var = torch.exp(batch_logvar)
+                batch_std = torch.exp(0.5 * batch_logvar)
+                bsz = batch_mu.shape[0]
+
+                # Labels for CFG-conditional nets
+                y_batch = None
+                if labels is not None:
+                    y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+                    if num_classes is not None:
+                        if (y_batch.min() < 0) or (y_batch.max() >= num_classes):
+                            raise ValueError("labels out of range for num_classes")
+
+                # Sample z0 ~ q(z0 | x)
+                eps_0 = torch.randn_like(batch_mu)
+                z0 = batch_mu + batch_std * eps_0
+
+                for t_val in t_grid:
+                    t = t_val.expand(bsz)  # [bsz]
+                    alpha = t_val.view(1, 1, 1, 1)  # scalar broadcast
+                    sigma = (1.0 - t_val).view(1, 1, 1, 1).clamp_min(1e-8)
+
+                    noise = torch.randn_like(z0)
+                    z_t = alpha * z0 + sigma * noise
+
+                    mu_t = alpha * batch_mu
+                    var_t = (alpha ** 2) * batch_var + (sigma ** 2)
+
+                    # component conditional mean of eps
+                    eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
+
+                    # model predicts eps directly (eps-parameterization)
+                    eps_pred = score_net(z_t, t, y_batch)
+
+                    sigma_sq = sigma ** 2 + 1e-8
+                    eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
+
+                    #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
+                    score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
+
+
+                    total_lsi_gap += score_gap_per_sample.sum().item()
+                    total_count += bsz
+
+        return total_lsi_gap / total_count if total_count > 0 else 0.0
+
+    # ---------------- legacy OU / cosine (eps parameterization) ----------------
+    ou_sched = make_schedule(cfg, device)
+    T = int(ou_sched["T"].item())
+    t_idx_grid = torch.linspace(0, T - 1, int(num_time_points), device=device).round().long()
+
+    total_lsi_gap = 0.0
+    total_count = 0
+
+    with torch.no_grad():
+        for i in range(0, num_samples, batch_size):
+            batch_indices = sample_indices[i:i + batch_size]
+            batch_mu = encoder_mus[batch_indices].to(device)
+            batch_logvar = encoder_logvars[batch_indices].to(device)
+
+            batch_var = torch.exp(batch_logvar)
+            batch_std = torch.exp(0.5 * batch_logvar)
+            bsz = batch_mu.shape[0]
+
+            y_batch = None
+            if labels is not None:
+                y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+            eps_0 = torch.randn_like(batch_mu)
+            z0 = batch_mu + batch_std * eps_0
+
+            for t_idx_scalar in t_idx_grid:
+                t_idx = t_idx_scalar.expand(bsz)
+
+                t_val = ou_sched["times"].gather(0, t_idx_scalar.view(1)).view(1)
+                t = t_val.expand(bsz).float()
+
+                alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+
+                noise = torch.randn_like(z0)
+                z_t = alpha * z0 + sigma * noise
+
+                mu_t = alpha * batch_mu
+                var_t = (alpha ** 2) * batch_var + (sigma ** 2)
+
+                eps_target_lsi = sigma * ((z_t - mu_t) / (var_t + 1e-8))
+                eps_pred = score_net(z_t, t, y_batch)
+
+                sigma_sq = sigma ** 2 + 1e-8
+                eps_diff_sq = (eps_pred - eps_target_lsi) ** 2
+
+                #score_gap_per_sample = (eps_diff_sq / sigma_sq).sum(dim=(1, 2, 3))  # [bsz]
+                score_gap_per_sample = eps_diff_sq.sum(dim=(1, 2, 3))
+
+                total_lsi_gap += score_gap_per_sample.sum().item()
+                total_count += bsz
+
+    return total_lsi_gap / total_count if total_count > 0 else 0.0
+
+
+def compute_mse_gap(
+    score_net,
+    oracle_model,
+    encoder_mus: torch.Tensor,
+    encoder_logvars: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    labels: torch.Tensor | None = None,
+    num_classes: int | None = None,
+    num_samples: int = 5000,
+    batch_size: int = 128,
+    space: str = "eps",
+) -> float:
+    """Integrated MSE between the learned score network and the oracle score.
+
+    MSE_gap = E_{t, x}[ || eps_theta(z_t, t) - eps*(z_t, t) ||_2^2 ]
+
+    where t is drawn *uniformly* over the full discrete training time grid
+    (``num_train_timesteps`` points produced by ``make_schedule``), and
+    z_t is obtained by
+
+        x  -->  (mu_0, Sigma_0) = Enc(x)
+        z_0  ~  N(mu_0, Sigma_0)
+        z_t  =  alpha(t) z_0  +  sigma(t) eps,   eps ~ N(0,I)
+
+    Parameters
+    ----------
+    score_net : nn.Module | OracleScoreModel
+        Learned eps-prediction network (same call signature as DiTModel).
+    oracle_model : OracleScoreModel
+        Oracle (exact CSEM) eps-prediction model.
+    encoder_mus, encoder_logvars : Tensor [N, C, H, W]
+        Precomputed encoder outputs over the evaluation dataset (CPU).
+    cfg : dict
+        Experiment configuration (needs time_schedule, t_min, t_max, num_train_timesteps, â€¦).
+    device : torch.device
+    labels : Tensor [N] or None
+        Class labels; passed to both score_net and oracle_model.
+    num_classes : int or None
+    num_samples : int
+        How many data points to average over.
+    batch_size : int
+    space : ``"eps"`` | ``"score"``
+        ``"eps"``   â€“ plain MSE in eps-prediction space (default).
+        ``"score"`` â€“ divides each term by sigma(t)^2 so that the comparison
+                      is in score space  (score = -eps / sigma).
+
+    Returns
+    -------
+    float  â€“ the averaged MSE gap.
+    """
+    if score_net is None or oracle_model is None:
+        return 0.0
+
+    score_net.eval()
+    oracle_model.eval()
+
+    n_data = encoder_mus.shape[0]
+    num_samples = min(int(num_samples), int(n_data))
+    sample_indices = torch.randperm(n_data, device="cpu")[:num_samples]
+
+    stype = str(cfg.get("time_schedule", "log_snr")).lower()
+
+    # ------------------------------------------------------------------
+    # Build the full discrete training time grid
+    # ------------------------------------------------------------------
+    if stype in ("flow", "flow_matching"):
+        T = int(cfg.get("num_train_timesteps", 1000))
+        t_min = float(cfg.get("t_min", 1e-5))
+        t_max = float(cfg.get("t_max", 0.99999))
+        t_grid = torch.linspace(t_min, t_max, T, device=device, dtype=torch.float32)
+
+        total_mse = 0.0
+        total_count = 0
+
+        with torch.no_grad():
+            for i in range(0, num_samples, batch_size):
+                batch_indices = sample_indices[i:i + batch_size]
+                batch_mu = encoder_mus[batch_indices].to(device)
+                batch_logvar = encoder_logvars[batch_indices].to(device)
+                batch_std = torch.exp(0.5 * batch_logvar)
+                bsz = batch_mu.shape[0]
+
+                y_batch = None
+                if labels is not None:
+                    y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+                # Sample z0 ~ q(z0 | x)
+                eps_0 = torch.randn_like(batch_mu)
+                z0 = batch_mu + batch_std * eps_0
+
+                for t_val in t_grid:
+                    t = t_val.expand(bsz)
+                    alpha = t_val.view(1, 1, 1, 1)
+                    sigma = (1.0 - t_val).view(1, 1, 1, 1).clamp_min(1e-8)
+
+                    noise = torch.randn_like(z0)
+                    z_t = alpha * z0 + sigma * noise
+
+                    eps_pred = score_net(z_t, t, y_batch)
+                    eps_oracle = oracle_model(z_t, t, y_batch)
+
+                    diff_sq = (eps_pred - eps_oracle) ** 2
+                    if space == "score":
+                        sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                        diff_sq = diff_sq / sigma_sq
+
+                    mse_per_sample = diff_sq.sum(dim=(1, 2, 3))  # [bsz]
+                    total_mse += mse_per_sample.sum().item()
+                    total_count += bsz
+
+        return total_mse / total_count if total_count > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    # OU / cosine (discrete schedule)
+    # ------------------------------------------------------------------
+    ou_sched = make_schedule(cfg, device)
+    T = int(ou_sched["T"].item())
+    # Use all T discrete timesteps
+    t_idx_grid = torch.arange(T, device=device, dtype=torch.long)
+
+    total_mse = 0.0
+    total_count = 0
+
+    with torch.no_grad():
+        for i in range(0, num_samples, batch_size):
+            batch_indices = sample_indices[i:i + batch_size]
+            batch_mu = encoder_mus[batch_indices].to(device)
+            batch_logvar = encoder_logvars[batch_indices].to(device)
+            batch_std = torch.exp(0.5 * batch_logvar)
+            bsz = batch_mu.shape[0]
+
+            y_batch = None
+            if labels is not None:
+                y_batch = labels[batch_indices].to(device=device, dtype=torch.long).view(-1)
+
+            eps_0 = torch.randn_like(batch_mu)
+            z0 = batch_mu + batch_std * eps_0
+
+            for t_idx_scalar in t_idx_grid:
+                t_idx = t_idx_scalar.expand(bsz)
+
+                t_val = ou_sched["times"].gather(0, t_idx_scalar.view(1)).view(1)
+                t = t_val.expand(bsz).float()
+
+                alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+
+                noise = torch.randn_like(z0)
+                z_t = alpha * z0 + sigma * noise
+
+                eps_pred = score_net(z_t, t, y_batch)
+                eps_oracle = oracle_model(z_t, t, y_batch)
+
+                diff_sq = (eps_pred - eps_oracle) ** 2
+                if space == "score":
+                    sigma_sq = (sigma ** 2).clamp_min(1e-8)
+                    diff_sq = diff_sq / sigma_sq
+
+                mse_per_sample = diff_sq.sum(dim=(1, 2, 3))  # [bsz]
+                total_mse += mse_per_sample.sum().item()
+                total_count += bsz
+
+    return total_mse / total_count if total_count > 0 else 0.0
+
+
+# â”€â”€ VAE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+"""
+Refactored VAE with LDM-aligned architectural improvements.
+
+Changes vs previous version (all gated by flags, defaults reproduce old behaviour):
+  1. conv3x3_proj=True  : GNâ†’SiLUâ†’3Ã—3 combined mu+logvar projection (encoder)
+                          + 3Ã—3 decoder input conv (replaces 1Ã—1)
+  2. decoder_extra_block : +1 VAEResBlock per decoder stage (LDM asymmetry)
+  3. encoder_attn_half   : attention at half-res (16Ã—16) in encoder
+  4. use_tanh_out=False  : raw decoder output (no tanh saturation)
+  5. clamp_logvar=True   : clamp logvar to [-30, 20]
+  6. attn_zero_init=False: standard init on VAE attention proj (faster learning)
+"""
+
+# â”€â”€ VAEAttentionBlock (updated: optional zero-init) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class VAEAttentionBlock(nn.Module):
+    """
+    Multi-head self-attention with optional zero-init on output projection.
+
+    zero_init=True  (default): proj starts as no-op â€” good for score nets.
+    zero_init=False           : standard init â€” faster attention learning in VAEs.
+    """
+    def __init__(self, ch: int, num_heads: int = 4, zero_init: bool = True):
+        super().__init__()
+        ch = int(ch)
+        num_heads = int(num_heads)
+
+        num_heads = min(num_heads, ch)
+        while num_heads > 1 and (ch % num_heads) != 0:
+            num_heads -= 1
+
+        self.ch = ch
+        self.num_heads = num_heads
+        self.head_dim = ch // num_heads
+
+        self.norm = make_group_norm(ch)
+        self.qkv = nn.Conv2d(ch, 3 * ch, kernel_size=1)
+        self.proj = nn.Conv2d(ch, ch, kernel_size=1)
+
+        if zero_init:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        qkv = qkv.view(B, 3, self.num_heads, self.head_dim, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+        attn = torch.matmul(q.transpose(-2, -1).float(), k.float())
+        attn = attn * (self.head_dim ** -0.5)
+        attn = attn.softmax(dim=-1).to(q.dtype)
+
+        out = torch.matmul(v, attn.transpose(-2, -1))
+        out = out.reshape(B, C, H, W)
+        return x + self.proj(out)
+
+
+# â”€â”€ VAEResBlock (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class VAEResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            make_group_norm(in_ch), nn.SiLU(), nn.Conv2d(in_ch, out_ch, 3, 1, 1),
+            make_group_norm(out_ch), nn.SiLU(), nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+        )
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+    def forward(self, x): return self.net(x) + self.skip(x)
+
+class VAE(nn.Module):
+    """
+    Convolutional VAE with two stride-2 downsamples (img_size â†’ img_size/4 latent).
+
+    Backward-compatible: every NEW parameter's default reproduces the prior
+    architecture exactly.
+
+    Recommended CIFAR call (with all improvements):
+        VAE(latent_channels=8, base_ch=64, img_size=32, img_channels=3,
+            num_res_blocks=2, decoder_attn_half=True, latent_proj_depth=2,
+            encoder_attn_half=True, decoder_extra_block=True,
+            conv3x3_proj=True, use_tanh_out=False,
+            clamp_logvar=True, attn_zero_init=False,
+            num_classes=10, cond_emb_dim=64, use_norm=True)
+    """
+
+    def __init__(
+        self,
+        latent_channels: int = 4,
+        base_ch: int = 32,
+        use_norm: bool = False,
+        img_size: int = 28,
+        img_channels: int = 1,
+        # --- Optional conditional encoder ---
+        num_classes: int | None = None,
+        null_label: int | None = None,
+        cond_emb_dim: int = 64,
+        # --- Auxiliary encoder noise (mixture-of-Gaussians per x) ---
+        aux_d: int = 0,
+        # --- Capacity knobs (v1, defaults = original behaviour) ---
+        num_res_blocks: int = 1,
+        decoder_attn_half: bool = False,
+        latent_proj_depth: int = 1,
+        # --- v2 architectural knobs (defaults = v1 behaviour) ---
+        encoder_attn_half: bool = False,     # [4] attention at half-res in encoder
+        decoder_extra_block: bool = False,   # [3] +1 ResBlock per decoder stage
+        conv3x3_proj: bool = False,          # [1,2] 3Ã—3 latent projection + decoder input
+        use_tanh_out: bool = True,           # [5] False = raw output, no tanh
+        clamp_logvar: bool = False,          # [6] clamp logvar to [-30, 20]
+        attn_zero_init: bool = True,         # [7] False = standard init on VAE attn
+        # --- Time-dependent decoder (TDD) ---
+        time_cond_decoder: bool = False,     # Enable FiLM time conditioning in decoder
+        dec_time_emb_dim: int = 128,         # Dimension of decoder time embedding
+    ):
+        super().__init__()
+
+        # ---- bookkeeping ------------------------------------------------
+        self.use_norm = use_norm
+        self.img_size = img_size
+        self.img_channels = int(img_channels)
+        self.latent_channels = int(latent_channels)
+        self.base_ch = int(base_ch)
+        self.num_res_blocks = int(num_res_blocks)
+        self.decoder_attn_half = decoder_attn_half
+        self.latent_proj_depth = int(latent_proj_depth)
+        self.aux_d = int(aux_d)
+        self.encoder_attn_half = encoder_attn_half
+        self.decoder_extra_block = decoder_extra_block
+        self.conv3x3_proj = conv3x3_proj
+        self.use_tanh_out = use_tanh_out
+        self.clamp_logvar = clamp_logvar
+        self.attn_zero_init = attn_zero_init
+
+        self.num_classes = None if num_classes is None else int(num_classes)
+        self.null_label = (
+            None if self.num_classes is None
+            else int(self.num_classes if null_label is None else null_label)
+        )
+
+        ch1 = base_ch          # full res
+        ch2 = base_ch * 2      # half res
+        ch4 = base_ch * 4      # quarter res / bottleneck
+
+        azero = self.attn_zero_init  # shorthand for attention blocks
+
+        # ================================================================
+        #  ENCODER
+        # ================================================================
+        self.enc_conv_in = nn.Conv2d(img_channels, ch1, 3, 1, 1)
+
+        # Stage 0 â€” full-res â†’ half-res
+        enc_stage0 = [VAEResBlock(ch1, ch1) for _ in range(num_res_blocks)]
+        enc_stage0.append(nn.Conv2d(ch1, ch2, 3, 2, 1))           # stride-2 down
+
+        # Stage 1 â€” half-res â†’ quarter-res
+        enc_stage1: list[nn.Module] = [VAEResBlock(ch2, ch2) for _ in range(num_res_blocks)]
+        if encoder_attn_half:                                       # [4] NEW
+            enc_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
+        enc_stage1.append(nn.Conv2d(ch2, ch4, 3, 2, 1))           # stride-2 down
+
+        # Stage 2 â€” bottleneck (quarter-res, with attention)
+        enc_stage2: list[nn.Module] = [VAEResBlock(ch4, ch4)]
+        enc_stage2.append(VAEAttentionBlock(ch4, zero_init=azero))
+        for _ in range(num_res_blocks):
+            enc_stage2.append(VAEResBlock(ch4, ch4))
+
+        self.enc_blocks = nn.ModuleList([
+            nn.Sequential(*enc_stage0),
+            nn.Sequential(*enc_stage1),
+            nn.Sequential(*enc_stage2),
+        ])
+
+        enc_out_ch = ch4
+
+        # ---- conditional bottleneck bias --------------------------------
+        if self.num_classes is not None:
+            self.y_emb = nn.Embedding(self.num_classes + 1, cond_emb_dim)
+            self.cond_proj = nn.Linear(cond_emb_dim, enc_out_ch)
+            nn.init.zeros_(self.cond_proj.weight)
+            nn.init.zeros_(self.cond_proj.bias)
+        else:
+            self.y_emb = None
+            self.cond_proj = None
+
+        # ---- latent projection (enc_out_ch â†’ latent_channels) -----------
+        if latent_proj_depth >= 2:
+            self.enc_pre_proj = VAEResBlock(enc_out_ch, enc_out_ch)
+        else:
+            self.enc_pre_proj = None
+
+        proj_in_ch = enc_out_ch + self.aux_d
+
+        if self.conv3x3_proj:
+            # [1] NEW: terminal norm â†’ activation â†’ 3Ã—3 combined mu+logvar
+            self.enc_norm_out = make_group_norm(proj_in_ch)
+            self.enc_conv_out = nn.Conv2d(proj_in_ch, 2 * latent_channels, 3, 1, 1)
+            # no separate mu / logvar convs
+            self.mu = None
+            self.logvar = None
+        else:
+            # legacy: separate 1Ã—1 convs
+            self.enc_norm_out = None
+            self.enc_conv_out = None
+            self.mu = nn.Conv2d(proj_in_ch, latent_channels, 1)
+            self.logvar = nn.Conv2d(proj_in_ch, latent_channels, 1)
+
+        # aux zero-init (so aux channels are ignored at init)
+        if self.aux_d > 0:
+            with torch.no_grad():
+                if self.conv3x3_proj:
+                    self.enc_conv_out.weight[:, enc_out_ch:, :, :].zero_()
+                else:
+                    self.mu.weight[:, enc_out_ch:, :, :].zero_()
+                    self.logvar.weight[:, enc_out_ch:, :, :].zero_()
+
+        # GroupNorm on mu
+        if self.use_norm:
+            self.gn_mu = nn.GroupNorm(num_groups=1, num_channels=latent_channels, affine=False)
+
+        # ================================================================
+        #  DECODER
+        # ================================================================
+
+        # ---- latent back-projection (latent_channels â†’ ch4) -------------
+        dec_in_ks = 3 if self.conv3x3_proj else 1                  # [2] NEW
+        if latent_proj_depth >= 2:
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
+            self.dec_post_proj = VAEResBlock(ch4, ch4)
+        else:
+            self.dec_conv_in = nn.Conv2d(latent_channels, ch4, dec_in_ks, 1, dec_in_ks // 2)
+            self.dec_post_proj = None
+
+        # number of ResBlocks per decoder stage
+        dec_nrb = num_res_blocks + (1 if decoder_extra_block else 0)   # [3] NEW
+
+        # Stage 0 â€” bottleneck (quarter-res, with attention)
+        dec_stage0: list[nn.Module] = [VAEResBlock(ch4, ch4)]
+        dec_stage0.append(VAEAttentionBlock(ch4, zero_init=azero))
+        for _ in range(dec_nrb):
+            dec_stage0.append(VAEResBlock(ch4, ch4))
+
+        # Stage 1 â€” quarter-res â†’ half-res
+        dec_stage1: list[nn.Module] = [
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(ch4, ch2, 3, 1, 1),
+        ]
+        for _ in range(dec_nrb):
+            dec_stage1.append(VAEResBlock(ch2, ch2))
+        if decoder_attn_half:
+            dec_stage1.append(VAEAttentionBlock(ch2, zero_init=azero))
+
+        # Stage 2 â€” half-res â†’ full-res
+        dec_stage2: list[nn.Module] = [
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(ch2, ch1, 3, 1, 1),
+        ]
+        for _ in range(dec_nrb):
+            dec_stage2.append(VAEResBlock(ch1, ch1))
+
+        self.dec_blocks = nn.ModuleList([
+            nn.Sequential(*dec_stage0),
+            nn.Sequential(*dec_stage1),
+            nn.Sequential(*dec_stage2),
+        ])
+
+        self.dec_out = nn.Sequential(
+            nn.GroupNorm(16, ch1), nn.SiLU(), nn.Conv2d(ch1, img_channels, 3, 1, 1)
+        )
+
+        # ================================================================
+        #  TIME-DEPENDENT DECODER (TDD) â€” optional FiLM conditioning
+        # ================================================================
+        self.time_cond_decoder = time_cond_decoder
+        if time_cond_decoder:
+            self.dec_time_emb_dim = dec_time_emb_dim
+            # Sinusoidal embedding â†’ MLP (same pattern as score network)
+            self.dec_time_mlp = nn.Sequential(
+                nn.Linear(dec_time_emb_dim, 4 * dec_time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(4 * dec_time_emb_dim, dec_time_emb_dim),
+            )
+            # FiLM layers after each decoder stage: produce (scale, shift)
+            # Stage 0 output: ch4,  Stage 1 output: ch2,  Stage 2 output: ch1
+            film_channels = [ch4, ch2, ch1]
+            self.dec_film_layers = nn.ModuleList()
+            for fc in film_channels:
+                film = nn.Linear(dec_time_emb_dim, 2 * fc)
+                # Zero-init so that at t=0 (or any t at init): scale=0, shift=0
+                # => (1+0)*h + 0 = h, identity, backward compatible
+                nn.init.zeros_(film.weight)
+                nn.init.zeros_(film.bias)
+                self.dec_film_layers.append(film)
+
+    # -----------------------------------------------------------------
+    #  encode / decode / forward  â€” signatures IDENTICAL to before
+    # -----------------------------------------------------------------
+
+    def encode(self, x: torch.Tensor, y: torch.Tensor | None = None):
+        h = self.enc_conv_in(x)
+        for block in self.enc_blocks:
+            h = block(h)
+
+        # class-conditioning at bottleneck
+        if self.num_classes is not None:
+            B, C, H, W = h.shape
+            if y is None:
+                y = torch.full((B,), self.null_label, device=h.device, dtype=torch.long)
+            else:
+                y = y.to(device=h.device, dtype=torch.long).view(B)
+            emb = self.y_emb(y)
+            bias = self.cond_proj(emb).view(B, C, 1, 1)
+            h = h + bias
+
+        if self.enc_pre_proj is not None:
+            h = self.enc_pre_proj(h)
+
+        # Auxiliary stochastic conditioning
+        if self.aux_d > 0:
+            B, _, H, W = h.shape
+            w = torch.randn(B, self.aux_d, H, W, device=h.device, dtype=h.dtype)
+            h = torch.cat([h, w], dim=1)
+
+        # â”€â”€ latent projection â”€â”€
+        if self.conv3x3_proj:
+            # [1] combined: GN â†’ SiLU â†’ 3Ã—3 â†’ split
+            h = F.silu(self.enc_norm_out(h))
+            moments = self.enc_conv_out(h)
+            mu, logvar = moments.chunk(2, dim=1)
+        else:
+            # legacy: separate 1Ã—1 convs
+            mu = self.mu(h)
+            logvar = self.logvar(h)
+
+        # [6] logvar clamping
+        if self.clamp_logvar:
+            logvar = logvar.clamp(-30.0, 20.0)
+
+        if self.use_norm:
+            mu = self.gn_mu(mu)
+
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z, t=None):
+        h = self.dec_conv_in(z)
+        if self.dec_post_proj is not None:
+            h = self.dec_post_proj(h)
+
+        # Compute time embedding for FiLM (if enabled and t provided)
+        t_emb = None
+        if self.time_cond_decoder and t is not None:
+            # t: [B] continuous time scalars
+            raw_emb = timestep_embedding(t, self.dec_time_emb_dim)
+            t_emb = self.dec_time_mlp(raw_emb)
+
+        for i, block in enumerate(self.dec_blocks):
+            h = block(h)
+            # Apply FiLM modulation after each stage
+            if t_emb is not None:
+                scale_shift = self.dec_film_layers[i](t_emb)  # [B, 2*ch]
+                scale, shift = scale_shift.chunk(2, dim=1)
+                h = h * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
+
+        out = self.dec_out(h)
+        return torch.tanh(out) if self.use_tanh_out else out        # [5]
+
+    def forward(self, x, y: torch.Tensor | None = None):
+        mu, logvar = self.encode(x, y=y)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+
+
+# ---------------------------------------------------------------------------
+# PatchGAN Discriminator (Stable Diffusion / pix2pix style)
+# ---------------------------------------------------------------------------
+
+class PatchDiscriminator(nn.Module):
+    """Lightweight NLayerDiscriminator (PatchGAN) as used in SD / taming-transformers."""
+    def __init__(self, in_channels: int = 3, ndf: int = 64, n_layers: int = 2):
+        super().__init__()
+        layers = [nn.Conv2d(in_channels, ndf, 4, 2, 1), nn.LeakyReLU(0.2, True)]
+        ch = ndf
+        for i in range(1, n_layers):
+            ch_next = min(ch * 2, ndf * 8)
+            layers += [nn.Conv2d(ch, ch_next, 4, 2, 1), nn.LeakyReLU(0.2, True)]
+            ch = ch_next
+        ch_next = min(ch * 2, ndf * 8)
+        layers += [nn.Conv2d(ch, ch_next, 4, 1, 1), nn.LeakyReLU(0.2, True)]
+        ch = ch_next
+        layers += [nn.Conv2d(ch, 1, 4, 1, 1)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def hinge_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (F.relu(1.0 - logits_real).mean() + F.relu(1.0 + logits_fake).mean())
+
+
+def hinge_g_loss(logits_fake: torch.Tensor) -> torch.Tensor:
+    return -logits_fake.mean()
+
+
+# -*- coding: utf-8 -*-
+"""New_DIT.ipynb
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1KpCdfJsS9N-fQSLz1h6CKp1IGqsTyYyv
+"""
+
+# -*- coding: utf-8 -*-
+"""New_DIT.ipynb
+
+Automatically generated by Colab.
+
+Original file is located at
+    https://colab.research.google.com/drive/1KpCdfJsS9N-fQSLz1h6CKp1IGqsTyYyv
+"""
+
+import math
+from typing import Tuple, Optional
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10_000) -> torch.Tensor:
+    """
+    Standard sinusoidal timestep embedding.
+    t: [B] float (can be continuous)
+    returns: [B, dim]
+    """
+    if t.dim() != 1:
+        t = t.view(-1)
+    half = dim // 2
+    # exp(-log(max_period) * i/half)
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(0, half, device=t.device, dtype=torch.float32) / max(half, 1)
+    )
+    args = t.float()[:, None] * freqs[None, :]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb
+
+
+class TimeEmbedding(nn.Module):
+    """
+    Small change: use a more standard sinusoidal embedding implementation,
+    keep the same MLP width (4*dim) as your reference.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = int(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.SiLU(),
+            nn.Linear(4 * dim, 4 * dim),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        emb = timestep_embedding(t, self.dim)
+        return self.mlp(emb)
+
+
+class AttentionBlock(nn.Module):
+    """
+    Multi-head self-attention (defaults to a conservative head count).
+    Output projection is zero-initialized for stability (starts as no-op residual).
+    """
+    def __init__(self, ch: int, num_heads: int = 4):
+        super().__init__()
+        ch = int(ch)
+        num_heads = int(num_heads)
+
+        # Make heads divide channels (fallback to fewer heads if needed).
+        num_heads = min(num_heads, ch)
+        while num_heads > 1 and (ch % num_heads) != 0:
+            num_heads -= 1
+
+        self.ch = ch
+        self.num_heads = num_heads
+        self.head_dim = ch // num_heads
+
+        self.norm = make_group_norm(ch)
+        self.qkv = nn.Conv2d(ch, 3 * ch, kernel_size=1)
+        self.proj = nn.Conv2d(ch, ch, kernel_size=1)
+
+        # Zero-init proj => attention path starts off as exactly zero.
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)  # [B, 3C, H, W]
+        qkv = qkv.view(B, 3, self.num_heads, self.head_dim, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # each [B, heads, head_dim, N]
+
+        # Attention in fp32 for stability; cast back after softmax.
+        attn = torch.matmul(q.transpose(-2, -1).float(), k.float())  # [B, heads, N, N]
+        attn = attn * (self.head_dim ** -0.5)
+        attn = attn.softmax(dim=-1).to(q.dtype)
+
+        out = torch.matmul(v, attn.transpose(-2, -1))  # [B, heads, head_dim, N]
+        out = out.reshape(B, C, H, W)
+        return x + self.proj(out)
+
+
+class ResBlock(nn.Module):
+    """
+    Minimal-but-stronger ResBlock:
+      - FiLM time conditioning: (1+scale)*GN(h) + shift
+      - optional dropout before conv2
+      - zero-init conv2 so block starts as identity-ish
+      - optional attention at the end (also stabilized by zero-init proj)
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        t_dim: int,
+        *,
+        dropout: float = 0.0,
+        use_attn: bool = False,
+        attn_heads: int = 4,
+        skip_scale: float = 1.0,
+    ):
+        super().__init__()
+        in_ch = int(in_ch)
+        out_ch = int(out_ch)
+        t_dim = int(t_dim)
+
+        self.skip_scale = float(skip_scale)
+        self.dropout = float(dropout)
+
+        self.norm1 = make_group_norm(in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+
+        # Produce (scale, shift) for FiLM.
+        self.time_proj = nn.Linear(t_dim, 2 * out_ch)
+
+        self.norm2 = make_group_norm(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+
+        # Zero-init conv2 => residual path starts at 0.
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+        self.skip = nn.Conv2d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
+
+        self.attn = AttentionBlock(out_ch, num_heads=attn_heads) if use_attn else nn.Identity()
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        # First conv
+        h = self.conv1(F.silu(self.norm1(x)))
+
+        # FiLM on second norm
+        scale_shift = self.time_proj(t_emb).type_as(h)  # [B, 2*out_ch]
+        scale, shift = scale_shift.chunk(2, dim=1)
+        scale = scale[:, :, None, None]
+        shift = shift[:, :, None, None]
+
+        h = self.norm2(h)
+        h = h * (1.0 + scale) + shift
+        h = F.silu(h)
+
+        if self.dropout > 0:
+            h = F.dropout(h, p=self.dropout, training=self.training)
+
+        h = self.conv2(h)
+
+        # Residual + (optional) attention + gentle scaling
+        h = h + self.skip(x)
+        h = self.attn(h)
+        return h * self.skip_scale
+
+
+# ---------------------------------------------------------------------------
+# DiT (Diffusion Transformer) â€” drop-in replacement for UNetModel
+# ---------------------------------------------------------------------------
+# Same forward API:  forward(x, t, y) -> eps_pred
+#   x: [B, C, H, W]  latent tensor
+#   t: [B]            continuous time scalars
+#   y: [B] | None     class labels (None â†’ null/unconditional token)
+#
+# Architecture:  patchify â†’ transformer blocks with adaLN-Zero â†’ unpatchify
+# Reference: Peebles & Xie, "Scalable Diffusion Models with Transformers" (2023)
+# ---------------------------------------------------------------------------
+
+
+
+
+class RMSNorm(nn.Module):
+    """RMSNorm with learnable scale (LightningDiT style)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(int(dim)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [..., D]
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU MLP: (SiLU(a) * b)W3."""
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        dim = int(dim)
+        mlp_ratio = float(mlp_ratio)
+        hidden = int((2.0 / 3.0) * mlp_ratio * dim)  # LightningDiT default: 2/3 * 4 * dim
+        self.w12 = nn.Linear(dim, 2 * hidden)
+        self.w3 = nn.Linear(hidden, dim)
+        self.dropout = float(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = self.w12(x).chunk(2, dim=-1)
+        x = F.silu(a) * b
+        if self.dropout > 0:
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.w3(x)
+        if self.dropout > 0:
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+
+
+class DiTBlock(nn.Module):
+    """Transformer block with adaLN-Zero, RMSNorm, and SwiGLU."""
+    def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.hidden_dim // self.num_heads
+
+        # --- Self-attention ---
+        self.norm1 = RMSNorm(self.hidden_dim, eps=1e-6)
+        self.attn_qkv = nn.Linear(self.hidden_dim, 3 * self.hidden_dim)
+        self.attn_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+
+        # --- Feed-forward ---
+        self.norm2 = RMSNorm(self.hidden_dim, eps=1e-6)
+        self.mlp = SwiGLU(self.hidden_dim, mlp_ratio=mlp_ratio, dropout=dropout)
+
+        # --- adaLN-Zero modulation: produces 6 * hidden_dim from conditioning ---
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 6 * self.hidden_dim),
+        )
+        # Zero-init so block starts as identity
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """x: [B, N, D], c: [B, D]."""
+        mod = self.adaLN_modulation(c).unsqueeze(1)  # [B, 1, 6D]
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = mod.chunk(6, dim=-1)
+
+        # --- Attention branch ---
+        h = self.norm1(x)
+        h = h * (1.0 + gamma1) + beta1
+
+        B, N, D = h.shape
+        qkv = self.attn_qkv(h).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        scale = self.head_dim ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1)
+        h = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        h = self.attn_proj(h)
+        x = x + alpha1 * h
+
+        # --- MLP branch ---
+        h = self.norm2(x)
+        h = h * (1.0 + gamma2) + beta2
+        h = self.mlp(h)
+        x = x + alpha2 * h
+
+        return x
+
+
+
+class DiTModel(nn.Module):
+    """Diffusion Transformer (DiT) configured for strong diffusion/flow training (eps prediction).
+
+    - patchify -> transformer blocks with adaLN-Zero -> unpatchify
+    - RMSNorm + SwiGLU (LightningDiT-style)
+    - fixed 2D sin-cos positional embeddings
+    - outputs an eps prediction ÎµÌ‚(z_t, t)
+
+    Forward signature stays: forward(x, t, y) -> [B,C,H,W]
+    """
+    def __init__(
+        self,
+        in_channels: int = 4,
+        patch_size: int = 1,
+        hidden_dim: int = 384,
+        depth: int = 12,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        num_classes: int | None = None,
+        *,
+        dropout: float = 0.0,
+        latent_size: int = 8,
+        # accepted (ignored) for backward compat with UNetModel call sites
+        base_channels: int = 32,
+        channel_mults: Tuple[int, ...] = (1, 2, 4),
+        num_res_blocks: int = 2,
+        attn_levels: Optional[Tuple[int, ...]] = None,
+        attn_heads: int = 4,
+        skip_scale: float = 1.0,
+        mid_attn: bool = True,
+        factored_head: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.patch_size = int(patch_size)
+        self.hidden_dim = int(hidden_dim)
+        self.factored_head = bool(factored_head)
+
+        self.num_classes = num_classes
+        self.null_label = num_classes if num_classes is not None else None
+
+        # Patch embedding
+        self.patch_embed = nn.Conv2d(
+            self.in_channels, self.hidden_dim,
+            kernel_size=self.patch_size, stride=self.patch_size,
+        )
+
+        # Time embedding (sinusoidal -> MLP)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+
+        # Class embedding
+        if num_classes is not None:
+            self.label_emb = nn.Embedding(int(num_classes) + 1, self.hidden_dim)
+        else:
+            self.label_emb = None
+
+        # Fixed 2D sin-cos positional embedding
+        grid = int(latent_size // self.patch_size)
+        num_tokens = grid * grid
+        pos = self._build_2d_sincos_pos_embed(self.hidden_dim, grid)  # [1, N, D]
+        self.register_buffer("pos_embed", pos, persistent=False)
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            DiTBlock(self.hidden_dim, int(num_heads), mlp_ratio=float(mlp_ratio), dropout=float(dropout))
+            for _ in range(int(depth))
+        ])
+
+        # Final layer: adaLN modulation + projection back to pixels
+        self.final_norm = RMSNorm(self.hidden_dim, eps=1e-6)
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 2 * self.hidden_dim),
+        )
+
+        patch_out_dim = self.in_channels * self.patch_size * self.patch_size
+        if self.factored_head:
+            # Factored Natural-Parameter head (Î», Î½):
+            #   prec_proj  -> predicts log(Î»), where Î» = Ïƒâ‚œ Â· diag(Î£â‚œ(x)â»Â¹)
+            #   nu_proj    -> predicts Î½ = Î» âŠ™ Î¼â‚œ  (precision-weighted mean)
+            #   output  ÎµÌ‚ = Î» âŠ™ zâ‚œ âˆ’ Î½
+            # The aggregate score is always s*(z,t) = -Î›_eff z + Î½_eff,
+            # so this is the exact functional form with no approximation.
+            self.nu_proj   = nn.Linear(self.hidden_dim, patch_out_dim)
+            self.prec_proj = nn.Linear(self.hidden_dim, patch_out_dim)
+        else:
+            self.final_proj = nn.Linear(self.hidden_dim, patch_out_dim)
+
+        self.initialize_weights()
+
+    @staticmethod
+    def _build_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
+        """Return fixed 2D sin-cos positional embedding as torch Tensor [1, N, D]."""
+        # Based on common MAE/ViT utilities
+        grid_h = np.arange(grid_size, dtype=np.float32)
+        grid_w = np.arange(grid_size, dtype=np.float32)
+        grid = np.meshgrid(grid_w, grid_h)  # (w, h)
+        grid = np.stack(grid, axis=0)  # [2, Gh, Gw]
+        grid = grid.reshape(2, 1, grid_size, grid_size)
+
+        def get_1d(embed_dim_1d: int, pos: np.ndarray) -> np.ndarray:
+            assert embed_dim_1d % 2 == 0
+            omega = np.arange(embed_dim_1d // 2, dtype=np.float32)
+            omega /= (embed_dim_1d / 2.0)
+            omega = 1.0 / (10000 ** omega)  # [D/2]
+            pos = pos.reshape(-1)  # [M]
+            out = np.einsum("m,d->md", pos, omega)  # [M, D/2]
+            emb = np.concatenate([np.sin(out), np.cos(out)], axis=1)  # [M, D]
+            return emb
+
+        assert embed_dim % 2 == 0, "embed_dim must be even for 2D sin-cos"
+        emb_h = get_1d(embed_dim // 2, grid[1])  # [N, D/2]
+        emb_w = get_1d(embed_dim // 2, grid[0])  # [N, D/2]
+        pos_embed = np.concatenate([emb_w, emb_h], axis=1)  # [N, D]
+        pos_embed = torch.from_numpy(pos_embed).float().unsqueeze(0)  # [1, N, D]
+        return pos_embed
+
+    def initialize_weights(self) -> None:
+        """LightningDiT-style init: Xavier on linears/convs, zero on adaLN/final."""
+        def _init(m):
+            if isinstance(m, (nn.Linear, nn.Conv2d)):
+                if m.weight is not None and m.weight.dim() > 1:
+                    nn.init.xavier_uniform_(m.weight)
+                if getattr(m, "bias", None) is not None and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        self.apply(_init)
+
+        # Zero-init all adaLN modulations + final projection (identity start)
+        for blk in self.blocks:
+            nn.init.zeros_(blk.adaLN_modulation[1].weight)
+            nn.init.zeros_(blk.adaLN_modulation[1].bias)
+        nn.init.zeros_(self.final_modulation[1].weight)
+        nn.init.zeros_(self.final_modulation[1].bias)
+        if self.factored_head:
+            nn.init.zeros_(self.nu_proj.weight)
+            nn.init.zeros_(self.nu_proj.bias)
+            nn.init.zeros_(self.prec_proj.weight)
+            # Bias init: exp(-4) â‰ˆ 0.018, so initial Îµ â‰ˆ 0.018Â·zâ‚œ
+            # (near-zero output at init while keeping grad alive to both heads)
+            nn.init.constant_(self.prec_proj.bias, -4.0)
+        else:
+            nn.init.zeros_(self.final_proj.weight)
+            nn.init.zeros_(self.final_proj.bias)
+
+    def unpatchify(self, x: torch.Tensor, H_tok: int, W_tok: int) -> torch.Tensor:
+        p = self.patch_size
+        C = self.in_channels
+        x = x.reshape(-1, H_tok, W_tok, p, p, C)
+        x = x.permute(0, 5, 1, 3, 2, 4)
+        x = x.reshape(-1, C, H_tok * p, W_tok * p)
+        return x
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None, *, return_components: bool = False, detach_components: bool = False):
+        """Return eps prediction ÎµÌ‚(z_t, t).
+
+        When factored_head=True the prediction uses natural parameters:
+            ÎµÌ‚ = Î» âŠ™ z_t âˆ’ Î½
+        where Î» = Ïƒâ‚œÂ·Î£â‚œâ»Â¹ (diagonal precision) and Î½ = Î»âŠ™Î¼â‚œ.
+
+        If return_components=True and factored_head=True, returns (eps, lam, nu).
+        If detach_components=True, (lam, nu) are computed from detached trunk tokens
+        so auxiliary losses can update only the head without backpropagating to the encoder.
+        """
+        B, C, H, W = x.shape
+        z_t = x                      # keep original input for factored combination
+        t = t.view(-1)
+
+        tokens = self.patch_embed(x)  # [B, D, H_tok, W_tok]
+        H_tok, W_tok = tokens.shape[2], tokens.shape[3]
+        tokens = tokens.flatten(2).transpose(1, 2)  # [B, N, D]
+
+        tokens = tokens + self.pos_embed
+
+        # conditioning vector c = time_emb + class_emb
+        t_emb = timestep_embedding(t, self.hidden_dim)
+        c = self.time_mlp(t_emb)
+
+        if self.label_emb is not None:
+            if y is None:
+                y_ids = torch.full((B,), int(self.null_label), device=x.device, dtype=torch.long)
+            else:
+                y_ids = y.to(device=x.device, dtype=torch.long).view(-1)
+                if y_ids.shape[0] != B:
+                    y_ids = y_ids.expand(B)
+            c = c + self.label_emb(y_ids)
+
+        for blk in self.blocks:
+            tokens = blk(tokens, c)
+
+        # final adaLN modulation
+        gamma, beta = self.final_modulation(c).unsqueeze(1).chunk(2, dim=-1)
+        tokens = self.final_norm(tokens) * (1.0 + gamma) + beta
+
+        if self.factored_head:
+            # Natural-parameter form: ÎµÌ‚ = Î» âŠ™ zâ‚œ âˆ’ Î½
+            nu_hat  = self.unpatchify(self.nu_proj(tokens), H_tok, W_tok)
+            log_lam = self.unpatchify(self.prec_proj(tokens), H_tok, W_tok)
+            log_lam = log_lam.clamp(-20.0, 20.0)
+            lam     = torch.exp(log_lam)
+            out = lam * z_t - nu_hat
+
+            if return_components:
+                if detach_components:
+                    tokens_aux = tokens.detach()
+                    nu_aux  = self.unpatchify(self.nu_proj(tokens_aux), H_tok, W_tok)
+                    log_lam_aux = self.unpatchify(self.prec_proj(tokens_aux), H_tok, W_tok)
+                    log_lam_aux = log_lam_aux.clamp(-20.0, 20.0)
+                    lam_aux = torch.exp(log_lam_aux)
+                else:
+                    lam_aux = lam
+                    nu_aux  = nu_hat
+                return out, lam_aux, nu_aux
+        else:
+            tokens = self.final_proj(tokens)
+            out = self.unpatchify(tokens, H_tok, W_tok)
+            if return_components:
+                raise ValueError("return_components=True requires factored_head=True")
+
+        return out
+
+
+# Alias so that existing code referencing UNetModel still works
+UNetModel = DiTModel
+
+# ----------------------------------------------------------------------
+# DiT default config notes:
+#   DiTModel(hidden_dim=384, depth=8, num_heads=6, patch_size=2)
+#   operates on 8Ã—8 latents â†’ 16 tokens; ~4.3M params.
+#   For larger latents or more capacity, increase hidden_dim/depth.
+# ----------------------------------------------------------------------
+
+
+class UniversalSampler:
+    def __init__(
+        self,
+        method: str = "heun_sde",
+        num_steps: int = 20,
+        t_min: float = 2e-5,
+        t_max: float = 2.0,
+        schedule_cfg: Dict[str, Any] | None = None,
+        ddim_eta: float = 0.0,
+        schedule_type: str = "log_snr",
+        cosine_s: float = 0.008,
+    ):
+        self.num_steps = int(num_steps)
+        self.t_min = float(t_min)
+        self.t_max = float(t_max)
+        self.method = str(method).lower()
+        self.schedule_type = str(schedule_type).lower()
+        self.cosine_s = float(cosine_s)
+
+        # For discrete samplers (DDIM), we need the same schedule used in training.
+        self.schedule_cfg = schedule_cfg
+        self.ddim_eta = float(ddim_eta)
+        self._ddpm_schedule: Dict[str, torch.Tensor] | None = None
+
+    # -------------------- schedule-aware helpers --------------------
+
+    def _get_alpha_sigma(self, t_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (alpha, sigma) at continuous time t_vec, dispatching on schedule type."""
+        if self.schedule_type in ("flow", "flow_matching"):
+            # linear interpolant
+            return get_flow_params(t_vec)
+        if self.schedule_type == "cosine":
+            a, s, _ = get_cosine_params(t_vec, cosine_s=self.cosine_s)
+            return a, s
+        # log_t or log_snr â€” both use OU params
+        return get_ou_params(t_vec)
+
+    def _get_beta(self, t_vec: torch.Tensor) -> torch.Tensor:
+        """Return instantaneous beta(t) â€” only meaningful for cosine VP."""
+        if self.schedule_type == "cosine":
+            _, _, b = get_cosine_params(t_vec, cosine_s=self.cosine_s)
+            return b
+        else:
+            # For OU, beta is formally 2 (constant), but the ODE form is different.
+            return torch.full_like(t_vec, 2.0)
+
+    def _make_time_grid(self, device: torch.device) -> torch.Tensor:
+        """Build a time grid for sampling.
+
+        - OU / cosine samplers run **reverse-time**: t_max -> t_min (descending grid).
+        - Flow matching runs **forward-time**: t_min -> t_max (ascending grid).
+        """
+        N = self.num_steps + 1
+        if self.schedule_type in ("flow", "flow_matching"):
+            return torch.linspace(self.t_min, self.t_max, N, device=device)
+        if self.schedule_type == "cosine":
+            return torch.linspace(self.t_max, self.t_min, N, device=device)
+        if self.schedule_type == "log_snr":
+            lam_min_val = ou_logsnr(torch.tensor(self.t_max, dtype=torch.float64)).item()
+            lam_max_val = ou_logsnr(torch.tensor(self.t_min, dtype=torch.float64)).item()
+            lam_grid = torch.linspace(lam_min_val, lam_max_val, N, device=device, dtype=torch.float64)
+            times = ou_time_from_logsnr(lam_grid).float()
+            return times.clamp(self.t_min, self.t_max)
+        # log_t
+        return torch.logspace(math.log10(self.t_max), math.log10(self.t_min), N, device=device)
+
+    @staticmethod
+    def _predict_eps(
+        unet,
+        x: torch.Tensor,
+        t_vec: torch.Tensor,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Classifier-Free Guidance in eps-parameterization."""
+        if cfg_scale is None or cfg_scale <= 0.0 or y is None:
+            return unet(x, t_vec, y)
+
+        # unconditional branch uses y=None (UNetModel maps to null label internally)
+        eps_uncond = unet(x, t_vec, None)
+        eps_cond = unet(x, t_vec, y)
+        return eps_uncond + float(cfg_scale) * (eps_cond - eps_uncond)
+
+    # ---------- factored-head helpers (exponential integrator) ----------
+
+    @staticmethod
+    def _predict_components(
+        unet,
+        x: torch.Tensor,
+        t_vec: torch.Tensor,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict (eps, lam, nu) from a factored-head model, with optional CFG.
+
+        Requires unet.factored_head == True.  The CFG combination is exact
+        because eps = lam * z - nu is bilinear in (lam, nu) for fixed z.
+        """
+        if not getattr(unet, "factored_head", False):
+            raise ValueError(
+                "Exponential integrator samplers (exp_euler_ode / exp_heun_ode) "
+                "require a model with factored_head=True so that the precision "
+                "and natural-mean heads are exposed."
+            )
+
+        if cfg_scale is None or cfg_scale <= 0.0 or y is None:
+            return unet(x, t_vec, y, return_components=True)
+
+        eps_u, lam_u, nu_u = unet(x, t_vec, None, return_components=True)
+        eps_c, lam_c, nu_c = unet(x, t_vec, y, return_components=True)
+        w = float(cfg_scale)
+        eps = eps_u + w * (eps_c - eps_u)
+        lam = lam_u + w * (lam_c - lam_u)
+        nu = nu_u + w * (nu_c - nu_u)
+        return eps, lam, nu
+
+    @staticmethod
+    def _phi1(x: torch.Tensor) -> torch.Tensor:
+        r"""Compute the entire function \varphi_1(x) = (e^x - 1) / x.
+
+        Uses a 4th-order Taylor expansion for |x| < 1e-4 to avoid 0/0.
+        """
+        small = x.abs() < 1e-4
+        # Taylor: 1 + x/2 + x^2/6 + x^3/24
+        taylor = 1.0 + x * (0.5 + x * (1.0 / 6.0 + x / 24.0))
+        # For |x| >= 1e-4 the direct formula is fine
+        x_safe = torch.where(small, torch.ones_like(x), x)
+        exact = torch.expm1(x_safe) / x_safe
+        return torch.where(small, taylor, exact)
+
+    def _exp_integrate(
+        self,
+        z: torch.Tensor,
+        lam: torch.Tensor,
+        nu: torch.Tensor,
+        t_curr: torch.Tensor,
+        dt: torch.Tensor,
+    ) -> torch.Tensor:
+        r"""Exact diagonal exponential integration over one frozen-coefficient step.
+
+        The probability-flow ODE with factored score takes the form (per channel)
+
+            dz_i / dt  =  A_i \cdot z_i  +  C_i
+
+        where A (diagonal) and C depend on the schedule type:
+
+        * OU:     A_i = lam_i / sigma - 1,      C_i = -nu_i / sigma
+        * Cosine: A_i = 0.5 beta (lam_i/sigma - 1),  C_i = -0.5 beta nu_i / sigma
+
+        With A and C frozen, the exact solution is
+
+            z_i(t + dt) = exp(A_i dt) z_i(t)  +  phi_1(A_i dt) dt C_i
+        """
+        B = z.shape[0]
+        t_vec = t_curr.expand(B)
+
+        _, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-10)
+
+        if self.schedule_type in ("flow", "flow_matching"):
+            raise ValueError(
+                "Exponential integrator is not supported for flow matching schedules."
+            )
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            half_beta = 0.5 * beta_t
+            A = half_beta * (lam * inv_sigma - 1.0)
+            C = -half_beta * nu * inv_sigma
+        else:
+            # OU (log_t or log_snr): dz/dt = -z + eps/sigma
+            # with eps = lam*z - nu  =>  dz/dt = (lam/sigma - 1)*z - nu/sigma
+            A = lam * inv_sigma - 1.0
+            C = -nu * inv_sigma
+
+        Ah = A * dt
+        return torch.exp(Ah) * z + self._phi1(Ah) * dt * C
+
+    # ------------------------- Continuous-time samplers -------------------------
+
+    def get_ode_derivative(self, x, t, unet, y=None, cfg_scale=None):
+        """ODE derivative.
+
+        - Flow matching: dz/dt = v(z,t)
+        - OU/cosine: probability-flow ODE (eps parameterization)
+        """
+        B = x.shape[0]
+        t_vec = t.expand(B)
+
+        if self.schedule_type in ("flow", "flow_matching"):
+            # Model predicts eps; convert to velocity via z_t = eps + t * v.
+            eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+            t_b = t_vec.view(B, 1, 1, 1).clamp_min(1e-5)
+            v_pred = (x - eps_pred) / t_b
+            return v_pred
+
+        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+        alpha, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-10)
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            return -0.5 * beta_t * (x - inv_sigma * eps_pred)
+        # OU (log_t or log_snr)
+        return -x + inv_sigma * eps_pred
+
+    def get_rev_sde_drift(self, x, t, unet, y=None, cfg_scale=None):
+        """Reverse-time SDE drift (OU/cosine only)."""
+        if self.schedule_type in ("flow", "flow_matching"):
+            raise ValueError("Reverse-time SDE drift is not defined for flow matching. Use an ODE sampler (rk4_ode/heun_ode/euler_ode).")
+
+        B = x.shape[0]
+        t_vec = t.expand(B)
+        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+        alpha, sigma = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        inv_sigma = 1.0 / (sigma + 1e-8)
+
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_vec.view(B, 1, 1, 1))
+            return -0.5 * beta_t * x + beta_t * inv_sigma * eps_pred
+        return -x + 2.0 * inv_sigma * eps_pred
+
+    def step_euler_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        dt = t_next - t_curr
+        d_curr = self.get_ode_derivative(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        return x + dt * d_curr
+
+    def step_rk4_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        dt = t_next - t_curr
+        half_dt = dt * 0.5
+        t_half = t_curr + half_dt
+
+        k1 = self.get_ode_derivative(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        k2 = self.get_ode_derivative(x + half_dt * k1, t_half, unet, y=y, cfg_scale=cfg_scale)
+        k3 = self.get_ode_derivative(x + half_dt * k2, t_half, unet, y=y, cfg_scale=cfg_scale)
+        k4 = self.get_ode_derivative(x + dt * k3, t_next, unet, y=y, cfg_scale=cfg_scale)
+
+        return x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+    def step_heun_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        B = x.shape[0]
+        dt = t_next - t_curr
+
+        d_curr = self.get_ode_derivative(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        x_proposed = x + dt * d_curr
+
+        if t_next > self.t_min:
+            d_next = self.get_ode_derivative(x_proposed, t_next, unet, y=y, cfg_scale=cfg_scale)
+            x = x + 0.5 * dt * (d_curr + d_next)
+        else:
+            x = x_proposed
+
+        return x
+
+    def step_heun_sde(self, x, t_curr, t_next, unet, y=None, cfg_scale=None, generator=None):
+        """Heun SDE step with schedule-aware diffusion coefficient.
+
+        OU:     diffusion = sqrt(2)
+        Cosine: diffusion = sqrt(beta(t))
+        """
+        dt = t_next - t_curr
+        dt_abs = torch.abs(dt).clamp_min(1e-12)
+
+        if generator is None:
+            noise = torch.randn_like(x)
+        else:
+            noise = torch.randn(x.shape, device=x.device, generator=generator)
+
+        B = x.shape[0]
+        if self.schedule_type == "cosine":
+            beta_t = self._get_beta(t_curr.expand(B).view(B, 1, 1, 1))
+            diff_coeff = torch.sqrt(beta_t.clamp_min(1e-8))
+        else:  # OU: constant diffusion sqrt(2)
+            diff_coeff = math.sqrt(2.0)
+
+        dW = diff_coeff * torch.sqrt(dt_abs) * noise
+
+        b_curr = self.get_rev_sde_drift(x, t_curr, unet, y=y, cfg_scale=cfg_scale)
+        x_hat = x + dt * b_curr + dW
+
+        b_next = self.get_rev_sde_drift(x_hat, t_next, unet, y=y, cfg_scale=cfg_scale)
+        x_new = x + 0.5 * dt * (b_curr + b_next) + dW
+        return x_new
+
+    # --------------- Diagonal exponential integrators ---------------
+
+    def step_exp_euler_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        """First-order diagonal exponential integrator (1 NFE per step).
+
+        Freezes the learned (lam, nu) at (x, t_curr) and exactly integrates
+        the resulting constant-coefficient diagonal-linear ODE over [t_curr, t_next].
+
+        Requires a model with ``factored_head=True``.
+        """
+        B = x.shape[0]
+        t_vec = t_curr.expand(B)
+        _eps, lam, nu = self._predict_components(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+        dt = t_next - t_curr
+        return self._exp_integrate(x, lam, nu, t_curr, dt)
+
+    def step_exp_heun_ode(self, x, t_curr, t_next, unet, y=None, cfg_scale=None):
+        """Second-order exponential Heun integrator (2 NFE per step).
+
+        1. Evaluate (lam, nu) at (x, t_curr); exp-Euler predict x_hat at t_next.
+        2. Evaluate (lam, nu) at (x_hat, t_next).
+        3. Average the two sets of natural parameters.
+        4. Re-integrate from x using the averaged coefficients.
+
+        This exactly treats per-channel stiffness at the cost of two forward
+        passes (same as standard Heun) and matches the second-order exponential
+        Heun variant described in Section 5.1 of the precision-head note.
+
+        Requires a model with ``factored_head=True``.
+        """
+        B = x.shape[0]
+        dt = t_next - t_curr
+
+        # --- predictor: exp-Euler from t_curr ---
+        t_vec_curr = t_curr.expand(B)
+        _eps_curr, lam_curr, nu_curr = self._predict_components(
+            unet, x, t_vec_curr, y=y, cfg_scale=cfg_scale,
+        )
+        x_hat = self._exp_integrate(x, lam_curr, nu_curr, t_curr, dt)
+
+        # At the terminal step just return the Euler prediction
+        if (t_next <= self.t_min).item():
+            return x_hat
+
+        # --- corrector: evaluate at predicted point ---
+        t_vec_next = t_next.expand(B)
+        _eps_next, lam_next, nu_next = self._predict_components(
+            unet, x_hat, t_vec_next, y=y, cfg_scale=cfg_scale,
+        )
+
+        # Average natural parameters and re-integrate from x
+        lam_avg = 0.5 * (lam_curr + lam_next)
+        nu_avg = 0.5 * (nu_curr + nu_next)
+        return self._exp_integrate(x, lam_avg, nu_avg, t_curr, dt)
+
+    # ------------------------- Discrete DDIM sampler -------------------------
+
+    def _get_ddpm_schedule(self, device: torch.device) -> Dict[str, torch.Tensor]:
+        if self._ddpm_schedule is None or self._ddpm_schedule["betas"].device != device:
+            if self.schedule_cfg is None:
+                raise ValueError("DDIM sampling requires schedule_cfg (pass the same cfg used for training).")
+            self._ddpm_schedule = make_ddpm_schedule(self.schedule_cfg, device)
+        return self._ddpm_schedule
+
+
+    def step_ddim(
+        self,
+        x: torch.Tensor,
+        t_curr: torch.Tensor,          # scalar tensor on device
+        t_next: torch.Tensor,          # scalar tensor on device (smaller than t_curr)
+        unet,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+        generator=None,
+    ) -> torch.Tensor:
+        """DDIM step using schedule-aware alpha/sigma (works for OU and cosine)."""
+        B = x.shape[0]
+
+        t_vec = t_curr.expand(B)
+        eps_pred = self._predict_eps(unet, x, t_vec, y=y, cfg_scale=cfg_scale)
+
+        alpha_t, sigma_t = self._get_alpha_sigma(t_vec.view(B, 1, 1, 1))
+        alpha_t = alpha_t.to(x.dtype)
+        sigma_t = sigma_t.to(x.dtype)
+
+        # x0 prediction
+        x0_pred = (x - sigma_t * eps_pred) / (alpha_t + 1e-8)
+
+        # If we're at (or below) the terminal noise level, return the denoised prediction
+        if (t_next <= self.t_min).item():
+            return x0_pred
+
+        t_next_vec = t_next.expand(B)
+        alpha_next, sigma_next = self._get_alpha_sigma(t_next_vec.view(B, 1, 1, 1))
+        alpha_next = alpha_next.to(x.dtype)
+        sigma_next = sigma_next.to(x.dtype)
+
+        # DDIM-style stochasticity using a(t) = alpha(t)^2
+        a_t = alpha_t ** 2
+        a_next = alpha_next ** 2
+
+        eta = float(self.ddim_eta)
+        if eta <= 0.0:
+            sigma_ddim = torch.zeros_like(sigma_next)
+        else:
+            denom = (1.0 - a_t).clamp_min(1e-12)
+            term1 = ((1.0 - a_next) / denom).clamp_min(0.0)
+            term2 = (1.0 - (a_t / (a_next + 1e-12))).clamp_min(0.0)
+            sigma_ddim = eta * torch.sqrt(term1 * term2)
+
+        # direction coefficient
+        dir_coeff = torch.sqrt((1.0 - a_next - sigma_ddim ** 2).clamp_min(0.0))
+
+        if eta > 0.0:
+            if generator is None:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.randn(x.shape, device=x.device, generator=generator)
+            x_next = alpha_next * x0_pred + dir_coeff * eps_pred + sigma_ddim * noise
+        else:
+            x_next = alpha_next * x0_pred + dir_coeff * eps_pred
+
+        return x_next
+
+    def sample(
+        self,
+        unet,
+        shape=None,
+        device=None,
+        x_init=None,
+        generator=None,
+        y: torch.Tensor | None = None,
+        cfg_scale: float | None = None,
+    ):
+        unet.eval()
+
+        if x_init is None:
+            assert shape is not None and device is not None
+            x = torch.randn(shape, device=device, generator=generator)
+        else:
+            x = x_init
+        device = x.device
+
+        # Build descending time grid matching the training schedule type
+        ts = self._make_time_grid(device)
+
+        # --- Discrete DDIM path ---
+        if self.method == "ddim":
+            for i in range(self.num_steps):
+                t_curr = ts[i]
+                t_next = ts[i + 1]
+                x = self.step_ddim(
+                    x,
+                    t_curr=t_curr,
+                    t_next=t_next,
+                    unet=unet,
+                    y=y,
+                    cfg_scale=cfg_scale,
+                    generator=generator,
+                )
+            return x
+
+        # --- Continuous ODE/SDE samplers ---
+        for i in range(self.num_steps):
+            t_curr = ts[i]
+            t_next = ts[i + 1]
+
+            if self.method == "rk4_ode":
+                x = self.step_rk4_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "euler_ode":
+                x = self.step_euler_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "heun_ode":
+                x = self.step_heun_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "heun_sde":
+                x = self.step_heun_sde(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale, generator=generator)
+            elif self.method == "exp_euler_ode":
+                x = self.step_exp_euler_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            elif self.method == "exp_heun_ode":
+                x = self.step_exp_heun_ode(x, t_curr, t_next, unet, y=y, cfg_scale=cfg_scale)
+            else:
+                raise ValueError(f"Unknown sampling method: {self.method}")
+
+        return x
+
+# ---------------------------------------------------------------------------
+# Oracle Score Model (exact CSEM identity over full training set)
+# ---------------------------------------------------------------------------
+
+class OracleScoreModel:
+    """Exact CSEM oracle score computed by importance-weighted sum over all
+    training-set Gaussian components.
+
+    Interface matches ``DiTModel.__call__(z_t, t, y) -> eps_pred`` so it can
+    be used as a drop-in replacement inside ``UniversalSampler``.
+
+    Parameters
+    ----------
+    all_mu : Tensor [N, C, H, W]   â€“ encoder means (CPU)
+    all_logvar : Tensor [N, C, H, W] â€“ encoder log-variances (CPU)
+    all_labels : Tensor [N]         â€“ integer class labels (CPU)
+    cfg : dict                      â€“ experiment config (needs time_schedule, t_min, t_max, â€¦)
+    device : torch.device
+    ref_chunk_size : int            â€“ how many Gaussian components to load on GPU at once
+    """
+
+    def __init__(
+        self,
+        all_mu: torch.Tensor,
+        all_logvar: torch.Tensor,
+        all_labels: torch.Tensor,
+        cfg: Dict[str, Any],
+        device: torch.device,
+        ref_chunk_size: int = 4096,
+    ):
+        self.spatial_shape = tuple(all_mu.shape[1:])                              # (C, H, W)
+        self.N = all_mu.shape[0]
+        self.D = int(np.prod(self.spatial_shape))
+        self.cfg = cfg
+        self.device = device
+        self.num_classes = cfg.get("num_classes", None)
+        self.null_label = self.num_classes if self.num_classes is not None else None
+
+        # Pre-load ALL reference data on GPU (â‰ˆ 2 Ã— N Ã— D Ã— 4 bytes).
+        # For N=60k, D=512 this is ~240 MB â€” comfortably fits on any modern GPU.
+        self.all_mu_flat = all_mu.reshape(self.N, -1).float().to(device)          # [N, D]
+        self.all_var_flat = torch.exp(
+            all_logvar.reshape(self.N, -1).float()
+        ).to(device)                                                               # [N, D]
+        self.all_labels = all_labels.long().to(device)                             # [N]
+
+    # ------------------------------------------------------------------
+
+    def eval(self):
+        """No-op (compatibility with model.eval())."""
+        return self
+
+    def train(self, mode=True):
+        """No-op (compatibility)."""
+        return self
+
+    def parameters(self):
+        """No parameters (compatibility)."""
+        return iter([])
+
+    # ------------------------------------------------------------------
+
+    def _get_alpha_sigma(self, t_scalar: torch.Tensor):
+        """Return (alpha, sigma) scalars for a single time value."""
+        stype = str(self.cfg.get("time_schedule", "log_snr")).lower()
+        t = t_scalar.view(1, 1)
+        if stype in ("flow", "flow_matching"):
+            a, s = get_flow_params(t)
+        elif stype == "cosine":
+            a, s, _ = get_cosine_params(t, cosine_s=float(self.cfg.get("cosine_s", 0.008)))
+        else:
+            a, s = get_ou_params(t)
+        return a.squeeze(), s.squeeze()
+
+    # ------------------------------------------------------------------
+
+    def _compute_eps(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        label_filter: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Core oracle computation (all reference data GPU-resident, no chunking).
+
+        Parameters
+        ----------
+        z_t : [B, C, H, W]
+        t   : [B]  (assumed constant across batch)
+        label_filter : [B] int labels â€“ if given, restrict the sum per query to
+                       reference points whose label matches.  ``None`` â†’ unconditional.
+
+        Returns
+        -------
+        eps_oracle : [B, C, H, W]
+        """
+        B = z_t.shape[0]
+        device = z_t.device
+
+        t_scalar = t[0]
+        alpha, sigma = self._get_alpha_sigma(t_scalar)
+        alpha = alpha.to(device)
+        sigma = sigma.to(device)
+        alpha_sq = alpha * alpha
+        sigma_sq = sigma * sigma
+
+        z_flat = z_t.reshape(B, self.D)                          # [B, D]
+
+        # Diffuse reference components to time t
+        mu_t = alpha * self.all_mu_flat                           # [N, D]
+        var_t = alpha_sq * self.all_var_flat + sigma_sq           # [N, D]
+        one_over_var = 1.0 / var_t                                # [N, D]
+        mu_over_var = mu_t * one_over_var                         # [N, D]
+
+        # --- log-weights [B, N] ---
+        log_var_sum = torch.log(var_t).sum(dim=1)                 # [N]
+        mu_sq_over_var_sum = (mu_t * mu_over_var).sum(dim=1)      # [N]
+
+        # log p(z_t | x_i) âˆ -0.5 [log|Î£_t| + z^2Â·(1/v) - 2 zÂ·(Î¼/v) + Î¼^2/v]
+        all_log_w = -0.5 * (
+            log_var_sum.unsqueeze(0)                              # [1, N]
+            + (z_flat * z_flat) @ one_over_var.T                  # [B, N]
+            - 2.0 * z_flat @ mu_over_var.T                        # [B, N]
+            + mu_sq_over_var_sum.unsqueeze(0)                     # [1, N]
+        )
+
+        # Conditional masking
+        if label_filter is not None:
+            mask = (self.all_labels.unsqueeze(0) == label_filter.unsqueeze(1))  # [B, N]
+            all_log_w[~mask] = float('-inf')
+
+        # Softmax weights
+        w = torch.softmax(all_log_w, dim=1)                      # [B, N]
+
+        # Weighted score: eps = sigma * (z * (w @ 1/var) - (w @ mu/var))
+        A = w @ one_over_var                                      # [B, D]
+        Bv = w @ mu_over_var                                      # [B, D]
+        eps_flat = sigma * (z_flat * A - Bv)
+
+        return eps_flat.reshape(B, *self.spatial_shape)
+
+    # ------------------------------------------------------------------
+
+    def __call__(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward call matching DiTModel interface.
+
+        * ``y is None``  â†’ unconditional oracle score (sum over all components).
+        * ``y`` given     â†’ class-conditional oracle score (sum over matching labels).
+        """
+        return self._compute_eps(z_t, t, label_filter=y)
+
+
+def evaluate_current_state(
+    epoch_idx,
+    prefix,
+    vae,
+    unet,
+    loader,
+    cfg,
+    device,
+    lpips_fn,
+    fixed_noise_bank=None,
+    fixed_posterior_eps_bank_A=None,
+    fixed_posterior_eps_bank_B=None,
+    fixed_sw2_theta=None,
+    results_dir=None,
+    fid_model=None,
+    use_lenet_fid=False,
+):
+    """Evaluate unconditional generation and (optionally) class-conditional generation with CFG.
+
+    Conditional evaluation is controlled via:
+      - cfg['eval_class_labels']: list[int] (e.g. [2] to evaluate the '2' class)
+      - cfg['cfg_eval_scale']: float (e.g. 3.0)
+    """
+
+    # In terminal-KL mode, fail before sampling if K_T and the sampler endpoint
+    # have somehow been configured independently.
+    validate_terminal_time_contract(cfg)
+
+    print(f"\n--- Evaluation: {prefix} @ Ep {epoch_idx} ---")
+    vae.eval()
+    if unet is not None:
+        unet.eval()
+
+    target_count = len(loader.dataset)
+    eval_max_samples = cfg.get("eval_max_samples", None)
+    if eval_max_samples is not None:
+        target_count = min(target_count, int(eval_max_samples))
+    bs = cfg["batch_size"]
+    # Compute latent spatial size from img_size (default 32 for backward compat)
+    img_size = cfg.get("img_size", 32)
+    latent_spatial = img_size // 4
+    latent_shape = (cfg["latent_channels"], latent_spatial, latent_spatial)
+    sw2_nproj = int(cfg.get("sw2_n_projections", 1000))
+    _dt = cfg.get("decode_time", None)
+    decode_time = float(_dt) if _dt is not None else float(cfg["t_min"])
+
+    # Validate banks
+    if fixed_noise_bank is not None:
+        assert fixed_noise_bank.shape[0] >= target_count
+        assert tuple(fixed_noise_bank.shape[1:]) == latent_shape
+    if fixed_posterior_eps_bank_A is not None:
+        assert fixed_posterior_eps_bank_A.shape[0] >= target_count
+        assert tuple(fixed_posterior_eps_bank_A.shape[1:]) == latent_shape
+    if fixed_posterior_eps_bank_B is not None:
+        assert fixed_posterior_eps_bank_B.shape[0] >= target_count
+        assert tuple(fixed_posterior_eps_bank_B.shape[1:]) == latent_shape
+
+    # -----------------------------------------------------------------------
+    # Collect data: latents, images, encoder outputs, labels, dataset indices
+    # -----------------------------------------------------------------------
+    real_latents_A, real_latents_B, real_imgs = [], [], []
+    encoder_mus, encoder_logvars = [], []
+    real_labels, sample_indices = [], []
+    bank_idx = 0
+
+    with torch.no_grad():
+        for x, y in loader:
+            # Evaluation may intentionally use only a prefix of the test set
+            # (eval_max_samples < len(loader.dataset)). The fixed evaluation
+            # banks are created at exactly target_count, so truncate the final
+            # DataLoader batch to the number of samples still required.
+            #
+            # Example: target_count=2000, batch_size=256:
+            #   bank_idx=1792 -> only 208 samples remain.
+            # Without this truncation, mu has batch 256 while epsA has 208.
+            remaining = target_count - bank_idx
+            if remaining <= 0:
+                break
+
+            if x.shape[0] > remaining:
+                x = x[:remaining]
+                y = y[:remaining]
+
+            x = x.to(device)
+            bsz = x.shape[0]
+
+            use_cond_enc = bool(cfg.get("use_cond_encoder", False))
+            mu, logvar = vae.encode(x, y=y.to(device=device, dtype=torch.long) if use_cond_enc else None)
+            std = torch.exp(0.5 * logvar)
+
+            encoder_mus.append(mu.cpu())
+            encoder_logvars.append(logvar.cpu())
+            real_labels.append(y.view(-1).cpu())
+
+            idx = torch.arange(bank_idx, bank_idx + bsz, dtype=torch.long)
+            sample_indices.append(idx)
+
+            # Posterior samples (fixed if provided)
+            epsA = fixed_posterior_eps_bank_A[bank_idx:bank_idx + bsz].to(device) \
+                   if fixed_posterior_eps_bank_A is not None else torch.randn_like(std)
+            zA = mu + std * epsA
+            real_latents_A.append(zA.cpu())
+
+            if fixed_posterior_eps_bank_B is not None:
+                epsB = fixed_posterior_eps_bank_B[bank_idx:bank_idx + bsz].to(device)
+                real_latents_B.append((mu + std * epsB).cpu())
+
+            real_imgs.append(x.cpu())
+            bank_idx += bsz
+            if bank_idx >= target_count:
+                break
+
+    real_latents_A = torch.cat(real_latents_A, 0)[:target_count]
+    real_imgs = torch.cat(real_imgs, 0)[:target_count]
+    encoder_mus = torch.cat(encoder_mus, 0)[:target_count]
+    encoder_logvars = torch.cat(encoder_logvars, 0)[:target_count]
+    real_labels = torch.cat(real_labels, 0)[:target_count]
+    sample_indices = torch.cat(sample_indices, 0)[:target_count]
+
+    real_flat_A = real_latents_A.view(target_count, -1).to(device)
+
+    if fixed_posterior_eps_bank_B is not None:
+        real_latents_B = torch.cat(real_latents_B, 0)[:target_count]
+        real_flat_B = real_latents_B.view(target_count, -1).to(device)
+    else:
+        real_flat_B = None
+
+    # -----------------------------------------------------------------------
+    # Pre-compute shared quantities (FID features, unconditional LSI gap)
+    # -----------------------------------------------------------------------
+    print("  Extracting features for FID...")
+    if use_lenet_fid:
+        real_features, fid_model = extract_lenet_features(
+            real_imgs, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+        )
+    else:
+        real_features, fid_model = extract_inception_features(
+            real_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+        )
+    real_features = real_features.to(device)
+
+    lsi_gap_unet = compute_lsi_gap(
+        unet,
+        encoder_mus,
+        encoder_logvars,
+        cfg,
+        device,
+        labels=None,  # unconditional branch
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(int(cfg.get("eval_lsi_gap_samples", 2500)), target_count),
+        num_time_points=int(cfg.get("eval_lsi_gap_time_points", 50)),
+        batch_size=bs,
+    )
+
+    # -----------------------------------------------------------------------
+    # Optional exact CSEM oracle diagnostics.
+    # These are valuable for a benchmark paper, but vastly more expensive than
+    # the scale-anchor mechanism test and do not affect training.
+    # -----------------------------------------------------------------------
+    eval_oracle = bool(cfg.get("eval_oracle", True))
+    oracle_model = None
+    if eval_oracle:
+        print("  Building OracleScoreModel from precomputed Gaussian components...")
+        oracle_model = OracleScoreModel(
+            all_mu=encoder_mus,
+            all_logvar=encoder_logvars,
+            all_labels=real_labels,
+            cfg=cfg,
+            device=device,
+            ref_chunk_size=4096,
+        )
+
+        lsi_gap_oracle = compute_lsi_gap(
+            oracle_model,
+            encoder_mus,
+            encoder_logvars,
+            cfg,
+            device,
+            labels=None,
+            num_classes=cfg.get("num_classes", None),
+            num_samples=min(int(cfg.get("eval_oracle_gap_samples", 2500)), target_count),
+            num_time_points=int(cfg.get("eval_oracle_gap_time_points", 50)),
+            batch_size=bs,
+        )
+        print(f"  Oracle (unconditional) LSI gap = {lsi_gap_oracle:.6f}")
+    else:
+        lsi_gap_oracle = float("nan")
+        print("  Oracle CSEM diagnostics disabled for mechanism run.")
+
+    mse_gap_eps = lsi_gap_oracle
+    mse_gap_score = lsi_gap_oracle
+
+    '''
+    # -----------------------------------------------------------------------
+    # MSE gap: learned score net vs oracle (eps-space and score-space)
+    # -----------------------------------------------------------------------
+    print("  Computing MSE gap (eps-space) vs oracle...")
+    mse_gap_eps = compute_mse_gap(
+        unet, oracle_model,
+        encoder_mus, encoder_logvars,
+        cfg, device,
+        labels=None,
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(2500, target_count),
+        batch_size=bs,
+        space="eps",
+    )
+    print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
+    mse_gap_score = mse_gap_eps
+    print("  Computing MSE gap (score-space) vs oracle...")
+    mse_gap_score = compute_mse_gap(
+        unet, oracle_model,
+        encoder_mus, encoder_logvars,
+        cfg, device,
+        labels=None,
+        num_classes=cfg.get("num_classes", None),
+        num_samples=min(5000, target_count),
+        batch_size=bs,
+        space="score",
+    )
+    print(f"  MSE gap (score-space, uncond) = {mse_gap_score:.6f}")
+    '''
+
+    # -----------------------------------------------------------------------
+    # Sampler configurations (unconditional baseline)
+    # -----------------------------------------------------------------------
+    # One CFG strength controls every guided evaluation path: the main
+    # random-token sweep, optional oracle sweep, and per-class evaluation.
+    cfg_eval_scale = float(cfg.get("cfg_eval_scale", 3.0))
+    configs = [
+        {"method": "VAE_Rec_eps", "steps": 0, "desc": "Recon (posterior z)", "use_rand_token": False},
+    ]
+    if unet is not None:
+         configs.extend([
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
+            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
+            #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+            #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
+            {"method": "heun_sde", "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": cfg_eval_scale},
+            {"method": "rk4_ode", "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": cfg_eval_scale},
+        ])
+    # Oracle sampler configs are optional. They are deliberately disabled in
+    # the fast mechanism protocol because they do not change the learned model.
+    if eval_oracle:
+        configs.extend([
+            {"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": cfg_eval_scale, "use_oracle": True},
+            {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": cfg_eval_scale, "use_oracle": True},
+        ])
+
+    results = []
+
+    # -----------------------------------------------------------------------
+    # Shared banks for comparability (noise + random labels)
+    # -----------------------------------------------------------------------
+    # Align fixed noise bank with the realized dataset order
+    noise_bank_all = fixed_noise_bank[sample_indices] if fixed_noise_bank is not None else None
+
+    # Fixed random token bank: used when sampler config has use_rand_token=True
+    rand_token_bank_all = None
+    if cfg.get("num_classes", None) is not None:
+        num_classes = int(cfg["num_classes"])
+        # Use an independent CPU RNG so this bank is stable and does not depend on global seeding state.
+        g_tok = torch.Generator(device="cpu")
+        g_tok.manual_seed(int(cfg.get("seed", 0)) + 1337)
+        # Sample *valid class labels* uniformly: [0, num_classes-1]. (null label is `num_classes`.)
+        rand_token_bank_all = torch.randint(
+            low=0, high=num_classes, size=(target_count,), generator=g_tok, dtype=torch.long
+        )
+        rand_token_bank_all = rand_token_bank_all[sample_indices]
+
+    # -----------------------------------------------------------------------
+    # Unconditional evaluation sweep
+    # -----------------------------------------------------------------------
+
+    for scfg in configs:
+        method = scfg["method"]
+        steps = int(scfg.get("steps", 0))
+        desc = scfg.get("desc", "")
+        use_rand_token = bool(scfg.get("use_rand_token", False))
+        cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
+        use_oracle = bool(scfg.get("use_oracle", False))
+
+        # Choose which score model to sample with
+        score_model = oracle_model if use_oracle else unet
+
+        # Build suffix for naming - include cfg_level if present
+        oracle_tag = "_oracle" if use_oracle else ""
+        if use_rand_token:
+            if cfg_level is not None:
+                config_suffix = f"_randtok_cfg{cfg_level}{oracle_tag}"
+            else:
+                config_suffix = f"_randtok{oracle_tag}"
+        else:
+            config_suffix = oracle_tag
+        config_name = f"{method}@{steps}{config_suffix}"
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        with torch.no_grad():
+            if method == "VAE_Rec_eps":
+                fake_imgs = torch.cat([
+                    vae.decode(real_latents_A[i:i + bs].to(device),
+                               t=torch.full((min(bs, len(real_latents_A)-i),), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
+                    for i in range(0, len(real_latents_A), bs)
+                ], 0)
+
+                # SW2: aggregated posterior floor
+                if real_flat_B is not None:
+                    w2 = compute_sw2(real_flat_A, real_flat_B, n_projections=sw2_nproj, theta=fixed_sw2_theta)
+                else:
+                    perm = torch.randperm(real_flat_A.size(0), device=device)
+                    half = real_flat_A.size(0) // 2
+                    w2 = compute_sw2(real_flat_A[perm[:half]], real_flat_A[perm[half:2*half]],
+                                     n_projections=sw2_nproj, theta=fixed_sw2_theta)
+                lsi_gap = 0.0
+
+            else:
+                sampler_kwargs = dict(
+                    method=method,
+                    num_steps=steps,
+                    t_min=cfg["t_min"],
+                    t_max=cfg["t_max"],
+                    schedule_type=cfg.get("time_schedule", "log_snr"),
+                    cosine_s=cfg.get("cosine_s", 0.008),
+                )
+                # For cosine schedule, override t_min/t_max with cosine fraction endpoints
+                if cfg.get("time_schedule", "log_snr") == "cosine":
+                    sampler_kwargs["t_min"] = cfg.get("cosine_t_min", 2e-4)
+                    sampler_kwargs["t_max"] = cfg.get("cosine_t_max", 0.9999)
+                if method == "ddim":
+                    sampler_kwargs.update(
+                        schedule_cfg=cfg,
+                        ddim_eta=float(cfg.get("ddim_eta", 0.0)),
+                    )
+                sampler = UniversalSampler(**sampler_kwargs)
+                fake_latents_list, fake_imgs_list = [], []
+
+                for i in range(0, target_count, bs):
+                    batch_sz = min(bs, target_count - i)
+
+                    y_batch = None
+                    if use_rand_token and rand_token_bank_all is not None:
+                        y_batch = rand_token_bank_all[i:i + batch_sz].to(device)
+
+                    g_scale = cfg_level if use_rand_token and cfg_level is not None else None
+                    if noise_bank_all is not None:
+                        xT = noise_bank_all[i:i + batch_sz].to(device)
+                        z_gen = sampler.sample(score_model, x_init=xT, y=y_batch, cfg_scale=g_scale)
+                    else:
+                        z_gen = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
+
+                    fake_latents_list.append(z_gen.cpu())
+                    t_dec = torch.full((z_gen.shape[0],), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                    fake_imgs_list.append(vae.decode(z_gen, t=t_dec).cpu())
+
+                fake_latents = torch.cat(fake_latents_list, 0)
+                fake_imgs = torch.cat(fake_imgs_list, 0)
+                # Line 2977: change .view to .reshape
+
+                fake_flat = fake_latents.reshape(fake_latents.shape[0], -1).to(device)
+                #fake_flat = fake_latents.view(fake_latents.shape[0], -1).to(device)
+                w2 = compute_sw2(real_flat_A, fake_flat, n_projections=sw2_nproj, theta=fixed_sw2_theta)
+                lsi_gap = lsi_gap_oracle if use_oracle else lsi_gap_unet
+
+        # Compute image metrics (unconditional)
+        if use_lenet_fid:
+            fake_features, fid_model = extract_lenet_features(
+                fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+            )
+        else:
+            fake_features, fid_model = extract_inception_features(
+                fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+            )
+        fake_features = fake_features.to(device)
+
+        fid = compute_fid_from_features(real_features, fake_features)
+        kid = compute_kid(
+            real_features,
+            fake_features,
+            num_subsets=int(cfg.get("kid_num_subsets", 100)),
+            subset_size=int(cfg.get("kid_subset_size", 1000)),
+        )
+        div = compute_diversity(fake_imgs.to(device), lpips_fn) if LPIPS_AVAILABLE else 0.0
+
+        results.append({
+            "config": config_name,
+            "desc": desc,
+            "fid": fid,
+            "kid": kid,
+            "w2": w2,
+            "div": div,
+            "lsi_gap": lsi_gap,
+            "mse_gap_eps": mse_gap_eps if not use_oracle else 0.0,
+            "mse_gap_score": mse_gap_score if not use_oracle else 0.0,
+        })
+
+        # Save sample panels for the main sweep
+        if method in ("VAE_Rec_eps",) or "rk4" in method or "heun" in method or method == "ddim":
+            if results_dir is not None:
+                samples_dir = os.path.join(results_dir, "samples")
+                os.makedirs(samples_dir, exist_ok=True)
+                save_path = os.path.join(samples_dir, f"{prefix}_{method}_{steps}{config_suffix}_ep{epoch_idx}.png")
+            else:
+                save_path = os.path.join("samples", f"{prefix}_{method}_{steps}{config_suffix}_ep{epoch_idx}.png")
+            panel = fake_imgs[:16] if fake_imgs.shape[0] >= 16 else fake_imgs
+            tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
+
+    # Print main results
+    print(f"\n  >>> Sweep Results [{prefix}] <<<")
+    print(f"  {'Config':<40} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10} | {'MSE(eps)':<10} | {'MSE(score)':<10}")
+    print("  " + "-" * 150)
+    for r in results:
+        print(f"  {r['config']:<40} | {r['desc']:<20} | {r['fid']:<8.2f} | {r['kid']:<10.4f} | "
+              f"{r['w2']:<10.6f} | {r['div']:<8.4f} | {r['lsi_gap']:<10.4f} | "
+              f"{r['mse_gap_eps']:<10.4f} | {r['mse_gap_score']:<10.4f}")
+    print("  " + "-" * 150 + "\n")
+
+    # Flatten for DataFrame logging
+    output_dict: Dict[str, Any] = {}
+    output_dict["lsi_gap_oracle_uncond"] = lsi_gap_oracle
+    output_dict["lsi_gap_unet_uncond"] = lsi_gap_unet
+    output_dict["mse_gap_eps_uncond"] = mse_gap_eps
+    output_dict["mse_gap_score_uncond"] = mse_gap_score
+    for r in results:
+        config = r["config"]
+        if "VAE_Rec_eps" in config:
+            output_dict["fid_vae_recon"] = r["fid"]
+            output_dict["kid_vae_recon"] = r["kid"]
+            output_dict["sw2_vae_recon"] = r["w2"]
+            output_dict["div_vae_recon"] = r["div"]
+        elif "rk4" in config.lower():
+            # Extract everything after @ (e.g., "20_randtok_cfg1.5")
+            after_at = config.split("@")[1] if "@" in config else "10"
+            col_suffix = after_at.replace(".", "_")  # dots to underscores for column names
+            output_dict[f"fid_rk4_{col_suffix}"] = r["fid"]
+            output_dict[f"kid_rk4_{col_suffix}"] = r["kid"]
+            output_dict[f"sw2_rk4_{col_suffix}"] = r["w2"]
+            output_dict[f"div_rk4_{col_suffix}"] = r["div"]
+            output_dict[f"lsi_gap_rk4_{col_suffix}"] = r["lsi_gap"]
+            output_dict[f"mse_gap_eps_rk4_{col_suffix}"] = r["mse_gap_eps"]
+            output_dict[f"mse_gap_score_rk4_{col_suffix}"] = r["mse_gap_score"]
+        elif "heun" in config.lower():
+            after_at = config.split("@")[1] if "@" in config else "20"
+            col_suffix = after_at.replace(".", "_")
+            output_dict[f"fid_heun_{col_suffix}"] = r["fid"]
+            output_dict[f"kid_heun_{col_suffix}"] = r["kid"]
+            output_dict[f"sw2_heun_{col_suffix}"] = r["w2"]
+            output_dict[f"div_heun_{col_suffix}"] = r["div"]
+            output_dict[f"lsi_gap_heun_{col_suffix}"] = r["lsi_gap"]
+            output_dict[f"mse_gap_eps_heun_{col_suffix}"] = r["mse_gap_eps"]
+            output_dict[f"mse_gap_score_heun_{col_suffix}"] = r["mse_gap_score"]
+
+    # -----------------------------------------------------------------------
+    # Optional: class-conditional evaluation + CFG
+    # -----------------------------------------------------------------------
+    eval_class_labels = cfg.get("eval_class_labels", None)
+    if eval_class_labels is not None and not isinstance(eval_class_labels, (list, tuple)):
+        eval_class_labels = [int(eval_class_labels)]
+
+    if unet is not None and eval_class_labels:
+        print(f"  Conditional eval on labels: {list(eval_class_labels)} (CFG scale={cfg_eval_scale:g})")
+        noise_bank_all = None
+        if fixed_noise_bank is not None:
+            noise_bank_all = fixed_noise_bank[sample_indices]
+
+        cond_results_by_label: Dict[int, Any] = {}
+
+        for y0 in eval_class_labels:
+            y0 = int(y0)
+            mask = (real_labels == y0)
+            n_y = int(mask.sum().item())
+            output_dict[f"n_real_y{y0}"] = n_y
+            if n_y < 2:
+                print(f"    Skipping y={y0}: only {n_y} samples")
+                continue
+
+            # Same-class reals
+            real_features_y = real_features[mask]
+            real_imgs_y = real_imgs[mask]  # CPU tensor, [-1,1]
+            real_latents_A_y = real_latents_A[mask]
+            real_flat_A_y = real_latents_A_y.view(n_y, -1).to(device)
+
+            # For posterior-floor SW2 in class case
+            if fixed_posterior_eps_bank_B is not None:
+                real_latents_B_y = real_latents_B[mask]
+                real_flat_B_y = real_latents_B_y.view(n_y, -1).to(device)
+            else:
+                real_flat_B_y = None
+
+            # Fixed noise bank aligned to dataset order, then class-filtered
+            if noise_bank_all is not None:
+                noise_bank_y = noise_bank_all[mask]
+            else:
+                noise_bank_y = None
+
+            rows = []
+
+            # ---------------------------------------------------------------
+            # NEW: Class-conditional VAE recon metrics (encode->reparam->decode)
+            # ---------------------------------------------------------------
+            with torch.no_grad():
+                fake_imgs_recon_y = torch.cat([
+                    vae.decode(real_latents_A_y[i:i + bs].to(device),
+                               t=torch.full((min(bs, n_y-i),), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None).cpu()
+                    for i in range(0, n_y, bs)
+                ], 0)
+
+            # Feature extraction for recon
+            if use_lenet_fid:
+                fake_features_recon_y, fid_model = extract_lenet_features(
+                    fake_imgs_recon_y, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+                )
+            else:
+                fake_features_recon_y, fid_model = extract_inception_features(
+                    fake_imgs_recon_y, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+                )
+            fake_features_recon_y = fake_features_recon_y.to(device)
+
+            fid_recon_y = compute_fid_from_features(real_features_y, fake_features_recon_y)
+
+            subset_size = min(1000, real_features_y.shape[0], fake_features_recon_y.shape[0])
+            if subset_size < 2:
+                kid_recon_y = -1.0
+            else:
+                kid_recon_y = compute_kid(real_features_y, fake_features_recon_y, num_subsets=50, subset_size=subset_size)
+
+            # SW2 posterior floor, restricted to class
+            if real_flat_B_y is not None:
+                w2_recon_y = compute_sw2(real_flat_A_y, real_flat_B_y, n_projections=sw2_nproj, theta=fixed_sw2_theta)
+            else:
+                perm = torch.randperm(real_flat_A_y.size(0), device=device)
+                half = max(1, real_flat_A_y.size(0) // 2)
+                w2_recon_y = compute_sw2(
+                    real_flat_A_y[perm[:half]],
+                    real_flat_A_y[perm[half:2 * half]],
+                    n_projections=sw2_nproj,
+                    theta=fixed_sw2_theta,
+                )
+
+            div_recon_y = compute_diversity(fake_imgs_recon_y.to(device), lpips_fn) if LPIPS_AVAILABLE else 0.0
+
+            rows.append({
+                "config": "VAE_Rec_eps@0",
+                "mode": "recon",
+                "desc": "Recon (posterior z)",
+                "fid": float(fid_recon_y),
+                "kid": float(kid_recon_y),
+                "w2": float(w2_recon_y),
+                "div": float(div_recon_y),
+            })
+
+            # Log recon metrics per class (so existing unconditional keys remain unchanged)
+            output_dict[f"fid_vae_recon_y{y0}"] = fid_recon_y
+            output_dict[f"kid_vae_recon_y{y0}"] = kid_recon_y
+            output_dict[f"sw2_vae_recon_y{y0}"] = w2_recon_y
+            output_dict[f"div_vae_recon_y{y0}"] = div_recon_y
+
+            # Optionally save a recon panel for the class
+            if results_dir is not None:
+                samples_dir = os.path.join(results_dir, "samples")
+                os.makedirs(samples_dir, exist_ok=True)
+                save_path = os.path.join(samples_dir, f"{prefix}_VAE_Rec_eps_0_y{y0}_ep{epoch_idx}.png")
+                panel = fake_imgs_recon_y[:16] if fake_imgs_recon_y.shape[0] >= 16 else fake_imgs_recon_y
+                tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
+
+            # ---------------------------------------------------------------
+            # Diffusion conditional + CFG methods
+            # ---------------------------------------------------------------
+            for method, steps, desc in [("heun_ode", 20, "Baseline (Heun)"), ("rk4_ode", 10, "Smoothness (RK4)")]:
+                for g_scale in [0.0, cfg_eval_scale]:
+                    tag = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
+                    mode = "cond" if g_scale <= 0.0 else f"cfg{g_scale:g}"
+
+                    sampler_kwargs_cond = dict(
+                        method=method,
+                        num_steps=steps,
+                        t_min=cfg["t_min"],
+                        t_max=cfg["t_max"],
+                        schedule_type=cfg.get("time_schedule", "log_snr"),
+                        cosine_s=cfg.get("cosine_s", 0.008),
+                    )
+                    if cfg.get("time_schedule", "log_snr") == "cosine":
+                        sampler_kwargs_cond["t_min"] = cfg.get("cosine_t_min", 2e-4)
+                        sampler_kwargs_cond["t_max"] = cfg.get("cosine_t_max", 0.9999)
+                    sampler = UniversalSampler(**sampler_kwargs_cond)
+                    fake_latents_list, fake_imgs_list = [], []
+
+                    for i in range(0, n_y, bs):
+                        batch_sz = min(bs, n_y - i)
+                        y_batch = torch.full((batch_sz,), y0, device=device, dtype=torch.long)
+
+                        if noise_bank_y is not None:
+                            xT = noise_bank_y[i:i + batch_sz].to(device)
+                            z_gen = sampler.sample(
+                                unet,
+                                x_init=xT,
+                                y=y_batch,
+                                cfg_scale=(None if g_scale <= 0.0 else float(g_scale)),
+                            )
+                        else:
+                            z_gen = sampler.sample(
+                                unet,
+                                shape=(batch_sz, *latent_shape),
+                                device=device,
+                                y=y_batch,
+                                cfg_scale=(None if g_scale <= 0.0 else float(g_scale)),
+                            )
+
+                        fake_latents_list.append(z_gen.cpu())
+                        t_dec = torch.full((z_gen.shape[0],), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None
+                        fake_imgs_list.append(vae.decode(z_gen, t=t_dec).cpu())
+
+                    fake_latents = torch.cat(fake_latents_list, 0)
+                    fake_imgs = torch.cat(fake_imgs_list, 0)
+
+                    # Feature extraction
+                    if use_lenet_fid:
+                        fake_features_y, fid_model = extract_lenet_features(
+                            fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), lenet_model=fid_model
+                        )
+                    else:
+                        fake_features_y, fid_model = extract_inception_features(
+                            fake_imgs, device, batch_size=cfg.get("fid_batch_size", bs), inception_model=fid_model
+                        )
+                    fake_features_y = fake_features_y.to(device)
+
+                    fid_y = compute_fid_from_features(real_features_y, fake_features_y)
+
+                    subset_size = min(1000, real_features_y.shape[0], fake_features_y.shape[0])
+                    if subset_size < 2:
+                        kid_y = -1.0
+                    else:
+                        kid_y = compute_kid(real_features_y, fake_features_y, num_subsets=50, subset_size=subset_size)
+
+                    fake_flat_y = fake_latents.view(fake_latents.shape[0], -1).to(device)
+                    w2_y = compute_sw2(real_flat_A_y, fake_flat_y, n_projections=sw2_nproj, theta=fixed_sw2_theta)
+                    div_y = compute_diversity(fake_imgs.to(device), lpips_fn) if LPIPS_AVAILABLE else 0.0
+
+                    rows.append({
+                        "config": f"{method}@{steps}",
+                        "mode": mode,
+                        "desc": desc,
+                        "fid": float(fid_y),
+                        "kid": float(kid_y),
+                        "w2": float(w2_y),
+                        "div": float(div_y),
+                    })
+
+                    # Log with suffixes to avoid breaking existing plots
+                    steps_str = str(steps)
+                    suffix = f"_y{y0}_{tag}"
+                    if method == "rk4_ode":
+                        output_dict[f"fid_rk4_{steps_str}{suffix}"] = fid_y
+                        output_dict[f"kid_rk4_{steps_str}{suffix}"] = kid_y
+                        output_dict[f"sw2_rk4_{steps_str}{suffix}"] = w2_y
+                        output_dict[f"div_rk4_{steps_str}{suffix}"] = div_y
+                    else:
+                        output_dict[f"fid_heun_{steps_str}{suffix}"] = fid_y
+                        output_dict[f"kid_heun_{steps_str}{suffix}"] = kid_y
+                        output_dict[f"sw2_heun_{steps_str}{suffix}"] = w2_y
+                        output_dict[f"div_heun_{steps_str}{suffix}"] = div_y
+
+                    # Save panels for conditional methods
+                    if results_dir is not None:
+                        samples_dir = os.path.join(results_dir, "samples")
+                        os.makedirs(samples_dir, exist_ok=True)
+                        save_path = os.path.join(samples_dir, f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
+                    else:
+                        save_path = os.path.join("samples", f"{prefix}_{method}_{steps}_y{y0}_{tag}_ep{epoch_idx}.png")
+                    panel = fake_imgs[:16] if fake_imgs.shape[0] >= 16 else fake_imgs
+                    tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
+
+            cond_results_by_label[y0] = rows
+
+        # Print conditional results (mirrors the unconditional sweep printout)
+        if cond_results_by_label:
+            print(f"  >>> Conditional Sweep Results [{prefix}] <<<")
+            for y0 in sorted(cond_results_by_label.keys()):
+                rows = cond_results_by_label[y0]
+                if not rows:
+                    continue
+                n_y = int(output_dict.get(f"n_real_y{y0}", 0))
+                print(f"  [y={y0}] (n_real={n_y})")
+                print(f"  {'Config':<15} | {'Mode':<8} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8}")
+                print("  " + "-" * 96)
+                for r in rows:
+                    print(
+                        f"  {r['config']:<15} | {r['mode']:<8} | {r['desc']:<20} | "
+                        f"{r['fid']:<8.2f} | {r['kid']:<10.4f} | {r['w2']:<10.6f} | {r['div']:<8.4f}"
+                    )
+                print("  " + "-" * 96)
+            print("")
+
+        print("  Conditional eval complete. (Metrics stored with suffix: _yK_cond / _yK_cfgS; "
+              "and recon metrics as fid_vae_recon_yK, etc.)\n")
+
+    return output_dict
+
+
+
+def setup_run_results_dir(base_dir="run_results", wipe=True, preserve_checkpoints=True):
+    if os.path.exists(base_dir) and wipe:
+        if preserve_checkpoints:
+            # delete everything except checkpoints
+            for sub in ["plots", "samples", "dataframes"]:
+                shutil.rmtree(os.path.join(base_dir, sub), ignore_errors=True)
+        else:
+            shutil.rmtree(base_dir)
+
+    os.makedirs(base_dir, exist_ok=True)
+    os.makedirs(os.path.join(base_dir, "plots"), exist_ok=True)
+    os.makedirs(os.path.join(base_dir, "samples"), exist_ok=True)
+    os.makedirs(os.path.join(base_dir, "dataframes"), exist_ok=True)
+    os.makedirs(os.path.join(base_dir, "checkpoints"), exist_ok=True)
+
+    return base_dir
+
+
+
+# ===========================================================================
+# REFACTORED PLOTTING FUNCTIONS
+# ===========================================================================
+# These functions dynamically discover available metrics from the DataFrame
+# instead of hardcoding column names like "fid_rk4_10" or "fid_heun_20".
+#
+# Replace your existing plotting functions with these.
+# ===========================================================================
+
+import os
+import re
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def discover_metric_columns(eval_df, metric_prefix):
+    """
+    Discover all columns matching a metric prefix pattern.
+
+    Args:
+        eval_df: DataFrame with evaluation metrics
+        metric_prefix: One of 'fid', 'kid', 'sw2', 'div', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score'
+
+    Returns:
+        List of column names matching the pattern, excluding vae_recon variants
+    """
+    if metric_prefix == 'lsi_gap':
+        # lsi_gap columns look like: lsi_gap_rk4_20_randtok
+        pattern = re.compile(r'^lsi_gap_')
+    elif metric_prefix == 'mse_gap_eps':
+        # mse_gap_eps columns look like: mse_gap_eps_rk4_20_randtok
+        pattern = re.compile(r'^mse_gap_eps_')
+    elif metric_prefix == 'mse_gap_score':
+        # mse_gap_score columns look like: mse_gap_score_rk4_20_randtok
+        pattern = re.compile(r'^mse_gap_score_')
+    else:
+        # Other columns look like: fid_rk4_20_randtok (exclude fid_vae_recon)
+        pattern = re.compile(rf'^{metric_prefix}_(?!vae_recon)')
+
+    return [col for col in eval_df.columns if pattern.match(col)]
+
+def parse_metric_column(col_name):
+    """
+    Parse a metric column name into its components.
+
+    Examples:
+        'fid_rk4_10' -> {'metric': 'fid', 'method': 'rk4', 'steps': '10', 'suffix': ''}
+        'fid_rk4_20_randtok' -> {'metric': 'fid', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
+        'lsi_gap_rk4_20_randtok' -> {'metric': 'lsi_gap', 'method': 'rk4', 'steps': '20', 'suffix': '_randtok'}
+        'mse_gap_eps_rk4_25_randtok' -> {'metric': 'mse_gap_eps', 'method': 'rk4', 'steps': '25', 'suffix': '_randtok'}
+        'mse_gap_score_rk4_25_randtok' -> {'metric': 'mse_gap_score', 'method': 'rk4', 'steps': '25', 'suffix': '_randtok'}
+    """
+    parts = col_name.split('_')
+
+    # Handle mse_gap_eps / mse_gap_score specially (3-token metric name)
+    if parts[0] == 'mse' and len(parts) > 2 and parts[1] == 'gap' and parts[2] in ('eps', 'score'):
+        metric = f'mse_gap_{parts[2]}'
+        remaining = parts[3:]  # Skip 'mse', 'gap', 'eps'/'score'
+    # Handle lsi_gap specially (has underscore in metric name)
+    elif parts[0] == 'lsi' and len(parts) > 1 and parts[1] == 'gap':
+        metric = 'lsi_gap'
+        remaining = parts[2:]  # Skip 'lsi' and 'gap'
+    else:
+        metric = parts[0]
+        remaining = parts[1:]
+
+    if len(remaining) < 2:
+        return None  # Not a valid metric column (e.g., fid_vae_recon)
+
+    method = remaining[0]  # rk4, heun, ddim, euler, etc.
+    steps = remaining[1]   # 10, 20, 50, etc.
+
+    # Everything after method_steps is the suffix
+    suffix = '_'.join(remaining[2:]) if len(remaining) > 2 else ''
+    if suffix:
+        suffix = '_' + suffix
+
+    return {
+        'metric': metric,
+        'method': method,
+        'steps': steps,
+        'suffix': suffix,
+        'full_name': col_name,
+    }
+
+
+def get_metric_groups(eval_df):
+    """
+    Group all metric columns by (method, steps, suffix) for systematic plotting.
+
+    Returns:
+        Dict mapping (method, steps, suffix) -> dict of metric columns
+        e.g., {('rk4', '20', '_randtok'): {'fid': 'fid_rk4_20_randtok', 'kid': 'kid_rk4_20_randtok', ...}}
+    """
+    groups = {}
+
+    for metric_type in ['fid', 'kid', 'sw2', 'div', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
+        cols = discover_metric_columns(eval_df, metric_type)
+        for col in cols:
+            parsed = parse_metric_column(col)
+            if parsed is None:
+                continue
+
+            key = (parsed['method'], parsed['steps'], parsed['suffix'])
+            if key not in groups:
+                groups[key] = {}
+            groups[key][metric_type] = col
+
+    return groups
+
+
+def plot_generic_metric(eval_df, metric_col, metric_name, ylabel, title, save_path,
+                        use_log=False, include_vae_recon=True):
+    """
+    Generic plotting function for any metric column.
+    Plots LSI vs Tweedie (blue vs red) with optional VAE recon baseline.
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)]
+    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)]
+
+    # VAE recon baseline (if available and requested)
+    vae_recon_col = f"{metric_name}_vae_recon"
+    if include_vae_recon and vae_recon_col in lsi_df.columns and not lsi_df[vae_recon_col].isna().all():
+        ax.plot(lsi_df["epoch"], lsi_df[vae_recon_col],
+                color="black", linestyle="--", linewidth=2, marker='o', markersize=4,
+                label=f"VAE Recon {metric_name.upper()}")
+
+    # LSI metric
+    if metric_col in lsi_df.columns and not lsi_df[metric_col].isna().all():
+        ax.plot(lsi_df["epoch"], lsi_df[metric_col],
+                color="blue", linewidth=2, marker='o', markersize=4,
+                label=f"LSI {metric_name.upper()}")
+
+    # Tweedie metric
+    if metric_col in ctrl_df.columns and not ctrl_df[metric_col].isna().all():
+        ax.plot(ctrl_df["epoch"], ctrl_df[metric_col],
+                color="red", linewidth=2, marker='s', markersize=4,
+                label=f"Tweedie {metric_name.upper()}")
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+    if use_log:
+        ax.set_yscale("log")
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
+    ax.set_xlim(left=0)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
+
+
+def plot_gap_metric(eval_df, metric_col, metric_name, title, save_path):
+    """
+    Plot the gap between Tweedie and LSI for a given metric.
+    Positive gap = LSI is better.
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    lsi_df = eval_df[eval_df["tag"].str.contains("LSI", case=False)].copy()
+    ctrl_df = eval_df[eval_df["tag"].str.contains("Ctrl", case=False)].copy()
+
+    if len(lsi_df) > 0 and len(ctrl_df) > 0 and metric_col in lsi_df.columns and metric_col in ctrl_df.columns:
+        # Merge on epoch
+        merged = pd.merge(
+            lsi_df[["epoch", metric_col]],
+            ctrl_df[["epoch", metric_col]],
+            on="epoch",
+            suffixes=("_lsi", "_ctrl")
+        )
+
+        lsi_col = f"{metric_col}_lsi"
+        ctrl_col = f"{metric_col}_ctrl"
+
+        if lsi_col in merged.columns and ctrl_col in merged.columns:
+            merged["gap"] = merged[ctrl_col] - merged[lsi_col]
+            ax.plot(merged["epoch"], merged["gap"],
+                    color="purple", linewidth=2, marker='o', markersize=4,
+                    label=f"{metric_name.upper()} Gap (Tweedie - LSI)")
+
+            ax.axhline(y=0, color="gray", linestyle="--", linewidth=1, alpha=0.7)
+            if len(merged) > 0:
+                ax.fill_between(merged["epoch"], 0, merged["gap"],
+                                where=merged["gap"] > 0, alpha=0.3, color="green",
+                                label="LSI Better")
+                ax.fill_between(merged["epoch"], 0, merged["gap"],
+                                where=merged["gap"] < 0, alpha=0.3, color="red",
+                                label="Tweedie Better")
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(f"{metric_name.upper()} Gap (Tweedie - LSI)", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
+
+
+def format_config_label(method, steps, suffix):
+    """Create a human-readable label for a sampler configuration."""
+    method_names = {
+        'rk4': 'RK4',
+        'heun': 'Heun',
+        'euler': 'Euler',
+        'ddim': 'DDIM',
+    }
+    base = f"{method_names.get(method, method.upper())} {steps} Steps"
+
+    if suffix:
+        # Parse suffix for human readability
+        suffix_clean = suffix.lstrip('_')
+        if 'randtok' in suffix_clean:
+            parts = []
+            if 'cfg' in suffix_clean:
+                cfg_match = re.search(r'cfg([\d.]+)', suffix_clean)
+                if cfg_match:
+                    parts.append(f"CFG={cfg_match.group(1)}")
+            parts.insert(0, "RandTok")
+            base += f" ({', '.join(parts)})"
+        elif 'cfg' in suffix_clean:
+            cfg_match = re.search(r'cfg([\d.]+)', suffix_clean)
+            if cfg_match:
+                base += f" (CFG={cfg_match.group(1)})"
+
+    return base
+
+
+def generate_all_visualizations(loss_df, eval_df, results_dir):
+    """
+    Generate visualization plots dynamically based on available metrics.
+    """
+    plots_dir = os.path.join(results_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    print("\n--> Generating visualization suite...")
+
+    # Discover all available metric columns
+    metric_groups = {}
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
+        cols = discover_metric_columns(eval_df, metric_type)
+        for col in cols:
+            parsed = parse_metric_column(col)
+            if parsed is None:
+                continue
+
+            key = (parsed['method'], parsed['steps'], parsed['suffix'])
+            if key not in metric_groups:
+                metric_groups[key] = {}
+            metric_groups[key][metric_type] = col
+
+    if metric_groups:
+        print(f"    Found {len(metric_groups)} sampler configuration(s):")
+        for (method, steps, suffix) in sorted(metric_groups.keys()):
+            label = format_config_label(method, steps, suffix)
+            available = list(metric_groups[(method, steps, suffix)].keys())
+            print(f"      - {label}: {available}")
+
+    plot_idx = 1
+
+    # --- Loss plots (always generate these) ---
+    plot_vae_recon_loss(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_vae_recon_loss.png"))
+    plot_idx += 1
+    plot_score_losses(loss_df, os.path.join(plots_dir, f"{plot_idx:02d}_score_losses.png"))
+    plot_idx += 1
+
+    if not metric_groups:
+        print("--> Warning: No metric columns found. Skipping eval metric plots.")
+        print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
+        return
+
+    # --- Metric plots for each sampler configuration ---
+    for (method, steps, suffix) in sorted(metric_groups.keys()):
+        group = metric_groups[(method, steps, suffix)]
+        config_label = format_config_label(method, steps, suffix)
+        config_tag = f"{method}_{steps}{suffix}".replace('.', '_')
+
+        # FID plot
+        if 'fid' in group:
+            plot_generic_metric(
+                eval_df, group['fid'], 'fid', 'FID',
+                f"FID Comparison ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_fid_{config_tag}.png"),
+                use_log=False, include_vae_recon=True
+            )
+            plot_idx += 1
+
+        # KID plot
+        if 'kid' in group:
+            plot_generic_metric(
+                eval_df, group['kid'], 'kid', 'KID',
+                f"KID Comparison ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_kid_{config_tag}.png"),
+                use_log=False, include_vae_recon=True
+            )
+            plot_idx += 1
+
+        # SW2 plot (log scale)
+        if 'sw2' in group:
+            plot_generic_metric(
+                eval_df, group['sw2'], 'sw2', 'SW2 (log scale)',
+                f"Sliced-Wasserstein-2 ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_sw2_{config_tag}.png"),
+                use_log=True, include_vae_recon=True
+            )
+            plot_idx += 1
+
+        # FID Gap plot
+        if 'fid' in group:
+            plot_gap_metric(
+                eval_df, group['fid'], 'fid',
+                f"LSI Advantage: FID Gap ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_fid_gap_{config_tag}.png")
+            )
+            plot_idx += 1
+
+        # LSI Gap Metric plot
+        if 'lsi_gap' in group:
+            plot_generic_metric(
+                eval_df, group['lsi_gap'], 'lsi_gap', 'LSI Gap (lower = better)',
+                f"LSI Gap Metric ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_lsi_gap_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+
+        # MSE Gap (eps-space) plot
+        if 'mse_gap_eps' in group:
+            plot_generic_metric(
+                eval_df, group['mse_gap_eps'], 'mse_gap_eps', 'MSE Gap eps (lower = better)',
+                f"MSE Gap vs Oracle, eps-space ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_mse_gap_eps_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+
+        # MSE Gap (score-space) plot
+        if 'mse_gap_score' in group:
+            plot_generic_metric(
+                eval_df, group['mse_gap_score'], 'mse_gap_score', 'MSE Gap score (lower = better)',
+                f"MSE Gap vs Oracle, score-space ({config_label})",
+                os.path.join(plots_dir, f"{plot_idx:02d}_mse_gap_score_{config_tag}.png"),
+                use_log=False, include_vae_recon=False
+            )
+            plot_idx += 1
+
+    print(f"--> Visualization suite complete ({plot_idx - 1} plots generated)!")
+
+def plot_vae_recon_loss(loss_df, save_path):
+    """Plot VAE reconstruction loss (cotrain epochs only)."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    cotrain_df = loss_df[loss_df["stage"] == "cotrain"]
+
+    if len(cotrain_df) > 0:
+        ax.plot(cotrain_df["epoch"], cotrain_df["recon"],
+                color="black", linewidth=2, marker='o', markersize=4)
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel("Reconstruction Loss (MSE)", fontsize=12)
+    ax.set_title("VAE Reconstruction Loss (Co-training Phase)", fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
+
+
+def plot_score_losses(loss_df, save_path):
+    """Plot LSI vs Tweedie score losses (log scale)."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ax.plot(loss_df["epoch"], loss_df["score_lsi"],
+            color="blue", linewidth=2, marker='o', markersize=4, label="LSI Score Loss")
+    ax.plot(loss_df["epoch"], loss_df["score_control"],
+            color="red", linewidth=2, marker='s', markersize=4, label="Tweedie Score Loss")
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel("Score Loss (MSE, log scale)", fontsize=12)
+    ax.set_title("Score Network Losses: LSI vs Tweedie", fontsize=14)
+    ax.set_yscale("log")
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3, which='both')
+    ax.set_xlim(left=0)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
+
+
+def generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, results_dir):
+    """
+    Generate all comparison plots (4-way: cotrain vs indep, LSI vs Tweedie)
+    dynamically based on available metric columns.
+    """
+    plots_dir = os.path.join(results_dir, "comparison_plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    print("\n--> Generating comparison visualization suite...")
+
+    # Discover all available metric columns from both dataframes
+    all_columns = set(eval_df_cotrain.columns) | set(eval_df_indep.columns)
+
+    # Group columns by (method, steps, suffix)
+    metric_groups = {}
+    for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
+        cols = discover_metric_columns(eval_df_cotrain, metric_type)
+        cols.extend(discover_metric_columns(eval_df_indep, metric_type))
+        cols = list(set(cols))  # Remove duplicates
+
+        for col in cols:
+            parsed = parse_metric_column(col)
+            if parsed is None:
+                continue
+
+            key = (parsed['method'], parsed['steps'], parsed['suffix'])
+            if key not in metric_groups:
+                metric_groups[key] = {}
+            metric_groups[key][metric_type] = col
+
+    if not metric_groups:
+        print("--> Warning: No metric columns found. Skipping comparison plots.")
+        return
+
+    print(f"    Found {len(metric_groups)} sampler configuration(s) to compare:")
+    for (method, steps, suffix) in sorted(metric_groups.keys()):
+        label = format_config_label(method, steps, suffix)
+        available = list(metric_groups[(method, steps, suffix)].keys())
+        print(f"      - {label}: {available}")
+
+    # Generate plots
+    plot_idx = 1
+    ylabel_map = {
+        'fid': 'FID',
+        'kid': 'KID',
+        'sw2': 'SW2 (log scale)',
+        'lsi_gap': 'LSI Gap (lower=better)',
+        'mse_gap_eps': 'MSE Gap eps (lower=better)',
+        'mse_gap_score': 'MSE Gap score (lower=better)',
+    }
+
+    for (method, steps, suffix) in sorted(metric_groups.keys()):
+        group = metric_groups[(method, steps, suffix)]
+        config_label = format_config_label(method, steps, suffix)
+        config_tag = f"{method}_{steps}{suffix}".replace('.', '_')  # Safe filename
+
+        for metric_type in ['fid', 'kid', 'sw2', 'lsi_gap', 'mse_gap_eps', 'mse_gap_score']:
+            if metric_type not in group:
+                continue
+
+            metric_col = group[metric_type]
+            use_log = (metric_type == 'sw2')
+            ylabel = ylabel_map[metric_type]
+            title = f"Co-trained vs Independent: {metric_type.upper()} ({config_label})"
+            save_path = os.path.join(plots_dir, f"{plot_idx:02d}_comparison_{metric_type}_{config_tag}.png")
+
+            plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log)
+            plot_idx += 1
+
+    print(f"--> Comparison visualization suite complete ({plot_idx - 1} plots generated)!")
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_comparison_metric(eval_df_cotrain, eval_df_indep, metric_col, ylabel, title, save_path, use_log=False):
+    """
+    4-way comparison plot for any metric.
+    - Solid blue: Co-trained LSI
+    - Solid red: Co-trained Tweedie
+    - Dashed blue: Independent LSI
+    - Dashed red: Independent Tweedie
+    """
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    # Co-trained data
+    lsi_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("LSI", case=False)]
+    ctrl_cotrain = eval_df_cotrain[eval_df_cotrain["tag"].str.contains("Ctrl", case=False)]
+
+    # Independent data
+    lsi_indep = eval_df_indep[eval_df_indep["tag"].str.contains("LSI", case=False)]
+    ctrl_indep = eval_df_indep[eval_df_indep["tag"].str.contains("Ctrl", case=False)]
+
+    # Plot Co-trained (solid lines)
+    if metric_col in lsi_cotrain.columns and not lsi_cotrain[metric_col].isna().all():
+        ax.plot(lsi_cotrain["epoch"], lsi_cotrain[metric_col],
+                color="blue", linewidth=2, marker='o', markersize=4,
+                linestyle="-", label="Co-trained LSI")
+
+    if metric_col in ctrl_cotrain.columns and not ctrl_cotrain[metric_col].isna().all():
+        ax.plot(ctrl_cotrain["epoch"], ctrl_cotrain[metric_col],
+                color="red", linewidth=2, marker='s', markersize=4,
+                linestyle="-", label="Co-trained Tweedie")
+
+    # Plot Independent (dashed lines)
+    if metric_col in lsi_indep.columns and not lsi_indep[metric_col].isna().all():
+        ax.plot(lsi_indep["epoch"], lsi_indep[metric_col],
+                color="blue", linewidth=2, marker='o', markersize=4,
+                linestyle="--", label="Independent LSI")
+
+    if metric_col in ctrl_indep.columns and not ctrl_indep[metric_col].isna().all():
+        ax.plot(ctrl_indep["epoch"], ctrl_indep[metric_col],
+                color="red", linewidth=2, marker='s', markersize=4,
+                linestyle="--", label="Independent Tweedie")
+
+    ax.set_xlabel("LDM Training Epoch", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14)
+    if use_log:
+        ax.set_yscale("log")
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3, which='both' if use_log else 'major')
+    ax.set_xlim(left=0)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {save_path}")
+
+
+def save_dataframes(loss_df, eval_df, results_dir):
+    """
+    Save the dataframes to CSV files.
+    """
+    df_dir = os.path.join(results_dir, "dataframes")
+
+    loss_path = os.path.join(df_dir, "loss_history.csv")
+    eval_path = os.path.join(df_dir, "eval_metrics.csv")
+
+    loss_df.to_csv(loss_path, index=False)
+    eval_df.to_csv(eval_path, index=False)
+
+    print(f"--> Saved loss history to {loss_path}")
+    print(f"--> Saved eval metrics to {eval_path}")
+
+# ---------------------------------------------------------------------------
+# Data & Training
+# ---------------------------------------------------------------------------
+
+def make_dataloaders(batch_size, num_workers, dataset_key="FMNIST"):
+    """Create dataloaders for specified dataset."""
+    if dataset_key not in DATASET_INFO:
+        raise ValueError(f"Unknown dataset: {dataset_key}. Choose from {list(DATASET_INFO.keys())}")
+
+    info = DATASET_INFO[dataset_key]
+    dataset_cls = info["class"]
+    num_classes = info["num_classes"]
+    img_size = info.get("img_size", 28)
+    img_channels = info.get("img_channels", 1)
+    is_grayscale_cifar = info.get("grayscale", False)
+
+    # Build transforms based on dataset
+    if dataset_key == "CIFAR":
+        # CIFAR-10 RGB: 32x32, 3 channels, no padding needed
+        tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+    elif dataset_key == "GCIFAR":
+        # CIFAR-10 grayscale: 32x32, no padding needed
+        tf = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+    else:
+        # MNIST-family datasets: 28x28, pad to 32x32
+        tf = transforms.Compose([
+            transforms.Pad(2),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+
+    if dataset_key == "EMNIST":
+        train = dataset_cls("./data", split=info["split"], train=True, download=True, transform=tf)
+        test = dataset_cls("./data", split=info["split"], train=False, download=True, transform=tf)
+    else:
+        train = dataset_cls("./data", train=True, download=True, transform=tf)
+        test = dataset_cls("./data", train=False, download=True, transform=tf)
+
+    tl = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
+    vl = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    print(f"--> Loaded {dataset_key}: {len(train)} train, {len(test)} test, {num_classes} classes, img_size={img_size}, img_channels={img_channels}")
+    return tl, vl, num_classes
+
+
+def train_vae_cotrained_cond(cfg):
+    """
+    Modified co-training function with DataFrame logging and visualization.
+
+    Changes from original:
+    - Wipes and recreates run_results directory at start
+    - Logs per-epoch losses to a DataFrame
+    - Logs evaluate_current_state results to a DataFrame
+    - Generates visualization suite after training completes
+    - Saves all results to run_results directory
+    """
+    # Validate before setup_run_results_dir wipes/recreates any prior output.
+    validate_terminal_time_contract(cfg)
+
+    # --- Setup Results Directory ---
+    results_dir = setup_run_results_dir(cfg.get("results_dir", "run_results"),
+                                   wipe=True, preserve_checkpoints=True)
+
+    # Update checkpoint directory to be within results
+    cfg["ckpt_dir"] = os.path.join(results_dir, "checkpoints")
+    eval_freq = cfg.get("eval_freq", 10)
+    eval_freq_cotrain = cfg.get("eval_freq_cotrain", eval_freq)  # ADD THIS
+    eval_freq_refine = cfg.get("eval_freq_refine", eval_freq)    # ADD THIS
+
+    device = default_device()
+    # --- Discrete diffusion schedule (train + sampling) ---
+    # This switches training from continuous log-uniform OU times to discrete VP/DDPM timesteps.
+
+
+    # --- Unified discrete schedule (log_t / log_snr / cosine depending on cfg) ---
+    ou_sched = make_schedule(cfg, device)
+    validate_terminal_time_contract(cfg, ou_sched)
+    score_time_weighting = validate_score_time_weighting(cfg, ou_sched)
+    T = int(ou_sched["T"].item())
+    noise_sched = ou_sched
+    print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
+    print(f"--> Score time weighting: {score_time_weighting}")
+    if score_time_weighting == "canonical":
+        weight_grid_summary = canonical_stability_weight_grid_summary(ou_sched)
+    else:
+        weight_grid_summary = {
+            "mean": 1.0,
+            "rms": 1.0,
+            "min": 1.0,
+            "max": 1.0,
+            "cv": 0.0,
+            "ess_fraction": 1.0,
+            "inverse_mean": 1.0,
+        }
+    cfg["resolved_score_weight_grid_summary"] = weight_grid_summary
+    print(
+        "--> Score-weight grid: "
+        f"mean={weight_grid_summary['mean']:.6g}, "
+        f"rms={weight_grid_summary['rms']:.6g}, "
+        f"range=[{weight_grid_summary['min']:.6g}, "
+        f"{weight_grid_summary['max']:.6g}], "
+        f"CV={weight_grid_summary['cv']:.4f}, "
+        f"ESS/N={weight_grid_summary['ess_fraction']:.4f}, "
+        f"1/mean={weight_grid_summary['inverse_mean']:.6g}"
+    )
+    in_progress_config_path = os.path.join(results_dir, "config_in_progress.txt")
+    with open(in_progress_config_path, "w") as in_progress_config_file:
+        for config_key, config_value in cfg.items():
+            in_progress_config_file.write(f"{config_key}: {config_value}\n")
+
+    dataset_key = cfg.get("dataset", "FMNIST")
+    train_l, test_l, num_classes = make_dataloaders(cfg["batch_size"], cfg["num_workers"], dataset_key)
+    cfg["num_classes"] = num_classes  # for CFG label embedding / eval
+
+    # Get image size from dataset info (for model initialization)
+    img_size = DATASET_INFO.get(dataset_key, {}).get("img_size", 28)
+    img_channels = DATASET_INFO.get(dataset_key, {}).get("img_channels", 1)
+    # Effective size after padding (28->32 for MNIST-family, 32 for CIFAR variants)
+    effective_img_size = 32 if img_size == 28 else img_size
+    cfg["img_size"] = effective_img_size  # store for later use
+    cfg["img_channels"] = img_channels    # store for later use
+    latent_spatial = effective_img_size // 4  # latent H=W after 2 stride-2 downsamples
+
+    # Get the selected FID feature extractor. In paired mechanism runs a
+    # bespoke classifier checkpoint is shared, so it is trained exactly once
+    # on real target data and then reused unchanged by the second arm.
+    fid_ckpt_dir = cfg.get("fid_ckpt_dir", cfg["ckpt_dir"])
+    fid_model, use_lenet_fid = get_fid_model(
+        dataset_key,
+        train_l,
+        num_classes,
+        device,
+        fid_ckpt_dir,
+        use_bespoke_classifier=cfg.get("use_bespoke_fid_classifier", None),
+    )
+    cfg["resolved_fid_feature_extractor"] = (
+        "bespoke_target_classifier" if use_lenet_fid else "imagenet_inception"
+    )
+
+    # Make the actual VAE/DiT initialization independent of whether the
+    # auxiliary FID classifier was loaded or trained.
+    seed_everything(int(cfg.get("seed", 42)))
+
+    use_ddim_times = cfg.get("use_ddim_times", False)
+    if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
+        use_ddim_times = False
+
+    vae = VAE(
+                  latent_channels=cfg["latent_channels"],
+                  base_ch=int(cfg.get("base_ch", 64)),
+                  use_norm=cfg.get("use_latent_norm", False),
+                  img_size=effective_img_size,
+                  img_channels=img_channels,
+                  num_classes=(num_classes if cfg.get("use_cond_encoder", False) else None),
+                  null_label=int(num_classes),
+                  cond_emb_dim=int(cfg.get("cond_emb_dim", 64)),
+                  aux_d=int(cfg.get("aux_d", 0)),
+                  # v1 knobs
+                  num_res_blocks=int(cfg.get("num_res_blocks", 2)),
+                  decoder_attn_half=cfg.get("decoder_attn_half", True),
+                  latent_proj_depth=int(cfg.get("latent_proj_depth", 2)),
+                  # v2 knobs
+                  encoder_attn_half=cfg.get("encoder_attn_half", False),
+                  decoder_extra_block=cfg.get("decoder_extra_block", False),
+                  conv3x3_proj=cfg.get("conv3x3_proj", False),
+                  use_tanh_out=cfg.get("use_tanh_out", True),
+                  clamp_logvar=cfg.get("clamp_logvar", False),
+                  attn_zero_init=cfg.get("attn_zero_init", True),
+                  # TDD knobs
+                  time_cond_decoder=cfg.get("time_cond_decoder", False),
+                  dec_time_emb_dim=int(cfg.get("dec_time_emb_dim", 128)),
+              ).to(device)
+
+    # --- Online Models ---
+    dit_kwargs = dict(
+        in_channels=int(cfg["latent_channels"]),
+        patch_size=int(cfg.get("dit_patch_size", 1)),
+        hidden_dim=int(cfg.get("dit_hidden_dim", 384)),
+        depth=int(cfg.get("dit_depth", 12)),
+        num_heads=int(cfg.get("dit_num_heads", 6)),
+        mlp_ratio=float(cfg.get("dit_mlp_ratio", 4.0)),
+        dropout=float(cfg.get("dit_dropout", 0.0)),
+        num_classes=num_classes,
+        latent_size=int(latent_spatial),
+        factored_head=bool(cfg.get("factored_head", False)),
+    )
+    unet_lsi = UNetModel(**dit_kwargs).to(device)
+    unet_control = UNetModel(**dit_kwargs).to(device)
+
+    if cfg.get("load_from_checkpoint", False):
+        ckpt_load_dir = cfg.get("ckpt_load_dir", cfg["ckpt_dir"])
+        print(f"--> Loading checkpoints from {ckpt_load_dir}...")
+        try:
+            vae.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "vae_cotrained.pt"), map_location=device), strict=False)
+            print("    Loaded VAE.")
+        except Exception as e:
+            print(f"    Warning: Could not load VAE ({e})")
+
+        try:
+            unet_lsi.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "unet_lsi.pt"), map_location=device), strict=False)
+            print("    Loaded UNet LSI.")
+        except Exception as e:
+            print(f"    Warning: Could not load UNet LSI ({e})")
+
+        try:
+            unet_control.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "unet_control.pt"), map_location=device), strict=False)
+            print("    Loaded UNet Control.")
+        except Exception as e:
+            print(f"    Warning: Could not load UNet Control ({e})")
+
+
+    # --- EMA Models (Score Heads Only) ---
+    unet_lsi_ema = UNetModel(**dit_kwargs).to(device)
+    unet_lsi_ema.load_state_dict(unet_lsi.state_dict())
+    unet_lsi_ema.eval()
+    for p in unet_lsi_ema.parameters(): p.requires_grad = False
+
+    unet_control_ema = UNetModel(**dit_kwargs).to(device)
+    unet_control_ema.load_state_dict(unet_control.state_dict())
+    unet_control_ema.eval()
+    for p in unet_control_ema.parameters(): p.requires_grad = False
+
+    ema_decay = cfg.get("ema_decay", .999)
+
+    # --- Asymmetric LR Settings ---
+    score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
+    cotrain_head = cfg.get("cotrain_head", "lsi")
+    aux_head_w = float(cfg.get("aux_head_w", 0.05))
+    freeze_score_in_cotrain = cfg.get("freeze_score_in_cotrain", False)
+    train_tracking_head = bool(cfg.get("train_tracking_head", True))
+    vae_parameters = tuple(vae.parameters())
+    encoder_parameters, decoder_parameters = partition_vae_parameters(vae)
+    encoder_param_group_index = 0
+    decoder_param_group_index = 1
+    score_param_group_index = 2
+    vae_optimizer_groups = [
+        {
+            "params": encoder_parameters,
+            "lr": float(cfg.get("lr_encoder", cfg["lr_vae"])),
+            "name": "encoder",
+        },
+        {
+            "params": decoder_parameters,
+            "lr": float(cfg.get("lr_decoder", cfg["lr_vae"])),
+            "name": "decoder",
+        },
+    ]
+
+    if freeze_score_in_cotrain:
+        # Independent mode: VAE-only optimizer during cotrain phase
+        # Score networks will only be trained during refine phase
+        opt_joint = optim.AdamW(
+            vae_optimizer_groups,
+            weight_decay=1e-4,
+            betas=(0.9, float(cfg.get("adam_beta2", 0.95))),
+        )
+        opt_tracking = None  # No tracking optimizer needed
+        print("--> Independent mode: Score networks FROZEN during cotrain phase")
+    else:
+        # Standard co-training mode
+        if cotrain_head == "lsi":
+            opt_joint = optim.AdamW(
+                vae_optimizer_groups + [{
+                    'params': unet_lsi.parameters(),
+                    'lr': cfg["lr_score_head"],
+                    'name': 'score',
+                }],
+                weight_decay=1e-4,
+                betas=(0.9, float(cfg.get("adam_beta2", 0.95))),
+            )
+            opt_tracking = (
+                optim.AdamW(
+                    unet_control.parameters(),
+                    lr=cfg.get("lr_tracking_head", cfg["lr_ldm"]),
+                    weight_decay=1e-4,
+                    betas=(0.9, float(cfg.get("adam_beta2", 0.95))),
+                )
+                if train_tracking_head else None
+            )
+        else:  # cotrain_head == "control"
+            opt_joint = optim.AdamW(
+                vae_optimizer_groups + [{
+                    'params': unet_control.parameters(),
+                    'lr': cfg["lr_score_head"],
+                    'name': 'score',
+                }],
+                weight_decay=1e-4,
+                betas=(0.9, float(cfg.get("adam_beta2", 0.95))),
+            )
+            opt_tracking = (
+                optim.AdamW(
+                    unet_lsi.parameters(),
+                    lr=cfg.get("lr_tracking_head", cfg["lr_ldm"]),
+                    weight_decay=1e-4,
+                    betas=(0.9, float(cfg.get("adam_beta2", 0.95))),
+                )
+                if train_tracking_head else None
+            )
+
+    # --- Cosine LR Schedulers (cotrain phase) ---
+    lr_schedule_epochs = int(cfg.get("lr_schedule_epochs", cfg["epochs_vae"]))
+    sched_joint = CosineAnnealingLR(opt_joint, T_max=lr_schedule_epochs, eta_min=1e-6)
+    sched_tracking = (
+        CosineAnnealingLR(opt_tracking, T_max=lr_schedule_epochs, eta_min=1e-6)
+        if opt_tracking is not None else None
+    )
+
+    lpips_fn = lpips.LPIPS(net='vgg').to(device) if LPIPS_AVAILABLE else None
+
+    # --- PatchGAN Discriminator ---
+    gan_w = float(cfg.get("gan_w", 0.0))
+    disc_start_epoch = int(cfg.get("disc_start_epoch", 0))
+    if gan_w > 0.0:
+        disc = PatchDiscriminator(
+            in_channels=img_channels, ndf=int(cfg.get("disc_ndf", 64)),
+            n_layers=int(cfg.get("disc_n_layers", 2)),
+        ).to(device)
+        opt_disc = optim.Adam(disc.parameters(), lr=float(cfg.get("lr_disc", 5e-5)), betas=(0.5, 0.9))
+    else:
+        disc = None
+        opt_disc = None
+
+    # --- Fixed Evaluation Banks ---
+    # Latent spatial size: img_size // 4 (two 2x downsampling in encoder)
+    latent_spatial = effective_img_size // 4
+    if cfg.get("use_fixed_eval_banks", True):
+        N_test = len(test_l.dataset)
+        eval_max_samples = cfg.get("eval_max_samples", None)
+        if eval_max_samples is not None:
+            N_test = min(N_test, int(eval_max_samples))
+        latent_shape = (cfg["latent_channels"], latent_spatial, latent_spatial)
+        seed = int(cfg.get("seed", 0))
+
+        g_noise = torch.Generator(device="cpu").manual_seed(seed + 12345)
+        fixed_noise_bank = torch.randn((N_test, *latent_shape), generator=g_noise)
+
+        g_postA = torch.Generator(device="cpu").manual_seed(seed + 54321)
+        g_postB = torch.Generator(device="cpu").manual_seed(seed + 98765)
+        fixed_posterior_eps_bank_A = torch.randn((N_test, *latent_shape), generator=g_postA)
+        fixed_posterior_eps_bank_B = torch.randn((N_test, *latent_shape), generator=g_postB)
+
+        D = cfg["latent_channels"] * latent_spatial * latent_spatial
+        K = int(cfg.get("sw2_n_projections", 1000))
+        g_theta = torch.Generator(device="cpu").manual_seed(seed + 22222)
+        theta = torch.randn((D, K), generator=g_theta)
+        theta = theta / torch.norm(theta, dim=0, keepdim=True).clamp_min(1e-12)
+        fixed_sw2_theta = theta
+    else:
+        fixed_noise_bank = None
+        fixed_posterior_eps_bank_A = None
+        fixed_posterior_eps_bank_B = None
+        fixed_sw2_theta = None
+
+    # --- Initialize Logging DataFrames ---
+    loss_records = []
+    eval_records = []
+
+    mechanism_diagnostics = bool(cfg.get("mechanism_diagnostics", False))
+    active_score_model = unet_lsi if cotrain_head == "lsi" else unet_control
+    active_score_parameters = tuple(active_score_model.parameters())
+    vae_grad_clip = float(cfg.get("vae_grad_clip", 1.0))
+    score_grad_clip = float(cfg.get("score_grad_clip", 1.0))
+    disc_grad_clip = float(cfg.get("disc_grad_clip", 1.0))
+    encoder_score_warmup_epochs = int(cfg.get("encoder_score_warmup_epochs", 0))
+    encoder_warmup_mode = str(
+        cfg.get("encoder_warmup_mode", "detach-csem")
+    ).lower()
+    if encoder_warmup_mode not in ("detach-csem", "freeze-encoder"):
+        raise ValueError(
+            "encoder_warmup_mode must be 'detach-csem' or 'freeze-encoder'; "
+            f"got {encoder_warmup_mode!r}."
+        )
+    csem_ramp_epochs = int(cfg.get("csem_ramp_epochs", 0))
+    score_tracking_steps = int(cfg.get("score_tracking_steps", 0))
+    score_tracking_every = int(cfg.get("score_tracking_every", 1))
+    grad_diagnostics_every = int(cfg.get("grad_diagnostics_every", 0))
+    time_diagnostic_bins = int(cfg.get("time_diagnostic_bins", 4))
+    fail_on_nonfinite = bool(cfg.get("fail_on_nonfinite", True))
+    global_cotrain_batch = 0
+    gradient_diagnostics_path = os.path.join(
+        results_dir,
+        "dataframes",
+        "gradient_diagnostics.csv",
+    )
+    gradient_diagnostic_fieldnames = [
+        "arm", "epoch", "global_batch", "joint_loss",
+        "score_mse_unweighted", "score_mse_weighted",
+        "score_weight_mean", "score_weight_max",
+        "vae_grad_preclip", "score_grad_preclip",
+        "vae_clip_multiplier", "score_clip_multiplier",
+        "grad_recon_to_vae", "grad_kl_to_vae", "grad_csem_to_vae",
+        "grad_csem_to_score", "grad_kl_csem_cosine",
+        "grad_kl_csem_combined_ratio", "encoder_csem_gradient_multiplier",
+        "grad_recon_to_encoder", "grad_csem_to_encoder",
+        "grad_recon_csem_encoder_cosine",
+        "grad_recon_csem_encoder_combined_ratio",
+        "latent_mu_rms", "posterior_var", "batch_t_min", "batch_t_max",
+        "lr_vae", "lr_encoder", "lr_decoder", "lr_score", "lr_tracking_head",
+    ]
+    if grad_diagnostics_every > 0:
+        with open(
+            gradient_diagnostics_path,
+            "w",
+            newline="",
+        ) as gradient_diagnostics_file:
+            csv.DictWriter(
+                gradient_diagnostics_file,
+                fieldnames=gradient_diagnostic_fieldnames,
+            ).writeheader()
+
+    print(
+        "--> Canonical stability controls: "
+        f"vae_clip={vae_grad_clip:g}, score_clip={score_grad_clip:g}, "
+        f"disc_clip={disc_grad_clip:g}, "
+        f"encoder_warmup={encoder_score_warmup_epochs} epochs "
+        f"({encoder_warmup_mode}), "
+        f"encoder_CSEM_grad_ramp={csem_ramp_epochs} epochs, "
+        f"same_head_tracking={score_tracking_steps} step(s)/"
+        f"{score_tracking_every} batch(es), grad_diag_every="
+        f"{grad_diagnostics_every or 'off'}"
+    )
+
+    print("--> Starting Dual Co-training...")
+    for ep in range(cfg["epochs_vae"]):
+        epoch_t0 = time.perf_counter()
+        vae.train(); unet_lsi.train(); unet_control.train()
+        if ep < encoder_score_warmup_epochs:
+            encoder_csem_gradient_multiplier = 0.0
+        elif csem_ramp_epochs > 0:
+            epochs_after_warmup = ep - encoder_score_warmup_epochs + 1
+            encoder_csem_gradient_multiplier = min(
+                1.0,
+                float(epochs_after_warmup) / float(csem_ramp_epochs),
+            )
+        else:
+            encoder_csem_gradient_multiplier = 1.0
+        encoder_score_is_detached = encoder_csem_gradient_multiplier == 0.0
+        freeze_encoder_this_epoch = (
+            encoder_warmup_mode == "freeze-encoder"
+            and ep < encoder_score_warmup_epochs
+        )
+        # Preserve the full canonical objective and full head gradient. Only the
+        # backward path from CSEM into the VAE uses the continuation multiplier.
+        active_score_w_vae = score_w_vae
+        metrics = {
+            k: 0.0 for k in [
+                "loss", "recon", "kl", "terminal_kl", "latent_mu_sq",
+                "latent_rms_median", "posterior_var", "posterior_var_median",
+                "posterior_std", "logvar_median",
+                "score_lsi", "score_control", "aux_lam",
+                "aux_nu", "perc", "stiff", "gan_d", "gan_g", "tdd",
+                "score_mse_weighted", "score_mse_unweighted",
+                "same_head_tracking_loss", "vae_grad_preclip",
+                "score_grad_preclip", "vae_clip_multiplier",
+                "score_clip_multiplier", "vae_clip_hit", "score_clip_hit",
+                "disc_grad_preclip", "disc_clip_hit",
+                "tracking_score_grad_preclip", "tracking_score_clip_hit",
+                "grad_recon_to_vae", "grad_kl_to_vae",
+                "grad_csem_to_vae", "grad_csem_to_score",
+                "grad_kl_csem_cosine", "grad_kl_csem_combined_ratio",
+                "grad_recon_to_encoder", "grad_csem_to_encoder",
+                "grad_recon_csem_encoder_cosine",
+                "grad_recon_csem_encoder_combined_ratio",
+                "logvar_floor_fraction", "logvar_ceiling_fraction",
+                "joint_loss_max", "score_mse_weighted_max",
+                "vae_grad_preclip_max", "score_grad_preclip_max"
+            ]
+        }
+        diagnostic_gradient_samples = 0
+        same_head_tracking_updates = 0
+        score_weight_sum = 0.0
+        score_weight_square_sum = 0.0
+        score_weight_sample_count = 0
+        score_weight_min = math.inf
+        score_weight_max = -math.inf
+        time_bin_sample_counts = [0 for _ in range(time_diagnostic_bins)]
+        time_bin_unweighted_sums = [0.0 for _ in range(time_diagnostic_bins)]
+        time_bin_weighted_sums = [0.0 for _ in range(time_diagnostic_bins)]
+        mu_stats = []
+
+        for x, y in tqdm(train_l, desc=f"Ep {ep+1}", leave=False):
+            global_cotrain_batch += 1
+            x = x.to(device)
+            y = y.to(device=device, dtype=torch.long)
+            B = x.shape[0]
+
+            # --- Classifier-Free Guidance (label dropout) ---
+            p_uncond = float(cfg.get("cfg_label_dropout", 0.1))
+            if p_uncond > 0.0:
+                drop = (torch.rand(B, device=device) < p_uncond)
+                y_in = y.clone()
+                # reserve index num_classes as the unconditional "null" label
+                y_in[drop] = int(cfg["num_classes"])
+            else:
+                y_in = y
+
+            # --- VAE Encode ---
+            mu_base, logvar_base = vae.encode(x)
+
+            # --- Conditional geometry correction (ResidualGaussianAdapter) ---
+            use_cond_enc = bool(cfg.get("use_cond_encoder", False))
+            mu, logvar = vae.encode(x, y=y_in if use_cond_enc else None)
+            logvar = torch.clamp(
+                logvar,
+                min=float(cfg.get("logvar_min", -30.0)),
+                max=float(cfg.get("logvar_max", 20.0)),
+            )
+
+            # Reparameterize z0 from encoder
+            z0 = vae.reparameterize(mu, logvar)
+
+            if mechanism_diagnostics and len(mu_stats) < 5:
+                mu_stats.append(mu.detach())
+
+            # --- Time / forward process (BEFORE decode) ---
+            t_idx = None
+            if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
+                t = sample_logit_normal_times(B, cfg["t_min"], cfg["t_max"], device)
+                alpha, sigma = get_flow_params(t.view(B, 1, 1, 1))
+            else:
+                t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
+                alpha, sigma = get_ou_params(t.view(B, 1, 1, 1))
+
+            if use_ddim_times:
+
+                t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
+
+                # time embedding = actual OU time on the discrete grid
+                t = ou_sched["times"].gather(0, t_idx).float()  # [B]
+
+                # alpha/sigma = OU alpha(t), sigma(t) on the same grid
+                alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+
+
+            noise = torch.randn_like(z0)
+            z_t = alpha * z0 + sigma * noise
+            if cfg.get("train_on_mu", False):
+                z_mu_t =  alpha * mu + sigma * noise
+            else:
+                z_mu_t = z_t
+
+            var_0 = torch.exp(logvar)
+            mu_t = alpha * mu
+            var_t = (alpha**2) * var_0 + (sigma**2)
+
+            # --- Decode from z_t with time-dependent decoder ---
+            # All reconstruction losses (recon, lpips, gan) are applied to D(z_t, t)
+            x_rec = vae.decode(z_t, t)
+
+            recon = F.mse_loss(x_rec, x)
+
+            if LPIPS_AVAILABLE:
+                x_3c = x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
+                x_rec_3c = x_rec.repeat(1, 3, 1, 1) if x_rec.shape[1] == 1 else x_rec
+                perc = lpips_fn(x_rec_3c, x_3c).mean()
+            else:
+                perc = torch.tensor(0.0, device=device)
+
+            # Flexible KL regularization.
+            #
+            # Existing modes are intentionally unchanged.  "terminal" is the
+            # new scale-anchor experiment: instead of penalizing the randomly
+            # sampled q(z_t|x), evaluate the component KL only at the actual
+            # terminal/start-of-reverse-process time T from the configured
+            # diffusion schedule.
+            reg_type = cfg.get("kl_reg_type", "mod")  # normal | mod | norm | vol | terminal
+            logvar_t = torch.log(var_t + 1e-8)
+
+            if reg_type == "normal":
+                # ORIGINAL BEHAVIOUR: standard VAE KL applied to the sampled
+                # q(z_t|x): N(mu_t, var_t) vs N(0,1).
+                kl = -0.5 * torch.mean(1 + logvar_t - mu_t.pow(2) - var_t)
+
+            elif reg_type == "mod":
+                # ORIGINAL BEHAVIOUR: energy/trace control on sampled z_t moments.
+                kl = -0.5 * torch.mean(1 - mu_t.pow(2) - var_t)
+
+            elif reg_type == "norm":
+                # ORIGINAL BEHAVIOUR: variance anchor on sampled z_t.
+                kl = torch.mean(logvar_t.pow(2))
+
+            elif reg_type == "vol":
+                # ORIGINAL BEHAVIOUR: volume-preserving regularization.
+                logvar_t_clamped = torch.clamp(logvar_t, min=-10.0)
+                log_det = torch.sum(logvar_t_clamped, dim=[1, 2, 3])  # [B]
+                kl = - torch.mean(log_det)
+
+            elif reg_type in ("terminal", "terminal_kl", "terminal-time"):
+                # NEW: K_T = E_x KL(q_phi,T(.|x) || N(0,I)).
+                kl = terminal_component_kl_from_schedule(mu, logvar, ou_sched)
+
+            else:
+                raise ValueError(f"Unknown kl_reg_type: {reg_type}")
+
+            # --- Representation/scale diagnostics (ALWAYS logged for BOTH arms) ---
+            # These are diagnostics only: detach them so the baseline and
+            # terminal objectives are completely unaffected.
+            with torch.no_grad():
+                if reg_type in ("terminal", "terminal_kl", "terminal-time"):
+                    # Avoid recomputing K_T in the active terminal arm.
+                    terminal_kl_diag = kl.detach()
+                else:
+                    terminal_kl_diag = terminal_component_kl_from_schedule(
+                        mu.detach(), logvar.detach(), ou_sched
+                    )
+
+                mu_det = mu.detach()
+                var_det = var_0.detach()
+                logvar_det = logvar.detach()
+
+                latent_mu_sq_diag = mu_det.pow(2).mean()
+
+                # Robust latent-center scale: per-sample RMS across the complete
+                # latent tensor, then median across the minibatch.
+                per_sample_mu_rms = mu_det.flatten(1).pow(2).mean(dim=1).sqrt()
+                latent_rms_median_diag = per_sample_mu_rms.median()
+
+                # Posterior variance scale and robust median.
+                posterior_var_diag = var_det.mean()
+                posterior_var_median_diag = var_det.median()
+                posterior_std_diag = var_det.sqrt().mean()
+                logvar_median_diag = logvar_det.median()
+                logvar_floor = float(cfg.get("logvar_min", -30.0))
+                logvar_ceiling = float(cfg.get("logvar_max", 20.0))
+                logvar_floor_fraction_diag = (
+                    logvar_det <= logvar_floor + 1e-6
+                ).float().mean()
+                logvar_ceiling_fraction_diag = (
+                    logvar_det >= logvar_ceiling - 1e-6
+                ).float().mean()
+
+            # --- Compute score losses ---
+            cos_w = float(cfg.get("cosine_w", 1.0))
+            resid = (z_t - mu_t) / (var_t + 1e-8)
+            eps_target_lsi = sigma * resid  # E[eps | z_t, x]
+            # Control head predicts the sampled eps directly.
+            eps_target_control = noise
+            score_time_weights = score_time_importance_weights(
+                t=t,
+                sigma=sigma,
+                cfg=cfg,
+                schedule=ou_sched,
+                t_idx=t_idx,
+            )
+            with torch.no_grad():
+                score_weights_detached = score_time_weights.detach().float()
+                score_weight_sum += float(score_weights_detached.sum().cpu().item())
+                score_weight_square_sum += float(
+                    score_weights_detached.square().sum().cpu().item()
+                )
+                score_weight_sample_count += int(score_weights_detached.numel())
+                score_weight_min = min(
+                    score_weight_min,
+                    float(score_weights_detached.min().cpu().item()),
+                )
+                score_weight_max = max(
+                    score_weight_max,
+                    float(score_weights_detached.max().cpu().item()),
+                )
+
+            if freeze_score_in_cotrain:
+                score_loss_lsi = torch.tensor(0.0, device=device)
+                score_loss_control = torch.tensor(0.0, device=device)
+                loss_mse_lsi = torch.tensor(0.0, device=device)
+                loss_mse_lsi_unweighted = torch.tensor(0.0, device=device)
+                aux_loss_lam = torch.tensor(0.0, device=device)
+                aux_loss_nu  = torch.tensor(0.0, device=device)
+            else:
+                # During encoder warmup the head sees the identical regression
+                # problem, but the CSEM path cannot update the VAE geometry.
+                z_t_for_score = canonical_stability_scale_gradient(
+                    z_t,
+                    encoder_csem_gradient_multiplier,
+                )
+                z_mu_t_for_score = canonical_stability_scale_gradient(
+                    z_mu_t,
+                    encoder_csem_gradient_multiplier,
+                )
+                eps_target_lsi_for_score = canonical_stability_scale_gradient(
+                    eps_target_lsi,
+                    encoder_csem_gradient_multiplier,
+                )
+                eps_target_control_for_score = canonical_stability_scale_gradient(
+                    eps_target_control,
+                    encoder_csem_gradient_multiplier,
+                )
+                use_factored = bool(getattr(unet_lsi, "factored_head", False))
+                if use_factored:
+                    eps_pred_lsi, lam_pred, nu_pred = unet_lsi(
+                        z_t_for_score, t, y_in,
+                        return_components=True,
+                        detach_components=True,
+                    )
+                    lam_tgt = (sigma / (var_t + 1e-8)).detach()
+                    nu_tgt  = (lam_tgt * mu_t.detach())
+                    aux_loss_lam = F.mse_loss(lam_pred, lam_tgt)
+                    aux_loss_nu  = F.mse_loss(nu_pred,  nu_tgt)
+                else:
+                    eps_pred_lsi = unet_lsi(z_t_for_score, t, y_in)
+                    aux_loss_lam = torch.tensor(0.0, device=device)
+                    aux_loss_nu  = torch.tensor(0.0, device=device)
+
+                loss_mse_lsi, loss_cos_lsi = weighted_score_prediction_losses(
+                    eps_pred_lsi, eps_target_lsi_for_score, score_time_weights
+                )
+                eps_mse_per_example = (
+                    eps_pred_lsi - eps_target_lsi_for_score
+                ).square().flatten(1).mean(dim=1)
+                loss_mse_lsi_unweighted = eps_mse_per_example.mean()
+                score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
+                if use_factored:
+                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
+
+                if train_tracking_head or cotrain_head == "control":
+                    if cfg.get("train_on_mu", False):
+                        eps_pred_control = unet_control(z_mu_t_for_score, t, y_in)
+                    else:
+                        eps_pred_control = unet_control(z_t_for_score, t, y_in)
+                    loss_mse_ctrl, loss_cos_ctrl = weighted_score_prediction_losses(
+                        eps_pred_control,
+                        eps_target_control_for_score,
+                        score_time_weights,
+                    )
+                    score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
+                else:
+                    score_loss_control = torch.tensor(0.0, device=device)
+
+                # Log score error by log-time quartile (or requested bin count).
+                # Both raw and canonical-weighted values are retained so a spike
+                # can be attributed to prediction error versus reweighting.
+                with torch.no_grad():
+                    log_fraction = (
+                        (t.detach().float().log() - math.log(float(cfg["t_min"])))
+                        / math.log(float(cfg["t_max"]) / float(cfg["t_min"]))
+                    ).clamp(0.0, 1.0 - 1e-7)
+                    time_bin_indices = torch.clamp(
+                        (log_fraction * time_diagnostic_bins).long(),
+                        min=0,
+                        max=time_diagnostic_bins - 1,
+                    )
+                    weighted_mse_per_example = (
+                        score_weights_detached * eps_mse_per_example.detach().float()
+                    )
+                    for time_bin_index in range(time_diagnostic_bins):
+                        in_bin = time_bin_indices == time_bin_index
+                        bin_count = int(in_bin.sum().cpu().item())
+                        if bin_count == 0:
+                            continue
+                        time_bin_sample_counts[time_bin_index] += bin_count
+                        time_bin_unweighted_sums[time_bin_index] += float(
+                            eps_mse_per_example.detach().float()[in_bin].sum().cpu().item()
+                        )
+                        time_bin_weighted_sums[time_bin_index] += float(
+                            weighted_mse_per_example[in_bin].sum().cpu().item()
+                        )
+
+            # --- Stiffness penalty ---
+            stiff_w = cfg.get("stiff_w", 0.0)
+            if stiff_w > 0.0 and not freeze_score_in_cotrain:
+                inv_var_t = 1.0 / (var_t + 1e-8)
+                stiff_pen = inv_var_t.flatten(1).mean(dim=1).mean()
+            else:
+                stiff_pen = torch.tensor(0.0, device=device)
+
+            # --- TDD loss removed: all reconstruction losses now applied directly to D(z_t, t) ---
+            tdd_loss = torch.tensor(0.0, device=device)
+
+            # --- PatchGAN adversarial loss ---
+            use_gan = gan_w > 0.0 and disc is not None and (ep + 1) >= disc_start_epoch
+            if use_gan:
+                # Discriminator step (detached reconstructions)
+                logits_real = disc(x)
+                logits_fake = disc(x_rec.detach())
+                d_loss = hinge_d_loss(logits_real, logits_fake)
+                if fail_on_nonfinite:
+                    canonical_stability_assert_finite(
+                        {"discriminator_loss": d_loss},
+                        context=(
+                            f"discriminator epoch={ep + 1}, "
+                            f"global_batch={global_cotrain_batch}, "
+                            f"arm={cfg.get('comparison_arm', 'unknown')}"
+                        ),
+                    )
+                opt_disc.zero_grad(set_to_none=True)
+                d_loss.backward()
+                (
+                    discriminator_grad_preclip,
+                    _,
+                    discriminator_clip_hit,
+                ) = canonical_stability_clip_group(
+                    tuple(disc.parameters()),
+                    disc_grad_clip,
+                    group_name="PatchGAN discriminator",
+                )
+                opt_disc.step()
+                # Generator loss (non-detached)
+                g_loss = hinge_g_loss(disc(x_rec))
+            else:
+                d_loss = torch.tensor(0.0, device=device)
+                g_loss = torch.tensor(0.0, device=device)
+                discriminator_grad_preclip = 0.0
+                discriminator_clip_hit = 0.0
+
+            # --- Joint loss ---
+            reconstruction_objective = recon + cfg["perc_w"] * perc + gan_w * g_loss
+            kl_objective = cfg["kl_w"] * kl
+            stiffness_objective = stiff_w * stiff_pen
+            if freeze_score_in_cotrain:
+                # Independent mode: VAE-only loss (no score, no stiffness)
+                active_score_objective = torch.tensor(0.0, device=device)
+                loss_joint = reconstruction_objective + kl_objective
+            else:
+                # Co-training mode: the scalar theorem coefficient is always
+                # exact; the continuation is implemented only in the tensor
+                # backward bridge above.
+                if cotrain_head == "lsi":
+                    active_score_objective = active_score_w_vae * score_loss_lsi
+                else:  # cotrain_head == "control"
+                    active_score_objective = active_score_w_vae * score_loss_control
+                loss_joint = (
+                    reconstruction_objective
+                    + kl_objective
+                    + active_score_objective
+                    + stiffness_objective
+                )
+
+            if fail_on_nonfinite:
+                canonical_stability_assert_finite(
+                    {
+                        "joint_loss": loss_joint,
+                        "reconstruction": reconstruction_objective,
+                        "kl_objective": kl_objective,
+                        "score_objective": active_score_objective,
+                        "score_weights": score_time_weights,
+                        "mu": mu,
+                        "logvar": logvar,
+                        "posterior_var": var_0,
+                    },
+                    context=(
+                        f"cotrain epoch={ep + 1}, global_batch={global_cotrain_batch}, "
+                        f"arm={cfg.get('comparison_arm', 'unknown')}"
+                    ),
+                )
+
+            should_measure_component_gradients = (
+                grad_diagnostics_every > 0
+                and global_cotrain_batch % grad_diagnostics_every == 0
+            )
+            if should_measure_component_gradients:
+                measured_reconstruction_gradient_norm = (
+                    canonical_stability_gradient_l2_norm(
+                        reconstruction_objective,
+                        vae_parameters,
+                    )
+                )
+                metrics["grad_recon_to_vae"] += measured_reconstruction_gradient_norm
+                (
+                    measured_kl_gradient_norm,
+                    measured_csem_vae_gradient_norm,
+                    measured_kl_csem_cosine,
+                    measured_kl_csem_combined_ratio,
+                ) = canonical_stability_gradient_pair_geometry(
+                    kl_objective,
+                    active_score_objective,
+                    vae_parameters,
+                )
+                metrics["grad_kl_to_vae"] += measured_kl_gradient_norm
+                metrics["grad_csem_to_vae"] += measured_csem_vae_gradient_norm
+                metrics["grad_kl_csem_cosine"] += measured_kl_csem_cosine
+                metrics["grad_kl_csem_combined_ratio"] += (
+                    measured_kl_csem_combined_ratio
+                )
+                measured_csem_score_gradient_norm = (
+                    canonical_stability_gradient_l2_norm(
+                        active_score_objective,
+                        active_score_parameters,
+                    )
+                )
+                metrics["grad_csem_to_score"] += measured_csem_score_gradient_norm
+                (
+                    measured_reconstruction_encoder_gradient_norm,
+                    measured_csem_encoder_gradient_norm,
+                    measured_reconstruction_csem_encoder_cosine,
+                    measured_reconstruction_csem_encoder_combined_ratio,
+                ) = canonical_stability_gradient_pair_geometry(
+                    reconstruction_objective,
+                    active_score_objective,
+                    encoder_parameters,
+                )
+                metrics["grad_recon_to_encoder"] += (
+                    measured_reconstruction_encoder_gradient_norm
+                )
+                metrics["grad_csem_to_encoder"] += (
+                    measured_csem_encoder_gradient_norm
+                )
+                metrics["grad_recon_csem_encoder_cosine"] += (
+                    measured_reconstruction_csem_encoder_cosine
+                )
+                metrics["grad_recon_csem_encoder_combined_ratio"] += (
+                    measured_reconstruction_csem_encoder_combined_ratio
+                )
+                diagnostic_gradient_samples += 1
+
+            opt_joint.zero_grad(set_to_none=True)
+            loss_joint.backward()
+            if freeze_encoder_this_epoch:
+                # A genuine frozen-encoder warmup keeps the score target fixed
+                # while still allowing the decoder and score head to learn.
+                # Setting gradients to None also prevents AdamW weight decay
+                # from moving encoder parameters during the warmup.
+                for parameter in encoder_parameters:
+                    parameter.grad = None
+            vae_grad_preclip, vae_clip_multiplier, vae_clip_hit = (
+                canonical_stability_clip_group(
+                    vae_parameters,
+                    vae_grad_clip,
+                    group_name="VAE",
+                )
+            )
+            if freeze_score_in_cotrain:
+                score_grad_preclip = 0.0
+                score_clip_multiplier = 1.0
+                score_clip_hit = 0.0
+            else:
+                score_grad_preclip, score_clip_multiplier, score_clip_hit = (
+                    canonical_stability_clip_group(
+                        active_score_parameters,
+                        score_grad_clip,
+                        group_name="score head",
+                    )
+                )
+            if should_measure_component_gradients:
+                gradient_diagnostic_row = {
+                    "arm": cfg.get("comparison_arm", "unknown"),
+                    "epoch": ep + 1,
+                    "global_batch": global_cotrain_batch,
+                    "joint_loss": float(loss_joint.detach().cpu().item()),
+                    "score_mse_unweighted": float(
+                        loss_mse_lsi_unweighted.detach().cpu().item()
+                    ),
+                    "score_mse_weighted": float(
+                        loss_mse_lsi.detach().cpu().item()
+                    ),
+                    "score_weight_mean": float(
+                        score_weights_detached.mean().cpu().item()
+                    ),
+                    "score_weight_max": float(
+                        score_weights_detached.max().cpu().item()
+                    ),
+                    "vae_grad_preclip": vae_grad_preclip,
+                    "score_grad_preclip": score_grad_preclip,
+                    "vae_clip_multiplier": vae_clip_multiplier,
+                    "score_clip_multiplier": score_clip_multiplier,
+                    "grad_recon_to_vae": measured_reconstruction_gradient_norm,
+                    "grad_kl_to_vae": measured_kl_gradient_norm,
+                    "grad_csem_to_vae": measured_csem_vae_gradient_norm,
+                    "grad_csem_to_score": measured_csem_score_gradient_norm,
+                    "grad_kl_csem_cosine": measured_kl_csem_cosine,
+                    "grad_kl_csem_combined_ratio": (
+                        measured_kl_csem_combined_ratio
+                    ),
+                    "grad_recon_to_encoder": (
+                        measured_reconstruction_encoder_gradient_norm
+                    ),
+                    "grad_csem_to_encoder": measured_csem_encoder_gradient_norm,
+                    "grad_recon_csem_encoder_cosine": (
+                        measured_reconstruction_csem_encoder_cosine
+                    ),
+                    "grad_recon_csem_encoder_combined_ratio": (
+                        measured_reconstruction_csem_encoder_combined_ratio
+                    ),
+                    "encoder_csem_gradient_multiplier": (
+                        encoder_csem_gradient_multiplier
+                    ),
+                    "latent_mu_rms": float(
+                        mu_det.square().mean().sqrt().cpu().item()
+                    ),
+                    "posterior_var": float(var_det.mean().cpu().item()),
+                    "batch_t_min": float(t.detach().min().cpu().item()),
+                    "batch_t_max": float(t.detach().max().cpu().item()),
+                    "lr_vae": float(
+                        opt_joint.param_groups[encoder_param_group_index]["lr"]
+                    ),
+                    "lr_encoder": float(
+                        opt_joint.param_groups[encoder_param_group_index]["lr"]
+                    ),
+                    "lr_decoder": float(
+                        opt_joint.param_groups[decoder_param_group_index]["lr"]
+                    ),
+                    "lr_score": (
+                        float(opt_joint.param_groups[score_param_group_index]["lr"])
+                        if not freeze_score_in_cotrain
+                        else 0.0
+                    ),
+                    "lr_tracking_head": (
+                        float(opt_tracking.param_groups[0]["lr"])
+                        if opt_tracking is not None
+                        else 0.0
+                    ),
+                }
+                with open(
+                    gradient_diagnostics_path,
+                    "a",
+                    newline="",
+                ) as gradient_diagnostics_file:
+                    csv.DictWriter(
+                        gradient_diagnostics_file,
+                        fieldnames=gradient_diagnostic_fieldnames,
+                    ).writerow(gradient_diagnostic_row)
+                tqdm.write(
+                    "[grad-diag] "
+                    f"arm={cfg.get('comparison_arm', 'unknown')} "
+                    f"epoch={ep + 1} global_batch={global_cotrain_batch} | "
+                    f"joint={float(loss_joint.detach().cpu().item()):.6g} "
+                    f"score_raw/weighted="
+                    f"{float(loss_mse_lsi_unweighted.detach().cpu().item()):.6g}/"
+                    f"{float(loss_mse_lsi.detach().cpu().item()):.6g} "
+                    f"w_mean/max={float(score_weights_detached.mean().cpu().item()):.4g}/"
+                    f"{float(score_weights_detached.max().cpu().item()):.4g} | "
+                    f"preclip_VAE/score={vae_grad_preclip:.4g}/"
+                    f"{score_grad_preclip:.4g} "
+                    f"clip_mult={vae_clip_multiplier:.3g}/"
+                    f"{score_clip_multiplier:.3g} | "
+                    f"component_to_VAE recon/KL/CSEM="
+                    f"{measured_reconstruction_gradient_norm:.4g}/"
+                    f"{measured_kl_gradient_norm:.4g}/"
+                    f"{measured_csem_vae_gradient_norm:.4g} "
+                    f"CSEM_to_score={measured_csem_score_gradient_norm:.4g} "
+                    f"KL_CSEM_cos={measured_kl_csem_cosine:.4f} "
+                    f"combined_ratio={measured_kl_csem_combined_ratio:.4f} | "
+                    f"encoder_CSEM_grad={encoder_csem_gradient_multiplier:.3f} "
+                    f"mu_rms={float(mu_det.square().mean().sqrt().cpu().item()):.4g} "
+                    f"post_var={float(var_det.mean().cpu().item()):.4g} "
+                    f"t=[{float(t.detach().min().cpu().item()):.3g},"
+                    f"{float(t.detach().max().cpu().item()):.3g}]"
+                )
+            opt_joint.step()
+
+            # Give the active score head extra target-tracking capacity without
+            # adding another CSEM update to the moving encoder. This is the same
+            # head and optimizer state—not the optional control/oracle network.
+            should_run_same_head_tracking = (
+                not freeze_score_in_cotrain
+                and score_tracking_steps > 0
+                and global_cotrain_batch % score_tracking_every == 0
+            )
+            if should_run_same_head_tracking:
+                detached_z_t = z_t.detach()
+                detached_z_mu_t = z_mu_t.detach()
+                detached_lsi_target = eps_target_lsi.detach()
+                detached_control_target = eps_target_control.detach()
+                detached_time_weights = score_time_weights.detach()
+
+                for _ in range(score_tracking_steps):
+                    if cotrain_head == "lsi":
+                        tracking_uses_factored = bool(
+                            getattr(unet_lsi, "factored_head", False)
+                        )
+                        if tracking_uses_factored:
+                            (
+                                tracking_prediction,
+                                tracking_lambda_prediction,
+                                tracking_nu_prediction,
+                            ) = unet_lsi(
+                                detached_z_t,
+                                t,
+                                y_in,
+                                return_components=True,
+                                detach_components=True,
+                            )
+                            tracking_lambda_target = (
+                                sigma / (var_t + 1e-8)
+                            ).detach()
+                            tracking_nu_target = (
+                                tracking_lambda_target * mu_t.detach()
+                            )
+                            tracking_aux_lambda = F.mse_loss(
+                                tracking_lambda_prediction,
+                                tracking_lambda_target,
+                            )
+                            # Retained for finite diagnostics even though the
+                            # current factored objective only weights lambda.
+                            tracking_aux_nu = F.mse_loss(
+                                tracking_nu_prediction,
+                                tracking_nu_target,
+                            )
+                        else:
+                            tracking_prediction = unet_lsi(detached_z_t, t, y_in)
+                            tracking_aux_lambda = torch.tensor(0.0, device=device)
+                            tracking_aux_nu = torch.tensor(0.0, device=device)
+                        tracking_mse, tracking_cosine = weighted_score_prediction_losses(
+                            tracking_prediction,
+                            detached_lsi_target,
+                            detached_time_weights,
+                        )
+                        tracking_score_loss = (
+                            tracking_mse + cos_w * tracking_cosine
+                        )
+                        if tracking_uses_factored:
+                            tracking_score_loss = (
+                                tracking_score_loss
+                                + aux_head_w * tracking_aux_lambda
+                            )
+                    else:
+                        tracking_input = (
+                            detached_z_mu_t
+                            if cfg.get("train_on_mu", False)
+                            else detached_z_t
+                        )
+                        tracking_prediction = unet_control(
+                            tracking_input,
+                            t,
+                            y_in,
+                        )
+                        tracking_mse, tracking_cosine = weighted_score_prediction_losses(
+                            tracking_prediction,
+                            detached_control_target,
+                            detached_time_weights,
+                        )
+                        tracking_score_loss = (
+                            tracking_mse + cos_w * tracking_cosine
+                        )
+                        tracking_aux_lambda = torch.tensor(0.0, device=device)
+                        tracking_aux_nu = torch.tensor(0.0, device=device)
+
+                    # Full theorem coefficient: the ramp protects the encoder,
+                    # while this detached regression step keeps the head current.
+                    same_head_tracking_objective = score_w_vae * tracking_score_loss
+                    if fail_on_nonfinite:
+                        canonical_stability_assert_finite(
+                            {
+                                "tracking_objective": same_head_tracking_objective,
+                                "tracking_score_loss": tracking_score_loss,
+                                "tracking_aux_lambda": tracking_aux_lambda,
+                                "tracking_aux_nu": tracking_aux_nu,
+                            },
+                            context=(
+                                f"same-head tracking epoch={ep + 1}, "
+                                f"global_batch={global_cotrain_batch}, "
+                                f"arm={cfg.get('comparison_arm', 'unknown')}"
+                            ),
+                        )
+                    opt_joint.zero_grad(set_to_none=True)
+                    same_head_tracking_objective.backward()
+                    (
+                        tracking_score_grad_preclip,
+                        _,
+                        tracking_score_clip_hit,
+                    ) = canonical_stability_clip_group(
+                        active_score_parameters,
+                        score_grad_clip,
+                        group_name="same-head tracking score",
+                    )
+                    opt_joint.step()
+                    same_head_tracking_updates += 1
+                    metrics["same_head_tracking_loss"] += float(
+                        tracking_score_loss.detach().cpu().item()
+                    )
+                    metrics["tracking_score_grad_preclip"] += (
+                        tracking_score_grad_preclip
+                    )
+                    metrics["tracking_score_clip_hit"] += tracking_score_clip_hit
+
+            # --- EMA Update and Tracking (only if not frozen) ---
+            if not freeze_score_in_cotrain:
+                # --- EMA Update (co-trained head) ---
+                with torch.no_grad():
+                    if cotrain_head == "lsi":
+                        for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                    else:
+                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+
+                if train_tracking_head:
+                    # --- Tracking head (trains on detached latents) ---
+                    z_t_detached = z_t.detach()
+                    z_mu_t_detached = z_mu_t.detach()
+                    eps_target_control_det = eps_target_control.detach()
+                    eps_target_lsi_det = eps_target_lsi.detach()
+
+                    if cotrain_head == "lsi":
+                        # Control head tracks the velocity baseline
+                        x_in = z_mu_t_detached if cfg.get("train_on_mu", False) else z_t_detached
+                        eps_pred_control_tracking = unet_control(x_in, t, y_in)
+                        loss_mse, loss_cos = weighted_score_prediction_losses(
+                            eps_pred_control_tracking,
+                            eps_target_control_det,
+                            score_time_weights,
+                        )
+                        tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
+                    else:
+                        # LSI head tracks the CSEM velocity target
+                        use_factored = bool(getattr(unet_lsi, "factored_head", False))
+                        if use_factored:
+                            eps_pred_lsi_tracking, lam_pred, nu_pred = unet_lsi(
+                                z_t_detached, t, y_in,
+                                return_components=True,
+                                detach_components=True,
+                            )
+                            lam_tgt = (sigma / (var_t + 1e-8)).detach()
+                            nu_tgt  = (lam_tgt * mu_t.detach())
+                            aux_loss_lam_tr = F.mse_loss(lam_pred, lam_tgt)
+                            aux_loss_nu_tr  = F.mse_loss(nu_pred,  nu_tgt)
+                        else:
+                            eps_pred_lsi_tracking = unet_lsi(z_t_detached, t, y_in)
+                            aux_loss_lam_tr = torch.tensor(0.0, device=device)
+                            aux_loss_nu_tr  = torch.tensor(0.0, device=device)
+
+                        loss_mse, loss_cos = weighted_score_prediction_losses(
+                            eps_pred_lsi_tracking,
+                            eps_target_lsi_det,
+                            score_time_weights,
+                        )
+                        tracking_loss = cfg["score_w"] * (loss_mse + cos_w * loss_cos)
+                        if use_factored:
+                            #tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr + aux_loss_nu_tr)
+                            tracking_loss = tracking_loss + aux_head_w * (aux_loss_lam_tr)
+
+
+                    opt_tracking.zero_grad()
+                    tracking_loss.backward()
+                    if cotrain_head == "lsi":
+                        canonical_stability_clip_group(
+                            tuple(unet_control.parameters()),
+                            score_grad_clip,
+                            group_name="control tracking head",
+                        )
+                    else:
+                        canonical_stability_clip_group(
+                            tuple(unet_lsi.parameters()),
+                            score_grad_clip,
+                            group_name="LSI tracking head",
+                        )
+                    opt_tracking.step()
+
+                    # --- EMA Update (tracking head) ---
+                    with torch.no_grad():
+                        if cotrain_head == "lsi":
+                            for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                                p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+                        else:
+                            for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                                p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+
+            metrics["loss"] += loss_joint.item()
+            metrics["recon"] += recon.item()
+            metrics["kl"] += kl.item()
+            metrics["terminal_kl"] += terminal_kl_diag.item()
+            metrics["latent_mu_sq"] += latent_mu_sq_diag.item()
+            metrics["latent_rms_median"] += latent_rms_median_diag.item()
+            metrics["posterior_var"] += posterior_var_diag.item()
+            metrics["posterior_var_median"] += posterior_var_median_diag.item()
+            metrics["posterior_std"] += posterior_std_diag.item()
+            metrics["logvar_median"] += logvar_median_diag.item()
+            metrics["logvar_floor_fraction"] += (
+                logvar_floor_fraction_diag.item()
+            )
+            metrics["logvar_ceiling_fraction"] += (
+                logvar_ceiling_fraction_diag.item()
+            )
+            metrics["score_lsi"] += score_loss_lsi.item()
+            metrics["score_control"] += score_loss_control.item()
+            metrics["score_mse_weighted"] += loss_mse_lsi.item()
+            metrics["score_mse_unweighted"] += loss_mse_lsi_unweighted.item()
+            metrics["aux_lam"] += aux_loss_lam.item()
+            metrics["aux_nu"] += aux_loss_nu.item()
+            metrics["perc"] += perc.item()
+            metrics["stiff"] += stiff_pen.item()
+            metrics["gan_d"] += d_loss.item()
+            metrics["gan_g"] += g_loss.item()
+            metrics["tdd"] += tdd_loss.item()
+            metrics["vae_grad_preclip"] += vae_grad_preclip
+            metrics["score_grad_preclip"] += score_grad_preclip
+            metrics["disc_grad_preclip"] += discriminator_grad_preclip
+            metrics["vae_clip_multiplier"] += vae_clip_multiplier
+            metrics["score_clip_multiplier"] += score_clip_multiplier
+            metrics["vae_clip_hit"] += vae_clip_hit
+            metrics["score_clip_hit"] += score_clip_hit
+            metrics["disc_clip_hit"] += discriminator_clip_hit
+            metrics["joint_loss_max"] = max(
+                metrics["joint_loss_max"],
+                float(loss_joint.detach().cpu().item()),
+            )
+            metrics["score_mse_weighted_max"] = max(
+                metrics["score_mse_weighted_max"],
+                float(loss_mse_lsi.detach().cpu().item()),
+            )
+            metrics["vae_grad_preclip_max"] = max(
+                metrics["vae_grad_preclip_max"], vae_grad_preclip
+            )
+            metrics["score_grad_preclip_max"] = max(
+                metrics["score_grad_preclip_max"], score_grad_preclip
+            )
+
+        # --- Compute epoch averages and log ---
+        n_batches = len(train_l)
+        score_weight_mean = score_weight_sum / max(score_weight_sample_count, 1)
+        score_weight_mean_square = (
+            score_weight_square_sum / max(score_weight_sample_count, 1)
+        )
+        score_weight_rms = math.sqrt(max(score_weight_mean_square, 0.0))
+        score_weight_variance = max(
+            score_weight_mean_square - score_weight_mean ** 2,
+            0.0,
+        )
+        score_weight_cv = (
+            math.sqrt(score_weight_variance) / score_weight_mean
+            if score_weight_mean > 0.0
+            else float("nan")
+        )
+        score_weight_ess_fraction = (
+            score_weight_mean ** 2 / score_weight_mean_square
+            if score_weight_mean_square > 0.0
+            else float("nan")
+        )
+        component_gradient_divisor = max(diagnostic_gradient_samples, 1)
+        tracking_update_divisor = max(same_head_tracking_updates, 1)
+        epoch_metrics = {
+            "epoch": ep + 1,
+            "stage": "cotrain",
+            "loss": metrics["loss"] / n_batches,
+            "recon": metrics["recon"] / n_batches,
+            "kl": metrics["kl"] / n_batches,
+            "terminal_kl": metrics["terminal_kl"] / n_batches,
+            "latent_rms": math.sqrt(max(metrics["latent_mu_sq"] / n_batches, 0.0)),
+            "latent_rms_median": metrics["latent_rms_median"] / n_batches,
+            "posterior_var": metrics["posterior_var"] / n_batches,
+            "posterior_var_median": metrics["posterior_var_median"] / n_batches,
+            "posterior_std": metrics["posterior_std"] / n_batches,
+            "logvar_median": metrics["logvar_median"] / n_batches,
+            "logvar_floor_fraction": (
+                metrics["logvar_floor_fraction"] / n_batches
+            ),
+            "logvar_ceiling_fraction": (
+                metrics["logvar_ceiling_fraction"] / n_batches
+            ),
+            "score_lsi": metrics["score_lsi"] / n_batches,
+            "score_mse_weighted": metrics["score_mse_weighted"] / n_batches,
+            "score_mse_unweighted": metrics["score_mse_unweighted"] / n_batches,
+            "score_control": metrics["score_control"] / n_batches,
+            "aux_lam": metrics["aux_lam"] / n_batches,
+            "aux_nu": metrics["aux_nu"] / n_batches,
+            "perc": metrics["perc"] / n_batches,
+            "stiff": metrics["stiff"] / n_batches,
+            "gan_d": metrics["gan_d"] / n_batches,
+            "gan_g": metrics["gan_g"] / n_batches,
+            "tdd": metrics["tdd"] / n_batches,
+            "csem_ramp_multiplier": encoder_csem_gradient_multiplier,
+            "encoder_csem_gradient_multiplier": encoder_csem_gradient_multiplier,
+            "active_csem_w": active_score_w_vae,
+            "encoder_score_detached": float(encoder_score_is_detached),
+            "encoder_frozen": float(freeze_encoder_this_epoch),
+            "encoder_warmup_mode": encoder_warmup_mode,
+            "lr_vae_current": float(
+                opt_joint.param_groups[encoder_param_group_index]["lr"]
+            ),
+            "lr_encoder_current": float(
+                opt_joint.param_groups[encoder_param_group_index]["lr"]
+            ),
+            "lr_decoder_current": float(
+                opt_joint.param_groups[decoder_param_group_index]["lr"]
+            ),
+            "lr_score_current": (
+                float(opt_joint.param_groups[score_param_group_index]["lr"])
+                if not freeze_score_in_cotrain
+                else 0.0
+            ),
+            "lr_tracking_head_current": (
+                float(opt_tracking.param_groups[0]["lr"])
+                if opt_tracking is not None
+                else 0.0
+            ),
+            "vae_grad_preclip": metrics["vae_grad_preclip"] / n_batches,
+            "score_grad_preclip": metrics["score_grad_preclip"] / n_batches,
+            "disc_grad_preclip": metrics["disc_grad_preclip"] / n_batches,
+            "vae_clip_rate": metrics["vae_clip_hit"] / n_batches,
+            "score_clip_rate": metrics["score_clip_hit"] / n_batches,
+            "disc_clip_rate": metrics["disc_clip_hit"] / n_batches,
+            "vae_clip_multiplier": metrics["vae_clip_multiplier"] / n_batches,
+            "score_clip_multiplier": metrics["score_clip_multiplier"] / n_batches,
+            "joint_loss_max": metrics["joint_loss_max"],
+            "score_mse_weighted_max": metrics["score_mse_weighted_max"],
+            "vae_grad_preclip_max": metrics["vae_grad_preclip_max"],
+            "score_grad_preclip_max": metrics["score_grad_preclip_max"],
+            "vae_parameter_norm": canonical_stability_parameter_l2_norm(
+                vae_parameters
+            ),
+            "score_parameter_norm": canonical_stability_parameter_l2_norm(
+                active_score_parameters
+            ),
+            "same_head_tracking_updates": same_head_tracking_updates,
+            "same_head_tracking_loss": (
+                metrics["same_head_tracking_loss"] / tracking_update_divisor
+            ),
+            "tracking_score_grad_preclip": (
+                metrics["tracking_score_grad_preclip"] / tracking_update_divisor
+            ),
+            "tracking_score_clip_rate": (
+                metrics["tracking_score_clip_hit"] / tracking_update_divisor
+            ),
+            "gradient_diagnostic_samples": diagnostic_gradient_samples,
+            "grad_recon_to_vae": (
+                metrics["grad_recon_to_vae"] / component_gradient_divisor
+            ),
+            "grad_kl_to_vae": (
+                metrics["grad_kl_to_vae"] / component_gradient_divisor
+            ),
+            "grad_csem_to_vae": (
+                metrics["grad_csem_to_vae"] / component_gradient_divisor
+            ),
+            "grad_csem_to_score": (
+                metrics["grad_csem_to_score"] / component_gradient_divisor
+            ),
+            "grad_kl_csem_cosine": (
+                metrics["grad_kl_csem_cosine"] / component_gradient_divisor
+            ),
+            "grad_kl_csem_combined_ratio": (
+                metrics["grad_kl_csem_combined_ratio"]
+                / component_gradient_divisor
+            ),
+            "grad_recon_to_encoder": (
+                metrics["grad_recon_to_encoder"] / component_gradient_divisor
+            ),
+            "grad_csem_to_encoder": (
+                metrics["grad_csem_to_encoder"] / component_gradient_divisor
+            ),
+            "grad_recon_csem_encoder_cosine": (
+                metrics["grad_recon_csem_encoder_cosine"]
+                / component_gradient_divisor
+            ),
+            "grad_recon_csem_encoder_combined_ratio": (
+                metrics["grad_recon_csem_encoder_combined_ratio"]
+                / component_gradient_divisor
+            ),
+            "score_weight_mean": score_weight_mean,
+            "score_weight_rms": score_weight_rms,
+            "score_weight_min": score_weight_min,
+            "score_weight_max": score_weight_max,
+            "score_weight_cv": score_weight_cv,
+            "score_weight_ess_fraction": score_weight_ess_fraction,
+        }
+        for time_bin_index in range(time_diagnostic_bins):
+            bin_count = time_bin_sample_counts[time_bin_index]
+            log_fraction_low = float(time_bin_index) / float(time_diagnostic_bins)
+            log_fraction_high = float(time_bin_index + 1) / float(time_diagnostic_bins)
+            bin_t_low = float(cfg["t_min"]) * (
+                float(cfg["t_max"]) / float(cfg["t_min"])
+            ) ** log_fraction_low
+            bin_t_high = float(cfg["t_min"]) * (
+                float(cfg["t_max"]) / float(cfg["t_min"])
+            ) ** log_fraction_high
+            epoch_metrics[f"time_bin_{time_bin_index}_t_low"] = bin_t_low
+            epoch_metrics[f"time_bin_{time_bin_index}_t_high"] = bin_t_high
+            epoch_metrics[f"time_bin_{time_bin_index}_count"] = bin_count
+            epoch_metrics[f"time_bin_{time_bin_index}_mse_unweighted"] = (
+                time_bin_unweighted_sums[time_bin_index] / max(bin_count, 1)
+            )
+            epoch_metrics[f"time_bin_{time_bin_index}_mse_weighted"] = (
+                time_bin_weighted_sums[time_bin_index] / max(bin_count, 1)
+            )
+        loss_records.append(epoch_metrics)
+        # Persist after every epoch so a later NaN, timeout, or scheduler kill
+        # cannot erase all preceding stability evidence.
+        in_progress_loss_path = os.path.join(
+            results_dir,
+            "dataframes",
+            "loss_history_in_progress.csv",
+        )
+        in_progress_loss_tmp_path = in_progress_loss_path + ".tmp"
+        pd.DataFrame(loss_records).to_csv(
+            in_progress_loss_tmp_path,
+            index=False,
+        )
+        os.replace(in_progress_loss_tmp_path, in_progress_loss_path)
+
+        epoch_sec = time.perf_counter() - epoch_t0
+        remaining = cfg["epochs_vae"] - (ep + 1)
+        eta_min = (remaining * epoch_sec) / 60.0
+        print(
+            f"Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+            f"Rec: {epoch_metrics['recon']:.4f} | KL(loss): {epoch_metrics['kl']:.5f} | "
+            f"K_T: {epoch_metrics['terminal_kl']:.5f} | "
+            f"mu_rms: {epoch_metrics['latent_rms']:.4f} | "
+            f"mu_rms_med: {epoch_metrics['latent_rms_median']:.4f} | "
+            f"post_var_mean: {epoch_metrics['posterior_var']:.5f} | "
+            f"post_var_med: {epoch_metrics['posterior_var_median']:.5f} | "
+            f"post_std_mean: {epoch_metrics['posterior_std']:.5f} | "
+            f"logvar_med: {epoch_metrics['logvar_median']:.4f} | "
+            f"Perc: {epoch_metrics['perc']:.4f} | "
+            f"GAN_d: {epoch_metrics['gan_d']:.4f} | GAN_g: {epoch_metrics['gan_g']:.4f} | "
+            f"{epoch_sec:.1f}s/ep | arm ETA~{eta_min:.1f}m"
+        )
+        print(
+            "  Stability | "
+            f"raw/weighted score MSE={epoch_metrics['score_mse_unweighted']:.4f}/"
+            f"{epoch_metrics['score_mse_weighted']:.4f} | "
+            f"w mean/rms/max={epoch_metrics['score_weight_mean']:.3f}/"
+            f"{epoch_metrics['score_weight_rms']:.3f}/"
+            f"{epoch_metrics['score_weight_max']:.3f} | "
+            f"grad VAE/score={epoch_metrics['vae_grad_preclip']:.3g}/"
+            f"{epoch_metrics['score_grad_preclip']:.3g} | "
+            f"clip rate VAE/score={epoch_metrics['vae_clip_rate']:.1%}/"
+            f"{epoch_metrics['score_clip_rate']:.1%} | "
+            f"disc={epoch_metrics['disc_clip_rate']:.1%} | "
+            f"encoder CSEM grad={encoder_csem_gradient_multiplier:.3f} | "
+            f"encoder detached={encoder_score_is_detached} | "
+            f"logvar floor/ceil={epoch_metrics['logvar_floor_fraction']:.1%}/"
+            f"{epoch_metrics['logvar_ceiling_fraction']:.1%} | "
+            f"LR enc/dec/score/control={epoch_metrics['lr_encoder_current']:.3g}/"
+            f"{epoch_metrics['lr_decoder_current']:.3g}/"
+            f"{epoch_metrics['lr_score_current']:.3g}/"
+            f"{epoch_metrics['lr_tracking_head_current']:.3g} | "
+            f"same-head updates={same_head_tracking_updates}"
+        )
+        if diagnostic_gradient_samples > 0:
+            print(
+                "  Component gradients -> VAE | "
+                f"recon={epoch_metrics['grad_recon_to_vae']:.3g}, "
+                f"KL={epoch_metrics['grad_kl_to_vae']:.3g}, "
+                f"CSEM={epoch_metrics['grad_csem_to_vae']:.3g}; "
+                f"CSEM -> score={epoch_metrics['grad_csem_to_score']:.3g} "
+                f"| KL/CSEM cosine={epoch_metrics['grad_kl_csem_cosine']:.3f}, "
+                f"combined/(sum norms)="
+                f"{epoch_metrics['grad_kl_csem_combined_ratio']:.3f} "
+                f"| encoder recon/CSEM cosine="
+                f"{epoch_metrics['grad_recon_csem_encoder_cosine']:.3f} "
+                f"({diagnostic_gradient_samples} samples)"
+            )
+        if mechanism_diagnostics and len(mu_stats) > 0:
+            log_latent_stats("VAE_Train", torch.cat(mu_stats, 0))
+
+        # --- Step cosine LR schedulers ---
+        sched_joint.step()
+        if sched_tracking is not None:
+            sched_tracking.step()
+
+        # --- Evaluation (skip if score frozen - no LDM to evaluate) ---
+        should_eval_cotrain = (
+            (not freeze_score_in_cotrain)
+            and (
+                ((ep + 1) % eval_freq_cotrain == 0)
+                or ((ep + 1) == cfg["epochs_vae"])
+            )
+        )
+
+        if should_eval_cotrain:
+            # For cotrain, epoch = LDM training epoch (1-indexed)
+            ldm_epoch = ep + 1
+
+            # Evaluate LSI
+            results_lsi = evaluate_current_state(
+                ldm_epoch,
+                "LSI_Diff",
+                vae,
+                unet_lsi_ema,
+                test_l,
+                cfg,
+                device,
+                lpips_fn,
+                fixed_noise_bank=fixed_noise_bank,
+                fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
+                fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
+                fixed_sw2_theta=fixed_sw2_theta,
+                results_dir=results_dir,
+                fid_model=fid_model,
+                use_lenet_fid=use_lenet_fid,
+            )
+            if results_lsi is not None:
+                results_lsi["epoch"] = ldm_epoch  # LDM epoch for comparison
+                results_lsi["stage"] = "cotrain"
+                results_lsi["tag"] = "LSI_Diff"
+                eval_records.append(results_lsi)
+
+            results_ctrl = results_lsi
+            '''
+            # Evaluate Control
+            results_ctrl = evaluate_current_state(
+                ldm_epoch,
+                "Ctrl_Diff",
+                vae,
+                unet_control_ema,
+                test_l,
+                cfg,
+                device,
+                lpips_fn,
+                fixed_noise_bank=fixed_noise_bank,
+                fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
+                fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
+                fixed_sw2_theta=fixed_sw2_theta,
+                results_dir=results_dir,
+                fid_model=fid_model,
+                use_lenet_fid=use_lenet_fid,
+            )
+            '''
+            if train_tracking_head and results_ctrl is not None:
+                results_ctrl["epoch"] = ldm_epoch  # legacy/full-golden behavior
+                results_ctrl["stage"] = "cotrain"
+                results_ctrl["tag"] = "Ctrl_Diff"
+                eval_records.append(results_ctrl)
+
+            if eval_records:
+                in_progress_eval_path = os.path.join(
+                    results_dir,
+                    "dataframes",
+                    "eval_metrics_in_progress.csv",
+                )
+                in_progress_eval_tmp_path = in_progress_eval_path + ".tmp"
+                pd.DataFrame(eval_records).to_csv(
+                    in_progress_eval_tmp_path,
+                    index=False,
+                )
+                os.replace(in_progress_eval_tmp_path, in_progress_eval_path)
+
+
+    # ===========================================================================
+    # REFINEMENT STAGE: Freeze VAE, train only score networks
+    # ===========================================================================
+    epochs_refine = cfg.get("epochs_refine", 20)
+    lr_refine = cfg.get("lr_refine", 1e-4)
+
+    if epochs_refine > 0:
+        print(f"\n--> Starting Refinement Stage ({epochs_refine} epochs, lr={lr_refine})...")
+
+        vae.eval()
+        for p in vae.parameters():
+            p.requires_grad = False
+
+        opt_lsi_refine = optim.AdamW(
+            unet_lsi.parameters(), lr=lr_refine, weight_decay=1e-4,
+            betas=(0.9, float(cfg.get("adam_beta2", 0.95)))
+        )
+        opt_control_refine = (
+            optim.AdamW(
+                unet_control.parameters(), lr=lr_refine, weight_decay=1e-4,
+                betas=(0.9, float(cfg.get("adam_beta2", 0.95)))
+            )
+            if train_tracking_head else None
+        )
+
+        # --- Cosine LR Schedulers (refine phase) ---
+        sched_lsi_refine = CosineAnnealingLR(opt_lsi_refine, T_max=epochs_refine, eta_min=1e-7)
+        sched_control_refine = (
+            CosineAnnealingLR(opt_control_refine, T_max=epochs_refine, eta_min=1e-7)
+            if opt_control_refine is not None else None
+        )
+
+        for ep in range(epochs_refine):
+            unet_lsi.train()
+            if train_tracking_head:
+                unet_control.train()
+            metrics_refine = {k: 0.0 for k in ["score_lsi", "score_control", "aux_lam", "aux_nu"]}
+
+            for x, y in tqdm(train_l, desc=f"Refine Ep {ep+1}", leave=False):
+                x = x.to(device)
+                y = y.to(device=device, dtype=torch.long)
+                B = x.shape[0]
+
+                # --- Classifier-Free Guidance (label dropout) ---
+                p_uncond = float(cfg.get("cfg_label_dropout", 0.1))
+                if p_uncond > 0.0:
+                    drop = (torch.rand(B, device=device) < p_uncond)
+                    y_in = y.clone()
+                    y_in[drop] = int(cfg["num_classes"])
+                else:
+                    y_in = y
+
+                use_cond_enc = bool(cfg.get("use_cond_encoder", False))
+                with torch.no_grad():
+                    mu, logvar = vae.encode(x, y=y_in if use_cond_enc else None)
+                    logvar = torch.clamp(
+                        logvar,
+                        min=float(cfg.get("logvar_min", -30.0)),
+                        max=float(cfg.get("logvar_max", 20.0)),
+                    )
+                    z0 = vae.reparameterize(mu, logvar)
+
+                # --- Time / forward process ---
+                t_idx = None
+                if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
+                    t = sample_logit_normal_times(B, cfg["t_min"], cfg["t_max"], device)
+                    alpha, sigma = get_flow_params(t.view(B, 1, 1, 1))
+                else:
+                    t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
+                    alpha, sigma = get_ou_params(t.view(B, 1, 1, 1))
+
+                if use_ddim_times:
+
+                    t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
+
+                    # time embedding = actual OU time on the discrete grid
+                    t = ou_sched["times"].gather(0, t_idx).float()  # [B]
+
+                    # alpha/sigma = OU alpha(t), sigma(t) on the same grid
+                    alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
+                    sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+
+
+                noise = torch.randn_like(z0)
+                z_t = alpha * z0 + sigma * noise
+                if cfg.get("train_on_mu", False):
+                    z_mu_t = alpha * mu + sigma * noise
+                else:
+                    z_mu_t = z_t
+
+                # --- LSI Score Training (eps-parameterization) ---
+                cos_w = float(cfg.get("cosine_w", 1.0))
+                var_0 = torch.exp(logvar)
+                mu_t = alpha * mu
+                var_t = (alpha ** 2) * var_0 + (sigma ** 2)
+
+                resid = (z_t - mu_t) / (var_t + 1e-8)
+                eps_target_lsi = sigma * resid  # E[eps | z_t, x]
+                score_time_weights = score_time_importance_weights(
+                    t=t,
+                    sigma=sigma,
+                    cfg=cfg,
+                    schedule=ou_sched,
+                    t_idx=t_idx,
+                )
+
+                use_factored = bool(getattr(unet_lsi, "factored_head", False))
+                if use_factored:
+                    eps_pred_lsi, lam_pred, nu_pred = unet_lsi(
+                        z_t, t, y_in,
+                        return_components=True,
+                        detach_components=True,
+                    )
+                    lam_tgt = (sigma / (var_t + 1e-8)).detach()
+                    nu_tgt  = (lam_tgt * mu_t.detach())
+                    aux_loss_lam = F.mse_loss(lam_pred, lam_tgt)
+                    aux_loss_nu  = F.mse_loss(nu_pred,  nu_tgt)
+                else:
+                    eps_pred_lsi = unet_lsi(z_t, t, y_in)
+                    aux_loss_lam = torch.tensor(0.0, device=device)
+                    aux_loss_nu  = torch.tensor(0.0, device=device)
+
+                loss_mse_lsi, loss_cos_lsi = weighted_score_prediction_losses(
+                    eps_pred_lsi, eps_target_lsi, score_time_weights
+                )
+                score_loss_lsi = loss_mse_lsi + cos_w * loss_cos_lsi
+                if use_factored:
+                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
+                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
+
+                opt_lsi_refine.zero_grad()
+                if fail_on_nonfinite:
+                    canonical_stability_assert_finite(
+                        {
+                            "refine_score_loss": score_loss_lsi,
+                            "refine_score_weights": score_time_weights,
+                            "refine_mu": mu,
+                            "refine_logvar": logvar,
+                        },
+                        context=(
+                            f"refine epoch={ep + 1}, "
+                            f"arm={cfg.get('comparison_arm', 'unknown')}"
+                        ),
+                    )
+                score_loss_lsi.backward()
+                canonical_stability_clip_group(
+                    tuple(unet_lsi.parameters()),
+                    score_grad_clip,
+                    group_name="refine LSI score",
+                )
+                opt_lsi_refine.step()
+
+                # --- EMA Update (LSI) ---
+                with torch.no_grad():
+                    for p_online, p_ema in zip(unet_lsi.parameters(), unet_lsi_ema.parameters()):
+                        p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+
+                score_loss_control = torch.tensor(0.0, device=device)
+                if train_tracking_head:
+                    # --- Control (eps baseline) ---
+                    eps_target_control = noise
+                    if cfg.get("train_on_mu", False):
+                        eps_pred_control = unet_control(z_mu_t, t, y_in)
+                    else:
+                        eps_pred_control = unet_control(z_t, t, y_in)
+
+                    loss_mse_ctrl, loss_cos_ctrl = weighted_score_prediction_losses(
+                        eps_pred_control, eps_target_control, score_time_weights
+                    )
+                    score_loss_control = loss_mse_ctrl + cos_w * loss_cos_ctrl
+
+                    opt_control_refine.zero_grad()
+                    score_loss_control.backward()
+                    canonical_stability_clip_group(
+                        tuple(unet_control.parameters()),
+                        score_grad_clip,
+                        group_name="refine control score",
+                    )
+                    opt_control_refine.step()
+
+                    # --- EMA Update (Control) ---
+                    with torch.no_grad():
+                        for p_online, p_ema in zip(unet_control.parameters(), unet_control_ema.parameters()):
+                            p_ema.data.mul_(ema_decay).add_(p_online.data, alpha=1 - ema_decay)
+
+                metrics_refine["score_lsi"] += score_loss_lsi.item()
+                metrics_refine["score_control"] += score_loss_control.item()
+                metrics_refine["aux_lam"] += aux_loss_lam.item()
+                metrics_refine["aux_nu"] += aux_loss_nu.item()
+
+            # --- Log Refinement Epoch ---
+            n_batches = len(train_l)
+            global_epoch = cfg["epochs_vae"] + ep + 1
+            epoch_metrics = {
+                "epoch": global_epoch,
+                "stage": "refine",
+                "loss": 0.0,  # No joint loss in refinement
+                "recon": 0.0,
+                "kl": 0.0,
+                "score_lsi": metrics_refine["score_lsi"] / n_batches,
+                "score_control": metrics_refine["score_control"] / n_batches,
+                "aux_lam": metrics_refine["aux_lam"] / n_batches,
+                "aux_nu": metrics_refine["aux_nu"] / n_batches,
+                "perc": 0.0,
+            }
+            loss_records.append(epoch_metrics)
+
+            print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+                  f"Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f}")
+
+            # --- Step cosine LR schedulers ---
+            sched_lsi_refine.step()
+            if sched_control_refine is not None:
+                sched_control_refine.step()
+
+            if (ep + 1) % eval_freq_refine == 0:
+                # For refine phase:
+                # - Cotrain mode: LDM epoch = epochs_vae + refine_epoch
+                # - Indep mode: LDM epoch = refine_epoch (VAE phase had no LDM training)
+                if freeze_score_in_cotrain:
+                    ldm_epoch = ep + 1  # Indep: refine is the only LDM training
+                else:
+                    ldm_epoch = cfg["epochs_vae"] + ep + 1  # Cotrain: add cotrain epochs
+
+                results_lsi = evaluate_current_state(
+                        ldm_epoch,
+                        "LSI_Diff_Refine",
+                        vae,
+                        unet_lsi_ema,
+                        test_l,
+                        cfg,
+                        device,
+                        lpips_fn,
+                        fixed_noise_bank=fixed_noise_bank,
+                        fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
+                        fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
+                        fixed_sw2_theta=fixed_sw2_theta,
+                        results_dir=results_dir,
+                        fid_model=fid_model,
+                        use_lenet_fid=use_lenet_fid,
+                )
+                if results_lsi is not None:
+                    results_lsi["epoch"] = ldm_epoch
+                    results_lsi["stage"] = "refine"
+                    results_lsi["tag"] = "LSI_Diff_Refine"
+                    eval_records.append(results_lsi)
+
+                if train_tracking_head:
+                    results_ctrl = evaluate_current_state(
+                            ldm_epoch,
+                            "Ctrl_Diff_Refine",
+                            vae,
+                            unet_control_ema,
+                            test_l,
+                            cfg,
+                            device,
+                            lpips_fn,
+                            fixed_noise_bank=fixed_noise_bank,
+                            fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
+                            fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
+                            fixed_sw2_theta=fixed_sw2_theta,
+                            results_dir=results_dir,
+                            fid_model=fid_model,
+                            use_lenet_fid=use_lenet_fid,
+                    )
+                    if results_ctrl is not None:
+                        results_ctrl["epoch"] = ldm_epoch
+                        results_ctrl["stage"] = "refine"
+                        results_ctrl["tag"] = "Ctrl_Diff_Refine"
+                        eval_records.append(results_ctrl)
+
+    # --- Save Checkpoints ---
+    save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
+    save_checkpoint(unet_lsi_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_lsi.pt"))
+    if train_tracking_head:
+        save_checkpoint(unet_control_ema.state_dict(), os.path.join(cfg["ckpt_dir"], "unet_control.pt"))
+
+    # --- Create DataFrames ---
+    loss_df = pd.DataFrame(loss_records)
+    eval_df = pd.DataFrame(eval_records) if eval_records else pd.DataFrame()
+
+    # --- Save DataFrames ---
+    save_dataframes(loss_df, eval_df, results_dir)
+
+    # --- Generate Visualizations ---
+    if cfg.get("generate_visualizations", True):
+        if len(loss_df) > 0 and len(eval_df) > 0:
+            generate_all_visualizations(loss_df, eval_df, results_dir)
+        else:
+            print("--> Warning: Insufficient data for visualization generation")
+    else:
+        print("--> Full visualization suite disabled for mechanism run.")
+
+    # --- Save run configuration ---
+    cfg_path = os.path.join(results_dir, "config.txt")
+    with open(cfg_path, "w") as f:
+        for k, v in cfg.items():
+            f.write(f"{k}: {v}\n")
+    print(f"--> Saved configuration to {cfg_path}")
+
+
+    # --- ZIP the entire results directory (DEFAULT) ---
+    zip_path = zip_results_dir(results_dir)
+    print(f"--> Zipped results to: {zip_path}")
+
+    print(f"\n{'='*60}")
+    print(f"Training complete! All results saved to: {results_dir}")
+    print(f"{'='*60}")
+
+    return loss_df, eval_df
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+
+def run_cotrain_vs_indep_comparison(cfg_cotrain, cfg_indep):
+    """
+    Run both co-trained and independent training experiments,
+    then generate comparison plots.
+
+    Args:
+        cfg_cotrain: Config for co-training experiment
+        cfg_indep: Config for independent experiment
+
+    Returns:
+        dict containing all results and paths
+    """
+    print("=" * 70)
+    print("RUNNING CO-TRAINED vs INDEPENDENT TRAINING COMPARISON")
+    print("=" * 70)
+
+    # Create master results directory
+    master_results_dir = cfg_cotrain.get("master_results_dir", "run_results_comparison")
+    if os.path.exists(master_results_dir):
+        shutil.rmtree(master_results_dir)
+    os.makedirs(master_results_dir, exist_ok=True)
+
+    # Calculate total LDM epochs for each
+    cotrain_ldm_epochs = cfg_cotrain["epochs_vae"] + cfg_cotrain["epochs_refine"]
+    indep_ldm_epochs = cfg_indep["epochs_refine"]  # Only refine has LDM training
+
+    print(f"\nExperiment setup:")
+    print(f"  Co-trained: {cfg_cotrain['epochs_vae']} cotrain + {cfg_cotrain['epochs_refine']} refine = {cotrain_ldm_epochs} LDM epochs")
+    print(f"  Independent: {cfg_indep['epochs_vae']} VAE-only + {cfg_indep['epochs_refine']} refine = {indep_ldm_epochs} LDM epochs")
+
+    # --- EXPERIMENT 1: CO-TRAINED ---
+    print("\n" + "=" * 70)
+    print("EXPERIMENT 1: CO-TRAINED (CSEM)")
+    print("=" * 70)
+
+    cfg_cotrain["results_dir"] = os.path.join(master_results_dir, "run_results_cotrain")
+
+    seed_everything(cfg_cotrain["seed"])
+    loss_df_cotrain, eval_df_cotrain = train_vae_cotrained_cond(cfg_cotrain)
+
+    # --- EXPERIMENT 2: INDEPENDENT ---
+    print("\n" + "=" * 70)
+    print("EXPERIMENT 2: INDEPENDENT (Two-Stage)")
+    print("=" * 70)
+
+    cfg_indep["results_dir"] = os.path.join(master_results_dir, "run_results_indep")
+
+    seed_everything(cfg_indep["seed"])  # Reset seed for fair comparison
+    loss_df_indep, eval_df_indep = train_vae_cotrained_cond(cfg_indep)
+
+    # --- GENERATE COMPARISON PLOTS ---
+    print("\n" + "=" * 70)
+    print("GENERATING COMPARISON VISUALIZATIONS")
+    print("=" * 70)
+
+    generate_comparison_visualizations(eval_df_cotrain, eval_df_indep, master_results_dir)
+
+    # --- Save Combined DataFrames ---
+    combined_dir = os.path.join(master_results_dir, "combined_dataframes")
+    os.makedirs(combined_dir, exist_ok=True)
+
+    # Add source column to distinguish
+    eval_df_cotrain_save = eval_df_cotrain.copy()
+    eval_df_cotrain_save["experiment"] = "cotrained"
+    eval_df_indep_save = eval_df_indep.copy()
+    eval_df_indep_save["experiment"] = "independent"
+
+    combined_eval_df = pd.concat([eval_df_cotrain_save, eval_df_indep_save], ignore_index=True)
+    combined_eval_df.to_csv(os.path.join(combined_dir, "combined_eval_metrics.csv"), index=False)
+
+    loss_df_cotrain_save = loss_df_cotrain.copy()
+    loss_df_cotrain_save["experiment"] = "cotrained"
+    loss_df_indep_save = loss_df_indep.copy()
+    loss_df_indep_save["experiment"] = "independent"
+
+    combined_loss_df = pd.concat([loss_df_cotrain_save, loss_df_indep_save], ignore_index=True)
+    combined_loss_df.to_csv(os.path.join(combined_dir, "combined_loss_history.csv"), index=False)
+
+    print(f"--> Saved combined eval metrics to {combined_dir}/combined_eval_metrics.csv")
+    print(f"--> Saved combined loss history to {combined_dir}/combined_loss_history.csv")
+
+    # --- ZIP the entire comparison results directory ---
+    zip_path = zip_results_dir(master_results_dir)
+    print(f"--> Zipped all comparison results to: {zip_path}")
+
+    print(f"\n{'='*70}")
+    print(f"COMPARISON COMPLETE!")
+    print(f"All results saved to: {master_results_dir}")
+    print(f"  - Co-trained results: {master_results_dir}/run_results_cotrain/")
+    print(f"  - Independent results: {master_results_dir}/run_results_indep/")
+    print(f"  - Comparison plots: {master_results_dir}/comparison_plots/")
+    print(f"{'='*70}")
+
+    return {
+        "loss_df_cotrain": loss_df_cotrain,
+        "eval_df_cotrain": eval_df_cotrain,
+        "loss_df_indep": loss_df_indep,
+        "eval_df_indep": eval_df_indep,
+        "combined_eval_df": combined_eval_df,
+        "combined_loss_df": combined_loss_df,
+        "master_results_dir": master_results_dir,
+        "zip_path": zip_path,
+    }
+
+
+
+def save_scale_anchor_mechanism_plots(combined_loss: pd.DataFrame, out_dir: str) -> None:
+    """Cheap, mechanism-specific plots from per-epoch training diagnostics."""
+    if combined_loss.empty:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+
+    for metric, ylabel, filename in [
+        ("latent_rms", "latent RMS of encoder mean", "latent_rms_vs_epoch.png"),
+        ("latent_rms_median", "median per-sample latent RMS", "latent_rms_median_vs_epoch.png"),
+        ("terminal_kl", "terminal component KL K_T", "terminal_kl_vs_epoch.png"),
+        ("posterior_var", "mean posterior variance", "posterior_var_vs_epoch.png"),
+        ("posterior_var_median", "median posterior variance", "posterior_var_median_vs_epoch.png"),
+        ("posterior_std", "mean posterior standard deviation", "posterior_std_vs_epoch.png"),
+        ("score_lsi", "CSEM / LSI score loss", "csem_loss_vs_epoch.png"),
+        ("recon", "reconstruction MSE", "reconstruction_vs_epoch.png"),
+    ]:
+        if metric not in combined_loss.columns:
+            continue
+        plt.figure(figsize=(7, 4.5))
+        for name, group in combined_loss.groupby("scale_anchor"):
+            g = group[group["stage"] == "cotrain"].sort_values("epoch")
+            if len(g):
+                plt.plot(g["epoch"], g[metric], label=name)
+        plt.xlabel("joint-training epoch")
+        plt.ylabel(ylabel)
+        plt.title(ylabel)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, filename), dpi=160)
+        plt.close()
+
+
+
+SCALE_ANCHOR_ARMS = ("terminal_kl", "norm")
+
+
+def parse_arms_arg(value: str) -> Tuple[str, ...]:
+    """Parse an ordered, comma-separated nonempty subset of scale-anchor arms."""
+    arms = tuple(part.strip().lower() for part in value.split(",") if part.strip())
+    if not arms:
+        raise argparse.ArgumentTypeError(
+            "--arms must contain at least one arm: terminal_kl or norm"
+        )
+
+    unknown = [arm for arm in arms if arm not in SCALE_ANCHOR_ARMS]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            "unknown arm(s) "
+            + ", ".join(repr(arm) for arm in unknown)
+            + "; expected a comma-separated subset of terminal_kl,norm"
+        )
+
+    duplicates = [arm for i, arm in enumerate(arms) if arm in arms[:i]]
+    if duplicates:
+        raise argparse.ArgumentTypeError(
+            "--arms may not repeat an arm; duplicate(s): "
+            + ", ".join(sorted(set(duplicates)))
+        )
+    return arms
+
+
+def run_scale_anchor_comparison(cfg_norm, cfg_terminal, arms):
+    """Run exactly the requested scale-anchor arms, in the requested order.
+
+    ``terminal_kl`` removes encoder-mean GroupNorm and uses
+    K_T = E_x KL(q_phi,T(.|x) || N(0,I)). ``norm`` uses encoder-mean
+    GroupNorm with both the KL and stiffness penalties disabled. When both are
+    selected, their model/optimizer/diffusion/decoder/GAN/CFG/EMA recipes remain
+    identical apart from the intended scale-fixing mechanism.
+    """
+    print("=" * 78)
+    print("CSEM SCALE-ANCHOR RUN")
+    print("=" * 78)
+
+    arms = tuple(arms)
+    if not arms:
+        raise ValueError("At least one scale-anchor arm must be selected.")
+    unknown = [arm for arm in arms if arm not in SCALE_ANCHOR_ARMS]
+    if unknown or len(set(arms)) != len(arms):
+        raise ValueError(
+            f"Invalid ordered arms {arms!r}; expected a nonrepeating subset of "
+            f"{SCALE_ANCHOR_ARMS!r}."
+        )
+    print("Selected arm order: " + " -> ".join(arms))
+
+    if float(cfg_norm.get("kl_w", 0.0)) != 0.0 or float(cfg_norm.get("stiff_w", 0.0)) != 0.0:
+        raise ValueError(
+            "The scale-normalization arm must be GroupNorm-only: "
+            f"got kl_w={cfg_norm.get('kl_w')} and stiff_w={cfg_norm.get('stiff_w')}."
+        )
+
+    master_results_dir = cfg_norm.get(
+        "master_results_dir", "run_results_terminal_kl_vs_scale_norm"
+    )
+    if os.path.exists(master_results_dir):
+        if not bool(cfg_norm.get("overwrite_results", False)):
+            raise FileExistsError(
+                "Results root already exists and will not be overwritten: "
+                f"{os.path.abspath(master_results_dir)}. Choose a new "
+                "--master-results-dir or pass --overwrite-results explicitly."
+            )
+        shutil.rmtree(master_results_dir)
+    os.makedirs(master_results_dir, exist_ok=True)
+
+    # Share only the evaluation classifier checkpoint. This does not enter the
+    # training loss; it prevents retraining MNIST's LeNet FID feature model.
+    shared_fid_ckpt_dir = os.path.join(master_results_dir, "shared_eval_checkpoints")
+    os.makedirs(shared_fid_ckpt_dir, exist_ok=True)
+    cfg_norm["fid_ckpt_dir"] = shared_fid_ckpt_dir
+    cfg_terminal["fid_ckpt_dir"] = shared_fid_ckpt_dir
+
+    arm_specs = {
+        "terminal_kl": {
+            "cfg": cfg_terminal,
+            "title": "NO LATENT SCALE NORMALIZATION + TERMINAL-T KL",
+            "results_subdir": "run_terminal_kl",
+            "scale_anchor": "terminal_T_KL",
+        },
+        "norm": {
+            "cfg": cfg_norm,
+            "title": "SCALE NORMALIZATION ONLY (KL/STIFFNESS DISABLED)",
+            "results_subdir": "run_scale_norm",
+            "scale_anchor": "scale_norm_only",
+        },
+    }
+
+    loss_by_arm = {}
+    eval_by_arm = {}
+    for arm_index, arm in enumerate(arms, start=1):
+        spec = arm_specs[arm]
+        cfg = spec["cfg"]
+        print("\n" + "=" * 78)
+        print(f"ARM {arm_index}/{len(arms)} [{arm}]: {spec['title']}")
+        print("=" * 78)
+        status = (
+            f"dataset={cfg['dataset']} | "
+            f"use_latent_norm={cfg.get('use_latent_norm')} | "
+            f"kl_reg_type={cfg.get('kl_reg_type')} | "
+            f"kl_w={cfg.get('kl_w')}"
+        )
+        if arm == "terminal_kl":
+            status += f" | T=t_max={cfg.get('t_max')}"
+        print(status)
+
+        cfg["results_dir"] = os.path.join(
+            master_results_dir, spec["results_subdir"]
+        )
+        cfg["comparison_arm"] = arm
+        # Keep checkpoints inside the selected arm's result tree. This is
+        # essential when independent T-sweep jobs run concurrently from the
+        # same working directory.
+        cfg["ckpt_dir"] = os.path.join(cfg["results_dir"], "checkpoints")
+        # Every selected arm starts from the same RNG state, preserving paired
+        # comparability independently of selection and order.
+        seed_everything(int(cfg["seed"]))
+        loss_by_arm[arm], eval_by_arm[arm] = train_vae_cotrained_cond(cfg)
+
+    # ---- Save selected-arm tables ---------------------------------------
+    combined_dir = os.path.join(master_results_dir, "combined_dataframes")
+    os.makedirs(combined_dir, exist_ok=True)
+
+    loss_frames = []
+    eval_frames = []
+    for arm in arms:
+        loss_frame = loss_by_arm[arm].copy()
+        loss_frame["scale_anchor"] = arm_specs[arm]["scale_anchor"]
+        loss_frames.append(loss_frame)
+
+        eval_frame = eval_by_arm[arm].copy()
+        eval_frame["scale_anchor"] = arm_specs[arm]["scale_anchor"]
+        eval_frames.append(eval_frame)
+
+    combined_loss = pd.concat(loss_frames, ignore_index=True)
+    combined_loss.to_csv(
+        os.path.join(combined_dir, "combined_loss_history.csv"), index=False
+    )
+    if any(
+        bool(arm_specs[arm]["cfg"].get("mechanism_diagnostics", False))
+        for arm in arms
+    ):
+        save_scale_anchor_mechanism_plots(
+            combined_loss,
+            os.path.join(master_results_dir, "mechanism_plots"),
+        )
+
+    combined_eval = pd.concat(eval_frames, ignore_index=True)
+    combined_eval.to_csv(
+        os.path.join(combined_dir, "combined_eval_metrics.csv"), index=False
+    )
+
+    zip_path = zip_results_dir(master_results_dir)
+    print("\n" + "=" * 78)
+    print("CSEM SCALE-ANCHOR RUN COMPLETE")
+    print("=" * 78)
+    for arm in arms:
+        print(
+            f"{arm:16s} {master_results_dir}/"
+            f"{arm_specs[arm]['results_subdir']}/"
+        )
+    print(f"Combined tables:    {master_results_dir}/combined_dataframes/")
+    print(f"Zip:                {zip_path}")
+
+    return {
+        "arms": arms,
+        "loss_norm": loss_by_arm.get("norm", pd.DataFrame()),
+        "eval_norm": eval_by_arm.get("norm", pd.DataFrame()),
+        "loss_terminal": loss_by_arm.get("terminal_kl", pd.DataFrame()),
+        "eval_terminal": eval_by_arm.get("terminal_kl", pd.DataFrame()),
+        "combined_loss": combined_loss,
+        "combined_eval": combined_eval,
+        "master_results_dir": master_results_dir,
+        "zip_path": zip_path,
+    }
+
+
+# --- END NEW FUNCTIONS ---
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Selectable CSEM scale-anchor runs with automatic dataset-dependent "
+            "capacity presets: CIFAR uses the golden CSEM setup; MNIST-family "
+            "datasets use the compact grayscale setup."
+        )
+    )
+    parser.add_argument(
+        "--dataset",
+        default="CIFAR",
+        choices=list(DATASET_INFO.keys()),
+        help=(
+            "Dataset for every selected arm. Architecture/batch/LR defaults are "
+            "selected automatically from the dataset."
+        ),
+    )
+    parser.add_argument(
+        "--model-preset",
+        choices=["auto", "cifar_golden", "mnist_small", "fmnist_reference"],
+        default="auto",
+        help=(
+            "Model/training preset. 'auto' maps CIFAR/GCIFAR -> cifar_golden, "
+            "FMNIST -> fmnist_reference, and MNIST/EMNIST/KMNIST -> mnist_small."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help=(
+            "Training seed. Each comparison arm resets to this seed so paired "
+            "terminal-KL versus normalization runs start from matched randomness."
+        ),
+    )
+    parser.add_argument(
+        "--terminal-kl-w",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight multiplying K_T in the terminal-KL arm only. "
+            "The scale-normalized arm always uses kl_w=0 and stiff_w=0."
+        ),
+    )
+    parser.add_argument(
+        "--csem-w", "--csem-loss-w",
+        dest="csem_w",
+        type=float,
+        default=0.6,
+        help=(
+            "Weight multiplying the joint CSEM loss in every selected arm. "
+            "Default: 0.6 (the script's previous hard-coded value). For the exact "
+            "canonical CSEM + K_T coefficient identity, set this equal to "
+            "--terminal-kl-w."
+        ),
+    )
+    parser.add_argument(
+        "--T-terminal", "--T_terminal", "--t-terminal",
+        dest="T_terminal",
+        type=float,
+        default=None,
+        help=(
+            "Shared terminal diffusion time. This sets the score-training horizon, "
+            "the time used by K_T, and the Gaussian reverse-sampling initialization "
+            "time. If omitted, use the selected dataset preset's t_max."
+        ),
+    )
+    parser.add_argument(
+        "--score-time-weighting", "--time-weighting",
+        choices=list(SCORE_TIME_WEIGHTING_CHOICES),
+        default="unweighted-eps",
+        help=(
+            "Score-loss measure. 'unweighted-eps' preserves the current objective: "
+            "plain epsilon-MSE under the sampled time distribution (approximately "
+            "log-uniform time for the comparison presets). 'canonical' applies both "
+            "the epsilon-to-score factor 1/sigma(t)^2 and the proposal/quadrature "
+            "correction needed to approximate the physical-OU-time integral."
+        ),
+    )
+    parser.add_argument(
+        "--cfg-strength", "--cfg-scale", "--cfg_strength",
+        dest="cfg_strength",
+        type=float,
+        default=3.0,
+        help=(
+            "Classifier-free guidance strength used by every guided evaluation "
+            "sampler. Default: 3.0."
+        ),
+    )
+    parser.add_argument(
+        "--bespoke-fid-classifier",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use features from a classifier trained on the selected target "
+            "dataset for FID/KID. Use --no-bespoke-fid-classifier to force "
+            "ImageNet Inception features. If omitted, auto mode preserves the "
+            "legacy choice: bespoke for MNIST/EMNIST/KMNIST and Inception for "
+            "FMNIST/GCIFAR/CIFAR."
+        ),
+    )
+    parser.add_argument(
+        "--master-results-dir",
+        default=None,
+        help=(
+            "Output root. The default is derived from the dataset and ordered "
+            "arm list, e.g. run_results_fmnist_terminal_kl."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-results",
+        action="store_true",
+        help=(
+            "Allow deletion/recreation of an existing --master-results-dir. "
+            "By default an existing path is a hard error."
+        ),
+    )
+
+    # None means: take the natural value from the selected dataset preset.
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Joint co-training epochs per arm. Default comes from the dataset preset.",
+    )
+    parser.add_argument(
+        "--refine-epochs",
+        type=int,
+        default=None,
+        help="Frozen-VAE CSEM refinement epochs per arm. Default comes from the dataset preset.",
+    )
+    parser.add_argument(
+        "--lr-schedule-epochs",
+        type=int,
+        default=None,
+        help=(
+            "Cosine LR scheduler horizon for co-training. If omitted, preserve the "
+            "preset behavior. Set 700 for a 40-epoch screen intended to reproduce "
+            "the first 40 epochs of a 700-epoch run."
+        ),
+    )
+    parser.add_argument(
+        "--lr-vae",
+        type=float,
+        default=None,
+        help="Override VAE/encoder-decoder AdamW LR; otherwise use preset default.",
+    )
+    parser.add_argument(
+        "--lr-encoder",
+        type=float,
+        default=None,
+        help=(
+            "Direct effective AdamW LR for encoder parameters. If omitted, use "
+            "the resolved --lr-vae after --canonical-lr-scale. Explicit values "
+            "are not additionally scaled."
+        ),
+    )
+    parser.add_argument(
+        "--lr-decoder",
+        type=float,
+        default=None,
+        help=(
+            "Direct effective AdamW LR for decoder parameters. If omitted, use "
+            "the resolved --lr-vae after --canonical-lr-scale. Explicit values "
+            "are not additionally scaled."
+        ),
+    )
+    parser.add_argument(
+        "--lr-ldm",
+        type=float,
+        default=None,
+        help=(
+            "Override base CSEM/DiT AdamW LR; otherwise use preset default. "
+            "The co-trained LSI head preserves the existing optimizer convention "
+            "and uses lr_ldm / csem_w when csem_w > 0."
+        ),
+    )
+    parser.add_argument(
+        "--lr-score-head",
+        type=float,
+        default=None,
+        help=(
+            "Direct override for the actual co-trained score-head AdamW param-group "
+            "LR. If omitted, preserve the legacy lr_ldm / csem_w convention. This "
+            "flag is an effective LR and is not additionally multiplied by "
+            "--canonical-lr-scale."
+        ),
+    )
+    parser.add_argument(
+        "--lr-tracking-head",
+        type=float,
+        default=None,
+        help=(
+            "Direct effective AdamW LR for the detached auxiliary/control score "
+            "head. If omitted, use the resolved --lr-ldm after canonical scaling. "
+            "This does not set the co-trained score-head LR."
+        ),
+    )
+    parser.add_argument(
+        "--lr-refine",
+        type=float,
+        default=None,
+        help="Override frozen-VAE refinement LR; otherwise use preset default.",
+    )
+    parser.add_argument(
+        "--lr-disc",
+        type=float,
+        default=1.0e-4,
+        help="PatchGAN discriminator Adam LR. Default preserves the comparison setup.",
+    )
+    parser.add_argument(
+        "--gan-w",
+        type=float,
+        default=0.0025,
+        help="PatchGAN generator-loss coefficient. Set 0 to disable GAN training.",
+    )
+    parser.add_argument(
+        "--disc-start-epoch",
+        type=int,
+        default=25,
+        help="First 1-indexed co-training epoch that enables PatchGAN updates.",
+    )
+    parser.add_argument(
+        "--canonical-lr-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiply the resolved VAE LR and base LDM LR when canonical time "
+            "weighting is active. This compensates for the canonical loss's larger "
+            "absolute gradient scale without renormalizing or changing the theorem's "
+            "objective. Default 1.0. An explicit --lr-score-head remains final."
+        ),
+    )
+    parser.add_argument(
+        "--adam-beta2",
+        type=float,
+        default=0.95,
+        help=(
+            "AdamW second-moment coefficient for VAE and score optimizers. "
+            "Lower values adapt faster when encoder CSEM gradients turn on after "
+            "warmup; default 0.95 preserves the stable-script setting."
+        ),
+    )
+    parser.add_argument(
+        "--vae-grad-clip",
+        type=float,
+        default=1.0,
+        help="Independent global-norm clip for VAE/encoder-decoder gradients.",
+    )
+    parser.add_argument(
+        "--score-grad-clip",
+        type=float,
+        default=1.0,
+        help="Independent global-norm clip for score-head gradients.",
+    )
+    parser.add_argument(
+        "--disc-grad-clip",
+        type=float,
+        default=1.0,
+        help="Independent global-norm clip for PatchGAN discriminator gradients.",
+    )
+    parser.add_argument(
+        "--encoder-score-warmup-epochs",
+        type=int,
+        default=0,
+        help=(
+            "For the first N co-training epochs, train the score head on detached "
+            "latents so reconstruction/KL can establish the encoder geometry before "
+            "CSEM gradients reach it. Default 0 preserves prior behavior."
+        ),
+    )
+    parser.add_argument(
+        "--encoder-warmup-mode",
+        choices=["detach-csem", "freeze-encoder"],
+        default="detach-csem",
+        help=(
+            "Warmup behavior. 'detach-csem' leaves the encoder moving under "
+            "reconstruction/K_T. 'freeze-encoder' fixes encoder parameters while "
+            "the decoder and score head train on a stationary latent target."
+        ),
+    )
+    parser.add_argument(
+        "--csem-ramp-epochs", "--encoder-csem-ramp-epochs",
+        dest="csem_ramp_epochs",
+        type=int,
+        default=0,
+        help=(
+            "After encoder-score warmup, linearly ramp only the CSEM backward signal "
+            "into the encoder from 1/N to full strength over N epochs. The forward "
+            "canonical objective and score-head gradient retain their exact full "
+            "coefficient. Default 0 disables the ramp."
+        ),
+    )
+    parser.add_argument(
+        "--score-tracking-steps",
+        type=int,
+        default=0,
+        help=(
+            "Additional updates of the same co-trained score head on detached latents "
+            "per selected batch. These improve target tracking without adding encoder "
+            "CSEM gradients. Default 0."
+        ),
+    )
+    parser.add_argument(
+        "--score-tracking-every",
+        type=int,
+        default=1,
+        help="Run detached same-head tracking updates every N co-training batches.",
+    )
+    parser.add_argument(
+        "--grad-diagnostics-every",
+        type=int,
+        default=0,
+        help=(
+            "Every N co-training batches, separately measure reconstruction, KL, and "
+            "CSEM gradient norms before aggregation. 0 disables the extra autograd "
+            "passes."
+        ),
+    )
+    parser.add_argument(
+        "--time-diagnostic-bins",
+        type=int,
+        default=4,
+        help="Number of log-time bins for unweighted/weighted epsilon-MSE logging.",
+    )
+    parser.add_argument(
+        "--logvar-min",
+        type=float,
+        default=-30.0,
+        help="Numerical lower clamp for encoder log-variance during training.",
+    )
+    parser.add_argument(
+        "--logvar-max",
+        type=float,
+        default=20.0,
+        help="Numerical upper clamp for encoder log-variance during training.",
+    )
+    parser.add_argument(
+        "--fail-on-nonfinite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Abort immediately with epoch/batch diagnostics when a loss or tracked "
+            "state becomes NaN/Inf. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=None,
+        help="Maximum test examples per evaluation; otherwise use preset default.",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=None,
+        help=(
+            "Evaluate every N co-training epochs. 0 means final epoch only. "
+            "If omitted, use preset default."
+        ),
+    )
+    parser.add_argument(
+        "--arms",
+        type=parse_arms_arg,
+        default=parse_arms_arg("terminal_kl,norm"),
+        metavar="ARM[,ARM...]",
+        help=(
+            "Ordered nonrepeating subset of branches to run. Valid examples: "
+            "--arms terminal_kl, --arms norm, or --arms norm,terminal_kl. "
+            "Default: terminal_kl,norm."
+        ),
+    )
+    parser.add_argument(
+        "--full-golden",
+        action="store_true",
+        help=(
+            "Legacy reporting switch: force 800+100 schedule, full evaluation, "
+            "and visualization density. Architecture still follows --model-preset. "
+            "Control/oracle diagnostics remain disabled."
+        ),
+    )
+    args = parser.parse_args()
+    arms = tuple(args.arms)
+
+    preset_name, preset = resolve_model_preset(args.dataset, args.model_preset)
+
+    epochs = int(args.epochs if args.epochs is not None else preset["epochs"])
+    refine_epochs = int(
+        args.refine_epochs if args.refine_epochs is not None else preset["refine_epochs"]
+    )
+    base_lr_vae = float(args.lr_vae if args.lr_vae is not None else preset["lr_vae"])
+    base_lr_ldm = float(args.lr_ldm if args.lr_ldm is not None else preset["lr_ldm"])
+    lr_refine = float(
+        args.lr_refine if args.lr_refine is not None else preset["lr_refine"]
+    )
+    eval_samples = int(
+        args.eval_samples if args.eval_samples is not None else preset["eval_samples"]
+    )
+    eval_every = int(
+        args.eval_every if args.eval_every is not None else preset["eval_every"]
+    )
+    T_terminal = float(
+        args.T_terminal
+        if args.T_terminal is not None
+        else preset.get("t_max", 1.5)
+    )
+    csem_w = float(args.csem_w)
+    canonical_lr_scale = (
+        float(args.canonical_lr_scale)
+        if args.score_time_weighting == "canonical"
+        else 1.0
+    )
+    lr_vae = base_lr_vae * canonical_lr_scale
+    lr_ldm = base_lr_ldm * canonical_lr_scale
+    lr_encoder = (
+        float(args.lr_encoder) if args.lr_encoder is not None else lr_vae
+    )
+    lr_decoder = (
+        float(args.lr_decoder) if args.lr_decoder is not None else lr_vae
+    )
+    lr_score_head = (
+        float(args.lr_score_head)
+        if args.lr_score_head is not None
+        else (lr_ldm / csem_w if csem_w > 0.0 else 0.0)
+    )
+    lr_tracking_head = (
+        float(args.lr_tracking_head)
+        if args.lr_tracking_head is not None
+        else lr_ldm
+    )
+    cfg_strength = float(args.cfg_strength)
+    use_bespoke_fid_classifier = resolve_bespoke_fid_classifier(
+        args.dataset, args.bespoke_fid_classifier
+    )
+    t_min = float(preset.get("t_min", 3e-5))
+    master_results_dir = (
+        args.master_results_dir
+        if args.master_results_dir is not None
+        else f"run_results_{args.dataset.lower()}_{'_then_'.join(arms)}"
+    )
+
+    if epochs < 1:
+        raise ValueError("--epochs must be >= 1")
+    if args.lr_schedule_epochs is not None and args.lr_schedule_epochs < 1:
+        raise ValueError("--lr-schedule-epochs must be >= 1")
+    if refine_epochs < 0:
+        raise ValueError("--refine-epochs must be >= 0")
+    if eval_samples < 2:
+        raise ValueError("--eval-samples must be >= 2")
+    if eval_every < 0:
+        raise ValueError("--eval-every must be >= 0")
+    if not math.isfinite(T_terminal) or T_terminal <= t_min:
+        raise ValueError(
+            "--T-terminal must be finite and greater than the preset t_min; "
+            f"got T_terminal={T_terminal}, t_min={t_min}"
+        )
+    if not math.isfinite(cfg_strength) or cfg_strength < 0.0:
+        raise ValueError(
+            f"--cfg-strength must be finite and nonnegative, got {cfg_strength}"
+        )
+    if not math.isfinite(csem_w) or csem_w < 0.0:
+        raise ValueError(
+            f"--csem-w must be finite and nonnegative, got {csem_w}"
+        )
+    if not math.isfinite(args.terminal_kl_w) or args.terminal_kl_w < 0.0:
+        raise ValueError(
+            "--terminal-kl-w must be finite and nonnegative, got "
+            f"{args.terminal_kl_w}"
+        )
+    if (
+        not math.isfinite(canonical_lr_scale)
+        or canonical_lr_scale <= 0.0
+    ):
+        raise ValueError("--canonical-lr-scale must be finite and > 0")
+    if (
+        lr_vae <= 0
+        or lr_encoder <= 0
+        or lr_decoder <= 0
+        or lr_ldm <= 0
+        or lr_refine <= 0
+    ):
+        raise ValueError("Resolved learning rates must all be > 0")
+    if not math.isfinite(args.lr_disc) or args.lr_disc <= 0.0:
+        raise ValueError("--lr-disc must be finite and > 0")
+    if not math.isfinite(args.gan_w) or args.gan_w < 0.0:
+        raise ValueError("--gan-w must be finite and >= 0")
+    if args.disc_start_epoch < 1:
+        raise ValueError("--disc-start-epoch must be >= 1")
+    if not math.isfinite(lr_score_head) or lr_score_head < 0.0:
+        raise ValueError("Resolved --lr-score-head must be finite and >= 0")
+    if csem_w > 0.0 and lr_score_head <= 0.0:
+        raise ValueError("A positive --csem-w requires a positive score-head LR")
+    if not math.isfinite(lr_tracking_head) or lr_tracking_head <= 0.0:
+        raise ValueError("Resolved --lr-tracking-head must be finite and > 0")
+    if not math.isfinite(args.adam_beta2) or not (0.0 < args.adam_beta2 < 1.0):
+        raise ValueError("--adam-beta2 must be finite and strictly between 0 and 1")
+    if args.vae_grad_clip <= 0.0 or not math.isfinite(args.vae_grad_clip):
+        raise ValueError("--vae-grad-clip must be finite and > 0")
+    if args.score_grad_clip <= 0.0 or not math.isfinite(args.score_grad_clip):
+        raise ValueError("--score-grad-clip must be finite and > 0")
+    if args.disc_grad_clip <= 0.0 or not math.isfinite(args.disc_grad_clip):
+        raise ValueError("--disc-grad-clip must be finite and > 0")
+    if args.encoder_score_warmup_epochs < 0:
+        raise ValueError("--encoder-score-warmup-epochs must be >= 0")
+    if args.csem_ramp_epochs < 0:
+        raise ValueError("--csem-ramp-epochs must be >= 0")
+    if args.score_tracking_steps < 0:
+        raise ValueError("--score-tracking-steps must be >= 0")
+    if args.score_tracking_every < 1:
+        raise ValueError("--score-tracking-every must be >= 1")
+    if args.grad_diagnostics_every < 0:
+        raise ValueError("--grad-diagnostics-every must be >= 0")
+    if args.time_diagnostic_bins < 1:
+        raise ValueError("--time-diagnostic-bins must be >= 1")
+    if (
+        not math.isfinite(args.logvar_min)
+        or not math.isfinite(args.logvar_max)
+        or args.logvar_min >= args.logvar_max
+    ):
+        raise ValueError("Require finite --logvar-min < --logvar-max")
+
+    # Backend-only acceleration: model, losses, optimizer, and data are unchanged.
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    # For small targets, by default let the cosine schedule span the requested run.
+    # CIFAR keeps the canonical golden 800-epoch scheduler horizon.
+    preset_lr_horizon = preset.get("lr_schedule_epochs", None)
+    lr_schedule_epochs = (
+        int(args.lr_schedule_epochs)
+        if args.lr_schedule_epochs is not None
+        else (
+            int(preset_lr_horizon)
+            if preset_lr_horizon is not None
+            else int(epochs)
+        )
+    )
+
+    # === SHARED CONFIG (same scientific objective in both arms) ===
+    cfg_shared = {
+        # --- Dataset / capacity preset ---
+        "dataset": args.dataset,
+        "batch_size": int(preset["batch_size"]),
+        "num_workers": 2,
+
+        # --- Model Architecture ---
+        "latent_channels": int(preset["latent_channels"]),
+        "cond_emb_dim": int(preset["cond_emb_dim"]),
+
+        # --- DiT / Transformer settings ---
+        "dit_patch_size": int(preset["dit_patch_size"]),
+        "dit_hidden_dim": int(preset["dit_hidden_dim"]),
+        "dit_depth": int(preset["dit_depth"]),
+        "dit_num_heads": int(preset["dit_num_heads"]),
+        "dit_mlp_ratio": float(preset["dit_mlp_ratio"]),
+        "dit_dropout": float(preset["dit_dropout"]),
+
+        # --- Optimizer ---
+        "adam_beta2": float(args.adam_beta2),
+        "vae_grad_clip": float(args.vae_grad_clip),
+        "score_grad_clip": float(args.score_grad_clip),
+        "disc_grad_clip": float(args.disc_grad_clip),
+        "lr_tracking_head": lr_tracking_head,
+        "encoder_score_warmup_epochs": int(args.encoder_score_warmup_epochs),
+        "encoder_warmup_mode": str(args.encoder_warmup_mode),
+        "csem_ramp_epochs": int(args.csem_ramp_epochs),
+        "score_tracking_steps": int(args.score_tracking_steps),
+        "score_tracking_every": int(args.score_tracking_every),
+        "grad_diagnostics_every": int(args.grad_diagnostics_every),
+        "time_diagnostic_bins": int(args.time_diagnostic_bins),
+        "fail_on_nonfinite": bool(args.fail_on_nonfinite),
+
+        # --- CSEM score loss ---
+        "cosine_w": 0.0,
+        "aux_head_w": 0.0025,
+        # Shared coefficient on the joint CSEM term in both comparison arms.
+        "score_w_vae": csem_w,
+
+        # --- Encoder architecture ---
+        "aux_d": 0,
+        "base_ch": int(preset["base_ch"]),
+        "num_res_blocks": int(preset["num_res_blocks"]),
+        "decoder_attn_half": bool(preset["decoder_attn_half"]),
+        "latent_proj_depth": int(preset["latent_proj_depth"]),
+        "encoder_attn_half": bool(preset["encoder_attn_half"]),
+        "decoder_extra_block": bool(preset["decoder_extra_block"]),
+        "conv3x3_proj": bool(preset["conv3x3_proj"]),
+        "use_tanh_out": bool(preset["use_tanh_out"]),
+        "clamp_logvar": bool(preset["clamp_logvar"]),
+        "attn_zero_init": bool(preset["attn_zero_init"]),
+        "logvar_min": float(args.logvar_min),
+        "logvar_max": float(args.logvar_max),
+
+        # --- Learning Rates ---
+        "base_lr_vae": base_lr_vae,
+        "base_lr_ldm": base_lr_ldm,
+        "canonical_lr_scale": canonical_lr_scale,
+        "lr_vae": lr_vae,
+        "lr_encoder": lr_encoder,
+        "lr_decoder": lr_decoder,
+        "lr_ldm": lr_ldm,
+        "lr_score_head": lr_score_head,
+
+        # --- Arm-specific KL weight and ordinary image-space objectives ---
+        # The scale-normalized arm keeps this at zero; the terminal arm
+        # overrides it below with --terminal-kl-w.
+        "kl_w": 0.0,
+        "perc_w": 0.85,
+
+        # --- PatchGAN discriminator ---
+        "gan_w": float(args.gan_w),
+        "disc_start_epoch": int(args.disc_start_epoch),
+        "disc_ndf": 64,
+        "disc_n_layers": 2,
+        "lr_disc": float(args.lr_disc),
+
+        # --- Diffusion Settings ---
+        # Dataset preset can choose the historically validated forward horizon;
+        # both scale-anchor arms always share the exact same schedule.
+        "time_schedule": str(preset.get("time_schedule", "log_t")),
+        "use_ddim_times": bool(preset.get("use_ddim_times", True)),
+        "t_min": t_min,
+        # Single source of truth for the terminal-KL endpoint. Legacy schedule
+        # and sampler code read t_max; validation above/below forbids divergence.
+        "T_terminal": T_terminal,
+        "t_max": T_terminal,
+        "num_train_timesteps": int(preset.get("num_train_timesteps", 1000)),
+        "score_time_weighting": args.score_time_weighting,
+        "train_on_mu": False,
+
+        # --- Cosine VP schedule settings (inactive for log_t) ---
+        "cosine_t_min": 2e-4,
+        "cosine_t_max": 0.9999,
+        "cosine_s": 0.008,
+
+        # --- CFG ---
+        "cfg_label_dropout": 0.1,
+        "cfg_eval_scale": cfg_strength,
+        "eval_class_labels": [],
+
+        # --- Evaluation & Logging ---
+        # Directly useful metrics retained; expensive auxiliary oracle/control
+        # diagnostics and mechanism-only per-batch diagnostics remain off.
+        "use_fixed_eval_banks": True,
+        "sw2_n_projections": 1000,
+        "ema_decay": 0.9997,
+        "eval_max_samples": eval_samples,
+        "eval_lsi_gap_samples": min(2500, eval_samples),
+        "eval_lsi_gap_time_points": 50,
+        "eval_oracle": False,
+        "kid_num_subsets": 100,
+        "kid_subset_size": min(1000, eval_samples),
+        "use_bespoke_fid_classifier": use_bespoke_fid_classifier,
+        "generate_visualizations": False,
+        "mechanism_diagnostics": False,
+
+        # --- Misc ---
+        "seed": int(args.seed),
+        "load_from_checkpoint": False,
+        "ckpt_dir": "checkpoints",
+
+        # --- Comparison Output ---
+        "master_results_dir": master_results_dir,
+        "overwrite_results": bool(args.overwrite_results),
+        "model_preset": preset_name,
+    }
+
+    # === SCALE-NORMALIZED BASELINE ===
+    cfg_norm = cfg_shared.copy()
+    cfg_norm.update({
+        "epochs_vae": epochs,
+        "epochs_refine": refine_epochs,
+        "lr_schedule_epochs": lr_schedule_epochs,
+        "lr_refine": lr_refine,
+
+        "factored_head": True,
+        "freeze_score_in_cotrain": False,
+        "cotrain_head": "lsi",
+
+        # Pure scale-normalization treatment: GroupNorm is the only active
+        # scale-fixing mechanism in this arm. kl_reg_type remains "normal"
+        # solely so the unweighted KL value can still be logged diagnostically.
+        "use_latent_norm": True,
+        "use_cond_encoder": False,
+        "kl_reg_type": "normal",
+        "kl_w": 0.0,
+        "stiff_w": 0.0,
+        "score_w": 1.0,
+        "train_tracking_head": False,
+
+        # Time-dependent decoder
+        "time_cond_decoder": True,
+        "dec_time_emb_dim": 128,
+        "decode_time": preset.get("decode_time", None),
+
+        "eval_freq_cotrain": eval_every if eval_every > 0 else epochs,
+        "eval_freq_refine": (
+            eval_every if eval_every > 0 else max(1, refine_epochs)
+        ),
+    })
+
+    if args.full_golden:
+        cfg_norm.update({
+            "epochs_vae": 800,
+            "epochs_refine": 100,
+            "lr_schedule_epochs": 800,
+            "lr_refine": 1.5e-5,
+            "eval_freq_cotrain": 100,
+            "eval_freq_refine": 100,
+            "eval_max_samples": None,
+            "eval_lsi_gap_samples": 2500,
+            "eval_lsi_gap_time_points": 50,
+            "eval_oracle": False,
+            "sw2_n_projections": 1000,
+            "kid_num_subsets": 100,
+            "kid_subset_size": 1000,
+            "generate_visualizations": True,
+            "mechanism_diagnostics": False,
+            "train_tracking_head": False,
+        })
+
+    # === TERMINAL-T KL ARM ===
+    # Same network/preset/objective as baseline except the representation-scale
+    # treatment itself:
+    #   - no GroupNorm on encoder mean
+    #   - terminal component KL K_T is active; baseline KL has zero weight
+    #   - no stiffness penalty
+    cfg_terminal = cfg_norm.copy()
+    cfg_terminal.update({
+        "use_latent_norm": False,
+        "kl_reg_type": "terminal",
+        "kl_w": float(args.terminal_kl_w),
+        "stiff_w": 0.0,
+    })
+
+    cfg_norm["arms"] = arms
+    cfg_terminal["arms"] = arms
+
+    print("=" * 78)
+    print("=== CSEM: SELECTED SCALE-ANCHOR ARMS ===")
+    print("=" * 78)
+    print(f"Dataset: {args.dataset}")
+    print(f"Resolved preset: {preset_name}")
+    print(
+        f"Architecture: latent_ch={cfg_norm['latent_channels']} | "
+        f"VAE base_ch={cfg_norm['base_ch']} | "
+        f"DiT={cfg_norm['dit_hidden_dim']}x{cfg_norm['dit_depth']} "
+        f"heads={cfg_norm['dit_num_heads']} | batch={cfg_norm['batch_size']}"
+    )
+    print(
+        f"Training: arms={','.join(arms)} | "
+        f"cotrain={cfg_norm['epochs_vae']} | refine={cfg_norm['epochs_refine']} | "
+        f"LR horizon={cfg_norm['lr_schedule_epochs']} | "
+        f"eval_every={cfg_norm['eval_freq_cotrain']} | "
+        f"eval_samples={cfg_norm.get('eval_max_samples')}"
+    )
+    print(
+        f"LRs: VAE base/effective={cfg_norm['base_lr_vae']:.3g}/"
+        f"{cfg_norm['lr_vae']:.3g} | encoder/decoder="
+        f"{cfg_norm['lr_encoder']:.3g}/{cfg_norm['lr_decoder']:.3g} | "
+        f"LDM base/effective={cfg_norm['base_lr_ldm']:.3g}/"
+        f"{cfg_norm['lr_ldm']:.3g} | "
+        f"joint score param-group={cfg_norm['lr_score_head']:.3g} | "
+        f"control/tracking head={cfg_norm['lr_tracking_head']:.3g} | "
+        f"canonical scale={cfg_norm['canonical_lr_scale']:.6g} | "
+        f"Adam beta2={cfg_norm['adam_beta2']:.4g} | "
+        f"refine={cfg_norm['lr_refine']:.3g} | "
+        f"disc={cfg_norm['lr_disc']:.3g}"
+    )
+    print(
+        f"Diffusion: {cfg_norm['time_schedule']} | "
+        f"t_min={cfg_norm['t_min']:.3g} | "
+        f"T_terminal=t_max={cfg_norm['T_terminal']:.3g} | "
+        f"decode_time={cfg_norm.get('decode_time')}"
+    )
+    print(f"Score time weighting: {cfg_norm['score_time_weighting']}")
+    print(
+        "Stability: "
+        f"VAE/score/disc clips={cfg_norm['vae_grad_clip']:g}/"
+        f"{cfg_norm['score_grad_clip']:g}/"
+        f"{cfg_norm['disc_grad_clip']:g} | "
+        f"encoder warmup={cfg_norm['encoder_score_warmup_epochs']} "
+        f"({cfg_norm['encoder_warmup_mode']}) | "
+        f"encoder CSEM-grad ramp={cfg_norm['csem_ramp_epochs']} | "
+        f"same-head tracking={cfg_norm['score_tracking_steps']} every "
+        f"{cfg_norm['score_tracking_every']} batch(es) | "
+        f"grad diagnostics every={cfg_norm['grad_diagnostics_every'] or 'off'} | "
+        f"logvar=[{cfg_norm['logvar_min']:g}, {cfg_norm['logvar_max']:g}] | "
+        f"GAN start={cfg_norm['disc_start_epoch']}"
+    )
+    print(f"Seed: {cfg_norm['seed']} (reset identically for every selected arm)")
+    print(
+        f"Objective weights: csem_w={cfg_norm['score_w_vae']:g} | "
+        f"terminal_kl_w={cfg_terminal['kl_w']:g}"
+    )
+    if (
+        cfg_norm["score_time_weighting"] == "canonical"
+        and not math.isclose(
+            float(cfg_norm["score_w_vae"]),
+            float(cfg_terminal["kl_w"]),
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+    ):
+        print(
+            "NOTE: canonical selects the theorem's physical time measure, but "
+            "the exact CSEM + K_T coefficient identity also requires "
+            "csem_w == terminal_kl_w; resolved values are "
+            f"{cfg_norm['score_w_vae']:g} and {cfg_terminal['kl_w']:g}."
+        )
+    print(f"CFG evaluation strength: {cfg_norm['cfg_eval_scale']:g}")
+    print(
+        "FID/KID feature extractor: "
+        + (
+            "bespoke target classifier"
+            if cfg_norm["use_bespoke_fid_classifier"]
+            else "ImageNet Inception"
+        )
+    )
+    print("Auxiliary control/oracle diagnostics: OFF")
+    print(
+        "Per-epoch weight/time-bin/gradient/clip/K_T/latent-scale diagnostics: ON"
+    )
+
+    if "terminal_kl" in arms:
+        print("\nSelected arm -- terminal-time KL:")
+        print(f"  use_latent_norm = {cfg_terminal['use_latent_norm']}")
+        print(f"  kl_reg_type     = {cfg_terminal['kl_reg_type']}")
+        print(f"  kl_w            = {cfg_terminal['kl_w']}")
+        print(f"  csem_w          = {cfg_terminal['score_w_vae']}  (shared)")
+        print(f"  stiff_w         = {cfg_terminal['stiff_w']}  (disabled)")
+        print(
+            f"  terminal T      = T_terminal = t_max = "
+            f"{cfg_terminal['T_terminal']}"
+        )
+
+    if "norm" in arms:
+        print("\nSelected arm -- scale normalization only:")
+        print(f"  use_latent_norm = {cfg_norm['use_latent_norm']}")
+        print(f"  kl_reg_type     = {cfg_norm['kl_reg_type']}")
+        print(f"  kl_w            = {cfg_norm['kl_w']}")
+        print(f"  csem_w          = {cfg_norm['score_w_vae']}  (shared)")
+        print(f"  stiff_w         = {cfg_norm['stiff_w']}")
+    print("=" * 78)
+
+    results = run_scale_anchor_comparison(cfg_norm, cfg_terminal, arms)
+
+    print("\n" + "=" * 78)
+    print("FINAL SUMMARY")
+    print("=" * 78)
+    print(f"Results directory: {results['master_results_dir']}")
+    print(f"Zipped results: {results['zip_path']}")
+
+
+if __name__ == "__main__":
+    main() 
