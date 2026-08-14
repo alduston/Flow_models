@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Navier-Stokes inverse-problem GAD versus AGAD benchmark.
+"""Allen--Cahn inverse-problem LFGI-GAD versus MALA benchmark.
 
-Runs the same controlled two-arm comparison as the Darcy and Allen--Cahn
-experiments using GN-LFGI only.  GAD performs a transport-only chain, while
-AGAD inserts a completed-score probability-flow ratio node after every
-transport node.  Both arms use the same number of transport iterations and
-report iterations 1 and 3.
+Runs the three paper-facing rows requested for the inverse-problem comparison:
+LFGI-GAD after one and three transport rounds, plus an exact-score MALA
+baseline.  The hidden GAD round 2 is executed because it is part of the
+round-3 path, but it is excluded from tables and plots.  MALA uses parallel
+prior-initialized chains, warmup-only dual-averaging adaptation, a frozen
+production kernel, and post-warmup draws.
 
 Useful overrides:
 
     export IP_ITER_N_REF=2000
     export IP_ITER_ROUNDS=3
     export IP_ITER_TRANSPORT_STEPS=200
-    export IP_ITER_RATIO_STEPS=200
-    export IP_ITER_DENSITY_STEPS=32
+    export IP_MALA_N_CHAINS=32
+    export IP_MALA_WARMUP=217
+    export IP_MALA_THIN=1
+    export IP_MALA_DT=1e-4
 """
 import gc
 import os
+import random
 import sys
 from collections import OrderedDict
 
@@ -25,8 +29,9 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.20")
 
 try:
     THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:  # notebook / pasted-cell fallback
+except NameError:  # notebook / Colab cell execution
     THIS_DIR = os.getcwd()
+
 REPO_ROOT = os.path.dirname(THIS_DIR)
 if THIS_DIR not in sys.path:
     sys.path.insert(0, THIS_DIR)
@@ -39,6 +44,31 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from jax import lax
+from scipy.spatial.distance import cdist
+
+from gad_sampling import (
+    GaussianPrior,
+    compute_field_summary_metrics,
+    compute_heldout_predictive_metrics,
+    compute_latent_metrics,
+    configure_sampling,
+    get_valid_samples,
+    init_run_results,
+    make_physics_likelihood,
+    make_posterior_score_fn,
+    plot_field_reconstruction_grid,
+    plot_mean_ess_logs,
+    plot_pca_histograms,
+    resolve_plot_normalizer,
+    rmse_array,
+    run_standard_sampler_pipeline,
+    save_reproducibility_log,
+    save_results_tables,
+    summarize_sampler_run,
+    zip_run_results_dir,
+)
+
 
 # ==========================================
 # Dashboard PDF utilities
@@ -55,28 +85,6 @@ import textwrap
 from datetime import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.image as mpimg
-
-from sampling import (
-    GaussianPrior,
-    compute_heldout_predictive_metrics,
-    compute_latent_metrics,
-    configure_sampling,
-    get_valid_samples,
-    init_run_results,
-    make_physics_likelihood,
-    make_posterior_score_fn,
-    pearson_corr_array,
-    plot_field_reconstruction_grid,
-    plot_mean_ess_logs,
-    plot_pca_histograms,
-    resolve_plot_normalizer,
-    rmse_array,
-    run_standard_sampler_pipeline,
-    save_reproducibility_log,
-    save_results_tables,
-    summarize_sampler_run,
-    zip_run_results_dir,
-)
 
 SAVE_DASHBOARD_PDF = True
 DASHBOARD_SHOW_FIGURES = True
@@ -345,8 +353,20 @@ class DashboardPDF:
             "pde_gn_hessian_evals": "PDE GN Hess evals",
             "pde_solve_count": "PDE solves",
             "runtime_seconds": "runtime (s)",
+            "local_runtime_seconds": "local runtime (s)",
             "reference_method": "reference",
             "N_ref": "N ref",
+            "path_depth": "chain depth",
+            "mala_n_chains": "MALA chains",
+            "mala_warmup": "MALA warmup",
+            "mala_thin": "MALA thin",
+            "mala_draws_per_chain": "draws / chain",
+            "mala_dt_initial": "MALA dt init",
+            "mala_dt_final": "MALA dt final",
+            "mala_acceptance_rate": "MALA accept",
+            "mala_rhat_median": "Rhat median",
+            "mala_rhat_max": "Rhat max",
+            "mala_unique_fraction": "unique frac",
         }
         return df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
@@ -355,7 +375,7 @@ class DashboardPDF:
 
         The metrics page keeps the saved *_metrics.csv / tables.tex layout. The
         run-info page preserves the saved *_runinfo.csv contents, but splits the
-        many accounting columns into three normal table blocks on one page so it
+        many accounting columns into four normal table blocks on one page so it
         remains legible instead of becoming a tiny one-line wide table.
         """
         if not self.enabled:
@@ -410,7 +430,7 @@ class DashboardPDF:
             return [c for c in cols if c in runinfo.columns]
 
         config_cols = cols_present([
-            "method label", "sampler", "weights", "N ref", "steps",
+            "method label", "sampler", "weights", "N ref", "steps", "chain depth",
             "reference", "runtime (s)",
         ])
         score_cols = cols_present([
@@ -420,6 +440,15 @@ class DashboardPDF:
         budget_cols = cols_present([
             "method label", "PDE logL evals", "PDE score evals", "PDE GN Hess evals", "PDE solves",
         ])
+        mala_cols = cols_present([
+            "method label", "MALA chains", "MALA warmup", "MALA thin", "draws / chain",
+            "MALA dt init", "MALA dt final", "MALA accept", "Rhat median", "Rhat max",
+            "unique frac",
+        ])
+        if mala_cols and "sampler" in runinfo.columns:
+            mala_rows = runinfo.loc[runinfo["sampler"].astype(str).str.upper() == "MALA", mala_cols]
+        else:
+            mala_rows = runinfo[mala_cols] if mala_cols else pd.DataFrame()
 
         # Normalized column widths for each block. First column gets label width;
         # remaining columns share the rest.
@@ -431,29 +460,36 @@ class DashboardPDF:
         if config_cols:
             self._add_table_block(
                 ax, "Sampler configuration and runtime", runinfo[config_cols],
-                bbox=[0.035, 0.635, 0.93, 0.265], col_widths=widths(len(config_cols), first=0.22),
-                header_fontsize=8.8, body_fontsize=8.7,
+                bbox=[0.035, 0.670, 0.93, 0.225], col_widths=widths(len(config_cols), first=0.22),
+                header_fontsize=8.2, body_fontsize=8.2,
             )
         if score_cols:
             self._add_table_block(
                 ax, "Score-norm diagnostics", runinfo[score_cols],
-                bbox=[0.035, 0.355, 0.93, 0.185], col_widths=widths(len(score_cols), first=0.30),
-                header_fontsize=9.2, body_fontsize=9.0,
+                bbox=[0.035, 0.480, 0.93, 0.115], col_widths=widths(len(score_cols), first=0.30),
+                header_fontsize=8.8, body_fontsize=8.7,
+            )
+        if not mala_rows.empty:
+            self._add_table_block(
+                ax, "MALA convergence diagnostics", mala_rows,
+                bbox=[0.035, 0.275, 0.93, 0.125], col_widths=widths(len(mala_cols), first=0.20),
+                header_fontsize=7.6, body_fontsize=8.2,
             )
         if budget_cols:
             self._add_table_block(
                 ax, "PDE evaluation budget", runinfo[budget_cols],
-                bbox=[0.035, 0.115, 0.93, 0.165], col_widths=widths(len(budget_cols), first=0.30),
-                header_fontsize=9.2, body_fontsize=9.0,
+                bbox=[0.035, 0.085, 0.93, 0.115], col_widths=widths(len(budget_cols), first=0.30),
+                header_fontsize=8.8, body_fontsize=8.7,
             )
 
         # If future runinfo files add columns not covered above, surface them in a small note
         # instead of silently dropping them.
-        used = set(config_cols + score_cols + budget_cols + ["target", "label"])
+        used = set(config_cols + score_cols + budget_cols + mala_cols + ["target", "label"])
         extra = [c for c in runinfo.columns if c not in used]
         if extra:
-            ax.text(0.035, 0.055, "Additional run-info columns: " + ", ".join(extra),
-                    fontsize=8.0, alpha=0.75, ha="left", va="bottom")
+            extra_text = ", ".join(extra[:8]) + (f" (+{len(extra) - 8} more in CSV)" if len(extra) > 8 else "")
+            ax.text(0.035, 0.025, "Additional run-info columns: " + extra_text,
+                    fontsize=7.0, alpha=0.75, ha="left", va="bottom")
         self.pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
         self.table_pages += 1
@@ -488,7 +524,7 @@ class DashboardPDF:
     def add_run_results_png_figures(self, run_results_dir):
         """Append all saved run-results PNG figures, sorted by figure number.
 
-        This is intentionally based on the files saved by sampling.py's patched
+        This is intentionally based on the files saved by gad_sampling.py's patched
         plt.show() hook, so dashboard coverage matches the normal run-results
         directory exactly: ESS, PCA, field reconstructions, wavefields, boundary
         traces, curvature spectra, and any future diagnostics.
@@ -539,210 +575,186 @@ def dashboard_copy_into_run_dir(dashboard_path, results_df_path=None):
         shutil.copy2(dashboard_path, dest)
     return dest
 
-# ==========================================
-# Config generator
-# ==========================================
-N = 32
-# Moderately harder inverse-problem setting: fewer and mildly anisotropic
-# sensors, a somewhat larger latent state, and a rougher anisotropic prior.
-# This is intentionally harder than the original uploaded script but avoids
-# the previous over-hardened regime where CE-HLSI bootstrap references could
-# collapse to non-finite samples.
-num_observation = 80
-num_holdout_observation = 40
-num_truncated_series = 40
-num_modes_available = 120
-seed = 42
-prior_length_scale_x = 0.075
-prior_length_scale_y = 0.13
-INITIAL_VORTICITY_SCALE = 1.20
 
+
+# ==========================================
+# 0. KL basis generation
+# ==========================================
 os.makedirs('data', exist_ok=True)
-rng = np.random.default_rng(seed)
 
+N = 32
+x = np.linspace(0.0, 1.0, N, endpoint=False)
+X, Y = np.meshgrid(x, x, indexing='ij')
+coords = np.column_stack([X.ravel(), Y.ravel()])
 
-def build_anisotropic_periodic_fourier_basis(N, q_max=120, length_scale_x=0.075, length_scale_y=0.13):
-    x = np.linspace(0.0, 1.0, N, endpoint=False)
-    X, Y = np.meshgrid(x, x, indexing='ij')
-    freq_pairs = []
-    kmax = int(np.ceil(np.sqrt(q_max))) + 8
-    for kx in range(0, kmax + 1):
-        for ky in range(-kmax, kmax + 1):
-            if kx == 0 and ky <= 0:
-                continue
-            freq_pairs.append((kx, ky))
-    freq_pairs.sort(key=lambda kk: (kk[0] ** 2 + kk[1] ** 2, abs(kk[0]) + abs(kk[1]), kk[0], kk[1]))
-    cols, meta = [], []
-    for kx, ky in freq_pairs:
-        phase = 2.0 * np.pi * (kx * X + ky * Y)
-        k2 = float(kx * kx + ky * ky)
-        # Directional spectral envelope: high-kx modes survive much longer than high-ky modes.
-        # This creates an anisotropic rough/smooth split, hence a more ill-conditioned posterior.
-        amp = np.exp(-0.5 * ((2.0 * np.pi * length_scale_x * kx) ** 2 + (2.0 * np.pi * length_scale_y * ky) ** 2))
-        cos_mode = amp * np.cos(phase)
-        cos_mode = cos_mode - cos_mode.mean()
-        cos_norm = np.linalg.norm(cos_mode.ravel())
-        if cos_norm > 1e-12:
-            cols.append((amp * cos_mode / cos_norm).ravel())
-            meta.append((kx, ky, 'cos', amp))
-            if len(cols) >= q_max:
-                break
-        sin_mode = amp * np.sin(phase)
-        sin_mode = sin_mode - sin_mode.mean()
-        sin_norm = np.linalg.norm(sin_mode.ravel())
-        if sin_norm > 1e-12:
-            cols.append((amp * sin_mode / sin_norm).ravel())
-            meta.append((kx, ky, 'sin', amp))
-            if len(cols) >= q_max:
-                break
-    return np.column_stack(cols[:q_max]).astype(np.float64), meta[:q_max]
+ELL = 0.1
+SIGMA_PRIOR = 1.0
+q_max = 100
 
+dists = cdist(coords, coords)
+C = SIGMA_PRIOR ** 2 * np.exp(-dists / ELL)
+eigvals, eigvecs = np.linalg.eigh(C)
+idx = np.argsort(eigvals)[::-1]
+eigvals = eigvals[idx]
+eigvecs = eigvecs[:, idx]
+Basis_Modes = eigvecs[:, :q_max] * np.sqrt(eigvals[:q_max])
+np.savetxt('data/AllenCahn_Basis_Modes.csv', Basis_Modes, delimiter=',')
 
-full_basis, basis_meta = build_anisotropic_periodic_fourier_basis(
-    N=N,
-    q_max=num_modes_available,
-    length_scale_x=prior_length_scale_x,
-    length_scale_y=prior_length_scale_y,
+# ==========================================
+# 1. Configuration / data files
+# ==========================================
+num_observation = 40
+num_holdout_observation = 40
+num_truncated_series = 32
+seed = 42
+
+dimension_of_PoI = N * N
+num_modes_available = Basis_Modes.shape[1]
+basis_truncated = Basis_Modes[:, :num_truncated_series]
+
+key = jax.random.PRNGKey(seed)
+obs_indices_train = np.array(
+    jax.random.choice(key, jnp.arange(dimension_of_PoI), shape=(num_observation,), replace=False)
 )
-basis_truncated = full_basis[:, :num_truncated_series]
-basis_modes_path = 'data/NavierStokes_Basis_Modes_generated.csv'
-pd.DataFrame(full_basis).to_csv(basis_modes_path, index=False, header=False)
-pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
-# Mildly anisotropic sensor geometry.  Compared with the original random
-# 120-sensor problem, this keeps fewer sensors and some directional structure;
-# compared with the previous hard version, it restores enough spatial coverage
-# that bootstrap reference banks remain numerically sane.
-row_grid_np, col_grid_np = np.indices((N, N))
-train_mask = (
-    np.isin(col_grid_np, [int(0.55 * N), int(0.70 * N), int(0.85 * N)])
-    | ((row_grid_np == int(0.25 * N)) & (col_grid_np >= int(0.25 * N)))
-    | ((row_grid_np == int(0.58 * N)) & (col_grid_np <= int(0.80 * N)))
+remaining_indices = np.setdiff1d(np.arange(dimension_of_PoI), obs_indices_train)
+key_holdout = jax.random.PRNGKey(seed + 1)
+obs_indices_holdout = np.array(
+    jax.random.choice(key_holdout, jnp.array(remaining_indices), shape=(num_holdout_observation,), replace=False)
 )
-holdout_mask = (
-    np.isin(col_grid_np, [int(0.18 * N), int(0.38 * N), int(0.62 * N)])
-    | ((row_grid_np == int(0.75 * N)) & (col_grid_np <= int(0.75 * N)))
-)
-train_candidates = np.flatnonzero(train_mask.ravel())
-holdout_candidates = np.setdiff1d(np.flatnonzero(holdout_mask.ravel()), train_candidates)
-if train_candidates.size < num_observation:
-    raise ValueError(f"Need at least {num_observation} training candidates, found {train_candidates.size}.")
-if holdout_candidates.size < num_holdout_observation:
-    raise ValueError(f"Need at least {num_holdout_observation} holdout candidates, found {holdout_candidates.size}.")
-obs_indices_train = rng.choice(train_candidates, size=(num_observation,), replace=False)
-obs_indices_holdout = rng.choice(holdout_candidates, size=(num_holdout_observation,), replace=False)
 obs_indices = obs_indices_train
+
+pd.DataFrame(basis_truncated).to_csv('data/Basis.csv', index=False, header=False)
 pd.DataFrame(obs_indices_train).to_csv('data/obs_locations.csv', index=False, header=False)
 
 # ==========================================
-# Physics
+# 2. Physics: periodic Allen–Cahn dynamics
 # ==========================================
 jax.config.update("jax_enable_x64", True)
-dimension_of_PoI = N ** 2
-# Slightly lower viscosity and a slightly longer horizon than the original
-# make the forward map harder, but not so chaotic/stiff that CE-HLSI
-# bootstrapped references collapse.
-nu = 7.5e-4
-delta_t = 0.05
-T_end = 10.5
-num_time_steps = int(round(T_end / delta_t))
 
-Basis = jnp.array(basis_truncated)
-obs_locations = jnp.array(obs_indices, dtype=int)
-holdout_locations = jnp.array(obs_indices_holdout, dtype=int)
+Basis = jnp.array(basis_truncated, dtype=jnp.float64)
+obs_locations_train = jnp.array(obs_indices_train, dtype=int)
+obs_locations_holdout = jnp.array(obs_indices_holdout, dtype=int)
+obs_locations = obs_locations_train
 
 x_1d = jnp.linspace(0.0, 1.0, N, endpoint=False)
 X_grid, Y_grid = jnp.meshgrid(x_1d, x_1d, indexing='ij')
-freq_1d = jnp.fft.fftfreq(N, d=1.0 / N)
-KX, KY = jnp.meshgrid(2.0 * jnp.pi * freq_1d, 2.0 * jnp.pi * freq_1d, indexing='ij')
+
+OBS_TIME = 0.33
+ALLEN_CAHN_EPS = 0.045
+ALLEN_CAHN_DT = 5.0e-4
+ALLEN_CAHN_STEPS = int(round(OBS_TIME / ALLEN_CAHN_DT))
+NOISE_STD = 0.01
+
+kx_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
+ky_1d = 2.0 * jnp.pi * jnp.fft.fftfreq(N, d=1.0 / N)
+KX, KY = jnp.meshgrid(kx_1d, ky_1d, indexing='ij')
 K2 = KX ** 2 + KY ** 2
-K2_safe = jnp.where(K2 == 0.0, 1.0, K2)
-freq_abs_x = jnp.abs(jnp.fft.fftfreq(N, d=1.0 / N))
-freq_abs_y = jnp.abs(jnp.fft.fftfreq(N, d=1.0 / N))
-DEALIAS = ((freq_abs_x[:, None] <= (N / 3.0)) & (freq_abs_y[None, :] <= (N / 3.0))).astype(jnp.float64)
-# Moderate multiscale anisotropic forcing.  This is stronger and less isotropic
-# than the original single diagonal forcing, but backed off from the satanic
-# version that made the likelihood too stiff.
-forcing_field = (
-    0.14 * jnp.sin(2.0 * jnp.pi * (1.5 * X_grid + 0.35 * Y_grid))
-    + 0.08 * jnp.cos(2.0 * jnp.pi * (0.25 * X_grid + 2.5 * Y_grid))
-    + 0.04 * jnp.sin(2.0 * jnp.pi * (3.0 * X_grid - 0.75 * Y_grid))
-)
-forcing_hat = jnp.fft.fftn(forcing_field)
-
-# Mild anisotropic observation blur.  It adds ill-posedness relative to direct
-# final-vorticity sensing, but it is much less aggressive than the previous
-# filter and should leave bootstrap samples finite.
-OBS_FILTER = jnp.exp(-0.5 * ((freq_abs_x[:, None] / 8.0) ** 2 + (freq_abs_y[None, :] / 4.0) ** 2))
-
-
-def _observed_vorticity_field(omega_field):
-    return jnp.fft.ifftn(jnp.fft.fftn(omega_field) * OBS_FILTER).real
-CN_NUM = 1.0 - 0.5 * delta_t * nu * K2
-CN_DEN = 1.0 + 0.5 * delta_t * nu * K2
-
-
-def _latent_to_initial_vorticity(alpha):
-    omega0 = INITIAL_VORTICITY_SCALE * jnp.reshape(Basis @ alpha, (N, N))
-    return omega0 - jnp.mean(omega0)
-
-
-
-def _ns_step(_, omega_hat):
-    omega_hat = omega_hat * DEALIAS
-    psi_hat = -omega_hat / K2_safe
-    psi_hat = jnp.where(K2 == 0.0, 0.0, psi_hat)
-    vel_x = jnp.fft.ifftn(1j * KY * psi_hat).real
-    vel_y = jnp.fft.ifftn(-1j * KX * psi_hat).real
-    omega_x = jnp.fft.ifftn(1j * KX * omega_hat).real
-    omega_y = jnp.fft.ifftn(1j * KY * omega_hat).real
-    adv_hat = jnp.fft.fftn(vel_x * omega_x + vel_y * omega_y) * DEALIAS
-    rhs_hat = CN_NUM * omega_hat - delta_t * adv_hat + delta_t * forcing_hat
-    omega_hat_next = (rhs_hat / CN_DEN) * DEALIAS
-    return jnp.where(K2 == 0.0, 0.0, omega_hat_next)
+IMEX_DENOM = 1.0 / (1.0 + ALLEN_CAHN_DT * (ALLEN_CAHN_EPS ** 2) * K2)
 
 
 @jax.jit
-def solve_forward_full(alpha):
-    omega0 = _latent_to_initial_vorticity(alpha)
-    omega_hat0 = jnp.fft.fftn(omega0)
-    omega_hatT = jax.lax.fori_loop(0, num_time_steps, _ns_step, omega_hat0)
-    return jnp.fft.ifftn(omega_hatT).real
+def _allen_cahn_step(u_field):
+    reaction_rhs = u_field + ALLEN_CAHN_DT * (u_field - u_field ** 3)
+    reaction_hat = jnp.fft.fftn(reaction_rhs)
+    next_hat = reaction_hat * IMEX_DENOM
+    next_field = jnp.real(jnp.fft.ifftn(next_hat))
+    return next_field
+
+
+@jax.jit
+def _propagate_allen_cahn_obs_time(u0_field):
+    def body_fn(_, u):
+        return _allen_cahn_step(u)
+    return lax.fori_loop(0, ALLEN_CAHN_STEPS, body_fn, u0_field)
+
+
+def _propagate_allen_cahn(u0_field, t=OBS_TIME):
+    """Propagate periodic Allen–Cahn dynamics to time t."""
+    if abs(float(t) - float(OBS_TIME)) < 1e-15:
+        return _propagate_allen_cahn_obs_time(u0_field)
+    n_steps = max(1, int(round(float(t) / ALLEN_CAHN_DT)))
+    u = u0_field
+    for _ in range(n_steps):
+        u = _allen_cahn_step(u)
+    return u
 
 
 @jax.jit
 def solve_forward(alpha):
-    omega_T = _observed_vorticity_field(solve_forward_full(alpha))
-    return omega_T.reshape(-1)[obs_locations]
+    u0 = jnp.reshape(Basis @ alpha, (N, N))
+    uT = _propagate_allen_cahn_obs_time(u0)
+    return uT.reshape(-1)[obs_locations_train]
 
 
 @jax.jit
 def solve_forward_holdout(alpha):
-    omega_T = _observed_vorticity_field(solve_forward_full(alpha))
-    return omega_T.reshape(-1)[holdout_locations]
+    u0 = jnp.reshape(Basis @ alpha, (N, N))
+    uT = _propagate_allen_cahn_obs_time(u0)
+    return uT.reshape(-1)[obs_locations_holdout]
 
 
-batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
+def solve_full_state(alpha, t=OBS_TIME):
+    u0 = jnp.reshape(Basis @ alpha, (N, N))
+    return _propagate_allen_cahn(u0, t)
 
 
 # ==========================================
 # Shared sampling configuration
 # ==========================================
 ACTIVE_DIM = num_truncated_series
-NOISE_STD = 0.005
+PLOT_NORMALIZER = 'best'
 HESS_MIN = 1e-6
 HESS_MAX = 1e6
 DEFAULT_N_GEN = 2000
 N_REF = 2000
-PLOT_NORMALIZER = 'best'
-
 
 # ==========================================
-# GAD versus AGAD benchmark configuration
+# 3. Experiment execution
 # ==========================================
-# GAD follows T_1 -> ... -> T_K.  AGAD follows
-# T_1 -> R_1 -> ... -> T_K -> R_K, where each hidden R_r is the completed-score
-# probability-flow ratio correction implemented by sampling.CompletedRatioField.
-# Only the requested transport iterates enter tables and plots.
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+
+
+def make_structured_truth_coefficients(active_dim=ACTIVE_DIM):
+    """Build a phase-separated synthetic initial condition and project it into the KL basis."""
+    X_np = np.array(X_grid)
+    Y_np = np.array(Y_grid)
+    r1 = np.sqrt((X_np - 0.30) ** 2 + (Y_np - 0.36) ** 2)
+    r2 = np.sqrt((X_np - 0.69) ** 2 + (Y_np - 0.63) ** 2)
+    level_set = (
+        1.25 * np.tanh((0.17 - r1) / 0.035)
+        - 1.05 * np.tanh((0.14 - r2) / 0.040)
+        + 0.55 * np.cos(2.0 * np.pi * X_np) * np.cos(2.0 * np.pi * Y_np)
+        - 0.20 * np.sin(4.0 * np.pi * (X_np - 0.35 * Y_np))
+    )
+    truth_field = np.tanh(1.3 * level_set)
+    B = basis_truncated[:, :active_dim]
+    coeffs, *_ = np.linalg.lstsq(B, truth_field.reshape(-1), rcond=None)
+    return coeffs.astype(np.float64), truth_field.astype(np.float64)
+
+
+alpha_true_np, true_u0_target = make_structured_truth_coefficients(ACTIVE_DIM)
+y_clean = solve_forward(jnp.array(alpha_true_np))
+y_clean_np = np.array(y_clean)
+y_obs_np = y_clean_np + np.random.normal(0.0, NOISE_STD, size=y_clean_np.shape)
+y_holdout_clean_np = np.array(solve_forward_holdout(jnp.array(alpha_true_np)))
+y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_holdout_clean_np.shape)
+
+# ==========================================
+# LFGI-GAD versus MALA benchmark configuration
+# ==========================================
+# GAD follows T_1 -> ... -> T_K using GN-LFGI at every round.  Round 2 remains
+# in the execution DAG but is hidden.  MALA is an independent prior-initialized
+# exact-score baseline.  Its default schedule is intentionally close to the
+# cumulative round-3 GAD budget under the portable solve-counting proxy used by
+# gad_sampling.py.
 
 def _env_int(name, default):
     return int(os.environ.get(name, str(default)))
@@ -752,57 +764,55 @@ def _env_float(name, default):
     return float(os.environ.get(name, str(default)))
 
 
-N_REF = _env_int('IP_ITER_N_REF', _env_int('IP_NAVIER_ITER_N_REF', N_REF))
-DEFAULT_N_GEN = _env_int('IP_ITER_DEFAULT_N_GEN', _env_int('IP_NAVIER_ITER_DEFAULT_N_GEN', N_REF))
+N_REF = _env_int('IP_ITER_N_REF', _env_int('IP_ALLEN_CAHN_ITER_N_REF', N_REF))
+DEFAULT_N_GEN = _env_int(
+    'IP_ITER_DEFAULT_N_GEN',
+    _env_int('IP_ALLEN_CAHN_ITER_DEFAULT_N_GEN', N_REF),
+)
 ITERATIVE_TRANSPORT_ROUNDS = _env_int('IP_ITER_ROUNDS', 3)
+if ITERATIVE_TRANSPORT_ROUNDS != 3:
+    raise ValueError('This exact paper comparison requires IP_ITER_ROUNDS=3.')
 DISPLAY_TRANSPORT_ROUNDS = {1, 3}
 TRANSPORT_STEPS = _env_int('IP_ITER_TRANSPORT_STEPS', 200)
-RATIO_STEPS = _env_int('IP_ITER_RATIO_STEPS', TRANSPORT_STEPS)
-HELDOUT_BATCH_SIZE = _env_int('IP_ITER_HELDOUT_BATCH_SIZE', 8)
 
-RATIO_FLOW_COMMON = dict(
-    ratio_mode='pflow',
-    steps=RATIO_STEPS,
-    density_steps=_env_int('IP_ITER_DENSITY_STEPS', 32),
-    density_divergence=os.environ.get('IP_ITER_DENSITY_DIVERGENCE', 'auto'),
-    density_div_probes=_env_int('IP_ITER_DENSITY_DIV_PROBES', 1),
-    density_batch_size=_env_int('IP_ITER_DENSITY_BATCH_SIZE', 32),
-    ratio_log_weight_clip=_env_float('IP_ITER_RATIO_LOG_WEIGHT_CLIP', 20.0),
-    ratio_temperature=_env_float('IP_ITER_RATIO_TEMPERATURE', 1.0),
-    density_fd_eps=_env_float('IP_ITER_DENSITY_FD_EPS', 1e-3),
+MALA_N_CHAINS = max(1, _env_int('IP_MALA_N_CHAINS', 32))
+MALA_THIN = max(1, _env_int('IP_MALA_THIN', 1))
+MALA_EFFECTIVE_CHAINS = max(1, min(MALA_N_CHAINS, DEFAULT_N_GEN))
+MALA_DRAWS_PER_CHAIN = int(np.ceil(DEFAULT_N_GEN / MALA_EFFECTIVE_CHAINS))
+GAD3_EXPECTED_PDE_PROXY = 3 * 3 * N_REF
+MALA_MATCHED_WARMUP = max(
+    0,
+    int(np.floor(
+        GAD3_EXPECTED_PDE_PROXY / float(2 * MALA_EFFECTIVE_CHAINS)
+        - 1
+        - MALA_DRAWS_PER_CHAIN * MALA_THIN
+    )),
 )
+MALA_WARMUP = max(0, _env_int('IP_MALA_WARMUP', MALA_MATCHED_WARMUP))
+MALA_DT = _env_float('IP_MALA_DT', 1e-4)
+MALA_TARGET_ACCEPT = _env_float('IP_MALA_TARGET_ACCEPT', 0.574)
+MALA_MIN_DT = _env_float('IP_MALA_MIN_DT', 1e-12)
+MALA_MAX_DT = _env_float('IP_MALA_MAX_DT', 1e-1)
+MALA_PROGRESS_EVERY = _env_int('IP_MALA_PROGRESS_EVERY', 25)
+MALA_ADAPT = os.environ.get('IP_MALA_ADAPT', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 
 METHOD_SPECS = OrderedDict([
-    ('GAD', {
+    ('LFGI-GAD', {
         'score': 'lfgi',
-        'display': 'GAD (GN-LFGI)',
-        'use_ratio': False,
-    }),
-    ('AGAD', {
-        'score': 'lfgi',
-        'display': 'AGAD (GN-LFGI)',
-        'use_ratio': True,
-        'ratio_config': dict(RATIO_FLOW_COMMON),
+        'display': 'LFGI-GAD',
     }),
 ])
 
 
-def make_gad_vs_agad_sampler_configs(method_specs, rounds=ITERATIVE_TRANSPORT_ROUNDS):
-    """Build one transport chain per explicit GAD/AGAD method entry."""
+def make_gad_sampler_configs(method_specs, rounds=ITERATIVE_TRANSPORT_ROUNDS):
+    """Build one transport-only chain per GAD method entry."""
     configs = OrderedDict()
     for method_key, spec in method_specs.items():
         score_method = spec['score']
         display_base = spec['display']
-        use_ratio = bool(spec.get('use_ratio', False))
-        ratio_config = dict(spec.get('ratio_config', {}))
-        if use_ratio and ratio_config.get('ratio_mode', 'pflow') != 'pflow':
-            raise ValueError(
-                f'{method_key}: AGAD must use the completed-score pflow ratio node.'
-            )
-
         previous_label = None
         for round_idx in range(1, int(rounds) + 1):
-            transport_label = f'{method_key}-T{round_idx}'
+            transport_label = f'{method_key}-{round_idx}'
             transport_cfg = {
                 'node': 'transport',
                 'score': score_method,
@@ -813,36 +823,37 @@ def make_gad_vs_agad_sampler_configs(method_specs, rounds=ITERATIVE_TRANSPORT_RO
                 'bank_coupling': 'shared',
                 'log_mean_ess': True,
                 'include_results': round_idx in DISPLAY_TRANSPORT_ROUNDS,
-                'display_name': f'{display_base} iteration {round_idx}',
+                'display_name': f'{display_base} {round_idx}',
             }
             if previous_label is not None:
                 transport_cfg['ref_source'] = previous_label
             configs[transport_label] = transport_cfg
-
-            if use_ratio:
-                ratio_label = f'{method_key}-R{round_idx}'
-                ratio_cfg = {
-                    'node': 'ratio',
-                    'score': score_method,
-                    'ref_source': transport_label,
-                    'n_samples': DEFAULT_N_GEN,
-                    'n_ref': N_REF,
-                    'n_gate': N_REF,
-                    'bank_coupling': 'shared',
-                    'log_mean_ess': False,
-                    'include_results': False,
-                    'display_name': f'{display_base} completed ratio {round_idx}',
-                }
-                ratio_cfg.update(ratio_config)
-                configs[ratio_label] = ratio_cfg
-                previous_label = ratio_label
-            else:
-                previous_label = transport_label
+            previous_label = transport_label
 
     return configs
 
 
-SAMPLER_CONFIGS = make_gad_vs_agad_sampler_configs(METHOD_SPECS)
+SAMPLER_CONFIGS = make_gad_sampler_configs(METHOD_SPECS)
+SAMPLER_CONFIGS['MALA'] = {
+    'node': 'mala',
+    'n_samples': DEFAULT_N_GEN,
+    'mala_n_chains': MALA_N_CHAINS,
+    'mala_warmup': MALA_WARMUP,
+    'mala_thin': MALA_THIN,
+    'mala_dt': MALA_DT,
+    'mala_adapt': MALA_ADAPT,
+    'mala_target_accept': MALA_TARGET_ACCEPT,
+    'mala_min_dt': MALA_MIN_DT,
+    'mala_max_dt': MALA_MAX_DT,
+    'mala_progress_every': MALA_PROGRESS_EVERY,
+    'include_results': True,
+    'is_reference': True,
+    'display_name': 'MALA',
+}
+
+MALA_TOTAL_TRANSITIONS = MALA_WARMUP + MALA_DRAWS_PER_CHAIN * MALA_THIN
+MALA_EXPECTED_PDE_PROXY = 2 * MALA_EFFECTIVE_CHAINS * (MALA_TOTAL_TRANSITIONS + 1)
+MALA_TO_GAD3_PROXY_RATIO = MALA_EXPECTED_PDE_PROXY / float(max(1, GAD3_EXPECTED_PDE_PROXY))
 
 configure_sampling(
     active_dim=ACTIVE_DIM,
@@ -850,7 +861,7 @@ configure_sampling(
     hess_min=HESS_MIN,
     hess_max=HESS_MAX,
 )
-run_ctx = init_run_results('navier_stokes_gad_agad_explicit_arms')
+run_ctx = init_run_results('allen_cahn_lfgi_gad1_gad3_mala_20260814')
 DASHBOARD_PDF_PATH = os.path.join(
     run_ctx['run_results_dir'],
     f"{run_ctx['run_results_stem']}_summary_dashboard.pdf",
@@ -858,34 +869,76 @@ DASHBOARD_PDF_PATH = os.path.join(
 
 RUN_COMMAND_HINT = (
     'IP_ITER_N_REF={n_ref} IP_ITER_ROUNDS={rounds} '
-    'IP_ITER_TRANSPORT_STEPS={transport_steps} IP_ITER_RATIO_STEPS={ratio_steps} '
-    'IP_ITER_DENSITY_STEPS={density_steps} python navier_stokes_gad_agad_explicit_arms_20260811.py'
+    'IP_ITER_TRANSPORT_STEPS={transport_steps} IP_MALA_N_CHAINS={mala_chains} '
+    'IP_MALA_WARMUP={mala_warmup} IP_MALA_THIN={mala_thin} IP_MALA_DT={mala_dt} '
+    'python allen_cahn_gad_mala_comparison_20260814.py'
 ).format(
     n_ref=N_REF,
     rounds=ITERATIVE_TRANSPORT_ROUNDS,
     transport_steps=TRANSPORT_STEPS,
-    ratio_steps=RATIO_STEPS,
-    density_steps=RATIO_FLOW_COMMON['density_steps'],
+    mala_chains=MALA_N_CHAINS,
+    mala_warmup=MALA_WARMUP,
+    mala_thin=MALA_THIN,
+    mala_dt=MALA_DT,
 )
 
-# ==========================================
-# Execution
-# ==========================================
-gc.collect()
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
+if not 0.90 <= MALA_TO_GAD3_PROXY_RATIO <= 1.10:
+    print(
+        'WARNING: configured MALA budget is not within 10% of cumulative LFGI-GAD 3 '
+        f'under the portable PDE proxy (ratio={MALA_TO_GAD3_PROXY_RATIO:.4f}). '
+        'Unset IP_MALA_WARMUP to use the automatic matched default.'
+    )
 
-np.random.seed(seed)
-alpha_true_np = np.random.randn(ACTIVE_DIM) * 0.60
-y_clean = solve_forward(jnp.array(alpha_true_np))
-y_clean_np = np.array(y_clean)
-y_obs_np = y_clean_np + np.random.normal(0, NOISE_STD, size=y_clean_np.shape)
-y_clean_holdout = solve_forward_holdout(jnp.array(alpha_true_np))
-y_clean_holdout_np = np.array(y_clean_holdout)
-y_holdout_obs_np = y_clean_holdout_np + np.random.normal(0, NOISE_STD, size=y_clean_holdout_np.shape)
+
+dashboard = DashboardPDF(
+    DASHBOARD_PDF_PATH,
+    title='Allen-Cahn LFGI-GAD versus MALA dashboard',
+)
+dashboard.add_text_page(
+    'Allen-Cahn LFGI-GAD versus MALA dashboard',
+    [
+        f"Created: {datetime.now().isoformat(timespec='seconds')}",
+        'Paper-facing rows are LFGI-GAD 1, LFGI-GAD 3, and MALA. GAD round 2 is executed as a hidden dependency of round 3.',
+        'MALA is prior-initialized and exact-score. Dual averaging is restricted to warmup; the production kernel is frozen before samples are retained.',
+        'The MALA row is marked as the distributional reference for the legacy MMD diagnostic, so its self-MMD is zero by construction. Primary inverse-problem comparisons should use KSD, reconstruction, prediction, calibration, and work.',
+        'Included PNG diagnostics: ESS vs diffusion time, PCA histograms, field/state visualizations, and sensor residual maps.',
+        'Tables are intentionally limited to two pages: metrics plus a readable split run-info page.',
+        'Random progress output from precomputation / Hessian batching is intentionally excluded.',
+        f"run_results_dir = {run_ctx['run_results_dir']}",
+        '',
+        f'seed = {seed}',
+        f'ACTIVE_DIM = {ACTIVE_DIM}',
+        f'N_REF = {N_REF}',
+        f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
+        f'ITERATIVE_TRANSPORT_ROUNDS = {ITERATIVE_TRANSPORT_ROUNDS}',
+        f'DISPLAY_TRANSPORT_ROUNDS = {sorted(DISPLAY_TRANSPORT_ROUNDS)}',
+        f'TRANSPORT_STEPS = {TRANSPORT_STEPS}',
+        f'MALA_N_CHAINS = {MALA_N_CHAINS}',
+        f'MALA_WARMUP = {MALA_WARMUP}',
+        f'MALA_MATCHED_WARMUP (automatic default) = {MALA_MATCHED_WARMUP}',
+        f'MALA_THIN = {MALA_THIN}',
+        f'MALA_DT = {MALA_DT}',
+        f'MALA_ADAPT = {MALA_ADAPT}',
+        f'MALA_TARGET_ACCEPT = {MALA_TARGET_ACCEPT}',
+        f'Expected MALA PDE proxy = {MALA_EXPECTED_PDE_PROXY}',
+        f'Expected cumulative LFGI-GAD 3 PDE proxy = {GAD3_EXPECTED_PDE_PROXY}',
+        f'MALA / LFGI-GAD 3 expected proxy ratio = {MALA_TO_GAD3_PROXY_RATIO:.4f}',
+        f'NOISE_STD = {NOISE_STD}',
+        f'N = {N}, num_observation = {num_observation}, num_holdout_observation = {num_holdout_observation}',
+        f'OBS_TIME = {OBS_TIME}',
+        f'ALLEN_CAHN_EPS = {ALLEN_CAHN_EPS}',
+        f'ALLEN_CAHN_DT = {ALLEN_CAHN_DT}',
+        f'ALLEN_CAHN_STEPS = {ALLEN_CAHN_STEPS}',
+        f'HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}',
+        f'PLOT_NORMALIZER = {PLOT_NORMALIZER}',
+        f'run command = {RUN_COMMAND_HINT}',
+    ],
+)
+
+batch_solve_forward_holdout = jax.jit(jax.vmap(solve_forward_holdout))
 
 prior_model = GaussianPrior(dim=ACTIVE_DIM)
-lik_model, _ = make_physics_likelihood(
+lik_model, lik_aux = make_physics_likelihood(
     solve_forward,
     y_obs_np,
     NOISE_STD,
@@ -897,39 +950,7 @@ lik_model, _ = make_physics_likelihood(
 posterior_score_fn = make_posterior_score_fn(lik_model)
 
 
-dashboard = DashboardPDF(
-    DASHBOARD_PDF_PATH,
-    title='Navier-Stokes GAD versus AGAD dashboard',
-)
-dashboard.add_text_page(
-    'Navier-Stokes GAD versus AGAD dashboard',
-    [
-        f"Created: {datetime.now().isoformat(timespec='seconds')}",
-        'This dashboard compares matched GN-LFGI arms. GAD chains transport nodes directly; AGAD inserts a hidden completed-score probability-flow ratio node after every transport node.',
-        'Displayed methods are transport iterations 1 and 3 only; all AGAD ratio nodes remain hidden internal updates.',
-        f"run_results_dir = {run_ctx['run_results_dir']}",
-        '',
-        f'run command = {RUN_COMMAND_HINT}',
-        '',
-        f'seed = {seed}',
-        f'ACTIVE_DIM = {ACTIVE_DIM}',
-        f'N_REF = {N_REF}',
-        f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
-        f'ITERATIVE_TRANSPORT_ROUNDS = {ITERATIVE_TRANSPORT_ROUNDS}',
-        f'DISPLAY_TRANSPORT_ROUNDS = {sorted(DISPLAY_TRANSPORT_ROUNDS)}',
-        f'TRANSPORT_STEPS = {TRANSPORT_STEPS}',
-        f'RATIO_STEPS = {RATIO_STEPS}',
-        f'RATIO_FLOW_COMMON = {RATIO_FLOW_COMMON}',
-        f'METHOD_SPECS = {METHOD_SPECS}',
-        f'NOISE_STD = {NOISE_STD}',
-        f'N = {N}, num_observation = {num_observation}, num_holdout_observation = {num_holdout_observation}',
-        f'prior_length_scale_x = {prior_length_scale_x}, prior_length_scale_y = {prior_length_scale_y}',
-        f'INITIAL_VORTICITY_SCALE = {INITIAL_VORTICITY_SCALE}',
-        f'nu = {nu}, delta_t = {delta_t}, T_end = {T_end}, num_time_steps = {num_time_steps}',
-        f'HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}',
-        f'PLOT_NORMALIZER = {PLOT_NORMALIZER}',
-    ],
-)
+
 
 pipeline = run_standard_sampler_pipeline(
     prior_model,
@@ -957,92 +978,88 @@ metrics = compute_latent_metrics(
     posterior_score_fn,
     display_names=display_names,
 )
-try:
-    metrics = compute_heldout_predictive_metrics(
-        samples,
-        metrics,
-        heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
-        batched_forward_eval_fn=lambda a_batch: np.asarray(
-            batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
-        ),
-        batched_forward_eval_batch_size=HELDOUT_BATCH_SIZE,
-        y_holdout_obs_np=y_holdout_obs_np,
-        noise_std=NOISE_STD,
-        display_names=display_names,
-        min_valid=10,
-    )
-except Exception as exc:
-    print(f"WARNING: held-out predictive metrics failed and will be skipped: {exc}")
 
 Basis_np = np.array(Basis)
 obs_locs_np = np.array(obs_locations)
 obs_row = obs_locs_np // N
 obs_col = obs_locs_np % N
-holdout_locs_np = np.array(holdout_locations)
-holdout_row = holdout_locs_np // N
-holdout_col = holdout_locs_np % N
-OBS_FILTER_NP = np.array(OBS_FILTER)
 
 
-def reconstruct_initial_vorticity(latents):
+def reconstruct_initial_condition(latents):
     if isinstance(latents, torch.Tensor):
         latents = latents.detach().cpu().numpy()
     latents = np.asarray(latents)
     if latents.ndim == 1:
         latents = latents[None, :]
-    d_loc = latents.shape[1]
-    B = Basis_np[:, :d_loc]
-    fields = (latents @ B.T).reshape(latents.shape[0], N, N)
-    return fields - fields.mean(axis=(1, 2), keepdims=True)
+    d_lat = latents.shape[1]
+    B = Basis_np[:, :d_lat]
+    fields_flat = latents @ B.T
+    return fields_flat.reshape((-1, N, N))
 
 
-def solve_final_vorticity_field(alpha_vec):
-    return np.array(solve_forward_full(jnp.array(alpha_vec)))
+
+def latent_to_initial_condition(alpha):
+    return reconstruct_initial_condition(np.asarray(alpha)[None, :])[0]
 
 
-true_field = reconstruct_initial_vorticity(alpha_true_np)[0]
-true_final_field = solve_final_vorticity_field(alpha_true_np)
-norm_true = np.linalg.norm(true_field) + 1e-12
-norm_y_clean = np.linalg.norm(y_clean_np) + 1e-12
 
-print('\n=== Physical Parameter Space Metrics (Initial Vorticity + Forward) ===')
-print(f"{'Method':<32} | {'Inv RelL2(%)':<12} | {'Pearson':<10} | {'Final RelL2':<12} | {'RMSE_alpha':<12} | {'FwdRelErr':<12} | {'HeldoutNLL':<12} | {'HeldoutZ2':<12}")
-print('-' * 142)
-mean_fields = {}
-mean_final_fields = {}
-sensor_residuals = {}
-for label, samps in samples.items():
-    samps_clean = get_valid_samples(samps)
-    if samps_clean.shape[0] < 10:
-        continue
-    mean_latent = np.mean(samps_clean, axis=0)[:ACTIVE_DIM]
-    mean_field = reconstruct_initial_vorticity(mean_latent)[0]
-    mean_fields[label] = mean_field
-    inv_rel_l2_pct = 100.0 * (np.linalg.norm(mean_field - true_field) / norm_true)
-    y_pred = np.array(solve_forward(jnp.array(mean_latent)))
-    fwd_rel = float(np.linalg.norm(y_pred - y_clean_np) / norm_y_clean)
-    sensor_residuals[label] = np.abs(y_pred - y_clean_np)
-    mean_final_fields[label] = solve_final_vorticity_field(mean_latent)
-    metrics.setdefault(label, {})
-    final_rel = float(np.linalg.norm(mean_final_fields[label] - true_final_field) / (np.linalg.norm(true_final_field) + 1e-12))
-    metrics[label].update(dict(
-        mean_latent=mean_latent,
-        RMSE_alpha=float(np.sqrt(np.mean((mean_latent - alpha_true_np) ** 2))),
-        RMSE_field=rmse_array(mean_field, true_field),
-        RelL2_field=float(np.linalg.norm(mean_field - true_field) / norm_true),
-        Pearson_field=pearson_corr_array(mean_field, true_field),
-        RMSE_final_vorticity=rmse_array(mean_final_fields[label], true_final_field),
-        RelL2_final_vorticity=final_rel,
-        Pearson_final_vorticity=pearson_corr_array(mean_final_fields[label], true_final_field),
-        SensorRMSE=rmse_array(y_pred, y_clean_np),
-        SensorMaxAbsResidual=float(np.max(sensor_residuals[label])),
-        FwdRelErr=fwd_rel,
-    ))
+def solve_state_field(alpha_vec, t=OBS_TIME):
+    return np.array(solve_full_state(jnp.array(alpha_vec), t=t))
+
+
+
+def sensor_vector_to_grid(vec, fill_value=np.nan):
+    grid = np.full((N, N), fill_value, dtype=np.float64)
+    grid.flat[obs_locs_np] = np.asarray(vec)
+    return grid
+
+
+true_u0 = latent_to_initial_condition(alpha_true_np)
+true_uT = solve_state_field(alpha_true_np, t=OBS_TIME)
+
+mean_fields, metrics = compute_field_summary_metrics(
+    samples,
+    metrics,
+    alpha_true_np,
+    true_u0,
+    field_from_latent_fn=latent_to_initial_condition,
+    forward_eval_fn=lambda a: np.array(solve_forward(jnp.array(a))),
+    y_ref_np=y_clean_np,
+    display_names=display_names,
+    min_valid=10,
+    d_lat=ACTIVE_DIM,
+)
+
+metrics = compute_heldout_predictive_metrics(
+    samples,
+    metrics,
+    heldout_forward_eval_fn=lambda a: np.array(solve_forward_holdout(jnp.array(a))),
+    batched_forward_eval_fn=lambda a_batch: np.asarray(
+        batch_solve_forward_holdout(jnp.asarray(a_batch, dtype=jnp.float64))
+    ),
+    y_holdout_obs_np=y_holdout_obs_np,
+    noise_std=NOISE_STD,
+    display_names=display_names,
+    min_valid=10,
+)
+
+mean_final_states = {}
+norm_true_uT = np.linalg.norm(true_uT) + 1e-12
+
+print('\n=== Allen–Cahn field/state metrics ===')
+print(f"{'Method':<24} | {'IC RelL2(%)':<12} | {'Pearson':<10} | {'RMSE_a':<12} | {'StateRel':<12} | {'SensorRel':<12} | {'HeldoutNLL':<12} | {'HeldoutZ2':<12}")
+print('-' * 135)
+for label in [lab for lab in samples.keys() if lab in mean_fields]:
+    mean_latent = np.asarray(metrics[label]['mean_latent'])
+    mean_uT = solve_state_field(mean_latent, t=OBS_TIME)
+    mean_final_states[label] = mean_uT
+    final_rel = float(np.linalg.norm(mean_uT - true_uT) / norm_true_uT)
+    metrics[label]['RMSE_final'] = rmse_array(mean_uT, true_uT)
+    metrics[label]['RelL2_final'] = final_rel
+    ic_rel_l2_pct = 100.0 * float(metrics[label]['RelL2_field'])
     print(
-        f"{display_names.get(label, label):<32} | {inv_rel_l2_pct:<12.4f} | "
-        f"{metrics[label].get('Pearson_field', float('nan')):<10.4f} | "
-        f"{metrics[label].get('RelL2_final_vorticity', float('nan')):<12.4e} | "
-        f"{metrics[label].get('RMSE_alpha', float('nan')):<12.4e} | {fwd_rel:<12.4e} | "
+        f"{display_names.get(label, label):<24} | {ic_rel_l2_pct:<12.4f} | {metrics[label].get('Pearson_field', float('nan')):<10.4f} | "
+        f"{metrics[label]['RMSE_alpha']:<12.4e} | {final_rel:<12.4e} | {metrics[label]['FwdRelErr']:<12.4e} | "
         f"{metrics[label].get('HeldoutPredNLL', np.nan):<12.4e} | {metrics[label].get('HeldoutStdResSq', np.nan):<12.4e}"
     )
 
@@ -1055,7 +1072,6 @@ plot_normalizer_key = resolve_plot_normalizer(
     best_metric_keys=('RelL2_field',),
 )
 plot_normalizer_title = display_names.get(plot_normalizer_key, plot_normalizer_key)
-
 plot_pca_histograms(
     samples,
     alpha_true_np,
@@ -1069,7 +1085,7 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
     metrics,
     sampler_run_info,
     n_ref=N_REF,
-    target_name='Navier-Stokes GAD versus AGAD',
+    target_name='Allen–Cahn initial condition',
     display_names=display_names,
     reference_name=reference_title,
 )
@@ -1077,47 +1093,48 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
 dashboard.add_results_tables(results_df, results_runinfo_df)
 
 save_reproducibility_log(
-    title='Navier-Stokes GAD versus AGAD reproducibility log',
+    title='Allen–Cahn LFGI-GAD versus MALA reproducibility log',
     config={
         'seed': seed,
         'ACTIVE_DIM': ACTIVE_DIM,
-        'N_REF': N_REF,
         'DEFAULT_N_GEN': DEFAULT_N_GEN,
+        'N_REF': N_REF,
         'ITERATIVE_TRANSPORT_ROUNDS': ITERATIVE_TRANSPORT_ROUNDS,
         'DISPLAY_TRANSPORT_ROUNDS': sorted(DISPLAY_TRANSPORT_ROUNDS),
         'TRANSPORT_STEPS': TRANSPORT_STEPS,
-        'RATIO_STEPS': RATIO_STEPS,
-        'RATIO_FLOW_COMMON': RATIO_FLOW_COMMON,
+        'MALA_N_CHAINS': MALA_N_CHAINS,
+        'MALA_EFFECTIVE_CHAINS': MALA_EFFECTIVE_CHAINS,
+        'MALA_DRAWS_PER_CHAIN': MALA_DRAWS_PER_CHAIN,
+        'MALA_WARMUP': MALA_WARMUP,
+        'MALA_MATCHED_WARMUP': MALA_MATCHED_WARMUP,
+        'MALA_THIN': MALA_THIN,
+        'MALA_DT': MALA_DT,
+        'MALA_ADAPT': MALA_ADAPT,
+        'MALA_TARGET_ACCEPT': MALA_TARGET_ACCEPT,
+        'MALA_MIN_DT': MALA_MIN_DT,
+        'MALA_MAX_DT': MALA_MAX_DT,
+        'MALA_PROGRESS_EVERY': MALA_PROGRESS_EVERY,
+        'MALA_EXPECTED_PDE_PROXY': MALA_EXPECTED_PDE_PROXY,
+        'GAD3_EXPECTED_PDE_PROXY': GAD3_EXPECTED_PDE_PROXY,
+        'MALA_TO_GAD3_PROXY_RATIO': MALA_TO_GAD3_PROXY_RATIO,
         'METHOD_SPECS': METHOD_SPECS,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
         'RUN_COMMAND_HINT': RUN_COMMAND_HINT,
-        'num_holdout_observation': num_holdout_observation,
-        'HELDOUT_BATCH_SIZE': HELDOUT_BATCH_SIZE,
+        'PLOT_NORMALIZER': PLOT_NORMALIZER,
         'HESS_MIN': HESS_MIN,
         'HESS_MAX': HESS_MAX,
-        'basis_modes_path': basis_modes_path,
-        'prior_length_scale_x': prior_length_scale_x,
-        'prior_length_scale_y': prior_length_scale_y,
-        'INITIAL_VORTICITY_SCALE': INITIAL_VORTICITY_SCALE,
-        'nu': nu,
-        'delta_t': delta_t,
-        'T_end': T_end,
-        'num_time_steps': num_time_steps,
-        'OBS_FILTER': OBS_FILTER_NP,
-        'num_observation': num_observation,
-        'sensor_geometry': 'mild anisotropic strips plus two cross rows',
         'NOISE_STD': NOISE_STD,
-        'PLOT_NORMALIZER': PLOT_NORMALIZER,
-        'plot_normalizer_key': plot_normalizer_key,
-        'plot_normalizer_title': plot_normalizer_title,
-        'DASHBOARD_PDF_PATH': DASHBOARD_PDF_PATH,
+        'num_observation': num_observation,
+        'num_holdout_observation': num_holdout_observation,
+        'num_truncated_series': num_truncated_series,
+        'num_modes_available': num_modes_available,
+        'OBS_TIME': OBS_TIME,
+        'ALLEN_CAHN_EPS': ALLEN_CAHN_EPS,
+        'ALLEN_CAHN_DT': ALLEN_CAHN_DT,
+        'ALLEN_CAHN_STEPS': ALLEN_CAHN_STEPS,
     },
     extra_sections={
-        'saved_results_files': {
-            'metrics_csv': results_df_path,
-            'runinfo_csv': results_runinfo_df_path,
-            'dashboard_pdf': DASHBOARD_PDF_PATH,
-        },
+        'saved_results_files': {'metrics_csv': results_df_path, 'runinfo_csv': results_runinfo_df_path, 'dashboard_pdf': DASHBOARD_PDF_PATH},
         'summary_stats': {
             'reference_key': reference_key,
             'reference_title': reference_title,
@@ -1126,79 +1143,66 @@ save_reproducibility_log(
             'num_methods_evaluated': len(results_df.columns),
             'num_methods_with_samples': len(samples),
             'num_methods_with_mean_fields': len(mean_fields),
-            'num_methods_with_mean_final_fields': len(mean_final_fields),
+            'num_methods_with_mean_final_states': len(mean_final_states),
             'num_methods_with_ess_logs': len(ess_logs),
         },
     },
 )
 
+# ==========================================
+# 4. Problem-specific visualization
+# ==========================================
 
-print('Visualizing anisotropic sensing geometry and observation filter...')
-fig_geom, axes_geom = plt.subplots(1, 3, figsize=(13.5, 4.0))
-mask_train = np.zeros((N, N), dtype=float)
-mask_holdout = np.zeros((N, N), dtype=float)
-mask_train[obs_row, obs_col] = 1.0
-mask_holdout[holdout_row, holdout_col] = 1.0
-axes_geom[0].imshow(mask_train, origin='lower', cmap='gray_r', vmin=0.0, vmax=1.0)
-axes_geom[0].set_title('Training sensor mask')
-axes_geom[0].axis('off')
-axes_geom[1].imshow(mask_holdout, origin='lower', cmap='gray_r', vmin=0.0, vmax=1.0)
-axes_geom[1].set_title('Held-out sensor mask')
-axes_geom[1].axis('off')
-im_filter = axes_geom[2].imshow(OBS_FILTER_NP, origin='lower', cmap='viridis')
-axes_geom[2].set_title('Anisotropic observation blur filter')
-axes_geom[2].axis('off')
-plt.colorbar(im_filter, ax=axes_geom[2], fraction=0.046, pad=0.04)
-plt.suptitle('Navier-Stokes GAD versus AGAD: observation geometry', fontsize=15)
-plt.tight_layout()
-plt.show()
+def _overlay_sensors(ax):
+    ax.scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.7)
 
 
-def _overlay(ax):
-    ax.scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.6)
-
-
-plot_field_reconstruction_grid(
+fig_field, axes_field = plot_field_reconstruction_grid(
     samples,
     mean_fields,
-    reconstruct_initial_vorticity,
+    reconstruct_initial_condition,
     display_names=display_names,
-    true_field=true_field,
+    true_field=true_u0,
     plot_normalizer_key=plot_normalizer_key,
-    reference_bottom_panel=true_field,
-    reference_bottom_title='Ground Truth',
+    reference_bottom_panel=true_u0,
+    reference_bottom_title='Ground Truth\nInitial condition $u_0(x)$',
     field_cmap='RdBu_r',
     sample_cmap='RdBu_r',
     bottom_cmap='RdBu_r',
-    overlay_reference_fn=_overlay,
-    overlay_method_fn=_overlay,
-    suptitle=f'Navier-Stokes GAD versus AGAD (d={ACTIVE_DIM}): initial vorticity reconstruction',
-    field_name='Initial Vorticity $\\omega_0$',
+    overlay_reference_fn=_overlay_sensors,
+    overlay_method_fn=_overlay_sensors,
+    suptitle=f'Allen–Cahn LFGI-GAD versus MALA (d={ACTIVE_DIM}): initial condition reconstruction',
+    field_name='Initial condition $u_0(x)$',
 )
+plt.show()
 
-print('\nVisualizing final-time vorticity fields...')
+print('\nVisualizing Allen–Cahn states at observation time...')
 methods_to_plot = [label for label in samples.keys() if label in mean_fields]
 n_cols = len(methods_to_plot) + 1
 fig2, axes2 = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
-axes2[0].imshow(true_final_field, cmap='RdBu_r', origin='lower')
-axes2[0].scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.6, label='Sensors')
-axes2[0].set_title(r'Ground Truth\nFinal Vorticity $\omega(T)$', fontsize=14)
+
+im_true_final = axes2[0].imshow(true_uT, cmap='RdBu_r', origin='lower')
+axes2[0].scatter(obs_col, obs_row, c='red', s=12, marker='.', alpha=0.7, label='Sensors')
+axes2[0].set_title(f'Ground Truth\nAllen–Cahn state $u(x,T)$, $T={OBS_TIME:.2f}$', fontsize=14)
 axes2[0].axis('off')
 axes2[0].legend(fontsize=8, loc='upper right')
-final_vmin = float(np.min(true_final_field))
-final_vmax = float(np.max(true_final_field))
+plt.colorbar(im_true_final, ax=axes2[0], fraction=0.046, pad=0.04)
+
+vmin_final = float(np.min(true_uT))
+vmax_final = float(np.max(true_uT))
 for i, label in enumerate(methods_to_plot):
     col = i + 1
-    field_T = mean_final_fields.get(label)
-    if field_T is None:
+    mean_uT = mean_final_states.get(label)
+    if mean_uT is None:
         axes2[col].axis('off')
         continue
-    axes2[col].imshow(field_T, cmap='RdBu_r', origin='lower', vmin=final_vmin, vmax=final_vmax)
-    axes2[col].scatter(obs_col, obs_row, c='lime', s=8, marker='.', alpha=0.4)
-    axes2[col].set_title(f"{display_names.get(label, label)}\nFinal Vorticity", fontsize=14)
+    axes2[col].imshow(mean_uT, cmap='RdBu_r', origin='lower', vmin=vmin_final, vmax=vmax_final)
+    axes2[col].scatter(obs_col, obs_row, c='red', s=12, marker='.', alpha=0.5)
+    axes2[col].set_title(f"{display_names.get(label, label)}\nAllen–Cahn state", fontsize=14)
     axes2[col].axis('off')
+
 plt.suptitle(
-    f'Navier-Stokes GAD versus AGAD (d={ACTIVE_DIM}): final-time vorticity',
+    f'Allen–Cahn LFGI-GAD versus MALA (d={ACTIVE_DIM}): state at observation time',
     fontsize=16,
     y=1.05,
 )
@@ -1207,42 +1211,49 @@ plt.show()
 
 print('\nVisualizing sensor residual maps...')
 fig3, axes3 = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
-resid0 = np.zeros_like(obs_row, dtype=float)
-axes3[0].scatter(obs_col, obs_row, c=resid0, cmap='inferno', s=40, vmin=0.0, vmax=1.0)
-axes3[0].set_title('Ground Truth\n|Residual| = 0', fontsize=14)
-axes3[0].set_xlim(-0.5, N - 0.5)
-axes3[0].set_ylim(-0.5, N - 0.5)
-axes3[0].set_aspect('equal')
-axes3[0].invert_yaxis()
-axes3[0].grid(alpha=0.15)
-max_resid = max(1e-12, max(float(sensor_residuals[label].max()) for label in sensor_residuals)) if sensor_residuals else 1.0
+
+obs_grid = sensor_vector_to_grid(y_obs_np)
+im_obs = axes3[0].imshow(obs_grid, cmap='coolwarm', origin='lower')
+axes3[0].set_title('Noisy observations\nat sensors', fontsize=14)
+axes3[0].axis('off')
+plt.colorbar(im_obs, ax=axes3[0], fraction=0.046, pad=0.04)
+
+residual_scale = 1e-12
+residual_grids = {}
+for label in methods_to_plot:
+    mean_lat = np.asarray(metrics[label]['mean_latent'])
+    y_pred = np.array(solve_forward(jnp.array(mean_lat)))
+    resid_grid = sensor_vector_to_grid(y_pred - y_obs_np, fill_value=0.0)
+    residual_grids[label] = resid_grid
+    residual_scale = max(residual_scale, float(np.max(np.abs(resid_grid))))
+
 for i, label in enumerate(methods_to_plot):
     col = i + 1
-    resid = sensor_residuals.get(label)
-    if resid is None:
-        axes3[col].axis('off')
-        continue
-    sc = axes3[col].scatter(obs_col, obs_row, c=resid, cmap='inferno', s=40, vmin=0.0, vmax=max_resid)
-    axes3[col].set_title(f"{display_names.get(label, label)}\nSensor |Residual|", fontsize=14)
-    axes3[col].set_xlim(-0.5, N - 0.5)
-    axes3[col].set_ylim(-0.5, N - 0.5)
-    axes3[col].set_aspect('equal')
-    axes3[col].invert_yaxis()
-    axes3[col].grid(alpha=0.15)
-    plt.colorbar(sc, ax=axes3[col], fraction=0.046, pad=0.04)
+    im_res = axes3[col].imshow(
+        residual_grids[label],
+        cmap='RdBu_r',
+        origin='lower',
+        vmin=-residual_scale,
+        vmax=residual_scale,
+    )
+    axes3[col].set_title(f"{display_names.get(label, label)}\nSensor residuals", fontsize=14)
+    axes3[col].axis('off')
+    plt.colorbar(im_res, ax=axes3[col], fraction=0.046, pad=0.04)
+
 plt.suptitle(
-    f'Navier-Stokes GAD versus AGAD (d={ACTIVE_DIM}): sensor residuals',
+    f'Allen–Cahn LFGI-GAD versus MALA (d={ACTIVE_DIM}): sensor-space residuals',
     fontsize=16,
     y=1.05,
 )
 plt.tight_layout()
 plt.show()
 
-dashboard.add_run_results_png_figures(run_ctx['run_results_dir'])
+if DASHBOARD_SHOW_FIGURES:
+    dashboard.add_run_results_png_figures(run_ctx['run_results_dir'])
 dashboard.close()
-
+plt.close('all')
 run_results_zip_path = zip_run_results_dir(extra_paths=[DASHBOARD_PDF_PATH])
 print(f"Run-results directory: {run_ctx['run_results_dir']}")
 print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
-print('\n=== Navier-Stokes GAD versus AGAD comparison pipeline complete ===')
+print('\n=== Allen–Cahn LFGI-GAD versus MALA comparison pipeline complete ===')
