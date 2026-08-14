@@ -1,16 +1,18 @@
-# -*- coding: utf-8 -*- 
-"""Darcy flow inverse-problem GAD benchmark.
+# -*- coding: utf-8 -*-
+"""Darcy flow inverse-problem GAD versus AGAD benchmark.
 
-Runs the paper comparison for GN-LFGI, local matrix/scalar blends, global
-matrix/scalar blends, and Tweedie.  Each method performs three transport-only
-GAD iterations and reports iterations 1 and 3.  Every transport output becomes
-the reference particle law for the next iteration; no ratio node is scheduled.
+Runs a controlled two-arm comparison using GN-LFGI only.  GAD performs a
+transport-only chain, while AGAD inserts a completed-score probability-flow
+ratio node after every transport node.  Both arms use the same number of
+transport iterations and report transport iterations 1 and 3.
 
 Useful overrides:
 
     export IP_ITER_N_REF=1000
     export IP_ITER_ROUNDS=3
     export IP_ITER_TRANSPORT_STEPS=200
+    export IP_ITER_RATIO_STEPS=200
+    export IP_ITER_DENSITY_STEPS=32
 """
 import gc
 import os
@@ -737,76 +739,140 @@ ACTIVE_DIM = num_truncated_series
 PLOT_NORMALIZER = 'best'
 HESS_MIN = 1e-6
 HESS_MAX = 1e6
-DEFAULT_N_GEN = 1200
-N_REF = 1200
+DEFAULT_N_GEN = 1000
+N_REF = 1000
 
 
 # ==========================================
-# GAD transport-only benchmark configuration
+# GAD versus AGAD benchmark configuration
 # ==========================================
-# Each method repeatedly applies the sampling/transport node T_r.  Its unweighted
-# output particle law becomes the reference for T_{r+1}.  Only the requested
-# iterations enter tables and plots.
+# GAD follows T_1 -> ... -> T_K.  AGAD follows
+# T_1 -> R_1 -> ... -> T_K -> R_K, where each hidden R_r is the completed-score
+# probability-flow ratio correction implemented by sampling.CompletedRatioField.
+# Only the requested transport iterates enter tables and plots.
 
 def _env_int(name, default):
     return int(os.environ.get(name, str(default)))
 
 
+def _env_float(name, default):
+    return float(os.environ.get(name, str(default)))
+
+
 N_REF = _env_int('IP_ITER_N_REF', _env_int('IP_DARCY_ITER_N_REF', N_REF))
 DEFAULT_N_GEN = _env_int('IP_ITER_DEFAULT_N_GEN', _env_int('IP_DARCY_ITER_DEFAULT_N_GEN', N_REF))
-GAD_ITERATIONS = _env_int('IP_ITER_ROUNDS', 4)
-DISPLAY_GAD_ITERATIONS = {1,2,3,4}
+ITERATIVE_TRANSPORT_ROUNDS = _env_int('IP_ITER_ROUNDS', 3)
+DISPLAY_TRANSPORT_ROUNDS = {1,2,3}
 TRANSPORT_STEPS = _env_int('IP_ITER_TRANSPORT_STEPS', 200)
+RATIO_STEPS = _env_int('IP_ITER_RATIO_STEPS', TRANSPORT_STEPS)
+
+RATIO_FLOW_COMMON = dict(
+    ratio_mode='pflow',
+    steps=RATIO_STEPS,
+    density_steps=_env_int('IP_ITER_DENSITY_STEPS', 32),
+    density_divergence=os.environ.get('IP_ITER_DENSITY_DIVERGENCE', 'auto'),
+    density_div_probes=_env_int('IP_ITER_DENSITY_DIV_PROBES', 1),
+    density_batch_size=_env_int('IP_ITER_DENSITY_BATCH_SIZE', 32),
+    ratio_log_weight_clip=_env_float('IP_ITER_RATIO_LOG_WEIGHT_CLIP', 20.0),
+    ratio_temperature=_env_float('IP_ITER_RATIO_TEMPERATURE', 1.0),
+    density_fd_eps=_env_float('IP_ITER_DENSITY_FD_EPS', 1e-3),
+)
 
 
-'''
+
 METHOD_SPECS = OrderedDict([
-    ('LFGI', {
+    ('GAD-LFGI', {
         'score': 'lfgi',
-        'display': 'GN-LFGI',
+        'display': 'GAD (GN-LFGI)',
+        'use_ratio': False,
     }),
-    ('MatrixBlend', {
+    ('GAD-MatrixBlend', {
         'score': 'local_matrix_blend',
-        'display': 'MATRIX BLEND',
+        'display': 'GAD (Matrix Blend)',
+        'use_ratio': False,
     }),
-    ('ScalarBlend', {
+    ('GAD-ScalarBlend', {
         'score': 'local_scalar_blend',
-        'display': 'Local Scalar Blend',
+        'display': 'GAD (Local Scalar Blend)',
+        'use_ratio': False,
     }),
-    ('GlobalMatrixBlend', {
+    ('GAD-GlobalMatrixBlend', {
         'score': 'global_matrix_blend',
-        'display': 'Global Matrix Blend',
+        'display': 'GAD (Global Matrix Blend)',
+        'use_ratio': False,
     }),
-    ('GlobalScalarBlend', {
+    ('GAD-GlobalScalarBlend', {
         'score': 'global_scalar_blend',
-        'display': 'Global Scalar Blend',
+        'display': 'GAD (Global Scalar Blend)',
+        'use_ratio': False,
     }),
-    ('Tweedie', {
+    ('GAD-Tweedie', {
         'score': 'tweedie',
-        'display': 'Tweedie',
+        'display': 'GAD (Tweedie)',
+        'use_ratio': False,
+    }),
+])
+
+
+'''
+METHOD_SPECS = OrderedDict([
+    ('GAD-LFGI', {
+        'score': 'lfgi',
+        'display': 'GAD (GN-LFGI)',
+        'use_ratio': False,
+    }),
+    ('GAD-ScalarBlend', {
+        'score': 'local_scalar_blend',
+        'display': 'GAD (Local Scalar Blend)',
+        'use_ratio': False,
+    }),
+    ('GAD-GlobalMatrixBlend', {
+        'score': 'global_matrix_blend',
+        'display': 'GAD (Global Matrix Blend)',
+        'use_ratio': False,
+    }),
+    ('GAD-GlobalScalarBlend', {
+        'score': 'global_scalar_blend',
+        'display': 'GAD (Global Scalar Blend)',
+        'use_ratio': False,
+    }),
+])
+
+
+
+
+METHOD_SPECS = OrderedDict([
+    ('GAD', {
+        'score': 'lfgi',
+        'display': 'GAD (GN-LFGI)',
+        'use_ratio': False,
+    }),
+    ('AGAD', {
+        'score': 'lfgi',
+        'display': 'AGAD (GN-LFGI)',
+        'use_ratio': True,
+        'ratio_config': dict(RATIO_FLOW_COMMON),
     }),
 ])
 '''
 
 
-METHOD_SPECS = OrderedDict([
-    ('LFGI', {
-        'score': 'lfgi',
-        'display': 'GN-LFGI',
-    }),
-])
-
-
-def make_gad_sampler_configs(method_specs, iterations=GAD_ITERATIONS):
-    """Build transport-only GAD schedules T_1 -> ... -> T_K."""
+def make_gad_vs_agad_sampler_configs(method_specs, rounds=ITERATIVE_TRANSPORT_ROUNDS):
+    """Build one transport chain per explicit GAD/AGAD method entry."""
     configs = OrderedDict()
     for method_key, spec in method_specs.items():
         score_method = spec['score']
         display_base = spec['display']
-        prev_transport_label = None
+        use_ratio = bool(spec.get('use_ratio', False))
+        ratio_config = dict(spec.get('ratio_config', {}))
+        if use_ratio and ratio_config.get('ratio_mode', 'pflow') != 'pflow':
+            raise ValueError(
+                f'{method_key}: AGAD must use the completed-score pflow ratio node.'
+            )
 
-        for iteration_idx in range(1, int(iterations) + 1):
-            transport_label = f'{method_key}-T{iteration_idx}'
+        previous_label = None
+        for round_idx in range(1, int(rounds) + 1):
+            transport_label = f'{method_key}-T{round_idx}'
             transport_cfg = {
                 'node': 'transport',
                 'score': score_method,
@@ -816,18 +882,37 @@ def make_gad_sampler_configs(method_specs, iterations=GAD_ITERATIONS):
                 'n_gate': N_REF,
                 'bank_coupling': 'shared',
                 'log_mean_ess': True,
-                'include_results': iteration_idx in DISPLAY_GAD_ITERATIONS,
-                'display_name': f'{display_base} iteration {iteration_idx}',
+                'include_results': round_idx in DISPLAY_TRANSPORT_ROUNDS,
+                'display_name': f'{display_base} iteration {round_idx}',
             }
-            if prev_transport_label is not None:
-                transport_cfg['ref_source'] = prev_transport_label
+            if previous_label is not None:
+                transport_cfg['ref_source'] = previous_label
             configs[transport_label] = transport_cfg
-            prev_transport_label = transport_label
+
+            if use_ratio:
+                ratio_label = f'{method_key}-R{round_idx}'
+                ratio_cfg = {
+                    'node': 'ratio',
+                    'score': score_method,
+                    'ref_source': transport_label,
+                    'n_samples': DEFAULT_N_GEN,
+                    'n_ref': N_REF,
+                    'n_gate': N_REF,
+                    'bank_coupling': 'shared',
+                    'log_mean_ess': False,
+                    'include_results': False,
+                    'display_name': f'{display_base} completed ratio {round_idx}',
+                }
+                ratio_cfg.update(ratio_config)
+                configs[ratio_label] = ratio_cfg
+                previous_label = ratio_label
+            else:
+                previous_label = transport_label
 
     return configs
 
 
-SAMPLER_CONFIGS = make_gad_sampler_configs(METHOD_SPECS)
+SAMPLER_CONFIGS = make_gad_vs_agad_sampler_configs(METHOD_SPECS)
 
 configure_sampling(
     active_dim=ACTIVE_DIM,
@@ -835,7 +920,7 @@ configure_sampling(
     hess_min=HESS_MIN,
     hess_max=HESS_MAX,
 )
-run_ctx = init_run_results('darcy_gad')
+run_ctx = init_run_results('darcy_gad_vs_agad')
 DASHBOARD_PDF_PATH = os.path.join(
     run_ctx['run_results_dir'],
     f"{run_ctx['run_results_stem']}_summary_dashboard.pdf",
@@ -843,11 +928,14 @@ DASHBOARD_PDF_PATH = os.path.join(
 
 RUN_COMMAND_HINT = (
     'IP_ITER_N_REF={n_ref} IP_ITER_ROUNDS={rounds} '
-    'IP_ITER_TRANSPORT_STEPS={transport_steps} python darcy_gad.py'
+    'IP_ITER_TRANSPORT_STEPS={transport_steps} IP_ITER_RATIO_STEPS={ratio_steps} '
+    'IP_ITER_DENSITY_STEPS={density_steps} python darcy_gad_agad_explicit_arms_20260811.py'
 ).format(
     n_ref=N_REF,
-    rounds=GAD_ITERATIONS,
+    rounds=ITERATIVE_TRANSPORT_ROUNDS,
     transport_steps=TRANSPORT_STEPS,
+    ratio_steps=RATIO_STEPS,
+    density_steps=RATIO_FLOW_COMMON['density_steps'],
 )
 
 # ==========================================
@@ -869,13 +957,13 @@ y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_
 
 dashboard = DashboardPDF(
     DASHBOARD_PDF_PATH,
-    title='Darcy flow GAD dashboard',
+    title='Darcy flow GAD versus AGAD dashboard',
 )
 dashboard.add_text_page(
-    'Darcy flow GAD dashboard',
+    'Darcy flow GAD versus AGAD dashboard',
     [
         f"Created: {datetime.now().isoformat(timespec='seconds')}",
-        'This dashboard contains the two canonical saved-results tables plus every PNG diagnostic plot saved in the run directory. Rows are transport-only GAD iterates T_r; each iterate supplies the unweighted reference cloud for the next.',
+        'This dashboard compares matched GN-LFGI arms. GAD chains transport nodes directly; AGAD inserts a hidden completed-score probability-flow ratio node after every transport node. Public rows are transport iterations 1 and 3.',
         'Included PNG diagnostics: ESS vs diffusion time, PCA histograms, log-permeability reconstructions, pressure fields, and permeability fields.',
         'Tables are intentionally limited to two pages: metrics plus a readable split run-info page.',
         'Random progress output from precomputation / Hessian batching is intentionally excluded.',
@@ -885,9 +973,11 @@ dashboard.add_text_page(
         f'ACTIVE_DIM = {ACTIVE_DIM}',
         f'N_REF = {N_REF}',
         f'DEFAULT_N_GEN = {DEFAULT_N_GEN}',
-        f'GAD_ITERATIONS = {GAD_ITERATIONS}',
-        f'DISPLAY_GAD_ITERATIONS = {sorted(DISPLAY_GAD_ITERATIONS)}',
+        f'ITERATIVE_TRANSPORT_ROUNDS = {ITERATIVE_TRANSPORT_ROUNDS}',
+        f'DISPLAY_TRANSPORT_ROUNDS = {sorted(DISPLAY_TRANSPORT_ROUNDS)}',
         f'TRANSPORT_STEPS = {TRANSPORT_STEPS}',
+        f'RATIO_STEPS = {RATIO_STEPS}',
+        f'RATIO_FLOW_COMMON = {RATIO_FLOW_COMMON}',
         f'NOISE_STD = {NOISE_STD}',
         f'N = {N}, num_observation = {num_observation}, num_holdout_observation = {num_holdout_observation}',
         f'HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}',
@@ -1051,7 +1141,7 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
 dashboard.add_results_tables(results_df, results_runinfo_df)
 
 save_reproducibility_log(
-    title='Darcy flow GAD reproducibility log',
+    title='Darcy flow GAD versus AGAD reproducibility log',
     config={
         'seed': seed,
         'ACTIVE_DIM': ACTIVE_DIM,
@@ -1061,9 +1151,11 @@ save_reproducibility_log(
         'N': N,
         'NOISE_STD': NOISE_STD,
         'N_REF': N_REF,
-        'GAD_ITERATIONS': GAD_ITERATIONS,
-        'DISPLAY_GAD_ITERATIONS': sorted(DISPLAY_GAD_ITERATIONS),
+        'ITERATIVE_TRANSPORT_ROUNDS': ITERATIVE_TRANSPORT_ROUNDS,
+        'DISPLAY_TRANSPORT_ROUNDS': sorted(DISPLAY_TRANSPORT_ROUNDS),
         'TRANSPORT_STEPS': TRANSPORT_STEPS,
+        'RATIO_STEPS': RATIO_STEPS,
+        'RATIO_FLOW_COMMON': RATIO_FLOW_COMMON,
         'METHOD_SPECS': METHOD_SPECS,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
         'USE_GAUSS_NEWTON_HESSIAN': True,
@@ -1185,7 +1277,7 @@ if n_cols > 1:
             axes[3, col].text(0.5, 0.5, 'No valid\nsamples', ha='center', va='center', transform=axes[3, col].transAxes)
         axes[3, col].axis('off')
 
-    plt.suptitle(f'Inverse Darcy flow GAD (d={ACTIVE_DIM})', fontsize=22, y=1.01)
+    plt.suptitle(f'Inverse Darcy flow: GAD versus AGAD (d={ACTIVE_DIM})', fontsize=22, y=1.01)
     plt.tight_layout()
     plt.show()
 
@@ -1212,7 +1304,7 @@ if n_cols > 1:
         axes2[col].set_title(f"{display_names.get(label, label)}\nPressure", fontsize=14)
         axes2[col].axis('off')
 
-    plt.suptitle(f'Inverse Darcy flow GAD (d={ACTIVE_DIM}): pressure field', fontsize=16, y=1.05)
+    plt.suptitle(f'Inverse Darcy flow GAD versus AGAD (d={ACTIVE_DIM}): pressure field', fontsize=16, y=1.05)
     plt.tight_layout()
     plt.show()
 
@@ -1236,7 +1328,7 @@ if n_cols > 1:
         axes3[col].set_title(f"{display_names.get(label, label)}\n$k(x)=e^{{m(x)}}$", fontsize=14)
         axes3[col].axis('off')
 
-    plt.suptitle(f'Inverse Darcy flow GAD (d={ACTIVE_DIM}): permeability field', fontsize=16, y=1.05)
+    plt.suptitle(f'Inverse Darcy flow GAD versus AGAD (d={ACTIVE_DIM}): permeability field', fontsize=16, y=1.05)
     plt.tight_layout()
     plt.show()
 else:
@@ -1250,4 +1342,4 @@ run_results_zip_path = zip_run_results_dir(extra_paths=[DASHBOARD_PDF_PATH])
 print(f"Run-results directory: {run_ctx['run_results_dir']}")
 print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
-print('\n=== Darcy flow GAD comparison pipeline complete ===')
+print('\n=== Darcy flow GAD versus AGAD comparison pipeline complete ===')
