@@ -1,15 +1,17 @@
-"""CSEM comparison with split representation/score-head time metrics.
+"""CSEM comparison with independently parameterized representation and score-head routes.
 
-APPLIES-V1 MATCHED VARIANT: restores the historical joint norm-1 cotrain clip
-and unclipped PatchGAN update while retaining dual gradient routing.
+APPLIES-V2 DECOUPLED ROUTING VARIANT: retains the historical joint norm-1
+cotrain clip and unclipped PatchGAN update while making dual gradient routing
+explicit for every co-training configuration.
 
-The representation block may follow the canonical physical-time CSEM
-objective while the active score head follows the better-conditioned plain
-epsilon-MSE objective.  Gradients are routed blockwise: the VAE receives the
-outer objective's exact path (including the score network input Jacobian), and
-score-parameter gradients are replaced by gradients of the configured inner
-tracking objective.  Matching outer/inner modes exactly preserves the previous
-joint-update behavior.
+The representation route is controlled by ``--csem-w`` and
+``--score-time-weighting``. The active score-head route is controlled
+independently by ``--score-head-loss-w``, ``--score-head-time-weighting``, and
+``--lr-score-head``. The VAE receives the outer objective's exact path
+(including the score-network input Jacobian), while score-parameter gradients
+are always replaced by gradients of the configured inner tracking objective.
+Consequently, changing the representation regularization strength no longer
+changes either the routed score-head loss scale or its default learning rate.
 """
 
 from __future__ import annotations
@@ -4561,21 +4563,19 @@ def train_vae_cotrained_cond(cfg):
         config_key="score_head_time_weighting",
         role="inner score-head objective",
     )
-    split_score_gradient_routing = (
-        score_head_time_weighting != score_time_weighting
-    )
+    # Dual routing is now unconditional during co-training. Even when the
+    # outer and inner time metrics match, score gradients are replaced by the
+    # independently parameterized head objective so representation scaling can
+    # never leak into score-head optimization.
+    split_score_gradient_routing = True
     T = int(ou_sched["T"].item())
     noise_sched = ou_sched
     print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
     print(f"--> Outer/representation time weighting: {score_time_weighting}")
     print(f"--> Inner/score-head time weighting: {score_head_time_weighting}")
     print(
-        "--> Score gradient routing: "
-        + (
-            "split (outer gradient to VAE, inner gradient to score parameters)"
-            if split_score_gradient_routing
-            else "joint (outer and inner metrics match)"
-        )
+        "--> Score gradient routing: blockwise/decoupled "
+        "(outer gradient to VAE, independent inner gradient to score parameters)"
     )
     if score_time_weighting == "canonical":
         weight_grid_summary = canonical_stability_weight_grid_summary(ou_sched)
@@ -4722,8 +4722,9 @@ def train_vae_cotrained_cond(cfg):
 
     ema_decay = cfg.get("ema_decay", .999)
 
-    # --- Asymmetric LR Settings ---
-    score_w_vae = cfg.get("score_w_vae", cfg["score_w"])
+    # --- Independently parameterized representation / score-head routes ---
+    score_w_vae = float(cfg.get("score_w_vae", cfg["score_w"]))
+    score_head_loss_w = float(cfg.get("score_head_loss_w", 1.0))
     cotrain_head = cfg.get("cotrain_head", "lsi")
     aux_head_w = float(cfg.get("aux_head_w", 0.05))
     freeze_score_in_cotrain = cfg.get("freeze_score_in_cotrain", False)
@@ -4883,6 +4884,8 @@ def train_vae_cotrained_cond(cfg):
         f"{score_tracking_every} batch(es), grad_diag_every="
         f"{grad_diagnostics_every or 'off'}, "
         f"outer={score_time_weighting}, inner={score_head_time_weighting}, "
+        f"rep_csem_w={score_w_vae:g}, head_loss_w={score_head_loss_w:g}, "
+        f"head_lr={cfg['lr_score_head']:.6g}, "
         f"split_routing={split_score_gradient_routing}"
     )
 
@@ -4901,8 +4904,9 @@ def train_vae_cotrained_cond(cfg):
         else:
             encoder_csem_gradient_multiplier = 1.0
         encoder_score_is_detached = encoder_csem_gradient_multiplier == 0.0
-        # Preserve the full canonical objective and full head gradient. Only the
-        # backward path from CSEM into the VAE uses the continuation multiplier.
+        # Preserve the configured representation objective. Only the backward
+        # path from CSEM into the VAE uses the continuation multiplier; the score
+        # head has its own coefficient and LR and is routed independently below.
         active_score_w_vae = score_w_vae
         metrics = {
             k: 0.0 for k in [
@@ -5319,14 +5323,17 @@ def train_vae_cotrained_cond(cfg):
                 # inner objective has the same pointwise score oracle but may
                 # use a better-conditioned time metric for score parameters.
                 if cotrain_head == "lsi":
+                    # Representation route: this coefficient belongs only to the
+                    # objective whose gradient reaches the VAE/encoder.
                     active_score_objective = active_score_w_vae * score_loss_lsi
+                    # Score-head route: independent tracking coefficient.
                     active_score_inner_objective = (
-                        active_score_w_vae * score_loss_lsi_inner
+                        score_head_loss_w * score_loss_lsi_inner
                     )
                 else:  # cotrain_head == "control"
                     active_score_objective = active_score_w_vae * score_loss_control
                     active_score_inner_objective = (
-                        active_score_w_vae * score_loss_control_inner
+                        score_head_loss_w * score_loss_control_inner
                     )
                 loss_joint = (
                     reconstruction_objective
@@ -5654,9 +5661,12 @@ def train_vae_cotrained_cond(cfg):
                         tracking_aux_lambda = torch.tensor(0.0, device=device)
                         tracking_aux_nu = torch.tensor(0.0, device=device)
 
-                    # Full theorem coefficient: the ramp protects the encoder,
-                    # while this detached regression step keeps the head current.
-                    same_head_tracking_objective = score_w_vae * tracking_score_loss
+                    # Head-only tracking uses the independent score-head
+                    # coefficient; representation regularization strength does not
+                    # alter this numerical tracking objective.
+                    same_head_tracking_objective = (
+                        score_head_loss_w * tracking_score_loss
+                    )
                     if fail_on_nonfinite:
                         canonical_stability_assert_finite(
                             {
@@ -5877,6 +5887,8 @@ def train_vae_cotrained_cond(cfg):
             "csem_ramp_multiplier": encoder_csem_gradient_multiplier,
             "encoder_csem_gradient_multiplier": encoder_csem_gradient_multiplier,
             "active_csem_w": active_score_w_vae,
+            "score_head_loss_w": score_head_loss_w,
+            "lr_score_head": float(cfg["lr_score_head"]),
             "encoder_score_detached": float(encoder_score_is_detached),
             "lr_vae_current": float(opt_joint.param_groups[0]["lr"]),
             "lr_score_current": (
@@ -6811,10 +6823,22 @@ def main():
         type=float,
         default=0.6,
         help=(
-            "Weight multiplying the joint CSEM loss in every selected arm. "
-            "Default: 0.6 (the script's previous hard-coded value). For the exact "
-            "canonical CSEM + K_T coefficient identity, set this equal to "
-            "--terminal-kl-w."
+            "Representation-route CSEM coefficient: multiplies only the outer CSEM "
+            "objective whose gradient reaches the VAE/encoder. It does NOT scale "
+            "the routed score-head objective or determine the score-head LR. "
+            "Default: 0.6. For the exact canonical CSEM + K_T coefficient identity, "
+            "set this equal to --terminal-kl-w."
+        ),
+    )
+    parser.add_argument(
+        "--score-head-loss-w", "--score-head-w",
+        dest="score_head_loss_w",
+        type=float,
+        default=1.0,
+        help=(
+            "Independent coefficient multiplying the routed active score-head "
+            "tracking loss. Default: 1.0. This never multiplies the representation "
+            "CSEM route and is independent of --csem-w and --lr-score-head."
         ),
     )
     parser.add_argument(
@@ -6849,8 +6873,9 @@ def main():
         help=(
             "Time metric used only for active score-head parameter gradients, "
             "detached tracking steps, auxiliary tracking heads, and frozen-VAE "
-            "refinement. 'match-outer' preserves the previous joint gradient. "
-            "Use --score-time-weighting canonical together with "
+            "refinement. 'match-outer' copies the outer time metric, but the score "
+            "gradient is still routed independently. Use --score-time-weighting "
+            "canonical together with "
             "--score-head-time-weighting unweighted-eps for canonical-outer / "
             "epsilon-inner split-metric CSEM."
         ),
@@ -6918,9 +6943,9 @@ def main():
         type=float,
         default=None,
         help=(
-            "Override base CSEM/DiT AdamW LR; otherwise use preset default. "
-            "The co-trained LSI head preserves the existing optimizer convention "
-            "and uses lr_ldm / csem_w when csem_w > 0."
+            "Override the dataset preset base LDM LR used by auxiliary tracking and "
+            "refinement paths; otherwise use the preset default. This no longer "
+            "determines the active score-head LR through --csem-w."
         ),
     )
     parser.add_argument(
@@ -6928,10 +6953,10 @@ def main():
         type=float,
         default=None,
         help=(
-            "Direct override for the actual co-trained score-head AdamW param-group "
-            "LR. If omitted, preserve the legacy lr_ldm / csem_w convention. This "
-            "flag is an effective LR and is not additionally multiplied by "
-            "--canonical-lr-scale."
+            "Independent AdamW LR for the active co-trained score-head parameter "
+            "group. If omitted, use the dataset/base --lr-ldm value BEFORE any "
+            "--canonical-lr-scale adjustment. It is never divided by --csem-w and "
+            "is independent of --score-head-loss-w."
         ),
     )
     parser.add_argument(
@@ -6963,10 +6988,9 @@ def main():
         type=float,
         default=1.0,
         help=(
-            "Multiply the resolved VAE LR and base LDM LR when canonical time "
-            "weighting is active. This compensates for the canonical loss's larger "
-            "absolute gradient scale without renormalizing or changing the theorem's "
-            "objective. Default 1.0. An explicit --lr-score-head remains final."
+            "Multiply the resolved VAE LR and auxiliary/base LDM LR when canonical "
+            "representation weighting is active. The active score-head LR is "
+            "independent and is never multiplied by this scale. Default 1.0."
         ),
     )
     parser.add_argument(
@@ -7123,6 +7147,7 @@ def main():
         else preset.get("t_max", 1.5)
     )
     csem_w = float(args.csem_w)
+    score_head_loss_w = float(args.score_head_loss_w)
     score_head_time_weighting = (
         args.score_time_weighting
         if args.score_head_time_weighting == "match-outer"
@@ -7138,7 +7163,9 @@ def main():
     lr_score_head = (
         float(args.lr_score_head)
         if args.lr_score_head is not None
-        else (lr_ldm / csem_w if csem_w > 0.0 else 0.0)
+        # Independent default: do NOT divide by csem_w and do NOT inherit
+        # canonical_lr_scale from the representation route.
+        else base_lr_ldm
     )
     cfg_strength = float(args.cfg_strength)
     use_bespoke_fid_classifier = resolve_bespoke_fid_classifier(
@@ -7172,6 +7199,11 @@ def main():
         raise ValueError(
             f"--csem-w must be finite and nonnegative, got {csem_w}"
         )
+    if not math.isfinite(score_head_loss_w) or score_head_loss_w < 0.0:
+        raise ValueError(
+            "--score-head-loss-w must be finite and nonnegative, got "
+            f"{score_head_loss_w}"
+        )
     if (
         not math.isfinite(canonical_lr_scale)
         or canonical_lr_scale <= 0.0
@@ -7187,8 +7219,10 @@ def main():
         raise ValueError("--disc-start-epoch must be >= 1")
     if not math.isfinite(lr_score_head) or lr_score_head < 0.0:
         raise ValueError("Resolved --lr-score-head must be finite and >= 0")
-    if csem_w > 0.0 and lr_score_head <= 0.0:
-        raise ValueError("A positive --csem-w requires a positive score-head LR")
+    if score_head_loss_w > 0.0 and lr_score_head <= 0.0:
+        raise ValueError(
+            "A positive --score-head-loss-w requires a positive --lr-score-head"
+        )
     if args.vae_grad_clip <= 0.0 or not math.isfinite(args.vae_grad_clip):
         raise ValueError("--vae-grad-clip must be finite and > 0")
     if args.score_grad_clip <= 0.0 or not math.isfinite(args.score_grad_clip):
@@ -7267,8 +7301,9 @@ def main():
         # --- CSEM score loss ---
         "cosine_w": 0.0,
         "aux_head_w": 0.0025,
-        # Shared coefficient on the joint CSEM term in both comparison arms.
+        # Representation-route coefficient and independent score-head route scale.
         "score_w_vae": csem_w,
+        "score_head_loss_w": score_head_loss_w,
 
         # --- Encoder architecture ---
         "aux_d": 0,
@@ -7469,13 +7504,8 @@ def main():
         f"{cfg_norm['score_head_time_weighting']}"
     )
     print(
-        "Gradient routing: "
-        + (
-            "split (canonical representation gradient; separately weighted score gradient)"
-            if cfg_norm["score_time_weighting"]
-            != cfg_norm["score_head_time_weighting"]
-            else "joint (matching metrics)"
-        )
+        "Gradient routing: blockwise/decoupled "
+        "(outer representation objective -> VAE; independent inner objective -> score)"
     )
     print(
         "Stability: "
@@ -7491,8 +7521,12 @@ def main():
         f"GAN start={cfg_norm['disc_start_epoch']}"
     )
     print(
-        f"Objective weights: csem_w={cfg_norm['score_w_vae']:g} | "
+        f"Representation weights: csem_w={cfg_norm['score_w_vae']:g} | "
         f"terminal_kl_w={cfg_terminal['kl_w']:g}"
+    )
+    print(
+        f"Score-head tracking: loss_w={cfg_norm['score_head_loss_w']:g} | "
+        f"lr={cfg_norm['lr_score_head']:.6g}"
     )
     if (
         cfg_norm["score_time_weighting"] == "canonical"
@@ -7528,7 +7562,9 @@ def main():
         print(f"  use_latent_norm = {cfg_terminal['use_latent_norm']}")
         print(f"  kl_reg_type     = {cfg_terminal['kl_reg_type']}")
         print(f"  kl_w            = {cfg_terminal['kl_w']}")
-        print(f"  csem_w          = {cfg_terminal['score_w_vae']}  (shared)")
+        print(f"  csem_w          = {cfg_terminal['score_w_vae']}  (representation)")
+        print(f"  score_head_w    = {cfg_terminal['score_head_loss_w']}  (independent)")
+        print(f"  score_head_lr   = {cfg_terminal['lr_score_head']}")
         print(f"  stiff_w         = {cfg_terminal['stiff_w']}  (disabled)")
         print(
             f"  terminal T      = T_terminal = t_max = "
@@ -7540,7 +7576,9 @@ def main():
         print(f"  use_latent_norm = {cfg_norm['use_latent_norm']}")
         print(f"  kl_reg_type     = {cfg_norm['kl_reg_type']}")
         print(f"  kl_w            = {cfg_norm['kl_w']}")
-        print(f"  csem_w          = {cfg_norm['score_w_vae']}  (shared)")
+        print(f"  csem_w          = {cfg_norm['score_w_vae']}  (representation)")
+        print(f"  score_head_w    = {cfg_norm['score_head_loss_w']}  (independent)")
+        print(f"  score_head_lr   = {cfg_norm['lr_score_head']}")
         print(f"  stiff_w         = {cfg_norm['stiff_w']}")
     print("=" * 78)
 
