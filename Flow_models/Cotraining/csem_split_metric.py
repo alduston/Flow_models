@@ -1,5 +1,8 @@
 """CSEM comparison with split representation/score-head time metrics.
 
+APPLIES-V1 MATCHED VARIANT: restores the historical joint norm-1 cotrain clip
+and unclipped PatchGAN update while retaining dual gradient routing.
+
 The representation block may follow the canonical physical-time CSEM
 objective while the active score head follows the better-conditioned plain
 epsilon-MSE objective.  Gradients are routed blockwise: the VAE receives the
@@ -5287,15 +5290,12 @@ def train_vae_cotrained_cond(cfg):
                     )
                 opt_disc.zero_grad(set_to_none=True)
                 d_loss.backward()
-                (
-                    discriminator_grad_preclip,
-                    _,
-                    discriminator_clip_hit,
-                ) = canonical_stability_clip_group(
-                    tuple(disc.parameters()),
-                    disc_grad_clip,
-                    group_name="PatchGAN discriminator",
-                )
+                # Apples-to-apples with the historical csem_new.py run:
+                # the PatchGAN discriminator was stepped without gradient clipping.
+                # These diagnostics are intentionally neutral because component
+                # gradient diagnostics are disabled for the matched experiment.
+                discriminator_grad_preclip = 0.0
+                discriminator_clip_hit = 0.0
                 opt_disc.step()
                 # Generator loss (non-detached)
                 g_loss = hinge_g_loss(disc(x_rec))
@@ -5425,25 +5425,35 @@ def train_vae_cotrained_cond(cfg):
                     active_score_parameters,
                     routed_score_gradients,
                 )
-            vae_grad_preclip, vae_clip_multiplier, vae_clip_hit = (
-                canonical_stability_clip_group(
-                    vae_parameters,
-                    vae_grad_clip,
-                    group_name="VAE",
-                )
-            )
             if freeze_score_in_cotrain:
+                # Historical behavior for VAE-only cotraining: clip the VAE at 1.0.
+                joint_preclip = nn.utils.clip_grad_norm_(vae_parameters, 1.0)
+                joint_preclip_value = float(joint_preclip.detach().cpu().item())
+                vae_grad_preclip = joint_preclip_value
+                vae_clip_multiplier = min(1.0, 1.0 / (joint_preclip_value + 1e-12))
+                vae_clip_hit = float(joint_preclip_value > 1.0)
                 score_grad_preclip = 0.0
                 score_clip_multiplier = 1.0
                 score_clip_hit = 0.0
             else:
-                score_grad_preclip, score_clip_multiplier, score_clip_hit = (
-                    canonical_stability_clip_group(
-                        active_score_parameters,
-                        score_grad_clip,
-                        group_name="score head",
-                    )
-                )
+                # Apples-to-apples with the historical csem_new.py run. After the
+                # dual-routing replacement above, apply ONE global norm-1 clip to
+                # the combined VAE + active score-head parameter set.  This keeps
+                # the new gradient routing while restoring the old optimizer contract.
+                joint_parameters = vae_parameters + active_score_parameters
+                joint_preclip = nn.utils.clip_grad_norm_(joint_parameters, 1.0)
+                joint_preclip_value = float(joint_preclip.detach().cpu().item())
+                joint_clip_multiplier = min(1.0, 1.0 / (joint_preclip_value + 1e-12))
+                joint_clip_hit = float(joint_preclip_value > 1.0)
+                # Diagnostic fields are retained for schema compatibility. In this
+                # matched mode they report the shared joint clip rather than two
+                # independently clipped groups.
+                vae_grad_preclip = joint_preclip_value
+                score_grad_preclip = joint_preclip_value
+                vae_clip_multiplier = joint_clip_multiplier
+                score_clip_multiplier = joint_clip_multiplier
+                vae_clip_hit = joint_clip_hit
+                score_clip_hit = joint_clip_hit
             if should_measure_component_gradients:
                 gradient_diagnostic_row = {
                     "arm": cfg.get("comparison_arm", "unknown"),
