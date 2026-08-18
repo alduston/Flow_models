@@ -21,7 +21,7 @@ Consequently, changing the representation regularization strength no longer
 changes either the routed score-head loss scale or its default learning rate.
 """
 
-# CIFAR T_K SWEEP V1: adds an exact T_K=0 LDM-limit endpoint to the two-horizon implementation.
+# CIFAR T_K SWEEP V2: retains exact T_K=0 support and fixes factored-head outer/inner graph sharing.
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -6086,8 +6086,50 @@ def train_vae_cotrained_cond(cfg):
                     eps_pred_lsi, eps_target_lsi_for_score, score_time_weights
                 )
 
-                # Independent full-horizon score-head regression on detached latents.
-                eps_pred_lsi_inner_full = unet_lsi(z_t_head, t_head, y_in)
+                # Independent full-horizon score-head regression on detached
+                # latents. IMPORTANT: for the factored head the inner auxiliary
+                # loss must be computed from this *independent* forward pass.
+                # Reusing aux_loss_lam from the outer representation forward
+                # would make the inner and outer autograd graphs overlap; the
+                # routed autograd.grad(inner) call would then free saved tensors
+                # needed by loss_joint.backward().
+                if use_factored:
+                    (
+                        eps_pred_lsi_inner_full,
+                        lam_pred_inner,
+                        nu_pred_inner,
+                    ) = unet_lsi(
+                        z_t_head,
+                        t_head,
+                        y_in,
+                        return_components=True,
+                        detach_components=True,
+                    )
+                    lam_tgt_inner = (
+                        sigma_head / (var_t_head + 1e-8)
+                    ).detach()
+                    nu_tgt_inner = (
+                        lam_tgt_inner * mu_t_head.detach()
+                    )
+                    aux_loss_lam_inner = F.mse_loss(
+                        lam_pred_inner,
+                        lam_tgt_inner,
+                    )
+                    aux_loss_nu_inner = F.mse_loss(
+                        nu_pred_inner,
+                        nu_tgt_inner,
+                    )
+                else:
+                    eps_pred_lsi_inner_full = unet_lsi(
+                        z_t_head, t_head, y_in
+                    )
+                    aux_loss_lam_inner = torch.tensor(
+                        0.0, device=device
+                    )
+                    aux_loss_nu_inner = torch.tensor(
+                        0.0, device=device
+                    )
+
                 loss_mse_lsi_inner, loss_cos_lsi_inner = (
                     weighted_score_prediction_losses(
                         eps_pred_lsi_inner_full,
@@ -6104,10 +6146,15 @@ def train_vae_cotrained_cond(cfg):
                     loss_mse_lsi_inner + cos_w * loss_cos_lsi_inner
                 )
                 if use_factored:
-                    #score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam + aux_loss_nu)
-                    score_loss_lsi = score_loss_lsi + aux_head_w * (aux_loss_lam)
+                    # Outer auxiliary term belongs to the representation graph.
+                    score_loss_lsi = (
+                        score_loss_lsi + aux_head_w * aux_loss_lam
+                    )
+                    # Inner auxiliary term belongs only to the detached
+                    # full-horizon score-head graph.
                     score_loss_lsi_inner = (
-                        score_loss_lsi_inner + aux_head_w * aux_loss_lam
+                        score_loss_lsi_inner
+                        + aux_head_w * aux_loss_lam_inner
                     )
 
                 if train_tracking_head or cotrain_head == "control":
