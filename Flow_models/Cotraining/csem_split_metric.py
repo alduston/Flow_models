@@ -1,5 +1,12 @@
 """CSEM comparison with independently parameterized representation and score-head routes.
 
+WHY-V1 DIAGNOSTIC EXTENSION:
+  * optional exact empirical aggregate-score oracle over the full training set;
+  * learned-vs-oracle score error globally and as a function of diffusion time;
+  * CSEM residual = intrinsic component variance + learned-oracle error diagnostics;
+  * unconditional endpoint transport ablation separating exact-qT numerical error,
+    Gaussian terminal mismatch, and learned-score approximation.
+
 APPLIES-V2 DECOUPLED ROUTING VARIANT: retains the historical joint norm-1
 cotrain clip and unclipped PatchGAN update while making dual gradient routing
 explicit for every co-training configuration.
@@ -14,6 +21,7 @@ Consequently, changing the representation regularization strength no longer
 changes either the routed score-head loss scale or its default learning rate.
 """
 
+# T/T_K SPLIT V1: representation/KL horizon T_K is decoupled from score/sampling horizon T.
 from __future__ import annotations
 from torch._higher_order_ops import out_dtype
 import math
@@ -688,36 +696,40 @@ def validate_terminal_time_contract(
     cfg: Dict[str, Any],
     schedule: Dict[str, torch.Tensor] | None = None,
 ) -> float:
-    """Enforce one shared OU endpoint for K_T and reverse initialization.
+    """Validate the two-horizon T/T_K contract.
 
-    ``T_terminal`` is the user-facing name, while legacy training and sampler
-    code consume ``t_max``.  In a terminal-KL run they must denote the same
-    time.  If a schedule is supplied, its terminal grid point must agree too.
+    ``T_terminal`` is now the representation/KL horizon T_K.
+    ``t_max`` is the full score-training and Gaussian sampling horizon T.
+
+    Terminal-KL runs require t_min < T_K <= T.  If ``schedule`` is supplied
+    it is the full score schedule, so its endpoint must equal T, not T_K.
     """
-    t_max = float(cfg.get("t_max", 2.0))
-    T_terminal = float(cfg.get("T_terminal", t_max))
+    T = float(cfg.get("t_max", 2.0))
+    T_K = float(cfg.get("T_terminal", T))
+    t_min = float(cfg.get("t_min", 2e-5))
     reg_type = str(cfg.get("kl_reg_type", "mod")).lower()
 
     if reg_type not in TERMINAL_KL_REG_TYPES:
-        return T_terminal
+        return T_K
 
-    if not math.isfinite(T_terminal) or T_terminal <= 0.0:
-        raise ValueError(f"Terminal-KL mode requires finite T_terminal > 0, got {T_terminal}")
-    if not math.isclose(T_terminal, t_max, rel_tol=1e-9, abs_tol=1e-12):
+    if not math.isfinite(T_K) or T_K <= t_min:
         raise ValueError(
-            "Terminal-KL time mismatch: T_terminal controls K_T while t_max "
-            f"controls reverse-sampling initialization; got {T_terminal} != {t_max}."
+            f"Terminal-KL mode requires finite T_K=T_terminal > t_min; "
+            f"got T_K={T_K}, t_min={t_min}"
+        )
+    if not math.isfinite(T) or T < T_K:
+        raise ValueError(
+            f"Two-horizon contract requires finite T >= T_K; got T={T}, T_K={T_K}."
         )
 
     if schedule is not None:
         schedule_T = float(schedule["times"][-1].detach().cpu().item())
-        if not math.isclose(T_terminal, schedule_T, rel_tol=1e-6, abs_tol=1e-7):
+        if not math.isclose(T, schedule_T, rel_tol=1e-6, abs_tol=1e-7):
             raise ValueError(
-                "Terminal-KL schedule mismatch: configured T_terminal="
-                f"{T_terminal}, but the diffusion schedule ends at {schedule_T}."
+                f"Full score schedule ends at {schedule_T}, but configured T={T}."
             )
 
-    return T_terminal
+    return T_K
 
 
 
@@ -3199,6 +3211,596 @@ class OracleScoreModel:
         return self._compute_eps(z_t, t, label_filter=y)
 
 
+
+# ---------------------------------------------------------------------------
+# Focused oracle / transport diagnostics for reconstruction-matched sweeps
+# ---------------------------------------------------------------------------
+
+def collect_oracle_reference_components(
+    vae: nn.Module,
+    loader: DataLoader,
+    cfg: Dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Encode the *entire* dataset behind ``loader`` without dropping examples.
+
+    The returned CPU tensors define the empirical aggregate posterior mixture
+    used by :class:`OracleScoreModel`.  A fresh non-shuffled, drop_last=False
+    loader is built intentionally: the training loader used for optimization
+    shuffles and may drop its final partial batch.
+    """
+    ref_loader = DataLoader(
+        loader.dataset,
+        batch_size=int(cfg.get("oracle_reference_batch_size", cfg["batch_size"])),
+        shuffle=False,
+        num_workers=int(cfg.get("num_workers", 2)),
+        drop_last=False,
+    )
+    mus, logvars, labels = [], [], []
+    vae.eval()
+    use_cond_enc = bool(cfg.get("use_cond_encoder", False))
+    with torch.no_grad():
+        for x, y in tqdm(ref_loader, desc="  Encoding full oracle reference", leave=False):
+            x = x.to(device)
+            y_dev = y.to(device=device, dtype=torch.long) if use_cond_enc else None
+            mu, logvar = vae.encode(x, y=y_dev)
+            mus.append(mu.detach().cpu())
+            logvars.append(logvar.detach().cpu())
+            labels.append(y.view(-1).long().cpu())
+    return torch.cat(mus, 0), torch.cat(logvars, 0), torch.cat(labels, 0)
+
+
+
+def build_empirical_qT_init_bank(
+    reference_mus: torch.Tensor,
+    reference_logvars: torch.Tensor,
+    reference_labels: torch.Tensor,
+    *,
+    target_count: int,
+    cfg: Dict[str, Any],
+    epoch_idx: int,
+    target_labels: torch.Tensor | None = None,
+    terminal_time: float | None = None,
+) -> torch.Tensor:
+    """Sample exactly from the empirical aggregate q_t induced by the encoder.
+
+    ``reference_mus/logvars`` are the full training-set posterior components.
+    If ``target_labels`` is None, component indices are sampled uniformly from
+    the full empirical aggregate posterior.  If labels are supplied, every
+    requested label draws a component uniformly from that class, giving an
+    empirical class-conditional q_T initialization aligned with the random CFG
+    token used for that generated sample.
+
+    This is intentionally an *oracle evaluation initialization*: it uses the
+    training data posterior and is therefore an upper-bound/mechanism probe,
+    not a deployable latent prior.
+    """
+    n_ref = int(reference_mus.shape[0])
+    if n_ref < 1:
+        raise ValueError("Cannot build oracle q_T bank from an empty reference.")
+    target_count = int(target_count)
+    if target_count < 1:
+        raise ValueError("target_count must be positive.")
+
+    ref_labels = reference_labels.view(-1).long().cpu()
+    if len(ref_labels) != n_ref:
+        raise ValueError("reference labels must align with posterior components.")
+
+    g = torch.Generator(device="cpu").manual_seed(
+        int(cfg.get("seed", 42)) + 510001 + int(epoch_idx)
+    )
+
+    if target_labels is None:
+        chosen = torch.randint(0, n_ref, (target_count,), generator=g)
+    else:
+        labels = target_labels.view(-1).long().cpu()
+        if len(labels) != target_count:
+            raise ValueError(
+                f"target_labels has {len(labels)} entries; expected {target_count}."
+            )
+        chosen = torch.empty(target_count, dtype=torch.long)
+        for cls in torch.unique(labels).tolist():
+            mask = labels == int(cls)
+            candidates = torch.nonzero(ref_labels == int(cls), as_tuple=False).view(-1)
+            if candidates.numel() == 0:
+                raise ValueError(f"No oracle q_T reference components for class {cls}.")
+            draws = torch.randint(
+                0, int(candidates.numel()), (int(mask.sum().item()),), generator=g
+            )
+            chosen[mask] = candidates[draws]
+
+    mu = reference_mus[chosen].float().cpu()
+    logvar = reference_logvars[chosen].float().cpu()
+    std = torch.exp(0.5 * logvar)
+
+    eps0 = torch.randn(mu.shape, generator=g, dtype=torch.float32)
+    z0 = mu + std * eps0
+
+    bank_cfg = dict(cfg)
+    if terminal_time is not None:
+        bank_cfg["t_max"] = float(terminal_time)
+    schedule_cpu = make_schedule(bank_cfg, torch.device("cpu"))
+    alpha_T = schedule_cpu["alpha"][-1].detach().float().cpu()
+    sigma_T = schedule_cpu["sigma"][-1].detach().float().cpu()
+
+    epsT = torch.randn(z0.shape, generator=g, dtype=torch.float32)
+    zT = alpha_T * z0 + sigma_T * epsT
+    return zT
+
+
+def _oracle_profile_time_indices(schedule: Dict[str, torch.Tensor], n_points: int) -> torch.Tensor:
+    T = int(schedule["T"].item())
+    n_points = max(2, min(int(n_points), T))
+    idx = torch.linspace(0, T - 1, n_points, device=schedule["times"].device).round().long()
+    return torch.unique_consecutive(idx)
+
+
+def compute_oracle_score_time_profile(
+    score_net: nn.Module,
+    oracle_model: "OracleScoreModel",
+    reference_mus: torch.Tensor,
+    reference_logvars: torch.Tensor,
+    reference_labels: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    epoch_idx: int,
+) -> tuple[pd.DataFrame, Dict[str, float]]:
+    """Decompose CSEM regression error against the exact empirical aggregate score.
+
+    Query components are sampled from the same full-training empirical mixture
+    used by ``oracle_model``.  For every selected time we record, per latent
+    coordinate,
+
+        total component regression residual
+          = E ||eps_theta - eps_component||^2,
+        intrinsic CSEM variance
+          = E ||eps_oracle - eps_component||^2,
+        true learned-vs-aggregate-oracle error
+          = E ||eps_theta - eps_oracle||^2,
+
+    for both unconditional and class-conditional score fields.  We additionally
+    compare the CFG-guided learned field to the identically guided exact oracle
+    field.  Both eps-space and score-space (divide by sigma^2) quantities are
+    logged.
+
+    The summary contains two distinct aggregate measures:
+      * ``*_logtime_mean``: arithmetic mean over the selected schedule indices,
+        matching the historical approximately log-uniform index measure;
+      * ``*_physical_integral`` / ``*_physical_mean``: trapezoidal physical-time
+        integrals/means, the natural measure for canonical score error.
+    """
+    if score_net is None or oracle_model is None:
+        return pd.DataFrame(), {}
+
+    score_net.eval()
+    oracle_model.eval()
+    schedule = make_schedule(cfg, device)
+    time_indices = _oracle_profile_time_indices(
+        schedule, int(cfg.get("oracle_profile_time_points", 24))
+    )
+
+    n_ref = int(reference_mus.shape[0])
+    n_query = min(int(cfg.get("oracle_profile_query_samples", 256)), n_ref)
+    batch_size = max(1, int(cfg.get("oracle_profile_batch_size", 16)))
+    seed = int(cfg.get("seed", 42)) + 700001 + int(epoch_idx)
+
+    g_cpu = torch.Generator(device="cpu").manual_seed(seed)
+    query_idx = torch.randperm(n_ref, generator=g_cpu)[:n_query]
+    mu_q = reference_mus[query_idx].to(device=device, dtype=torch.float32)
+    logvar_q = reference_logvars[query_idx].to(device=device, dtype=torch.float32)
+    var_q = torch.exp(logvar_q)
+    std_q = torch.exp(0.5 * logvar_q)
+    y_q = reference_labels[query_idx].to(device=device, dtype=torch.long)
+
+    eps0 = torch.randn(mu_q.shape, generator=g_cpu, dtype=torch.float32).to(device)
+    z0 = mu_q + std_q * eps0
+
+    cfg_scale = float(cfg.get("cfg_eval_scale", 3.0))
+    rows: list[dict[str, float]] = []
+
+    metric_names = (
+        "uncond_component_residual_eps",
+        "uncond_intrinsic_var_eps",
+        "uncond_learned_oracle_eps",
+        "uncond_decomposition_closure_eps",
+        "cond_component_residual_eps",
+        "cond_intrinsic_var_eps",
+        "cond_learned_oracle_eps",
+        "cond_decomposition_closure_eps",
+        "guided_learned_oracle_eps",
+    )
+
+    with torch.no_grad():
+        for t_idx_scalar in time_indices:
+            t_idx_int = int(t_idx_scalar.item())
+            t_val = schedule["times"][t_idx_int].detach()
+            alpha_scalar = schedule["alpha"][t_idx_int].detach()
+            sigma_scalar = schedule["sigma"][t_idx_int].detach().clamp_min(1e-8)
+            alpha = alpha_scalar.view(1, 1, 1, 1)
+            sigma = sigma_scalar.view(1, 1, 1, 1)
+            sigma_sq = float(sigma_scalar.square().item())
+
+            totals = {name: 0.0 for name in metric_names}
+            total_examples = 0
+
+            # Independent but deterministic forward noise at each time.
+            noise_all = torch.randn(z0.shape, generator=g_cpu, dtype=torch.float32).to(device)
+
+            for start in range(0, n_query, batch_size):
+                stop = min(n_query, start + batch_size)
+                mu_b = mu_q[start:stop]
+                var_b = var_q[start:stop]
+                z0_b = z0[start:stop]
+                y_b = y_q[start:stop]
+                noise_b = noise_all[start:stop]
+                bsz = stop - start
+
+                z_t = alpha * z0_b + sigma * noise_b
+                mu_t_component = alpha * mu_b
+                var_t_component = (alpha * alpha) * var_b + sigma * sigma
+                eps_component = sigma * (
+                    (z_t - mu_t_component) / var_t_component.clamp_min(1e-8)
+                )
+
+                t_batch = t_val.expand(bsz).float()
+                eps_u = score_net(z_t, t_batch, None)
+                eps_ou = oracle_model(z_t, t_batch, None)
+
+                eps_c = score_net(z_t, t_batch, y_b)
+                eps_oc = oracle_model(z_t, t_batch, y_b)
+
+                eps_g = eps_u + cfg_scale * (eps_c - eps_u)
+                eps_og = eps_ou + cfg_scale * (eps_oc - eps_ou)
+
+                def mse(a: torch.Tensor, b: torch.Tensor) -> float:
+                    return float((a - b).square().flatten(1).mean(dim=1).sum().item())
+
+                u_total = mse(eps_u, eps_component)
+                u_intr = mse(eps_ou, eps_component)
+                u_oracle = mse(eps_u, eps_ou)
+                c_total = mse(eps_c, eps_component)
+                c_intr = mse(eps_oc, eps_component)
+                c_oracle = mse(eps_c, eps_oc)
+                g_oracle = mse(eps_g, eps_og)
+
+                totals["uncond_component_residual_eps"] += u_total
+                totals["uncond_intrinsic_var_eps"] += u_intr
+                totals["uncond_learned_oracle_eps"] += u_oracle
+                totals["uncond_decomposition_closure_eps"] += u_total - u_intr - u_oracle
+
+                totals["cond_component_residual_eps"] += c_total
+                totals["cond_intrinsic_var_eps"] += c_intr
+                totals["cond_learned_oracle_eps"] += c_oracle
+                totals["cond_decomposition_closure_eps"] += c_total - c_intr - c_oracle
+                totals["guided_learned_oracle_eps"] += g_oracle
+                total_examples += bsz
+
+            row: dict[str, float] = {
+                "epoch": float(epoch_idx),
+                "t_index": float(t_idx_int),
+                "t": float(t_val.item()),
+                "alpha": float(alpha_scalar.item()),
+                "sigma": float(sigma_scalar.item()),
+                "sigma_sq": sigma_sq,
+                "cfg_scale": cfg_scale,
+                "query_samples": float(total_examples),
+                "reference_components": float(n_ref),
+            }
+            for name in metric_names:
+                val = totals[name] / max(total_examples, 1)
+                row[name] = val
+                if name.endswith("_eps"):
+                    row[name[:-4] + "_score"] = val / max(sigma_sq, 1e-12)
+            rows.append(row)
+
+    profile = pd.DataFrame(rows).sort_values("t").reset_index(drop=True)
+    if profile.empty:
+        return profile, {}
+
+    # ------------------------------------------------------------------
+    # First-class time-axis diagnostics.
+    #
+    # The schedule used by this experiment is log_t, so uniform selected
+    # schedule indices are approximately uniform in log(t).  We explicitly
+    # record both the geometry of the diffusion time and the contribution of
+    # every node to physical-time score error.  This lets the analysis answer
+    # "where in t does canonical differ?" rather than only comparing one
+    # aggregate scalar.
+    # ------------------------------------------------------------------
+    t_np = profile["t"].to_numpy(dtype=float)
+    sigma_sq_np = profile["sigma_sq"].to_numpy(dtype=float)
+    alpha_np = profile["alpha"].to_numpy(dtype=float)
+
+    profile["log_t"] = np.log(np.maximum(t_np, 1e-30))
+    snr_np = np.square(alpha_np) / np.maximum(sigma_sq_np, 1e-30)
+    profile["snr"] = snr_np
+    profile["log_snr"] = np.log(np.maximum(snr_np, 1e-30))
+
+    # Trapezoid node widths on the *realized diagnostic grid*.  The sum of
+    # these widths equals t_max-t_min (up to floating-point roundoff).
+    if len(profile) == 1:
+        dt_widths = np.ones(1, dtype=float)
+    else:
+        dt_widths = np.empty(len(profile), dtype=float)
+        dt_widths[0] = 0.5 * (t_np[1] - t_np[0])
+        dt_widths[-1] = 0.5 * (t_np[-1] - t_np[-2])
+        if len(profile) > 2:
+            dt_widths[1:-1] = 0.5 * (t_np[2:] - t_np[:-2])
+    profile["physical_dt_node_width"] = dt_widths
+    profile["index_node_mass"] = 1.0 / float(len(profile))
+
+    # If epsilon error is being interpreted as score error, the canonical
+    # physical-time epsilon-space node mass is dt/sigma^2.
+    canonical_eps_mass = dt_widths / np.maximum(sigma_sq_np, 1e-30)
+    profile["canonical_eps_node_mass"] = canonical_eps_mass
+    canonical_mass_sum = max(float(np.sum(canonical_eps_mass)), 1e-30)
+    profile["canonical_eps_node_mass_fraction"] = canonical_eps_mass / canonical_mass_sum
+
+    # Aggregate summaries under both the historical index measure and physical dt.
+    summary: Dict[str, float] = {}
+    # Physical-time integrals below use explicit trapezoid node widths; no NumPy alias is needed.
+    t_span = max(float(t_np[-1] - t_np[0]), 1e-12)
+
+    base_metrics = [
+        c for c in profile.columns
+        if c.endswith("_eps") or c.endswith("_score")
+    ]
+    for col in base_metrics:
+        vals = profile[col].to_numpy(dtype=float)
+        summary[f"oracle_profile_{col}_logtime_mean"] = float(np.mean(vals))
+        integral = float(np.sum(vals * dt_widths))
+        summary[f"oracle_profile_{col}_physical_integral"] = integral
+        summary[f"oracle_profile_{col}_physical_mean"] = integral / t_span
+
+        # Per-t contribution columns.  These are especially useful for
+        # learned-vs-oracle error: they show whether an aggregate advantage is
+        # concentrated at very small t, mid t, or the terminal region.
+        log_contrib = vals / float(len(profile))
+        phys_contrib = vals * dt_widths
+        profile[f"{col}_logtime_contribution"] = log_contrib
+        profile[f"{col}_physical_contribution"] = phys_contrib
+
+        abs_phys = np.abs(phys_contrib)
+        denom = max(float(abs_phys.sum()), 1e-30)
+        profile[f"{col}_physical_abs_fraction"] = abs_phys / denom
+
+    # Ratios make the statistical-vs-approximation tradeoff easy to inspect.
+    u_intr = summary.get("oracle_profile_uncond_intrinsic_var_eps_logtime_mean", float("nan"))
+    u_err = summary.get("oracle_profile_uncond_learned_oracle_eps_logtime_mean", float("nan"))
+    c_intr = summary.get("oracle_profile_cond_intrinsic_var_eps_logtime_mean", float("nan"))
+    c_err = summary.get("oracle_profile_cond_learned_oracle_eps_logtime_mean", float("nan"))
+    summary["oracle_profile_uncond_error_to_intrinsic_ratio"] = u_err / max(u_intr, 1e-12)
+    summary["oracle_profile_cond_error_to_intrinsic_ratio"] = c_err / max(c_intr, 1e-12)
+    summary["oracle_profile_query_samples"] = float(n_query)
+    summary["oracle_profile_reference_components"] = float(n_ref)
+    summary["oracle_profile_time_points_realized"] = float(len(profile))
+    return profile, summary
+
+
+def _terminal_component_kl_full_reference(
+    reference_mus: torch.Tensor,
+    reference_logvars: torch.Tensor,
+    schedule: Dict[str, torch.Tensor],
+    device: torch.device,
+    chunk_size: int = 2048,
+) -> float:
+    """Mean per-coordinate E_x KL(q_T(.|x)||N(0,I)) over the full reference."""
+    alpha_T = schedule["alpha"][-1].detach().to(device=device, dtype=torch.float32)
+    sigma_T = schedule["sigma"][-1].detach().to(device=device, dtype=torch.float32)
+    total = 0.0
+    count = 0
+    for start in range(0, len(reference_mus), chunk_size):
+        mu = reference_mus[start:start + chunk_size].to(device=device, dtype=torch.float32)
+        logvar = reference_logvars[start:start + chunk_size].to(device=device, dtype=torch.float32)
+        var0 = torch.exp(logvar)
+        muT = alpha_T * mu
+        varT = alpha_T.square() * var0 + sigma_T.square()
+        logvarT = torch.log(varT.clamp_min(1e-12))
+        kl = -0.5 * (1.0 + logvarT - muT.square() - varT)
+        total += float(kl.sum().item())
+        count += int(kl.numel())
+    return total / max(count, 1)
+
+
+def run_oracle_sampling_decomposition(
+    *,
+    vae: nn.Module,
+    learned_score: nn.Module,
+    oracle_model: "OracleScoreModel",
+    reference_mus: torch.Tensor,
+    reference_logvars: torch.Tensor,
+    reference_labels: torch.Tensor,
+    real_features: torch.Tensor,
+    real_flat_latents: torch.Tensor,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    lpips_fn: Any,
+    fid_model: Any,
+    use_lenet_fid: bool,
+    fixed_sw2_theta: torch.Tensor | None,
+    epoch_idx: int,
+) -> tuple[pd.DataFrame, Dict[str, float]]:
+    """Factor the unconditional endpoint generation gap into three mechanisms.
+
+    The diagnostic target is the empirical aggregate posterior defined by the
+    full training set.  With one fixed set of component indices/noises we record:
+
+      direct_q0_train:
+          draw z0 directly from the aggregate posterior and decode;
+      oracle_qT:
+          forward-noise those *same* z0 samples to q_T, then reverse with the
+          exact empirical aggregate score (finite-NFE numerical error);
+      oracle_gaussian:
+          start the same exact-score reverse solver from N(0,I) instead of q_T
+          (adds terminal-prior mismatch);
+      learned_gaussian:
+          replace the oracle by the learned unconditional score while retaining
+          the same Gaussian initial bank (adds learned-score approximation).
+
+    Image FID/KID/diversity and latent SW2 are computed for every stage.
+    """
+    n_ref = int(reference_mus.shape[0])
+    n = min(int(cfg.get("oracle_sampling_samples", 512)), n_ref, int(real_flat_latents.shape[0]))
+    batch_size = max(1, int(cfg.get("oracle_sampling_batch_size", 32)))
+    steps = int(cfg.get("oracle_sampling_steps", 25))
+    method = str(cfg.get("oracle_sampling_method", "rk4_ode"))
+    seed = int(cfg.get("seed", 42)) + 900001 + int(epoch_idx)
+
+    g_cpu = torch.Generator(device="cpu").manual_seed(seed)
+    idx = torch.randperm(n_ref, generator=g_cpu)[:n]
+    mu = reference_mus[idx].float()
+    logvar = reference_logvars[idx].float()
+    std = torch.exp(0.5 * logvar)
+
+    eps0 = torch.randn(mu.shape, generator=g_cpu, dtype=torch.float32)
+    z0_cpu = mu + std * eps0
+
+    schedule = make_schedule(cfg, device)
+    alpha_T = float(schedule["alpha"][-1].detach().cpu().item())
+    sigma_T = float(schedule["sigma"][-1].detach().cpu().item())
+
+    epsT = torch.randn(z0_cpu.shape, generator=g_cpu, dtype=torch.float32)
+    zT_cpu = alpha_T * z0_cpu + sigma_T * epsT
+    gaussian_cpu = torch.randn(z0_cpu.shape, generator=g_cpu, dtype=torch.float32)
+
+    sampler = UniversalSampler(
+        method=method,
+        num_steps=steps,
+        t_min=float(cfg["t_min"]),
+        t_max=float(cfg["t_max"]),
+        schedule_type=str(cfg.get("time_schedule", "log_snr")),
+        cosine_s=float(cfg.get("cosine_s", 0.008)),
+    )
+
+    def sample_batches(model: Any, init_cpu: torch.Tensor) -> torch.Tensor:
+        outs = []
+        for start in range(0, n, batch_size):
+            x_init = init_cpu[start:start + batch_size].to(device)
+            with torch.no_grad():
+                out = sampler.sample(model, x_init=x_init, y=None, cfg_scale=None)
+            outs.append(out.detach().cpu())
+        return torch.cat(outs, 0)
+
+    print(f"  Oracle transport decomposition: n={n}, method={method}, steps={steps}")
+    oracle_qt_cpu = sample_batches(oracle_model, zT_cpu)
+    oracle_gauss_cpu = sample_batches(oracle_model, gaussian_cpu)
+    learned_gauss_cpu = sample_batches(learned_score, gaussian_cpu)
+
+    latent_sets = {
+        "direct_q0_train": z0_cpu,
+        f"oracle_qT_{method}_{steps}": oracle_qt_cpu,
+        f"oracle_gaussian_{method}_{steps}": oracle_gauss_cpu,
+        f"learned_gaussian_uncond_{method}_{steps}": learned_gauss_cpu,
+    }
+
+    # Use equal sample counts for all distributional metrics in this diagnostic.
+    real_features_diag = real_features[:n]
+    real_flat_diag = real_flat_latents[:n].to(device)
+
+    decode_time_cfg = cfg.get("decode_time", None)
+    decode_time = (
+        float(decode_time_cfg)
+        if decode_time_cfg is not None
+        else float(cfg["t_min"])
+    )
+
+    rows: list[dict[str, float | str]] = []
+    for name, lat_cpu in latent_sets.items():
+        imgs = []
+        for start in range(0, n, int(cfg["batch_size"])):
+            z = lat_cpu[start:start + int(cfg["batch_size"])].to(device)
+            t_dec = (
+                torch.full((z.shape[0],), decode_time, device=device)
+                if getattr(vae, "time_cond_decoder", False)
+                else None
+            )
+            with torch.no_grad():
+                imgs.append(vae.decode(z, t=t_dec).detach().cpu())
+        fake_imgs = torch.cat(imgs, 0)
+
+        if use_lenet_fid:
+            fake_features, _ = extract_lenet_features(
+                fake_imgs,
+                device,
+                batch_size=int(cfg.get("fid_batch_size", cfg["batch_size"])),
+                lenet_model=fid_model,
+            )
+        else:
+            fake_features, _ = extract_inception_features(
+                fake_imgs,
+                device,
+                batch_size=int(cfg.get("fid_batch_size", cfg["batch_size"])),
+                inception_model=fid_model,
+            )
+        fake_features = fake_features.to(device)
+
+        lat_flat = lat_cpu.reshape(n, -1).to(device)
+        try:
+            diag_fid = compute_fid_from_features(real_features_diag, fake_features)
+        except Exception as exc:
+            print(f"  [warning] Oracle diagnostic FID failed for {name}: {exc}")
+            diag_fid = float("nan")
+
+        row = {
+            "epoch": int(epoch_idx),
+            "mode": name,
+            "samples": n,
+            "fid": diag_fid,
+            "kid": compute_kid(
+                real_features_diag,
+                fake_features,
+                num_subsets=int(cfg.get("oracle_sampling_kid_subsets", 50)),
+                subset_size=min(int(cfg.get("oracle_sampling_kid_subset_size", 500)), n),
+            ),
+            "sw2": compute_sw2(
+                real_flat_diag,
+                lat_flat,
+                n_projections=int(cfg.get("sw2_n_projections", 1000)),
+                theta=fixed_sw2_theta,
+            ),
+            "diversity": (
+                compute_diversity(fake_imgs.to(device), lpips_fn)
+                if LPIPS_AVAILABLE else 0.0
+            ),
+        }
+        rows.append(row)
+
+    # Terminal mismatch diagnostics from the same exact-qT and Gaussian banks.
+    qT_flat = zT_cpu.reshape(n, -1).to(device)
+    g_flat = gaussian_cpu.reshape(n, -1).to(device)
+    terminal_sw2 = compute_sw2(
+        qT_flat,
+        g_flat,
+        n_projections=int(cfg.get("sw2_n_projections", 1000)),
+        theta=fixed_sw2_theta,
+    )
+    qt_mean = qT_flat.mean(dim=0)
+    qt_var = qT_flat.var(dim=0, unbiased=False)
+
+    summary: Dict[str, float] = {
+        "oracle_sampling_samples": float(n),
+        "oracle_sampling_steps": float(steps),
+        "terminal_qT_vs_gaussian_sw2": float(terminal_sw2),
+        "terminal_qT_mean_norm": float(qt_mean.norm().item()),
+        "terminal_qT_var_mean": float(qt_var.mean().item()),
+        "terminal_component_kl_fulltrain": _terminal_component_kl_full_reference(
+            reference_mus,
+            reference_logvars,
+            schedule,
+            device,
+            chunk_size=int(cfg.get("oracle_reference_batch_size", 2048)),
+        ),
+    }
+
+    for row in rows:
+        tag = str(row["mode"]).replace("-", "_").replace(".", "_")
+        for metric in ("fid", "kid", "sw2", "diversity"):
+            summary[f"oracle_transport_{metric}_{tag}"] = float(row[metric])
+
+    return pd.DataFrame(rows), summary
+
+
+
 def evaluate_current_state(
     epoch_idx,
     prefix,
@@ -3215,6 +3817,7 @@ def evaluate_current_state(
     results_dir=None,
     fid_model=None,
     use_lenet_fid=False,
+    oracle_reference_loader=None,
 ):
     """Evaluate unconditional generation and (optionally) class-conditional generation with CFG.
 
@@ -3354,73 +3957,122 @@ def evaluate_current_state(
     )
 
     # -----------------------------------------------------------------------
-    # Optional exact CSEM oracle diagnostics.
-    # These are valuable for a benchmark paper, but vastly more expensive than
-    # the scale-anchor mechanism test and do not affect training.
+    # Exact empirical aggregate-score diagnostics (focused mechanism sweep).
     # -----------------------------------------------------------------------
-    eval_oracle = bool(cfg.get("eval_oracle", True))
+    eval_oracle = bool(cfg.get("eval_oracle_diagnostics", cfg.get("eval_oracle", False)))
+    eval_sampling_init = str(cfg.get("eval_sampling_init", "gaussian")).lower()
+    valid_sampling_inits = {"gaussian", "oracle-qt", "oracle-qt-class"}
+    if eval_sampling_init not in valid_sampling_inits:
+        raise ValueError(
+            f"Unknown eval_sampling_init={eval_sampling_init!r}; "
+            f"expected one of {sorted(valid_sampling_inits)}."
+        )
+    eval_tk_vs_t_comparison = bool(cfg.get("eval_tk_vs_t_comparison", True))
+    needs_oracle_qt_init = (
+        eval_tk_vs_t_comparison or eval_sampling_init != "gaussian"
+    )
+
     oracle_model = None
+    oracle_profile = pd.DataFrame()
+    oracle_profile_summary: Dict[str, float] = {}
+    oracle_sampling_df = pd.DataFrame()
+    oracle_sampling_summary: Dict[str, float] = {}
+    oracle_reference_mus = encoder_mus
+    oracle_reference_logvars = encoder_logvars
+    oracle_reference_labels = real_labels
+
+    needs_full_reference = (
+        eval_tk_vs_t_comparison
+        or needs_oracle_qt_init
+        or (eval_oracle and bool(cfg.get("eval_oracle_full_train_reference", True)))
+    )
+    if needs_full_reference:
+        if oracle_reference_loader is None:
+            raise ValueError(
+                "Full-training oracle q_T initialization/score diagnostics require "
+                "oracle_reference_loader (the training loader)."
+            )
+        reason = (
+            "oracle q_T initialization"
+            if needs_oracle_qt_init and not eval_oracle
+            else "oracle q_T initialization / aggregate-score diagnostics"
+            if needs_oracle_qt_init and eval_oracle
+            else "exact aggregate-score oracle"
+        )
+        print(f"  Encoding the full training set for {reason}...")
+        (
+            oracle_reference_mus,
+            oracle_reference_logvars,
+            oracle_reference_labels,
+        ) = collect_oracle_reference_components(
+            vae, oracle_reference_loader, cfg, device
+        )
+
     if eval_oracle:
-        print("  Building OracleScoreModel from precomputed Gaussian components...")
+        print(
+            "  Building OracleScoreModel from "
+            f"{len(oracle_reference_mus)} empirical posterior components..."
+        )
         oracle_model = OracleScoreModel(
-            all_mu=encoder_mus,
-            all_logvar=encoder_logvars,
-            all_labels=real_labels,
+            all_mu=oracle_reference_mus,
+            all_logvar=oracle_reference_logvars,
+            all_labels=oracle_reference_labels,
             cfg=cfg,
             device=device,
-            ref_chunk_size=4096,
+            ref_chunk_size=int(cfg.get("oracle_ref_chunk_size", 4096)),
         )
 
-        lsi_gap_oracle = compute_lsi_gap(
+        oracle_profile, oracle_profile_summary = compute_oracle_score_time_profile(
+            unet,
             oracle_model,
-            encoder_mus,
-            encoder_logvars,
+            oracle_reference_mus,
+            oracle_reference_logvars,
+            oracle_reference_labels,
             cfg,
             device,
-            labels=None,
-            num_classes=cfg.get("num_classes", None),
-            num_samples=min(int(cfg.get("eval_oracle_gap_samples", 2500)), target_count),
-            num_time_points=int(cfg.get("eval_oracle_gap_time_points", 50)),
-            batch_size=bs,
+            epoch_idx,
         )
-        print(f"  Oracle (unconditional) LSI gap = {lsi_gap_oracle:.6f}")
+        if results_dir is not None and not oracle_profile.empty:
+            profile_dir = os.path.join(results_dir, "dataframes")
+            os.makedirs(profile_dir, exist_ok=True)
+            oracle_profile_path = os.path.join(
+                profile_dir, f"oracle_score_time_profile_ep{int(epoch_idx)}.csv"
+            )
+            oracle_profile.to_csv(oracle_profile_path, index=False)
+            print(f"  Saved oracle score time profile: {oracle_profile_path}")
+
+        latent_dim = int(np.prod(encoder_mus.shape[1:]))
+        # Preserve the legacy scalar columns but make them actual learned-vs-
+        # aggregate-oracle quantities.  The new explicit profile columns are
+        # per-coordinate; legacy MSE-gap columns historically summed dimensions.
+        mse_gap_eps = (
+            oracle_profile_summary.get(
+                "oracle_profile_uncond_learned_oracle_eps_logtime_mean", float("nan")
+            )
+            * latent_dim
+        )
+        mse_gap_score = (
+            oracle_profile_summary.get(
+                "oracle_profile_uncond_learned_oracle_score_logtime_mean", float("nan")
+            )
+            * latent_dim
+        )
+        lsi_gap_oracle = (
+            oracle_profile_summary.get(
+                "oracle_profile_uncond_intrinsic_var_eps_logtime_mean", float("nan")
+            )
+            * latent_dim
+        )
+        print(
+            "  Exact aggregate-score diagnostics: "
+            f"MSE(eps)={mse_gap_eps:.6g}, MSE(score)={mse_gap_score:.6g}, "
+            f"intrinsic-CSEM={lsi_gap_oracle:.6g}"
+        )
     else:
         lsi_gap_oracle = float("nan")
-        print("  Oracle CSEM diagnostics disabled for mechanism run.")
-
-    mse_gap_eps = lsi_gap_oracle
-    mse_gap_score = lsi_gap_oracle
-
-    '''
-    # -----------------------------------------------------------------------
-    # MSE gap: learned score net vs oracle (eps-space and score-space)
-    # -----------------------------------------------------------------------
-    print("  Computing MSE gap (eps-space) vs oracle...")
-    mse_gap_eps = compute_mse_gap(
-        unet, oracle_model,
-        encoder_mus, encoder_logvars,
-        cfg, device,
-        labels=None,
-        num_classes=cfg.get("num_classes", None),
-        num_samples=min(2500, target_count),
-        batch_size=bs,
-        space="eps",
-    )
-    print(f"  MSE gap (eps-space, uncond) = {mse_gap_eps:.6f}")
-    mse_gap_score = mse_gap_eps
-    print("  Computing MSE gap (score-space) vs oracle...")
-    mse_gap_score = compute_mse_gap(
-        unet, oracle_model,
-        encoder_mus, encoder_logvars,
-        cfg, device,
-        labels=None,
-        num_classes=cfg.get("num_classes", None),
-        num_samples=min(5000, target_count),
-        batch_size=bs,
-        space="score",
-    )
-    print(f"  MSE gap (score-space, uncond) = {mse_gap_score:.6f}")
-    '''
+        mse_gap_eps = float("nan")
+        mse_gap_score = float("nan")
+        print("  Exact aggregate-score diagnostics disabled.")
 
     # -----------------------------------------------------------------------
     # Sampler configurations (unconditional baseline)
@@ -3429,25 +4081,34 @@ def evaluate_current_state(
     # random-token sweep, optional oracle sweep, and per-class evaluation.
     cfg_eval_scale = float(cfg.get("cfg_eval_scale", 3.0))
     configs = [
-        {"method": "VAE_Rec_eps", "steps": 0, "desc": "Recon (posterior z)", "use_rand_token": False},
+        {
+            "method": "VAE_Rec_eps",
+            "steps": 0,
+            "desc": "Recon (posterior z)",
+            "use_rand_token": False,
+            "init_mode": "reconstruction",
+        },
     ]
     if unet is not None:
-         configs.extend([
-            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 0},
-            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1},
-            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 1.5},
-            #{"method": "rk4_ode",  "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": 2.0},
-            #{"method": "exp_heun_ode",  "steps": 50, "desc": "RandToken (Heun-Exp)", "use_rand_token": True, "cfg_level": 3.0},
-            #{"method": "exp_euler_ode",  "steps": 100, "desc": "RandToken (Euler-Exp)", "use_rand_token": True, "cfg_level": 3.0},
-            {"method": "heun_sde", "steps": 50, "desc": "RandToken (Heun-SDE)", "use_rand_token": True, "cfg_level": cfg_eval_scale},
-            {"method": "rk4_ode", "steps": 25, "desc": "RandToken (RK4)", "use_rand_token": True, "cfg_level": cfg_eval_scale},
-        ])
-    # Oracle sampler configs are optional. They are deliberately disabled in
-    # the fast mechanism protocol because they do not change the learned model.
-    if eval_oracle:
         configs.extend([
-            {"method": "heun_sde", "steps": 50, "desc": "Oracle (Heun-SDE)", "use_rand_token": True, "cfg_level": cfg_eval_scale, "use_oracle": True},
-            {"method": "rk4_ode", "steps": 25, "desc": "Oracle (RK4)", "use_rand_token": True, "cfg_level": cfg_eval_scale, "use_oracle": True},
+            {
+                "method": "rk4_ode",
+                "steps": 25,
+                "desc": f"RK4 oracle q_TK init (T_K={float(cfg['T_terminal']):g})",
+                "use_rand_token": True,
+                "cfg_level": cfg_eval_scale,
+                "init_mode": "oracle-qtk-class",
+                "sampler_t_max": float(cfg["T_terminal"]),
+            },
+            {
+                "method": "rk4_ode",
+                "steps": 25,
+                "desc": f"RK4 Gaussian init (T={float(cfg['t_max']):g})",
+                "use_rand_token": True,
+                "cfg_level": cfg_eval_scale,
+                "init_mode": "gaussian-T",
+                "sampler_t_max": float(cfg["t_max"]),
+            },
         ])
 
     results = []
@@ -3471,6 +4132,29 @@ def evaluate_current_state(
         )
         rand_token_bank_all = rand_token_bank_all[sample_indices]
 
+    # Exact empirical class-conditional q_{T_K} evaluation initialization.
+    oracle_qtk_bank_all = None
+    if needs_oracle_qt_init:
+        if rand_token_bank_all is None:
+            raise ValueError(
+                "q_TK class-conditional initialization requires class labels."
+            )
+        oracle_qtk_bank_all = build_empirical_qT_init_bank(
+            oracle_reference_mus,
+            oracle_reference_logvars,
+            oracle_reference_labels,
+            target_count=target_count,
+            cfg=cfg,
+            epoch_idx=int(epoch_idx),
+            target_labels=rand_token_bank_all,
+            terminal_time=float(cfg["T_terminal"]),
+        )
+        print(
+            "  Two-horizon sampler comparison: "
+            f"oracle class-conditional q_TK at T_K={float(cfg['T_terminal']):g} "
+            f"vs Gaussian at T={float(cfg['t_max']):g}"
+        )
+
     # -----------------------------------------------------------------------
     # Unconditional evaluation sweep
     # -----------------------------------------------------------------------
@@ -3482,19 +4166,25 @@ def evaluate_current_state(
         use_rand_token = bool(scfg.get("use_rand_token", False))
         cfg_level = scfg.get("cfg_level", None)  # NEW: extract cfg_level
         use_oracle = bool(scfg.get("use_oracle", False))
+        init_mode = str(scfg.get("init_mode", "reconstruction"))
 
-        # Choose which score model to sample with
+        # Both comparison samplers use the learned score network.
         score_model = oracle_model if use_oracle else unet
 
-        # Build suffix for naming - include cfg_level if present
+        if init_mode == "oracle-qtk-class":
+            init_tag = f"_initoracleqTK{float(cfg['T_terminal']):g}".replace(".", "p")
+        elif init_mode == "gaussian-T":
+            init_tag = f"_initgaussianT{float(cfg['t_max']):g}".replace(".", "p")
+        else:
+            init_tag = ""
         oracle_tag = "_oracle" if use_oracle else ""
         if use_rand_token:
             if cfg_level is not None:
-                config_suffix = f"_randtok_cfg{cfg_level}{oracle_tag}"
+                config_suffix = f"_randtok_cfg{cfg_level}{init_tag}{oracle_tag}"
             else:
-                config_suffix = f"_randtok{oracle_tag}"
+                config_suffix = f"_randtok{init_tag}{oracle_tag}"
         else:
-            config_suffix = oracle_tag
+            config_suffix = f"{init_tag}{oracle_tag}"
         config_name = f"{method}@{steps}{config_suffix}"
 
         if torch.cuda.is_available():
@@ -3523,7 +4213,7 @@ def evaluate_current_state(
                     method=method,
                     num_steps=steps,
                     t_min=cfg["t_min"],
-                    t_max=cfg["t_max"],
+                    t_max=float(scfg.get("sampler_t_max", cfg["t_max"])),
                     schedule_type=cfg.get("time_schedule", "log_snr"),
                     cosine_s=cfg.get("cosine_s", 0.008),
                 )
@@ -3547,11 +4237,29 @@ def evaluate_current_state(
                         y_batch = rand_token_bank_all[i:i + batch_sz].to(device)
 
                     g_scale = cfg_level if use_rand_token and cfg_level is not None else None
-                    if noise_bank_all is not None:
-                        xT = noise_bank_all[i:i + batch_sz].to(device)
-                        z_gen = sampler.sample(score_model, x_init=xT, y=y_batch, cfg_scale=g_scale)
+                    if init_mode == "oracle-qtk-class":
+                        if oracle_qtk_bank_all is None:
+                            raise RuntimeError("oracle q_TK bank was not constructed")
+                        xT = oracle_qtk_bank_all[i:i + batch_sz].to(device)
+                        z_gen = sampler.sample(
+                            score_model, x_init=xT, y=y_batch, cfg_scale=g_scale
+                        )
+                    elif init_mode == "gaussian-T":
+                        if noise_bank_all is not None:
+                            xT = noise_bank_all[i:i + batch_sz].to(device)
+                            z_gen = sampler.sample(
+                                score_model, x_init=xT, y=y_batch, cfg_scale=g_scale
+                            )
+                        else:
+                            z_gen = sampler.sample(
+                                score_model,
+                                shape=(batch_sz, *latent_shape),
+                                device=device,
+                                y=y_batch,
+                                cfg_scale=g_scale,
+                            )
                     else:
-                        z_gen = sampler.sample(score_model, shape=(batch_sz, *latent_shape), device=device, y=y_batch, cfg_scale=g_scale)
+                        raise ValueError(f"Unknown sampler init_mode={init_mode!r}")
 
                     fake_latents_list.append(z_gen.cpu())
                     t_dec = torch.full((z_gen.shape[0],), decode_time, device=device) if getattr(vae, 'time_cond_decoder', False) else None
@@ -3609,6 +4317,33 @@ def evaluate_current_state(
             panel = fake_imgs[:16] if fake_imgs.shape[0] >= 16 else fake_imgs
             tv_utils.save_image((panel + 1) / 2, save_path, nrow=4, padding=2)
 
+    if eval_oracle and bool(cfg.get("eval_oracle_transport_decomposition", True)):
+        oracle_sampling_df, oracle_sampling_summary = run_oracle_sampling_decomposition(
+            vae=vae,
+            learned_score=unet,
+            oracle_model=oracle_model,
+            reference_mus=oracle_reference_mus,
+            reference_logvars=oracle_reference_logvars,
+            reference_labels=oracle_reference_labels,
+            real_features=real_features,
+            real_flat_latents=real_flat_A,
+            cfg=cfg,
+            device=device,
+            lpips_fn=lpips_fn,
+            fid_model=fid_model,
+            use_lenet_fid=use_lenet_fid,
+            fixed_sw2_theta=fixed_sw2_theta,
+            epoch_idx=epoch_idx,
+        )
+        if results_dir is not None and not oracle_sampling_df.empty:
+            diag_dir = os.path.join(results_dir, "dataframes")
+            os.makedirs(diag_dir, exist_ok=True)
+            diag_path = os.path.join(
+                diag_dir, f"oracle_sampling_decomposition_ep{int(epoch_idx)}.csv"
+            )
+            oracle_sampling_df.to_csv(diag_path, index=False)
+            print(f"  Saved oracle transport decomposition: {diag_path}")
+
     # Print main results
     print(f"\n  >>> Sweep Results [{prefix}] <<<")
     print(f"  {'Config':<40} | {'Desc':<20} | {'FID':<8} | {'KID':<10} | {'SW2':<10} | {'Div':<8} | {'LSI Gap':<10} | {'MSE(eps)':<10} | {'MSE(score)':<10}")
@@ -3625,6 +4360,8 @@ def evaluate_current_state(
     output_dict["lsi_gap_unet_uncond"] = lsi_gap_unet
     output_dict["mse_gap_eps_uncond"] = mse_gap_eps
     output_dict["mse_gap_score_uncond"] = mse_gap_score
+    output_dict.update(oracle_profile_summary)
+    output_dict.update(oracle_sampling_summary)
     for r in results:
         config = r["config"]
         if "VAE_Rec_eps" in config:
@@ -4548,31 +5285,54 @@ def train_vae_cotrained_cond(cfg):
     # This switches training from continuous log-uniform OU times to discrete VP/DDPM timesteps.
 
 
-    # --- Unified discrete schedule (log_t / log_snr / cosine depending on cfg) ---
-    ou_sched = make_schedule(cfg, device)
-    validate_terminal_time_contract(cfg, ou_sched)
+    # --- Two-horizon schedules -------------------------------------------------
+    # score_sched spans [t_min, T] and is used only by the score-head route.
+    # ou_sched spans [t_min, T_K] and is used by the VAE/representation route
+    # and by K_{T_K}. Both use the same schedule type/node count.
+    score_sched = make_schedule(cfg, device)
+    T_K = validate_terminal_time_contract(cfg, score_sched)
+
+    # The representation sampler is strictly t<T_K.  For a discrete grid we
+    # place its final node at the immediately preceding representable float;
+    # K_{T_K} itself is evaluated on a separate schedule ending exactly at T_K.
+    rep_cfg = dict(cfg)
+    rep_cfg["t_max"] = math.nextafter(float(T_K), float(cfg["t_min"]))
+    ou_sched = make_schedule(rep_cfg, device)
+
+    kl_cfg = dict(cfg)
+    kl_cfg["t_max"] = float(T_K)
+    kl_sched = make_schedule(kl_cfg, device)
+
     score_time_weighting = validate_score_time_weighting(
-        cfg,
+        rep_cfg,
         ou_sched,
         config_key="score_time_weighting",
-        role="outer representation objective",
+        role="outer representation objective on [t_min,T_K]",
     )
     score_head_time_weighting = validate_score_time_weighting(
         cfg,
-        ou_sched,
+        score_sched,
         config_key="score_head_time_weighting",
-        role="inner score-head objective",
+        role="inner score-head objective on [t_min,T]",
     )
     # Dual routing is now unconditional during co-training. Even when the
     # outer and inner time metrics match, score gradients are replaced by the
     # independently parameterized head objective so representation scaling can
     # never leak into score-head optimization.
     split_score_gradient_routing = True
-    T = int(ou_sched["T"].item())
+    T_rep_steps = int(ou_sched["T"].item())
+    T_score_steps = int(score_sched["T"].item())
+    # Legacy alias used only by the optional score-only refinement loop.
+    T = T_score_steps
+    T_full = float(cfg["t_max"])
     noise_sched = ou_sched
-    print(f"--> Time schedule: {ou_sched['schedule_type']} ({T} steps)")
-    print(f"--> Outer/representation time weighting: {score_time_weighting}")
-    print(f"--> Inner/score-head time weighting: {score_head_time_weighting}")
+    print(
+        f"--> Time schedule: {ou_sched['schedule_type']} | "
+        f"representation gradients t<T_K={T_K:g} ({T_rep_steps} nodes) | "
+        f"score/sampling horizon T={T_full:g} ({T_score_steps} nodes)"
+    )
+    print(f"--> Outer/representation time weighting on t<=T_K: {score_time_weighting}")
+    print(f"--> Inner/score-head time weighting on t<=T: {score_head_time_weighting}")
     print(
         "--> Score gradient routing: blockwise/decoupled "
         "(outer gradient to VAE, independent inner gradient to score parameters)"
@@ -4983,15 +5743,17 @@ def train_vae_cotrained_cond(cfg):
             # --- Time / forward process (BEFORE decode) ---
             t_idx = None
             if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
-                t = sample_logit_normal_times(B, cfg["t_min"], cfg["t_max"], device)
+                t = sample_logit_normal_times(B, cfg["t_min"], T_K, device)
                 alpha, sigma = get_flow_params(t.view(B, 1, 1, 1))
             else:
-                t = sample_log_uniform_times(B, cfg["t_min"], cfg["t_max"], device)
+                t = sample_log_uniform_times(B, cfg["t_min"], T_K, device)
                 alpha, sigma = get_ou_params(t.view(B, 1, 1, 1))
 
             if use_ddim_times:
 
-                t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
+                t_idx = torch.randint(
+                    0, T_rep_steps, (B,), device=device, dtype=torch.long
+                )
 
                 # time embedding = actual OU time on the discrete grid
                 t = ou_sched["times"].gather(0, t_idx).float()  # [B]
@@ -5011,6 +5773,51 @@ def train_vae_cotrained_cond(cfg):
             var_0 = torch.exp(logvar)
             mu_t = alpha * mu
             var_t = (alpha**2) * var_0 + (sigma**2)
+
+            # --- Independent score-head path on the full horizon [t_min, T] ---
+            # This path is detached from the encoder/decoder. The shared score
+            # network therefore learns the complete path to T while the VAE is
+            # shaped only by the separate representation sample above (t<=T_K).
+            z0_head = z0.detach()
+            mu_head = mu.detach()
+            logvar_head = logvar.detach()
+
+            t_head_idx = None
+            if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
+                t_head = sample_logit_normal_times(
+                    B, cfg["t_min"], cfg["t_max"], device
+                )
+                alpha_head, sigma_head = get_flow_params(
+                    t_head.view(B, 1, 1, 1)
+                )
+            else:
+                t_head = sample_log_uniform_times(
+                    B, cfg["t_min"], cfg["t_max"], device
+                )
+                alpha_head, sigma_head = get_ou_params(
+                    t_head.view(B, 1, 1, 1)
+                )
+
+            if use_ddim_times:
+                t_head_idx = torch.randint(
+                    0, T_score_steps, (B,), device=device, dtype=torch.long
+                )
+                t_head = score_sched["times"].gather(0, t_head_idx).float()
+                alpha_head = extract_schedule(
+                    score_sched["alpha"], t_head_idx, z0_head.shape
+                )
+                sigma_head = extract_schedule(
+                    score_sched["sigma"], t_head_idx, z0_head.shape
+                )
+
+            noise_head = torch.randn_like(z0_head)
+            z_t_head = alpha_head * z0_head + sigma_head * noise_head
+            var0_head = torch.exp(logvar_head)
+            mu_t_head = alpha_head * mu_head
+            var_t_head = (alpha_head ** 2) * var0_head + (sigma_head ** 2)
+            resid_head = (z_t_head - mu_t_head) / (var_t_head + 1e-8)
+            eps_target_lsi_head = sigma_head * resid_head
+            eps_target_control_head = noise_head
 
             # --- Decode from z_t with time-dependent decoder ---
             # All reconstruction losses (recon, lpips, gan) are applied to D(z_t, t)
@@ -5056,7 +5863,7 @@ def train_vae_cotrained_cond(cfg):
 
             elif reg_type in ("terminal", "terminal_kl", "terminal-time"):
                 # NEW: K_T = E_x KL(q_phi,T(.|x) || N(0,I)).
-                kl = terminal_component_kl_from_schedule(mu, logvar, ou_sched)
+                kl = terminal_component_kl_from_schedule(mu, logvar, kl_sched)
 
             else:
                 raise ValueError(f"Unknown kl_reg_type: {reg_type}")
@@ -5070,7 +5877,7 @@ def train_vae_cotrained_cond(cfg):
                     terminal_kl_diag = kl.detach()
                 else:
                     terminal_kl_diag = terminal_component_kl_from_schedule(
-                        mu.detach(), logvar.detach(), ou_sched
+                        mu.detach(), logvar.detach(), kl_sched
                     )
 
                 mu_det = mu.detach()
@@ -5099,17 +5906,17 @@ def train_vae_cotrained_cond(cfg):
             score_time_weights = score_time_importance_weights(
                 t=t,
                 sigma=sigma,
-                cfg=cfg,
+                cfg=rep_cfg,
                 schedule=ou_sched,
                 t_idx=t_idx,
                 weighting_mode=score_time_weighting,
             )
             score_head_time_weights = score_time_importance_weights(
-                t=t,
-                sigma=sigma,
+                t=t_head,
+                sigma=sigma_head,
                 cfg=cfg,
-                schedule=ou_sched,
-                t_idx=t_idx,
+                schedule=score_sched,
+                t_idx=t_head_idx,
                 weighting_mode=score_head_time_weighting,
             )
             with torch.no_grad():
@@ -5189,10 +5996,13 @@ def train_vae_cotrained_cond(cfg):
                 loss_mse_lsi, loss_cos_lsi = weighted_score_prediction_losses(
                     eps_pred_lsi, eps_target_lsi_for_score, score_time_weights
                 )
+
+                # Independent full-horizon score-head regression on detached latents.
+                eps_pred_lsi_inner_full = unet_lsi(z_t_head, t_head, y_in)
                 loss_mse_lsi_inner, loss_cos_lsi_inner = (
                     weighted_score_prediction_losses(
-                        eps_pred_lsi,
-                        eps_target_lsi_for_score,
+                        eps_pred_lsi_inner_full,
+                        eps_target_lsi_head,
                         score_head_time_weights,
                     )
                 )
@@ -5221,10 +6031,13 @@ def train_vae_cotrained_cond(cfg):
                         eps_target_control_for_score,
                         score_time_weights,
                     )
+                    eps_pred_control_inner_full = unet_control(
+                        z_t_head, t_head, y_in
+                    )
                     loss_mse_ctrl_inner, loss_cos_ctrl_inner = (
                         weighted_score_prediction_losses(
-                            eps_pred_control,
-                            eps_target_control_for_score,
+                            eps_pred_control_inner_full,
+                            eps_target_control_head,
                             score_head_time_weights,
                         )
                     )
@@ -5242,7 +6055,7 @@ def train_vae_cotrained_cond(cfg):
                 with torch.no_grad():
                     log_fraction = (
                         (t.detach().float().log() - math.log(float(cfg["t_min"])))
-                        / math.log(float(cfg["t_max"]) / float(cfg["t_min"]))
+                        / math.log(float(T_K) / float(cfg["t_min"]))
                     ).clamp(0.0, 1.0 - 1e-7)
                     time_bin_indices = torch.clamp(
                         (log_fraction * time_diagnostic_bins).long(),
@@ -5421,7 +6234,7 @@ def train_vae_cotrained_cond(cfg):
                 routed_score_gradients = torch.autograd.grad(
                     active_score_inner_objective,
                     active_score_parameters,
-                    retain_graph=True,
+                    retain_graph=False,
                     allow_unused=True,
                 )
 
@@ -5583,10 +6396,10 @@ def train_vae_cotrained_cond(cfg):
                 and global_cotrain_batch % score_tracking_every == 0
             )
             if should_run_same_head_tracking:
-                detached_z_t = z_t.detach()
-                detached_z_mu_t = z_mu_t.detach()
-                detached_lsi_target = eps_target_lsi.detach()
-                detached_control_target = eps_target_control.detach()
+                detached_z_t = z_t_head.detach()
+                detached_z_mu_t = z_t_head.detach()
+                detached_lsi_target = eps_target_lsi_head.detach()
+                detached_control_target = eps_target_control_head.detach()
                 detached_time_weights = score_head_time_weights.detach()
 
                 for _ in range(score_tracking_steps):
@@ -5601,16 +6414,16 @@ def train_vae_cotrained_cond(cfg):
                                 tracking_nu_prediction,
                             ) = unet_lsi(
                                 detached_z_t,
-                                t,
+                                t_head,
                                 y_in,
                                 return_components=True,
                                 detach_components=True,
                             )
                             tracking_lambda_target = (
-                                sigma / (var_t + 1e-8)
+                                sigma_head / (var_t_head + 1e-8)
                             ).detach()
                             tracking_nu_target = (
-                                tracking_lambda_target * mu_t.detach()
+                                tracking_lambda_target * mu_t_head.detach()
                             )
                             tracking_aux_lambda = F.mse_loss(
                                 tracking_lambda_prediction,
@@ -5623,7 +6436,7 @@ def train_vae_cotrained_cond(cfg):
                                 tracking_nu_target,
                             )
                         else:
-                            tracking_prediction = unet_lsi(detached_z_t, t, y_in)
+                            tracking_prediction = unet_lsi(detached_z_t, t_head, y_in)
                             tracking_aux_lambda = torch.tensor(0.0, device=device)
                             tracking_aux_nu = torch.tensor(0.0, device=device)
                         tracking_mse, tracking_cosine = weighted_score_prediction_losses(
@@ -5647,7 +6460,7 @@ def train_vae_cotrained_cond(cfg):
                         )
                         tracking_prediction = unet_control(
                             tracking_input,
-                            t,
+                            t_head,
                             y_in,
                         )
                         tracking_mse, tracking_cosine = weighted_score_prediction_losses(
@@ -6095,6 +6908,7 @@ def train_vae_cotrained_cond(cfg):
                 results_dir=results_dir,
                 fid_model=fid_model,
                 use_lenet_fid=use_lenet_fid,
+                oracle_reference_loader=train_l,
             )
             if results_lsi is not None:
                 results_lsi["epoch"] = ldm_epoch  # LDM epoch for comparison
@@ -6121,6 +6935,7 @@ def train_vae_cotrained_cond(cfg):
                 results_dir=results_dir,
                 fid_model=fid_model,
                 use_lenet_fid=use_lenet_fid,
+                oracle_reference_loader=train_l,
             )
             '''
             if train_tracking_head and results_ctrl is not None:
@@ -6219,11 +7034,11 @@ def train_vae_cotrained_cond(cfg):
                     t_idx = torch.randint(0, T, (B,), device=device, dtype=torch.long)
 
                     # time embedding = actual OU time on the discrete grid
-                    t = ou_sched["times"].gather(0, t_idx).float()  # [B]
+                    t = score_sched["times"].gather(0, t_idx).float()  # [B]
 
-                    # alpha/sigma = OU alpha(t), sigma(t) on the same grid
-                    alpha = extract_schedule(ou_sched["alpha"], t_idx, z0.shape)
-                    sigma = extract_schedule(ou_sched["sigma"], t_idx, z0.shape)
+                    # alpha/sigma on the full score schedule [t_min,T].
+                    alpha = extract_schedule(score_sched["alpha"], t_idx, z0.shape)
+                    sigma = extract_schedule(score_sched["sigma"], t_idx, z0.shape)
 
 
                 noise = torch.randn_like(z0)
@@ -6245,7 +7060,7 @@ def train_vae_cotrained_cond(cfg):
                     t=t,
                     sigma=sigma,
                     cfg=cfg,
-                    schedule=ou_sched,
+                    schedule=score_sched,
                     t_idx=t_idx,
                     weighting_mode=score_head_time_weighting,
                 )
@@ -6384,6 +7199,7 @@ def train_vae_cotrained_cond(cfg):
                         results_dir=results_dir,
                         fid_model=fid_model,
                         use_lenet_fid=use_lenet_fid,
+                        oracle_reference_loader=train_l,
                 )
                 if results_lsi is not None:
                     results_lsi["epoch"] = ldm_epoch
@@ -6707,7 +7523,10 @@ def run_scale_anchor_comparison(cfg_norm, cfg_terminal, arms):
             f"kl_w={cfg.get('kl_w')}"
         )
         if arm == "terminal_kl":
-            status += f" | T=t_max={cfg.get('t_max')}"
+            status += (
+                f" | T_K={cfg.get('T_terminal')} "
+                f"| T={cfg.get('t_max')}"
+            )
         print(status)
 
         cfg["results_dir"] = os.path.join(
@@ -6842,14 +7661,24 @@ def main():
         ),
     )
     parser.add_argument(
-        "--T-terminal", "--T_terminal", "--t-terminal",
+        "--T-terminal", "--T_terminal", "--t-terminal", "--T-K", "--T_K",
         dest="T_terminal",
         type=float,
         default=None,
         help=(
-            "Shared terminal diffusion time. This sets the score-training horizon, "
-            "the time used by K_T, and the Gaussian reverse-sampling initialization "
-            "time. If omitted, use the selected dataset preset's t_max."
+            "Representation/KL horizon T_K. Encoder/decoder diffusion gradients are "
+            "generated only for t<=T_K, and terminal KL is evaluated exactly at T_K."
+        ),
+    )
+    parser.add_argument(
+        "--T", "--T-score", "--T-sampling",
+        dest="T_full",
+        type=float,
+        default=None,
+        help=(
+            "Full score-training and Gaussian sampling horizon T. The shared score "
+            "network trains on [t_min,T], while encoder/decoder gradients stop at "
+            "T_K. Require T>=T_K. If omitted, use the preset t_max."
         ),
     )
     parser.add_argument(
@@ -7087,6 +7916,102 @@ def main():
         ),
     )
     parser.add_argument(
+        "--eval-sampling-init",
+        choices=("gaussian", "oracle-qt", "oracle-qt-class"),
+        default="gaussian",
+        help=(
+            "Legacy initialization selector retained for compatibility. In this "
+            "T/T_K split script, ordinary evaluation always reports BOTH learned-score "
+            "RK4 modes: class-conditional oracle q_{T_K} initialization at T_K and "
+            "Gaussian initialization at the full horizon T."
+        ),
+    )
+    parser.add_argument(
+        "--eval-oracle-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the focused exact aggregate-score diagnostic suite. The oracle "
+            "uses the full training-set empirical aggregate posterior by default, "
+            "records learned-vs-oracle error as a function of time, decomposes the "
+            "CSEM component residual into intrinsic variance plus oracle error, and "
+            "runs the endpoint oracle-transport ablation."
+        ),
+    )
+    parser.add_argument(
+        "--eval-oracle-full-train-reference",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When oracle diagnostics are enabled, construct the empirical aggregate "
+            "score from every training-set posterior component. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-profile-query-samples",
+        type=int,
+        default=256,
+        help="Training-mixture query samples used at each oracle score-profile time.",
+    )
+    parser.add_argument(
+        "--oracle-profile-time-points",
+        type=int,
+        default=24,
+        help="Number of schedule times in the exact learned-vs-oracle score profile.",
+    )
+    parser.add_argument(
+        "--oracle-profile-batch-size",
+        type=int,
+        default=16,
+        help="Query batch size for exact full-mixture oracle score evaluation.",
+    )
+    parser.add_argument(
+        "--oracle-reference-batch-size",
+        type=int,
+        default=2048,
+        help="Batch size for full-training-set encoder/reference statistics.",
+    )
+    parser.add_argument(
+        "--oracle-sampling-samples",
+        type=int,
+        default=512,
+        help=(
+            "Samples in the endpoint oracle transport decomposition. Standard "
+            "reconstruction/generation metrics still use --eval-samples."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-sampling-batch-size",
+        type=int,
+        default=32,
+        help="Batch size for exact-oracle reverse sampling.",
+    )
+    parser.add_argument(
+        "--oracle-sampling-steps",
+        type=int,
+        default=25,
+        help="RK4 reverse steps in the endpoint oracle transport decomposition.",
+    )
+    parser.add_argument(
+        "--eval-oracle-transport-decomposition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "With oracle diagnostics, compare direct q0 samples, oracle reverse from "
+            "exact qT, oracle reverse from Gaussian, and learned reverse from Gaussian."
+        ),
+    )
+    parser.add_argument(
+        "--eval-oracle-standard-samplers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also add the legacy full-size oracle CFG samplers to the ordinary eval "
+            "sweep. Off by default because the focused transport decomposition is "
+            "more informative and much cheaper."
+        ),
+    )
+    parser.add_argument(
         "--eval-samples",
         type=int,
         default=None,
@@ -7146,6 +8071,11 @@ def main():
         if args.T_terminal is not None
         else preset.get("t_max", 1.5)
     )
+    T_full = float(
+        args.T_full
+        if args.T_full is not None
+        else preset.get("t_max", T_terminal)
+    )
     csem_w = float(args.csem_w)
     score_head_loss_w = float(args.score_head_loss_w)
     score_head_time_weighting = (
@@ -7186,10 +8116,29 @@ def main():
         raise ValueError("--eval-samples must be >= 2")
     if eval_every < 0:
         raise ValueError("--eval-every must be >= 0")
+    if args.oracle_profile_query_samples < 1:
+        raise ValueError("--oracle-profile-query-samples must be >= 1")
+    if args.oracle_profile_time_points < 2:
+        raise ValueError("--oracle-profile-time-points must be >= 2")
+    if args.oracle_profile_batch_size < 1:
+        raise ValueError("--oracle-profile-batch-size must be >= 1")
+    if args.oracle_reference_batch_size < 1:
+        raise ValueError("--oracle-reference-batch-size must be >= 1")
+    if args.oracle_sampling_samples < 2:
+        raise ValueError("--oracle-sampling-samples must be >= 2")
+    if args.oracle_sampling_batch_size < 1:
+        raise ValueError("--oracle-sampling-batch-size must be >= 1")
+    if args.oracle_sampling_steps < 1:
+        raise ValueError("--oracle-sampling-steps must be >= 1")
     if not math.isfinite(T_terminal) or T_terminal <= t_min:
         raise ValueError(
-            "--T-terminal must be finite and greater than the preset t_min; "
-            f"got T_terminal={T_terminal}, t_min={t_min}"
+            "--T-terminal/--T-K must be finite and greater than t_min; "
+            f"got T_K={T_terminal}, t_min={t_min}"
+        )
+    if not math.isfinite(T_full) or T_full < T_terminal:
+        raise ValueError(
+            f"--T must be finite and satisfy T>=T_K; got T={T_full}, "
+            f"T_K={T_terminal}"
         )
     if not math.isfinite(cfg_strength) or cfg_strength < 0.0:
         raise ValueError(
@@ -7347,10 +8296,12 @@ def main():
         "time_schedule": str(preset.get("time_schedule", "log_t")),
         "use_ddim_times": bool(preset.get("use_ddim_times", True)),
         "t_min": t_min,
-        # Single source of truth for the terminal-KL endpoint. Legacy schedule
-        # and sampler code read t_max; validation above/below forbids divergence.
+        # Two independent horizons:
+        # T_terminal is T_K (representation/KL), while t_max is the full score
+        # and Gaussian-sampling horizon T.
         "T_terminal": T_terminal,
-        "t_max": T_terminal,
+        "t_max": T_full,
+        "eval_tk_vs_t_comparison": True,
         "num_train_timesteps": int(preset.get("num_train_timesteps", 1000)),
         "score_time_weighting": args.score_time_weighting,
         "score_head_time_weighting": score_head_time_weighting,
@@ -7375,7 +8326,20 @@ def main():
         "eval_max_samples": eval_samples,
         "eval_lsi_gap_samples": min(2500, eval_samples),
         "eval_lsi_gap_time_points": 50,
-        "eval_oracle": False,
+        "eval_oracle": bool(args.eval_oracle_diagnostics),
+        "eval_sampling_init": str(args.eval_sampling_init),
+        "eval_oracle_diagnostics": bool(args.eval_oracle_diagnostics),
+        "eval_oracle_full_train_reference": bool(args.eval_oracle_full_train_reference),
+        "oracle_profile_query_samples": int(args.oracle_profile_query_samples),
+        "oracle_profile_time_points": int(args.oracle_profile_time_points),
+        "oracle_profile_batch_size": int(args.oracle_profile_batch_size),
+        "oracle_reference_batch_size": int(args.oracle_reference_batch_size),
+        "oracle_sampling_samples": int(args.oracle_sampling_samples),
+        "oracle_sampling_batch_size": int(args.oracle_sampling_batch_size),
+        "oracle_sampling_steps": int(args.oracle_sampling_steps),
+        "oracle_sampling_method": "rk4_ode",
+        "eval_oracle_transport_decomposition": bool(args.eval_oracle_transport_decomposition),
+        "eval_oracle_standard_samplers": bool(args.eval_oracle_standard_samplers),
         "kid_num_subsets": 100,
         "kid_subset_size": min(1000, eval_samples),
         "use_bespoke_fid_classifier": use_bespoke_fid_classifier,
@@ -7495,7 +8459,7 @@ def main():
     print(
         f"Diffusion: {cfg_norm['time_schedule']} | "
         f"t_min={cfg_norm['t_min']:.3g} | "
-        f"T_terminal=t_max={cfg_norm['T_terminal']:.3g} | "
+        f"T_K={cfg_norm['T_terminal']:.3g} | T={cfg_norm['t_max']:.3g} | "
         f"decode_time={cfg_norm.get('decode_time')}"
     )
     print(
@@ -7552,7 +8516,10 @@ def main():
             else "ImageNet Inception"
         )
     )
-    print("Auxiliary control/oracle diagnostics: OFF")
+    print(
+        "Exact aggregate-score diagnostics: "
+        + ("ON (full training mixture)" if cfg_norm.get("eval_oracle_diagnostics") else "OFF")
+    )
     print(
         "Per-epoch weight/time-bin/gradient/clip/K_T/latent-scale diagnostics: ON"
     )
@@ -7567,8 +8534,8 @@ def main():
         print(f"  score_head_lr   = {cfg_terminal['lr_score_head']}")
         print(f"  stiff_w         = {cfg_terminal['stiff_w']}  (disabled)")
         print(
-            f"  terminal T      = T_terminal = t_max = "
-            f"{cfg_terminal['T_terminal']}"
+            f"  representation T_K = {cfg_terminal['T_terminal']} | "
+            f"score/sampling T = {cfg_terminal['t_max']}"
         )
 
     if "norm" in arms:
