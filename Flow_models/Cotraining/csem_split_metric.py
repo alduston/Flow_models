@@ -5,7 +5,9 @@ WHY-V1 DIAGNOSTIC EXTENSION:
   * learned-vs-oracle score error globally and as a function of diffusion time;
   * CSEM residual = intrinsic component variance + learned-oracle error diagnostics;
   * unconditional endpoint transport ablation separating exact-qT numerical error,
-    Gaussian terminal mismatch, and learned-score approximation.
+    Gaussian terminal mismatch, and learned-score approximation;
+  * four-way learned-score initialization diagnostic: oracle q_t vs Gaussian at
+    both T_K and T, with reverse-step/NFE density matched across horizons.
 
 APPLIES-V2 DECOUPLED ROUTING VARIANT: retains the historical joint norm-1
 cotrain clip and unclipped PatchGAN update while making dual gradient routing
@@ -3328,6 +3330,71 @@ def build_empirical_qT_init_bank(
     return zT
 
 
+def matched_reverse_steps_for_horizon(
+    *,
+    reference_steps: int,
+    reference_t_max: float,
+    target_t_max: float,
+    t_min: float,
+    schedule_type: str,
+) -> int:
+    """Match reverse-sampler grid density when changing the start horizon.
+
+    ``reference_steps`` is the step budget at ``reference_t_max`` (normally
+    T_K).  The returned budget preserves the grid spacing in the coordinate
+    actually used by :meth:`UniversalSampler._make_time_grid`:
+
+      * log_t:   uniform in log(t), so steps scale with log(t_max / t_min);
+      * log_snr: uniform in OU log-SNR, so steps scale with the traversed
+                 log-SNR interval;
+      * flow/cosine/other linear grids: steps scale with the time interval.
+
+    We ceil rather than round so the longer-horizon run is never evaluated at
+    a *lower* NFE density.  RK4 uses four score-network evaluations per step,
+    so matching step density also matches NFE density.
+    """
+    reference_steps = int(reference_steps)
+    if reference_steps < 1:
+        raise ValueError("reference_steps must be >= 1")
+
+    reference_t_max = float(reference_t_max)
+    target_t_max = float(target_t_max)
+    t_min = float(t_min)
+    schedule_type = str(schedule_type).lower()
+
+    if target_t_max <= t_min or reference_t_max <= t_min:
+        raise ValueError(
+            "Reverse-sampler horizons must exceed t_min; "
+            f"got t_min={t_min}, reference_t_max={reference_t_max}, "
+            f"target_t_max={target_t_max}."
+        )
+
+    if math.isclose(target_t_max, reference_t_max, rel_tol=1e-12, abs_tol=1e-12):
+        return reference_steps
+
+    if schedule_type == "log_t":
+        reference_span = abs(math.log(reference_t_max / t_min))
+        target_span = abs(math.log(target_t_max / t_min))
+    elif schedule_type == "log_snr":
+        # UniversalSampler is uniform in lambda(t)=OU log-SNR for this mode.
+        t_ref = torch.tensor(reference_t_max, dtype=torch.float64)
+        t_target = torch.tensor(target_t_max, dtype=torch.float64)
+        t_lo = torch.tensor(t_min, dtype=torch.float64)
+        lam_lo = float(ou_logsnr(t_lo).item())
+        reference_span = abs(float(ou_logsnr(t_ref).item()) - lam_lo)
+        target_span = abs(float(ou_logsnr(t_target).item()) - lam_lo)
+    else:
+        # Flow matching and cosine use linear time grids in UniversalSampler.
+        reference_span = abs(reference_t_max - t_min)
+        target_span = abs(target_t_max - t_min)
+
+    if reference_span <= 0.0:
+        raise ValueError("Reference sampler span must be positive.")
+
+    scaled = reference_steps * (target_span / reference_span)
+    return max(1, int(math.ceil(scaled - 1e-12)))
+
+
 def _oracle_profile_time_indices(schedule: Dict[str, torch.Tensor], n_points: int) -> torch.Tensor:
     T = int(schedule["T"].item())
     n_points = max(2, min(int(n_points), T))
@@ -4090,26 +4157,68 @@ def evaluate_current_state(
         },
     ]
     if unet is not None:
+        T_K_eval = float(cfg["T_terminal"])
+        T_eval = float(cfg["t_max"])
+        tk_steps = int(cfg.get("eval_rk4_steps_tk", 25))
+        t_steps = matched_reverse_steps_for_horizon(
+            reference_steps=tk_steps,
+            reference_t_max=T_K_eval,
+            target_t_max=T_eval,
+            t_min=float(cfg["t_min"]),
+            schedule_type=str(cfg.get("time_schedule", "log_snr")),
+        )
+
+        # Full 2 x 2 mechanism diagnostic:
+        #   initialization in {empirical oracle q_t, Gaussian gamma}
+        #       x reversal horizon in {T_K, T}.
+        # This isolates how much the score-only tail (T_K, T] Gaussianizes the
+        # learned latent before generation, while the matched grid-density step
+        # budget prevents a longer horizon from silently receiving fewer NFEs
+        # per unit integration coordinate.
         configs.extend([
             {
                 "method": "rk4_ode",
-                "steps": 25,
-                "desc": f"RK4 oracle q_TK init (T_K={float(cfg['T_terminal']):g})",
+                "steps": tk_steps,
+                "desc": f"RK4 oracle q_TK init (T_K={T_K_eval:g})",
                 "use_rand_token": True,
                 "cfg_level": cfg_eval_scale,
                 "init_mode": "oracle-qtk-class",
-                "sampler_t_max": float(cfg["T_terminal"]),
+                "sampler_t_max": T_K_eval,
             },
             {
                 "method": "rk4_ode",
-                "steps": 25,
-                "desc": f"RK4 Gaussian init (T={float(cfg['t_max']):g})",
+                "steps": tk_steps,
+                "desc": f"RK4 Gaussian init (T_K={T_K_eval:g})",
+                "use_rand_token": True,
+                "cfg_level": cfg_eval_scale,
+                "init_mode": "gaussian-TK",
+                "sampler_t_max": T_K_eval,
+            },
+            {
+                "method": "rk4_ode",
+                "steps": t_steps,
+                "desc": f"RK4 oracle q_T init (T={T_eval:g})",
+                "use_rand_token": True,
+                "cfg_level": cfg_eval_scale,
+                "init_mode": "oracle-qT-class",
+                "sampler_t_max": T_eval,
+            },
+            {
+                "method": "rk4_ode",
+                "steps": t_steps,
+                "desc": f"RK4 Gaussian init (T={T_eval:g})",
                 "use_rand_token": True,
                 "cfg_level": cfg_eval_scale,
                 "init_mode": "gaussian-T",
-                "sampler_t_max": float(cfg["t_max"]),
+                "sampler_t_max": T_eval,
             },
         ])
+        print(
+            "  Four-way T_K/T initialization diagnostic: "
+            f"T_K={T_K_eval:g} uses {tk_steps} RK4 steps ({4 * tk_steps} NFE); "
+            f"T={T_eval:g} uses {t_steps} RK4 steps ({4 * t_steps} NFE), "
+            f"matched for {str(cfg.get('time_schedule', 'log_snr'))} grid density."
+        )
 
     results = []
 
@@ -4132,12 +4241,17 @@ def evaluate_current_state(
         )
         rand_token_bank_all = rand_token_bank_all[sample_indices]
 
-    # Exact empirical class-conditional q_{T_K} evaluation initialization.
+    # Exact empirical class-conditional q_t evaluation initializations at both
+    # horizons.  ``build_empirical_qT_init_bank`` resets its deterministic CPU
+    # generator on each call, so these two banks use the same selected encoder
+    # components, the same posterior z0 draws, and the same forward-noise draws;
+    # only the OU horizon changes.  That pairing reduces diagnostic variance.
     oracle_qtk_bank_all = None
+    oracle_qt_bank_all = None
     if needs_oracle_qt_init:
         if rand_token_bank_all is None:
             raise ValueError(
-                "q_TK class-conditional initialization requires class labels."
+                "Class-conditional oracle q_t initialization requires class labels."
             )
         oracle_qtk_bank_all = build_empirical_qT_init_bank(
             oracle_reference_mus,
@@ -4149,10 +4263,21 @@ def evaluate_current_state(
             target_labels=rand_token_bank_all,
             terminal_time=float(cfg["T_terminal"]),
         )
+        oracle_qt_bank_all = build_empirical_qT_init_bank(
+            oracle_reference_mus,
+            oracle_reference_logvars,
+            oracle_reference_labels,
+            target_count=target_count,
+            cfg=cfg,
+            epoch_idx=int(epoch_idx),
+            target_labels=rand_token_bank_all,
+            terminal_time=float(cfg["t_max"]),
+        )
         print(
-            "  Two-horizon sampler comparison: "
-            f"oracle class-conditional q_TK at T_K={float(cfg['T_terminal']):g} "
-            f"vs Gaussian at T={float(cfg['t_max']):g}"
+            "  Oracle initialization banks ready at both horizons: "
+            f"q_TK (T_K={float(cfg['T_terminal']):g}) and "
+            f"q_T (T={float(cfg['t_max']):g}); Gaussian controls use the shared "
+            "fixed N(0,I) noise bank at the corresponding reversal horizon."
         )
 
     # -----------------------------------------------------------------------
@@ -4173,6 +4298,10 @@ def evaluate_current_state(
 
         if init_mode == "oracle-qtk-class":
             init_tag = f"_initoracleqTK{float(cfg['T_terminal']):g}".replace(".", "p")
+        elif init_mode == "gaussian-TK":
+            init_tag = f"_initgaussianTK{float(cfg['T_terminal']):g}".replace(".", "p")
+        elif init_mode == "oracle-qT-class":
+            init_tag = f"_initoracleqT{float(cfg['t_max']):g}".replace(".", "p")
         elif init_mode == "gaussian-T":
             init_tag = f"_initgaussianT{float(cfg['t_max']):g}".replace(".", "p")
         else:
@@ -4244,7 +4373,17 @@ def evaluate_current_state(
                         z_gen = sampler.sample(
                             score_model, x_init=xT, y=y_batch, cfg_scale=g_scale
                         )
-                    elif init_mode == "gaussian-T":
+                    elif init_mode == "oracle-qT-class":
+                        if oracle_qt_bank_all is None:
+                            raise RuntimeError("oracle q_T bank was not constructed")
+                        xT = oracle_qt_bank_all[i:i + batch_sz].to(device)
+                        z_gen = sampler.sample(
+                            score_model, x_init=xT, y=y_batch, cfg_scale=g_scale
+                        )
+                    elif init_mode in ("gaussian-TK", "gaussian-T"):
+                        # Use the same fixed Gaussian bank for both horizons.  The
+                        # only differences are the declared start time and the
+                        # density-matched RK4 step budget.
                         if noise_bank_all is not None:
                             xT = noise_bank_all[i:i + batch_sz].to(device)
                             z_gen = sampler.sample(
@@ -7968,9 +8107,10 @@ def main():
         default="gaussian",
         help=(
             "Legacy initialization selector retained for compatibility. In this "
-            "T/T_K split script, ordinary evaluation always reports BOTH learned-score "
-            "RK4 modes: class-conditional oracle q_{T_K} initialization at T_K and "
-            "Gaussian initialization at the full horizon T."
+            "T/T_K split script, ordinary evaluation reports the full learned-score "
+            "2x2 RK4 diagnostic: oracle q_t and Gaussian initialization at both T_K "
+            "and T. The T-horizon RK4 step budget is increased automatically to "
+            "match the integration-grid/NFE density used at T_K."
         ),
     )
     parser.add_argument(
@@ -8349,6 +8489,10 @@ def main():
         "T_terminal": T_terminal,
         "t_max": T_full,
         "eval_tk_vs_t_comparison": True,
+        # Ordinary four-way initialization diagnostic uses this RK4 budget at
+        # T_K; the T budget is derived automatically to preserve sampler-grid
+        # density (and therefore RK4 NFE density).
+        "eval_rk4_steps_tk": 25,
         "num_train_timesteps": int(preset.get("num_train_timesteps", 1000)),
         "score_time_weighting": args.score_time_weighting,
         "score_head_time_weighting": score_head_time_weighting,
