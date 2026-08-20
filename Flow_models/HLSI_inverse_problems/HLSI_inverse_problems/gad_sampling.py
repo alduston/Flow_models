@@ -7,8 +7,9 @@ with the existing stochastic reverse-OU Heun scheme.  A ratio node reconstructs
 the endpoint log density and either carries static log weights or moves a fresh,
 unweighted cloud with the completed shared-statistic ratio field.
 
-Only the score families used in the current paper are exposed: LFGI, local and
-global scalar/matrix blends, Tweedie, and TSI.  Ratio nodes expose exactly two
+The score families used in the current paper are exposed: LFGI, the raw
+unrestricted (generally asymmetric) Dirichlet gate, local and global
+scalar/matrix blends, Tweedie, and TSI.  Ratio nodes expose exactly two
 modes: ``pflow`` and ``static``.  ``pflow`` denotes the moved-particle ratio
 node; particle generation deliberately retains this module's stochastic
 reverse-SDE integrator, while the deterministic probability flow is retained
@@ -563,6 +564,7 @@ class GaussianPrior(torch.nn.Module):
 
 SCORE_METHODS = (
     'lfgi',
+    'dirichlet',
     'local_scalar_blend',
     'local_matrix_blend',
     'global_scalar_blend',
@@ -581,6 +583,13 @@ def _canonical_token(value):
 
 def canonicalize_score_method(value):
     method = _canonical_token(value)
+    aliases = {
+        'raw_dirichlet': 'dirichlet',
+        'asymmetric_dirichlet': 'dirichlet',
+        'dirichlet_asymmetric': 'dirichlet',
+        'unrestricted_dirichlet': 'dirichlet',
+    }
+    method = aliases.get(method, method)
     if method not in SCORE_METHODS:
         raise ValueError(
             f"Unknown score method {value!r}. Expected one of {', '.join(SCORE_METHODS)}."
@@ -811,7 +820,7 @@ class ScoreComponents:
 
 
 class ScoreField:
-    """One of the seven paper score estimators on fixed score/gate banks."""
+    """One of the paper score estimators on fixed score/gate banks."""
 
     def __init__(self, signal_bank, method, gate_bank=None, *, eval_chunk=64,
                  matrix_blend_center=True, matrix_blend_ridge=1e-8,
@@ -837,6 +846,7 @@ class ScoreField:
         self._global_moment = None
         self._device_bank_cache = {}
         self._device_precision_cache = {}
+        self._device_precision_square_cache = {}
 
     def _bank_tensors(self, bank, target_device, dtype):
         key = (id(bank), str(target_device), dtype)
@@ -856,6 +866,16 @@ class ScoreField:
         if cached is None:
             cached = bank.P_ref.to(target_device, non_blocking=True, dtype=dtype)
             self._device_precision_cache[key] = cached
+        return cached
+
+    def _bank_precision_square(self, bank, target_device, dtype):
+        """Cache (H_0^g)^2 for Dirichlet B_q moments on each device/dtype."""
+        key = (id(bank), str(target_device), dtype)
+        cached = self._device_precision_square_cache.get(key)
+        if cached is None:
+            P = self._bank_precision(bank, target_device, dtype)
+            cached = torch.matmul(P, P)
+            self._device_precision_square_cache[key] = cached
         return cached
 
     def _weights_and_signals(self, y, t, bank):
@@ -928,6 +948,63 @@ class ScoreField:
         eigvals = eigvals.clamp(min=1e-6)
         gate_eig = (alpha * alpha) / torch.clamp(alpha * alpha + gamma * eigvals, min=1e-30)
         return torch.einsum('bik,bk,bjk->bij', eigvecs, gate_eig, eigvecs)
+
+    def _dirichlet_gate(self, y, t, alpha, gamma, gate_weights=None):
+        """Raw unrestricted Dirichlet gate using the stored GN information proxy.
+
+        For S_i = k_t I + H_i^g on the clean reference particles and conditional
+        weights w_i(y,t), compute
+
+            M_q = sum_i w_i S_i,
+            B_q = sum_i w_i S_i^2,
+            G_D = k_t M_q B_q^{-1}.
+
+        The solve is deliberately right-sided and the returned matrix is *not*
+        symmetrized: M_q and B_q are individually symmetric, but their product
+        M_q B_q^{-1} is generally asymmetric when the two moments do not commute.
+        ``P_ref`` is the existing band-regularized Gauss--Newton observed-
+        information proxy H_0^g produced by ``precompute_reference_bank``.
+        """
+        if gate_weights is None:
+            gate_weights, _bg, _cg, _ag, _gg = self._weights_and_signals(
+                y, t, self.gate_bank
+            )
+
+        H_gn = self._bank_precision(self.gate_bank, y.device, y.dtype)
+        H2_gn = self._bank_precision_square(self.gate_bank, y.device, y.dtype)
+        batch, d = y.shape
+        eye = torch.eye(d, device=y.device, dtype=y.dtype).expand(batch, d, d)
+        k_t = (alpha * alpha) / torch.clamp(gamma, min=1e-30)
+
+        # Avoid forming S_i and S_i^2 for every query.  Since
+        # S_i = k I + H_i^g,
+        #   M_q = k I + E_Q[H^g],
+        #   B_q = k^2 I + 2 k E_Q[H^g] + E_Q[(H^g)^2].
+        # H_i^2 is cached once per reference bank/device/dtype.
+        Hbar = torch.einsum('bn,nij->bij', gate_weights, H_gn)
+        H2bar = torch.einsum('bn,nij->bij', gate_weights, H2_gn)
+        M_q = k_t * eye + Hbar
+        B_q = (k_t * k_t) * eye + 2.0 * k_t * Hbar + H2bar
+
+        # M_q and B_q are symmetric in exact arithmetic.  Enforce only those
+        # moment symmetries; do not symmetrize the optimizer G_D itself.
+        M_q = _sym(torch.nan_to_num(M_q, nan=0.0, posinf=1e12, neginf=-1e12))
+        B_q = _sym(torch.nan_to_num(B_q, nan=0.0, posinf=1e24, neginf=-1e24))
+        rhs = k_t * M_q
+
+        # Solve G B = rhs by transposing the normal equation.  Since B is
+        # symmetric positive definite for the GN construction, this is the
+        # direct finite-bank realization of k M B^{-1}.  Pseudoinverse is only
+        # a numerical fallback and does not change the intended gate definition.
+        try:
+            G = torch.linalg.solve(B_q.transpose(-1, -2), rhs.transpose(-1, -2)).transpose(-1, -2)
+        except RuntimeError:
+            G = torch.matmul(rhs, torch.linalg.pinv(B_q))
+
+        if not bool(torch.isfinite(G).all().item()):
+            fallback = torch.matmul(rhs, torch.linalg.pinv(B_q))
+            G = torch.where(torch.isfinite(G), G, fallback)
+        return torch.nan_to_num(G, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _local_scalar_gate(self, y, t, gate_values=None):
         """Existing self-normalized finite-bank scalar blend calculation."""
@@ -1043,6 +1120,11 @@ class ScoreField:
 
         if self.method == 'lfgi':
             G = self._lfgi_gate(
+                y, t, alpha, gamma,
+                gate_weights=w if self.gate_bank is self.signal_bank else None,
+            )
+        elif self.method == 'dirichlet':
+            G = self._dirichlet_gate(
                 y, t, alpha, gamma,
                 gate_weights=w if self.gate_bank is self.signal_bank else None,
             )
@@ -3087,6 +3169,7 @@ def compute_heldout_predictive_metrics(samples_dict, metrics,
 def results_method_family(label, info):
     family_map = {
         'lfgi': 'LFGI',
+        'dirichlet': 'DIRICHLET',
         'local_scalar_blend': 'LOCAL SCALAR BLEND',
         'local_matrix_blend': 'MATRIX BLEND',
         'global_scalar_blend': 'GLOBAL SCALAR BLEND',
