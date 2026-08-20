@@ -1,21 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Darcy flow inverse-problem GAD versus AGAD benchmark.
+"""Darcy flow inverse-problem LFGI-GAD versus MALA benchmark.
 
-Runs a controlled two-arm comparison using GN-LFGI only.  GAD performs a
-transport-only chain, while AGAD inserts a completed-score probability-flow
-ratio node after every transport node.  Both arms use the same number of
-transport iterations and report transport iterations 1 and 3.
+Runs the three paper-facing rows requested for the inverse-problem comparison:
+LFGI-GAD after one and three transport rounds, plus an exact-score MALA
+baseline.  The hidden GAD round 2 is executed because it is part of the
+round-3 path, but it is excluded from tables and plots.  MALA uses parallel
+prior-initialized chains, warmup-only dual-averaging adaptation, a frozen
+production kernel, and post-warmup draws.
 
 Useful overrides:
 
     export IP_ITER_N_REF=1000
     export IP_ITER_ROUNDS=3
     export IP_ITER_TRANSPORT_STEPS=200
-    export IP_ITER_RATIO_STEPS=200
-    export IP_ITER_DENSITY_STEPS=32
+    export IP_MALA_N_CHAINS=32
+    export IP_MALA_WARMUP=107
+    export IP_MALA_THIN=1
+    export IP_MALA_DT=1e-4
 """
 import gc
 import os
+import random
 import sys
 from collections import OrderedDict
 
@@ -41,7 +46,7 @@ import pandas as pd
 import torch
 from scipy.spatial.distance import cdist
 
-from sampling import (
+from gad_sampling import (
     GaussianPrior,
     compute_field_summary_metrics,
     compute_heldout_predictive_metrics,
@@ -345,8 +350,20 @@ class DashboardPDF:
             "pde_gn_hessian_evals": "PDE GN Hess evals",
             "pde_solve_count": "PDE solves",
             "runtime_seconds": "runtime (s)",
+            "local_runtime_seconds": "local runtime (s)",
             "reference_method": "reference",
             "N_ref": "N ref",
+            "path_depth": "chain depth",
+            "mala_n_chains": "MALA chains",
+            "mala_warmup": "MALA warmup",
+            "mala_thin": "MALA thin",
+            "mala_draws_per_chain": "draws / chain",
+            "mala_dt_initial": "MALA dt init",
+            "mala_dt_final": "MALA dt final",
+            "mala_acceptance_rate": "MALA accept",
+            "mala_rhat_median": "Rhat median",
+            "mala_rhat_max": "Rhat max",
+            "mala_unique_fraction": "unique frac",
         }
         return df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
@@ -355,7 +372,7 @@ class DashboardPDF:
 
         The metrics page keeps the saved *_metrics.csv / tables.tex layout. The
         run-info page preserves the saved *_runinfo.csv contents, but splits the
-        many accounting columns into three normal table blocks on one page so it
+        many accounting columns into four normal table blocks on one page so it
         remains legible instead of becoming a tiny one-line wide table.
         """
         if not self.enabled:
@@ -410,7 +427,7 @@ class DashboardPDF:
             return [c for c in cols if c in runinfo.columns]
 
         config_cols = cols_present([
-            "method label", "sampler", "weights", "N ref", "steps",
+            "method label", "sampler", "weights", "N ref", "steps", "chain depth",
             "reference", "runtime (s)",
         ])
         score_cols = cols_present([
@@ -420,6 +437,15 @@ class DashboardPDF:
         budget_cols = cols_present([
             "method label", "PDE logL evals", "PDE score evals", "PDE GN Hess evals", "PDE solves",
         ])
+        mala_cols = cols_present([
+            "method label", "MALA chains", "MALA warmup", "MALA thin", "draws / chain",
+            "MALA dt init", "MALA dt final", "MALA accept", "Rhat median", "Rhat max",
+            "unique frac",
+        ])
+        if mala_cols and "sampler" in runinfo.columns:
+            mala_rows = runinfo.loc[runinfo["sampler"].astype(str).str.upper() == "MALA", mala_cols]
+        else:
+            mala_rows = runinfo[mala_cols] if mala_cols else pd.DataFrame()
 
         # Normalized column widths for each block. First column gets label width;
         # remaining columns share the rest.
@@ -431,29 +457,36 @@ class DashboardPDF:
         if config_cols:
             self._add_table_block(
                 ax, "Sampler configuration and runtime", runinfo[config_cols],
-                bbox=[0.035, 0.635, 0.93, 0.265], col_widths=widths(len(config_cols), first=0.22),
-                header_fontsize=8.8, body_fontsize=8.7,
+                bbox=[0.035, 0.670, 0.93, 0.225], col_widths=widths(len(config_cols), first=0.22),
+                header_fontsize=8.2, body_fontsize=8.2,
             )
         if score_cols:
             self._add_table_block(
                 ax, "Score-norm diagnostics", runinfo[score_cols],
-                bbox=[0.035, 0.355, 0.93, 0.185], col_widths=widths(len(score_cols), first=0.30),
-                header_fontsize=9.2, body_fontsize=9.0,
+                bbox=[0.035, 0.480, 0.93, 0.115], col_widths=widths(len(score_cols), first=0.30),
+                header_fontsize=8.8, body_fontsize=8.7,
+            )
+        if not mala_rows.empty:
+            self._add_table_block(
+                ax, "MALA convergence diagnostics", mala_rows,
+                bbox=[0.035, 0.275, 0.93, 0.125], col_widths=widths(len(mala_cols), first=0.20),
+                header_fontsize=7.6, body_fontsize=8.2,
             )
         if budget_cols:
             self._add_table_block(
                 ax, "PDE evaluation budget", runinfo[budget_cols],
-                bbox=[0.035, 0.115, 0.93, 0.165], col_widths=widths(len(budget_cols), first=0.30),
-                header_fontsize=9.2, body_fontsize=9.0,
+                bbox=[0.035, 0.085, 0.93, 0.115], col_widths=widths(len(budget_cols), first=0.30),
+                header_fontsize=8.8, body_fontsize=8.7,
             )
 
         # If future runinfo files add columns not covered above, surface them in a small note
         # instead of silently dropping them.
-        used = set(config_cols + score_cols + budget_cols + ["target", "label"])
+        used = set(config_cols + score_cols + budget_cols + mala_cols + ["target", "label"])
         extra = [c for c in runinfo.columns if c not in used]
         if extra:
-            ax.text(0.035, 0.055, "Additional run-info columns: " + ", ".join(extra),
-                    fontsize=8.0, alpha=0.75, ha="left", va="bottom")
+            extra_text = ", ".join(extra[:8]) + (f" (+{len(extra) - 8} more in CSV)" if len(extra) > 8 else "")
+            ax.text(0.035, 0.025, "Additional run-info columns: " + extra_text,
+                    fontsize=7.0, alpha=0.75, ha="left", va="bottom")
         self.pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
         self.table_pages += 1
@@ -744,12 +777,13 @@ N_REF = 1000
 
 
 # ==========================================
-# GAD versus AGAD benchmark configuration
+# LFGI-GAD versus MALA benchmark configuration
 # ==========================================
-# GAD follows T_1 -> ... -> T_K.  AGAD follows
-# T_1 -> R_1 -> ... -> T_K -> R_K, where each hidden R_r is the completed-score
-# probability-flow ratio correction implemented by sampling.CompletedRatioField.
-# Only the requested transport iterates enter tables and plots.
+# GAD follows T_1 -> ... -> T_K using GN-LFGI at every round.  Round 2 remains
+# in the execution DAG but is hidden.  MALA is an independent prior-initialized
+# exact-score baseline.  Its default schedule is intentionally close to the
+# cumulative round-3 GAD budget under the portable solve-counting proxy used by
+# sampling_gad_mala_20260814.py.
 
 def _env_int(name, default):
     return int(os.environ.get(name, str(default)))
@@ -762,117 +796,49 @@ def _env_float(name, default):
 N_REF = _env_int('IP_ITER_N_REF', _env_int('IP_DARCY_ITER_N_REF', N_REF))
 DEFAULT_N_GEN = _env_int('IP_ITER_DEFAULT_N_GEN', _env_int('IP_DARCY_ITER_DEFAULT_N_GEN', N_REF))
 ITERATIVE_TRANSPORT_ROUNDS = _env_int('IP_ITER_ROUNDS', 3)
-DISPLAY_TRANSPORT_ROUNDS = {1,2,3}
+if ITERATIVE_TRANSPORT_ROUNDS != 3:
+    raise ValueError('This exact paper comparison requires IP_ITER_ROUNDS=3.')
+DISPLAY_TRANSPORT_ROUNDS = {1, 3}
 TRANSPORT_STEPS = _env_int('IP_ITER_TRANSPORT_STEPS', 200)
-RATIO_STEPS = _env_int('IP_ITER_RATIO_STEPS', TRANSPORT_STEPS)
 
-RATIO_FLOW_COMMON = dict(
-    ratio_mode='pflow',
-    steps=RATIO_STEPS,
-    density_steps=_env_int('IP_ITER_DENSITY_STEPS', 32),
-    density_divergence=os.environ.get('IP_ITER_DENSITY_DIVERGENCE', 'auto'),
-    density_div_probes=_env_int('IP_ITER_DENSITY_DIV_PROBES', 1),
-    density_batch_size=_env_int('IP_ITER_DENSITY_BATCH_SIZE', 32),
-    ratio_log_weight_clip=_env_float('IP_ITER_RATIO_LOG_WEIGHT_CLIP', 20.0),
-    ratio_temperature=_env_float('IP_ITER_RATIO_TEMPERATURE', 1.0),
-    density_fd_eps=_env_float('IP_ITER_DENSITY_FD_EPS', 1e-3),
+MALA_N_CHAINS = max(1, _env_int('IP_MALA_N_CHAINS', 32))
+MALA_THIN = max(1, _env_int('IP_MALA_THIN', 1))
+MALA_EFFECTIVE_CHAINS = max(1, min(MALA_N_CHAINS, DEFAULT_N_GEN))
+MALA_DRAWS_PER_CHAIN = int(np.ceil(DEFAULT_N_GEN / MALA_EFFECTIVE_CHAINS))
+GAD3_EXPECTED_PDE_PROXY = 3 * 3 * N_REF
+MALA_MATCHED_WARMUP = max(
+    0,
+    int(np.floor(
+        GAD3_EXPECTED_PDE_PROXY / float(2 * MALA_EFFECTIVE_CHAINS)
+        - 1
+        - MALA_DRAWS_PER_CHAIN * MALA_THIN
+    )),
 )
-
-
+MALA_WARMUP = max(0, _env_int('IP_MALA_WARMUP', MALA_MATCHED_WARMUP))
+MALA_DT = _env_float('IP_MALA_DT', 1e-4)
+MALA_TARGET_ACCEPT = _env_float('IP_MALA_TARGET_ACCEPT', 0.574)
+MALA_MIN_DT = _env_float('IP_MALA_MIN_DT', 1e-12)
+MALA_MAX_DT = _env_float('IP_MALA_MAX_DT', 1e-1)
+MALA_PROGRESS_EVERY = _env_int('IP_MALA_PROGRESS_EVERY', 25)
+MALA_ADAPT = os.environ.get('IP_MALA_ADAPT', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
 
 METHOD_SPECS = OrderedDict([
-    ('GAD-LFGI', {
+    ('LFGI-GAD', {
         'score': 'lfgi',
-        'display': 'GAD (GN-LFGI)',
-        'use_ratio': False,
-    }),
-    ('GAD-MatrixBlend', {
-        'score': 'local_matrix_blend',
-        'display': 'GAD (Matrix Blend)',
-        'use_ratio': False,
-    }),
-    ('GAD-ScalarBlend', {
-        'score': 'local_scalar_blend',
-        'display': 'GAD (Local Scalar Blend)',
-        'use_ratio': False,
-    }),
-    ('GAD-GlobalMatrixBlend', {
-        'score': 'global_matrix_blend',
-        'display': 'GAD (Global Matrix Blend)',
-        'use_ratio': False,
-    }),
-    ('GAD-GlobalScalarBlend', {
-        'score': 'global_scalar_blend',
-        'display': 'GAD (Global Scalar Blend)',
-        'use_ratio': False,
-    }),
-    ('GAD-Tweedie', {
-        'score': 'tweedie',
-        'display': 'GAD (Tweedie)',
-        'use_ratio': False,
+        'display': 'LFGI-GAD',
     }),
 ])
 
 
-'''
-METHOD_SPECS = OrderedDict([
-    ('GAD-LFGI', {
-        'score': 'lfgi',
-        'display': 'GAD (GN-LFGI)',
-        'use_ratio': False,
-    }),
-    ('GAD-ScalarBlend', {
-        'score': 'local_scalar_blend',
-        'display': 'GAD (Local Scalar Blend)',
-        'use_ratio': False,
-    }),
-    ('GAD-GlobalMatrixBlend', {
-        'score': 'global_matrix_blend',
-        'display': 'GAD (Global Matrix Blend)',
-        'use_ratio': False,
-    }),
-    ('GAD-GlobalScalarBlend', {
-        'score': 'global_scalar_blend',
-        'display': 'GAD (Global Scalar Blend)',
-        'use_ratio': False,
-    }),
-])
-
-
-
-
-METHOD_SPECS = OrderedDict([
-    ('GAD', {
-        'score': 'lfgi',
-        'display': 'GAD (GN-LFGI)',
-        'use_ratio': False,
-    }),
-    ('AGAD', {
-        'score': 'lfgi',
-        'display': 'AGAD (GN-LFGI)',
-        'use_ratio': True,
-        'ratio_config': dict(RATIO_FLOW_COMMON),
-    }),
-])
-'''
-
-
-def make_gad_vs_agad_sampler_configs(method_specs, rounds=ITERATIVE_TRANSPORT_ROUNDS):
-    """Build one transport chain per explicit GAD/AGAD method entry."""
+def make_gad_sampler_configs(method_specs, rounds=ITERATIVE_TRANSPORT_ROUNDS):
+    """Build one transport-only chain per GAD method entry."""
     configs = OrderedDict()
     for method_key, spec in method_specs.items():
         score_method = spec['score']
         display_base = spec['display']
-        use_ratio = bool(spec.get('use_ratio', False))
-        ratio_config = dict(spec.get('ratio_config', {}))
-        if use_ratio and ratio_config.get('ratio_mode', 'pflow') != 'pflow':
-            raise ValueError(
-                f'{method_key}: AGAD must use the completed-score pflow ratio node.'
-            )
-
         previous_label = None
         for round_idx in range(1, int(rounds) + 1):
-            transport_label = f'{method_key}-T{round_idx}'
+            transport_label = f'{method_key}-{round_idx}'
             transport_cfg = {
                 'node': 'transport',
                 'score': score_method,
@@ -883,36 +849,37 @@ def make_gad_vs_agad_sampler_configs(method_specs, rounds=ITERATIVE_TRANSPORT_RO
                 'bank_coupling': 'shared',
                 'log_mean_ess': True,
                 'include_results': round_idx in DISPLAY_TRANSPORT_ROUNDS,
-                'display_name': f'{display_base} iteration {round_idx}',
+                'display_name': f'{display_base} {round_idx}',
             }
             if previous_label is not None:
                 transport_cfg['ref_source'] = previous_label
             configs[transport_label] = transport_cfg
-
-            if use_ratio:
-                ratio_label = f'{method_key}-R{round_idx}'
-                ratio_cfg = {
-                    'node': 'ratio',
-                    'score': score_method,
-                    'ref_source': transport_label,
-                    'n_samples': DEFAULT_N_GEN,
-                    'n_ref': N_REF,
-                    'n_gate': N_REF,
-                    'bank_coupling': 'shared',
-                    'log_mean_ess': False,
-                    'include_results': False,
-                    'display_name': f'{display_base} completed ratio {round_idx}',
-                }
-                ratio_cfg.update(ratio_config)
-                configs[ratio_label] = ratio_cfg
-                previous_label = ratio_label
-            else:
-                previous_label = transport_label
+            previous_label = transport_label
 
     return configs
 
 
-SAMPLER_CONFIGS = make_gad_vs_agad_sampler_configs(METHOD_SPECS)
+SAMPLER_CONFIGS = make_gad_sampler_configs(METHOD_SPECS)
+SAMPLER_CONFIGS['MALA'] = {
+    'node': 'mala',
+    'n_samples': DEFAULT_N_GEN,
+    'mala_n_chains': MALA_N_CHAINS,
+    'mala_warmup': MALA_WARMUP,
+    'mala_thin': MALA_THIN,
+    'mala_dt': MALA_DT,
+    'mala_adapt': MALA_ADAPT,
+    'mala_target_accept': MALA_TARGET_ACCEPT,
+    'mala_min_dt': MALA_MIN_DT,
+    'mala_max_dt': MALA_MAX_DT,
+    'mala_progress_every': MALA_PROGRESS_EVERY,
+    'include_results': True,
+    'is_reference': True,
+    'display_name': 'MALA',
+}
+
+MALA_TOTAL_TRANSITIONS = MALA_WARMUP + MALA_DRAWS_PER_CHAIN * MALA_THIN
+MALA_EXPECTED_PDE_PROXY = 2 * MALA_EFFECTIVE_CHAINS * (MALA_TOTAL_TRANSITIONS + 1)
+MALA_TO_GAD3_PROXY_RATIO = MALA_EXPECTED_PDE_PROXY / float(max(1, GAD3_EXPECTED_PDE_PROXY))
 
 configure_sampling(
     active_dim=ACTIVE_DIM,
@@ -920,7 +887,7 @@ configure_sampling(
     hess_min=HESS_MIN,
     hess_max=HESS_MAX,
 )
-run_ctx = init_run_results('darcy_gad_vs_agad')
+run_ctx = init_run_results('darcy_lfgi_gad1_gad3_mala_20260814')
 DASHBOARD_PDF_PATH = os.path.join(
     run_ctx['run_results_dir'],
     f"{run_ctx['run_results_stem']}_summary_dashboard.pdf",
@@ -928,15 +895,25 @@ DASHBOARD_PDF_PATH = os.path.join(
 
 RUN_COMMAND_HINT = (
     'IP_ITER_N_REF={n_ref} IP_ITER_ROUNDS={rounds} '
-    'IP_ITER_TRANSPORT_STEPS={transport_steps} IP_ITER_RATIO_STEPS={ratio_steps} '
-    'IP_ITER_DENSITY_STEPS={density_steps} python darcy_gad_agad_explicit_arms_20260811.py'
+    'IP_ITER_TRANSPORT_STEPS={transport_steps} IP_MALA_N_CHAINS={mala_chains} '
+    'IP_MALA_WARMUP={mala_warmup} IP_MALA_THIN={mala_thin} IP_MALA_DT={mala_dt} '
+    'python darcy_gad_mala_comparison_20260814.py'
 ).format(
     n_ref=N_REF,
     rounds=ITERATIVE_TRANSPORT_ROUNDS,
     transport_steps=TRANSPORT_STEPS,
-    ratio_steps=RATIO_STEPS,
-    density_steps=RATIO_FLOW_COMMON['density_steps'],
+    mala_chains=MALA_N_CHAINS,
+    mala_warmup=MALA_WARMUP,
+    mala_thin=MALA_THIN,
+    mala_dt=MALA_DT,
 )
+
+if not 0.90 <= MALA_TO_GAD3_PROXY_RATIO <= 1.10:
+    print(
+        'WARNING: configured MALA budget is not within 10% of cumulative LFGI-GAD 3 '
+        f'under the portable PDE proxy (ratio={MALA_TO_GAD3_PROXY_RATIO:.4f}). '
+        'Unset IP_MALA_WARMUP to use the automatic matched default.'
+    )
 
 # ==========================================
 # 3. Experiment execution
@@ -945,7 +922,11 @@ gc.collect()
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
+random.seed(seed)
 np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
 alpha_true_np = np.random.randn(ACTIVE_DIM) * 0.5
 
 y_clean = solve_forward(jnp.array(alpha_true_np))
@@ -957,13 +938,15 @@ y_holdout_obs_np = y_holdout_clean_np + np.random.normal(0.0, NOISE_STD, size=y_
 
 dashboard = DashboardPDF(
     DASHBOARD_PDF_PATH,
-    title='Darcy flow GAD versus AGAD dashboard',
+    title='Darcy flow LFGI-GAD versus MALA dashboard',
 )
 dashboard.add_text_page(
-    'Darcy flow GAD versus AGAD dashboard',
+    'Darcy flow LFGI-GAD versus MALA dashboard',
     [
         f"Created: {datetime.now().isoformat(timespec='seconds')}",
-        'This dashboard compares matched GN-LFGI arms. GAD chains transport nodes directly; AGAD inserts a hidden completed-score probability-flow ratio node after every transport node. Public rows are transport iterations 1 and 3.',
+        'Paper-facing rows are LFGI-GAD 1, LFGI-GAD 3, and MALA. GAD round 2 is executed as a hidden dependency of round 3.',
+        'MALA is prior-initialized and exact-score. Dual averaging is restricted to warmup; the production kernel is frozen before samples are retained.',
+        'The MALA row is marked as the distributional reference for the legacy MMD diagnostic, so its self-MMD is zero by construction. Primary inverse-problem comparisons should use KSD, reconstruction, prediction, calibration, and work.',
         'Included PNG diagnostics: ESS vs diffusion time, PCA histograms, log-permeability reconstructions, pressure fields, and permeability fields.',
         'Tables are intentionally limited to two pages: metrics plus a readable split run-info page.',
         'Random progress output from precomputation / Hessian batching is intentionally excluded.',
@@ -976,8 +959,16 @@ dashboard.add_text_page(
         f'ITERATIVE_TRANSPORT_ROUNDS = {ITERATIVE_TRANSPORT_ROUNDS}',
         f'DISPLAY_TRANSPORT_ROUNDS = {sorted(DISPLAY_TRANSPORT_ROUNDS)}',
         f'TRANSPORT_STEPS = {TRANSPORT_STEPS}',
-        f'RATIO_STEPS = {RATIO_STEPS}',
-        f'RATIO_FLOW_COMMON = {RATIO_FLOW_COMMON}',
+        f'MALA_N_CHAINS = {MALA_N_CHAINS}',
+        f'MALA_WARMUP = {MALA_WARMUP}',
+        f'MALA_MATCHED_WARMUP (automatic default) = {MALA_MATCHED_WARMUP}',
+        f'MALA_THIN = {MALA_THIN}',
+        f'MALA_DT = {MALA_DT}',
+        f'MALA_ADAPT = {MALA_ADAPT}',
+        f'MALA_TARGET_ACCEPT = {MALA_TARGET_ACCEPT}',
+        f'Expected MALA PDE proxy = {MALA_EXPECTED_PDE_PROXY}',
+        f'Expected cumulative LFGI-GAD 3 PDE proxy = {GAD3_EXPECTED_PDE_PROXY}',
+        f'MALA / LFGI-GAD 3 expected proxy ratio = {MALA_TO_GAD3_PROXY_RATIO:.4f}',
         f'NOISE_STD = {NOISE_STD}',
         f'N = {N}, num_observation = {num_observation}, num_holdout_observation = {num_holdout_observation}',
         f'HESS_MIN = {HESS_MIN}, HESS_MAX = {HESS_MAX}',
@@ -1141,7 +1132,7 @@ results_df, results_runinfo_df, results_df_path, results_runinfo_df_path = save_
 dashboard.add_results_tables(results_df, results_runinfo_df)
 
 save_reproducibility_log(
-    title='Darcy flow GAD versus AGAD reproducibility log',
+    title='Darcy flow LFGI-GAD versus MALA reproducibility log',
     config={
         'seed': seed,
         'ACTIVE_DIM': ACTIVE_DIM,
@@ -1154,8 +1145,18 @@ save_reproducibility_log(
         'ITERATIVE_TRANSPORT_ROUNDS': ITERATIVE_TRANSPORT_ROUNDS,
         'DISPLAY_TRANSPORT_ROUNDS': sorted(DISPLAY_TRANSPORT_ROUNDS),
         'TRANSPORT_STEPS': TRANSPORT_STEPS,
-        'RATIO_STEPS': RATIO_STEPS,
-        'RATIO_FLOW_COMMON': RATIO_FLOW_COMMON,
+        'MALA_N_CHAINS': MALA_N_CHAINS,
+        'MALA_WARMUP': MALA_WARMUP,
+        'MALA_MATCHED_WARMUP': MALA_MATCHED_WARMUP,
+        'MALA_THIN': MALA_THIN,
+        'MALA_DT': MALA_DT,
+        'MALA_ADAPT': MALA_ADAPT,
+        'MALA_TARGET_ACCEPT': MALA_TARGET_ACCEPT,
+        'MALA_MIN_DT': MALA_MIN_DT,
+        'MALA_MAX_DT': MALA_MAX_DT,
+        'MALA_EXPECTED_PDE_PROXY': MALA_EXPECTED_PDE_PROXY,
+        'GAD3_EXPECTED_PDE_PROXY': GAD3_EXPECTED_PDE_PROXY,
+        'MALA_TO_GAD3_PROXY_RATIO': MALA_TO_GAD3_PROXY_RATIO,
         'METHOD_SPECS': METHOD_SPECS,
         'SAMPLER_CONFIGS': SAMPLER_CONFIGS,
         'USE_GAUSS_NEWTON_HESSIAN': True,
@@ -1277,7 +1278,7 @@ if n_cols > 1:
             axes[3, col].text(0.5, 0.5, 'No valid\nsamples', ha='center', va='center', transform=axes[3, col].transAxes)
         axes[3, col].axis('off')
 
-    plt.suptitle(f'Inverse Darcy flow: GAD versus AGAD (d={ACTIVE_DIM})', fontsize=22, y=1.01)
+    plt.suptitle(f'Inverse Darcy flow: LFGI-GAD versus MALA (d={ACTIVE_DIM})', fontsize=22, y=1.01)
     plt.tight_layout()
     plt.show()
 
@@ -1304,7 +1305,7 @@ if n_cols > 1:
         axes2[col].set_title(f"{display_names.get(label, label)}\nPressure", fontsize=14)
         axes2[col].axis('off')
 
-    plt.suptitle(f'Inverse Darcy flow GAD versus AGAD (d={ACTIVE_DIM}): pressure field', fontsize=16, y=1.05)
+    plt.suptitle(f'Inverse Darcy flow LFGI-GAD versus MALA (d={ACTIVE_DIM}): pressure field', fontsize=16, y=1.05)
     plt.tight_layout()
     plt.show()
 
@@ -1328,7 +1329,7 @@ if n_cols > 1:
         axes3[col].set_title(f"{display_names.get(label, label)}\n$k(x)=e^{{m(x)}}$", fontsize=14)
         axes3[col].axis('off')
 
-    plt.suptitle(f'Inverse Darcy flow GAD versus AGAD (d={ACTIVE_DIM}): permeability field', fontsize=16, y=1.05)
+    plt.suptitle(f'Inverse Darcy flow LFGI-GAD versus MALA (d={ACTIVE_DIM}): permeability field', fontsize=16, y=1.05)
     plt.tight_layout()
     plt.show()
 else:
@@ -1342,4 +1343,4 @@ run_results_zip_path = zip_run_results_dir(extra_paths=[DASHBOARD_PDF_PATH])
 print(f"Run-results directory: {run_ctx['run_results_dir']}")
 print(f'Dashboard PDF: {DASHBOARD_PDF_PATH}')
 print(f'Run-results zip: {run_results_zip_path}')
-print('\n=== Darcy flow GAD versus AGAD comparison pipeline complete ===')
+print('\n=== Darcy flow LFGI-GAD versus MALA comparison pipeline complete ===')
