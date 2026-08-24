@@ -1,6 +1,0 @@
-cell_id,rep_id,rep_role,T_K,T_full,csem_w,terminal_kl_w,epochs,refine_epochs,eval_every,eval_samples,oracle_step_grid,oracle_sampling_samples,oracle_profile_query_samples,oracle_profile_time_points,result_name
-00,two_stage_c0_k40,no CSEM representation shaping / two-stage-like control,1.20,1.60,0.00,0.40,500,100,50,10000,"5,10,25,50",256,64,16,two_stage_c0_k40
-01,weak_c2_k40,weak CSEM shaping at matched terminal KL,1.20,1.60,0.02,0.40,500,100,50,10000,"5,10,25,50",256,64,16,weak_c2_k40
-02,sweet_c5_k40,near-optimal CSEM shaping at matched terminal KL,1.20,1.60,0.05,0.40,500,100,50,10000,"5,10,25,50",256,64,16,sweet_c5_k40
-03,strong_c8_k40,strong score-friendly CSEM shaping at matched terminal KL,1.20,1.60,0.08,0.40,500,100,50,10000,"5,10,25,50",256,64,16,strong_c8_k40
-04,highkl_c5_k80,same CSEM as sweet spot with stronger terminal Gaussianization,1.20,1.60,0.05,0.80,500,100,50,10000,"5,10,25,50",256,64,16,highkl_c5_k80
