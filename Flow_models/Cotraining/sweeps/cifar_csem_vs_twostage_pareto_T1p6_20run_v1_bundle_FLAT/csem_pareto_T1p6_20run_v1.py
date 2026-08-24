@@ -6577,34 +6577,38 @@ def train_vae_cotrained_cond(cfg):
                     score_loss_control = torch.tensor(0.0, device=device)
                     score_loss_control_inner = torch.tensor(0.0, device=device)
 
-                # Log score error by log-time quartile (or requested bin count).
-                # Both raw and canonical-weighted values are retained so a spike
-                # can be attributed to prediction error versus reweighting.
-                with torch.no_grad():
-                    log_fraction = (
-                        (t.detach().float().log() - math.log(float(cfg["t_min"])))
-                        / math.log(float(T_K) / float(cfg["t_min"]))
-                    ).clamp(0.0, 1.0 - 1e-7)
-                    time_bin_indices = torch.clamp(
-                        (log_fraction * time_diagnostic_bins).long(),
-                        min=0,
-                        max=time_diagnostic_bins - 1,
-                    )
-                    weighted_mse_per_example = (
-                        score_weights_detached * eps_mse_per_example.detach().float()
-                    )
-                    for time_bin_index in range(time_diagnostic_bins):
-                        in_bin = time_bin_indices == time_bin_index
-                        bin_count = int(in_bin.sum().cpu().item())
-                        if bin_count == 0:
-                            continue
-                        time_bin_sample_counts[time_bin_index] += bin_count
-                        time_bin_unweighted_sums[time_bin_index] += float(
-                            eps_mse_per_example.detach().float()[in_bin].sum().cpu().item()
+                # Log representation-side score error by log-time bin.  This
+                # diagnostic belongs to the CSEM representation route, whose
+                # domain is [t_min,T_K).  At the exact standard-LDM endpoint
+                # T_K=0 that route does not exist, so there is deliberately no
+                # representation-time histogram to compute.  (The detached
+                # full-horizon score head is diagnosed later by the oracle profile.)
+                if not standard_two_stage:
+                    with torch.no_grad():
+                        log_fraction = (
+                            (t.detach().float().log() - math.log(float(cfg["t_min"])))
+                            / math.log(float(T_K) / float(cfg["t_min"]))
+                        ).clamp(0.0, 1.0 - 1e-7)
+                        time_bin_indices = torch.clamp(
+                            (log_fraction * time_diagnostic_bins).long(),
+                            min=0,
+                            max=time_diagnostic_bins - 1,
                         )
-                        time_bin_weighted_sums[time_bin_index] += float(
-                            weighted_mse_per_example[in_bin].sum().cpu().item()
+                        weighted_mse_per_example = (
+                            score_weights_detached * eps_mse_per_example.detach().float()
                         )
+                        for time_bin_index in range(time_diagnostic_bins):
+                            in_bin = time_bin_indices == time_bin_index
+                            bin_count = int(in_bin.sum().cpu().item())
+                            if bin_count == 0:
+                                continue
+                            time_bin_sample_counts[time_bin_index] += bin_count
+                            time_bin_unweighted_sums[time_bin_index] += float(
+                                eps_mse_per_example.detach().float()[in_bin].sum().cpu().item()
+                            )
+                            time_bin_weighted_sums[time_bin_index] += float(
+                                weighted_mse_per_example[in_bin].sum().cpu().item()
+                            )
 
             # --- Stiffness penalty ---
             stiff_w = cfg.get("stiff_w", 0.0)
