@@ -1,9 +1,0 @@
-config_id,pair_id,slot_in_pair,outer_time_weighting,head_time_weighting,rep_weight,lr_score_head,score_head_loss_w,T_terminal,epochs,refine_epochs,eval_every,eval_samples,cfg_strength,oracle_profile_query_samples,oracle_profile_time_points,oracle_profile_batch_size,oracle_reference_batch_size,oracle_sampling_samples,oracle_sampling_batch_size,oracle_sampling_steps,prior_recon_fid,prior_mean_gen_fid,result_name
-000,00,0,unweighted-eps,unweighted-eps,0.6,0.0001,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,12.1066174333,16.5508524497,why_cfg_000_pair0_U_lam0p60_lr1em04
-001,00,1,canonical,unweighted-eps,0.1,0.0001,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,11.6443297888,21.2921043797,why_cfg_001_pair0_C_lam0p10_lr1em04
-002,01,0,unweighted-eps,unweighted-eps,0.6,0.0002,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,11.9659551912,15.8951458404,why_cfg_002_pair1_U_lam0p60_lr2em04
-003,01,1,canonical,unweighted-eps,0.1,0.0002,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,11.5300443368,20.6090672827,why_cfg_003_pair1_C_lam0p10_lr2em04
-004,02,0,unweighted-eps,unweighted-eps,0.6,0.0004,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,11.8360717763,15.7665227814,why_cfg_004_pair2_U_lam0p60_lr4em04
-005,02,1,canonical,unweighted-eps,0.1,0.0004,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,11.5137034968,20.8381638114,why_cfg_005_pair2_C_lam0p10_lr4em04
-006,03,0,unweighted-eps,unweighted-eps,0.6,0.0008,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,11.6825151317,15.4860409757,why_cfg_006_pair3_U_lam0p60_lr8em04
-007,03,1,canonical,unweighted-eps,0.1,0.0008,1.0,1.5,120,0,0,2000,3.0,256,32,16,2048,2000,32,25,11.5007157054,20.2495970353,why_cfg_007_pair3_C_lam0p10_lr8em04
