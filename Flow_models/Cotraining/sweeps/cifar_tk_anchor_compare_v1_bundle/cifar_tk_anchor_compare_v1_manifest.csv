@@ -1,0 +1,25 @@
+cell_id,arm_id,anchor_mode,terminal_kl_w,ou_visible_anchor_w,seed,T_K,T_full,delta_T,csem_w,cfg,rk4_steps,nfe,temperature,epochs,refine_epochs,eval_samples,description,result_name
+0,A_current_kl,none,0.60,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Current terminal KL only,A_current_kl_seed42
+1,A_current_kl,none,0.60,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Current terminal KL only,A_current_kl_seed43
+2,A_current_kl,none,0.60,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Current terminal KL only,A_current_kl_seed44
+3,B_unanchored,none,0.00,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,No GN-like anchor and no terminal KL,B_unanchored_seed42
+4,B_unanchored,none,0.00,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,No GN-like anchor and no terminal KL,B_unanchored_seed43
+5,B_unanchored,none,0.00,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,No GN-like anchor and no terminal KL,B_unanchored_seed44
+6,C_historical_gn0,gn0,0.00,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Historical hard GroupNorm at t=0 only,C_historical_gn0_seed42
+7,C_historical_gn0,gn0,0.00,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Historical hard GroupNorm at t=0 only,C_historical_gn0_seed43
+8,C_historical_gn0,gn0,0.00,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Historical hard GroupNorm at t=0 only,C_historical_gn0_seed44
+9,D_historical_gn0_plus_kl,gn0,0.60,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Historical hard GroupNorm at t=0 plus terminal KL,D_historical_gn0_plus_kl_seed42
+10,D_historical_gn0_plus_kl,gn0,0.60,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Historical hard GroupNorm at t=0 plus terminal KL,D_historical_gn0_plus_kl_seed43
+11,D_historical_gn0_plus_kl,gn0,0.60,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,Historical hard GroupNorm at t=0 plus terminal KL,D_historical_gn0_plus_kl_seed44
+12,E_ou_visible_tk,ou_visible,0.00,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-visible GN-like soft anchor at T_K only,E_ou_visible_tk_seed42
+13,E_ou_visible_tk,ou_visible,0.00,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-visible GN-like soft anchor at T_K only,E_ou_visible_tk_seed43
+14,E_ou_visible_tk,ou_visible,0.00,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-visible GN-like soft anchor at T_K only,E_ou_visible_tk_seed44
+15,F_ou_visible_tk_plus_kl,ou_visible,0.60,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-visible GN-like soft anchor at T_K plus terminal KL,F_ou_visible_tk_plus_kl_seed42
+16,F_ou_visible_tk_plus_kl,ou_visible,0.60,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-visible GN-like soft anchor at T_K plus terminal KL,F_ou_visible_tk_plus_kl_seed43
+17,F_ou_visible_tk_plus_kl,ou_visible,0.60,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-visible GN-like soft anchor at T_K plus terminal KL,F_ou_visible_tk_plus_kl_seed44
+18,G_ou_partial_tk,ou_partial,0.00,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-partial-GN layer at T_K only,G_ou_partial_tk_seed42
+19,G_ou_partial_tk,ou_partial,0.00,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-partial-GN layer at T_K only,G_ou_partial_tk_seed43
+20,G_ou_partial_tk,ou_partial,0.00,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-partial-GN layer at T_K only,G_ou_partial_tk_seed44
+21,H_ou_partial_tk_plus_kl,ou_partial,0.60,1.0,42,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-partial-GN layer at T_K plus terminal KL,H_ou_partial_tk_plus_kl_seed42
+22,H_ou_partial_tk_plus_kl,ou_partial,0.60,1.0,43,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-partial-GN layer at T_K plus terminal KL,H_ou_partial_tk_plus_kl_seed43
+23,H_ou_partial_tk_plus_kl,ou_partial,0.60,1.0,44,1.05,1.35,0.30,0.05,2.5,25,100,1.0,500,0,10000,OU-partial-GN layer at T_K plus terminal KL,H_ou_partial_tk_plus_kl_seed44
