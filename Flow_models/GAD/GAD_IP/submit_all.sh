@@ -22,9 +22,7 @@ ALL_PROBLEMS=(
 )
 
 PROBLEMS=(
-"darcy_flow"
-"known_z_calibration"
-"known_z_calibration2"
+"navier_stokes"
 )
 
 for p in "${PROBLEMS[@]}"; do
