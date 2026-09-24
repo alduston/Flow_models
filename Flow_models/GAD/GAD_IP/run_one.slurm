@@ -51,7 +51,7 @@ export JAX_PLATFORMS=cuda
 # --- base dir and target ---
 # Default to the directory from which sbatch was called; this should be the
 # repo root that contains sampling.py and the per-experiment subdirectories.
-BASEDIR="${SLURM_SUBMIT_DIR:-/work2/10812/ald4435/frontera/Flow_models/Flow_models/HLSI_inverse_problems/HLSI_inverse_problems}"
+BASEDIR="${SLURM_SUBMIT_DIR:-/work2/10812/ald4435/frontera/Flow_models/Flow_models/GAD/GAD_IP}"
 PROB_DIR="$BASEDIR/$PROB"
 TARGET="$PROB_DIR/${PROB}.py"
 export PYTHONPATH="$BASEDIR:${PYTHONPATH:-}"
