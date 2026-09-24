@@ -60,7 +60,7 @@ from datetime import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.image as mpimg
 
-from gad_sampling import (
+from sampling import (
     GaussianPrior,
     compute_heldout_predictive_metrics,
     compute_latent_metrics,
