@@ -582,7 +582,7 @@ N = 32
 # collapse to non-finite samples.
 num_observation = 80
 num_holdout_observation = 40
-num_truncated_series = 40
+num_truncated_series = 36
 num_modes_available = 120
 seed = 42
 prior_length_scale_x = 0.075
