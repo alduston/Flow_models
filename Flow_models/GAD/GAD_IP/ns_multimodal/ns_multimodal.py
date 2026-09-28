@@ -28,13 +28,16 @@ weak-flow case: the 48-dimensional Gaussian prior remains inside the stable
 time-step regime while the chosen truth still has distinct symmetric posterior
 branches and an informative likelihood.  The original harder amplitudes can be
 restored with NSM_INITIAL_STD=1 NSM_FORCING_STD=0.1
-NSM_ODD_TRUTH_SCALE=0.003, but the 256-reference GAD bootstrap is not expected
+NSM_ODD_TRUTH_SCALE=0.003, but even a 2000-reference GAD bootstrap may struggle
 to handle that regime.  No tail clipping or likelihood alteration is used.
 
-Use NSM_N_REF, NSM_N_GEN, NSM_ROUNDS, NSM_STEPS for work budget; NSM_N=32
-controls grid resolution (even >= 16).  The script prints a posterior midpoint
-barrier, a Gauss--Newton curvature spectrum, and mode masses.  Any nonfinite
-PDE output or escaped latent state is treated as an error, never a white plot.
+Defaults are 2000 reference/generation particles, four GAD rounds, and an
+independent, prior-initialized exact-score MALA comparison.  MALA diagnostics
+(acceptance, split-R-hat and mode occupancy) are essential: a short local chain
+is not automatically a reliable posterior reference.  Use NSM_N_REF,
+NSM_N_GEN, NSM_ROUNDS, NSM_STEPS, NSM_MALA_* to adjust budget; NSM_N=32
+controls grid resolution (even >= 16).  Any nonfinite PDE output or escaped
+latent state is treated as an error, never a white plot.
 """
 
 import os
@@ -54,7 +57,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from sampling import (GaussianPrior, configure_sampling,
+from sampling import (GaussianPrior, compute_mmd_rbf, configure_sampling,
                       init_run_results, make_physics_likelihood,
                       run_standard_sampler_pipeline, save_reproducibility_log,
                       summarize_sampler_run, zip_run_results_dir)
@@ -78,12 +81,18 @@ INITIAL_POINT_STD = float(os.environ.get("NSM_INITIAL_STD", "0.08"))
 FORCING_POINT_STD = float(os.environ.get("NSM_FORCING_STD", "0.005"))
 ODD_TRUTH_SCALE = float(os.environ.get("NSM_ODD_TRUTH_SCALE", "0.4"))
 MAX_LATENT_NORM = float(os.environ.get("NSM_MAX_LATENT_NORM", str(3*np.sqrt(DIM))))
-N_REF = int(os.environ.get("NSM_N_REF", "256"))
+N_REF = int(os.environ.get("NSM_N_REF", "2000"))
 N_GEN = int(os.environ.get("NSM_N_GEN", str(N_REF)))
-ROUNDS = int(os.environ.get("NSM_ROUNDS", "3"))
+ROUNDS = int(os.environ.get("NSM_ROUNDS", "4"))
 FLOW_STEPS = int(os.environ.get("NSM_STEPS", "128"))
+MALA_CHAINS = int(os.environ.get("NSM_MALA_CHAINS", "32"))
+MALA_WARMUP = int(os.environ.get("NSM_MALA_WARMUP", "500"))
+MALA_THIN = int(os.environ.get("NSM_MALA_THIN", "1"))
+MALA_DT = float(os.environ.get("NSM_MALA_DT", "1e-4"))
+FIELD_PLOT_SAMPLES = int(os.environ.get("NSM_FIELD_PLOT_SAMPLES", "64"))
 VALIDATE_ONLY = os.environ.get("NSM_VALIDATE_ONLY", "0") == "1"
-if min(N_REF, N_GEN, ROUNDS, FLOW_STEPS) < 1:
+if min(N_REF, N_GEN, ROUNDS, FLOW_STEPS, MALA_CHAINS, MALA_THIN,
+       FIELD_PLOT_SAMPLES) < 1 or MALA_WARMUP < 0 or MALA_DT <= 0:
     raise ValueError("All work-budget settings must be positive")
 if min(INITIAL_POINT_STD, FORCING_POINT_STD, ODD_TRUTH_SCALE, MAX_LATENT_NORM) <= 0:
     raise ValueError("Physical scales and the latent-norm diagnostic must be positive")
@@ -361,6 +370,14 @@ def main():
                               log_mean_ess=True, display_name=f"GAD round {k}")
         if k > 1:
             configs[label]['ref_source'] = f"GAD{k-1}"
+    configs['MALA'] = dict(
+        node='mala', n_samples=N_GEN,
+        mala_n_chains=MALA_CHAINS, mala_warmup=MALA_WARMUP,
+        mala_thin=MALA_THIN, mala_dt=MALA_DT, mala_adapt=True,
+        mala_target_accept=0.574, mala_min_dt=1e-12,
+        mala_max_dt=1e-3, mala_progress_every=100,
+        is_reference=True, display_name='MALA (prior-initialized)',
+    )
 
     pipeline = run_standard_sampler_pipeline(prior, likelihood, configs, n_ref=N_REF)
     summarize_sampler_run(pipeline['sampler_run_info'])
@@ -389,6 +406,15 @@ def main():
             probed_sensor_rmse_median=float(np.median(fit)) if fit else None,
             score_norm_max=float(pipeline['sampler_run_info'][label].get('score_norm_max', np.nan)),
         )
+        if label == 'MALA':
+            info = pipeline['sampler_run_info'][label]
+            round_diagnostics[label].update(
+                acceptance_rate=float(info['mala_acceptance_rate']),
+                split_rhat_median=float(info['mala_rhat_median']),
+                split_rhat_max=float(info['mala_rhat_max']),
+                final_step_size=float(info['mala_dt_final']),
+                unique_fraction=float(info['mala_unique_fraction']),
+            )
     (outdir / "round_diagnostics.json").write_text(json.dumps(round_diagnostics, indent=2))
     print("Round diagnostics:", json.dumps(round_diagnostics, indent=2))
     if any(row['probed_nonfinite_forward'] > 0 or
@@ -399,7 +425,8 @@ def main():
             "Figure-8 panels are intentionally withheld rather than plotting NaNs.")
 
     # Histograms expose both symmetry-related basins and mode collapse.
-    fig, axes = plt.subplots(1, ROUNDS, figsize=(4.3*ROUNDS, 3.5), squeeze=False)
+    n_methods = len(pipeline['samples'])
+    fig, axes = plt.subplots(1, n_methods, figsize=(4.3*n_methods, 3.5), squeeze=False)
     stats = {}
     for ax, (label, samples) in zip(axes[0], pipeline['samples'].items()):
         z = raw_particles(samples)
@@ -421,9 +448,55 @@ def main():
     fig.savefig(outdir / "mode_occupancy.png", dpi=180)
     plt.close(fig)
 
-    # Figure 8 analogue: truth, two draws, posterior mean, std, |mean-truth|.
+    # Compare latent laws to MALA, while reporting a split-MALA baseline and
+    # convergence diagnostics so a stuck local chain is not called ground truth.
+    mala = raw_particles(pipeline['samples']['MALA'])
+    n_compare = min(512, len(mala) // 2,
+                    *(len(raw_particles(s)) for s in pipeline['samples'].values()))
+    if n_compare < 10:
+        raise ValueError('Need at least ten samples per half for the MALA comparison')
+
+    def evenly_spaced(values, n):
+        return values[np.linspace(0, len(values)-1, num=n, dtype=int)]
+
+    mala_sub = evenly_spaced(mala, n_compare)
+    mala_split = (evenly_spaced(mala[:len(mala)//2], n_compare),
+                  evenly_spaced(mala[len(mala)//2:], n_compare))
+    comparison = {
+        'mala_diagnostics': round_diagnostics['MALA'],
+        'mala_split_half_mmd': compute_mmd_rbf(
+            torch.from_numpy(mala_split[0]), torch.from_numpy(mala_split[1])),
+        'warning': ('MALA split-R-hat exceeds 1.1; treat comparisons as exploratory.'
+                    if round_diagnostics['MALA']['split_rhat_max'] > 1.1 else
+                    'MALA diagnostics do not establish global mixing across modes.'),
+        'against_mala': {},
+    }
     for label, samples in pipeline['samples'].items():
-        z = raw_particles(samples)
+        if label == 'MALA':
+            continue
+        z = evenly_spaced(raw_particles(samples), n_compare)
+        proj_z, proj_m = np.sort(z @ odd), np.sort(mala_sub @ odd)
+        comparison['against_mala'][label] = dict(
+            latent_rbf_mmd=compute_mmd_rbf(torch.from_numpy(z),
+                                            torch.from_numpy(mala_sub)),
+            rotation_odd_w1=float(np.mean(np.abs(proj_z-proj_m))),
+            mean_l2_gap=float(np.linalg.norm(z.mean(0)-mala_sub.mean(0))),
+            covariance_fro_gap=float(np.linalg.norm(
+                np.cov(z, rowvar=False)-np.cov(mala_sub, rowvar=False))),
+            positive_fraction_gap=float(abs(stats[label]['positive_fraction']-
+                                            stats['MALA']['positive_fraction'])),
+        )
+    (outdir / 'comparison_to_mala.json').write_text(json.dumps(comparison, indent=2))
+    print('Comparison to MALA:', json.dumps(comparison, indent=2))
+
+    # The histogram uses all particles.  The much more expensive Figure 8
+    # field summaries use a deterministic, evenly spaced subset of each law.
+    # Their Monte Carlo precision is limited by FIELD_PLOT_SAMPLES, not N_GEN.
+    for label, samples in pipeline['samples'].items():
+        z_all = raw_particles(samples)
+        ids = np.linspace(0, len(z_all)-1,
+                          num=min(FIELD_PLOT_SAMPLES, len(z_all)), dtype=int)
+        z = z_all[ids]
         f = []
         for a in z:
             field = np.asarray(final_field(jnp.asarray(a)))
@@ -449,7 +522,7 @@ def main():
                        facecolors="none", edgecolors="lime", linewidths=1.4)
             ax.set(title=title, xticks=[], yticks=[])
             fig.colorbar(im, ax=ax, fraction=.046, pad=.04)
-        fig.suptitle(f"{label}: terminal vorticity | {len(z)} particles")
+        fig.suptitle(f"{label}: terminal vorticity | {len(z)} of {len(z_all)} particles")
         fig.savefig(outdir / f"figure8_{label}.png", dpi=170)
         plt.close(fig)
 
@@ -461,6 +534,9 @@ def main():
                     forcing_std=FORCING_POINT_STD,
                     odd_truth_scale=ODD_TRUTH_SCALE,
                     n_ref=N_REF, n_gen=N_GEN, rounds=ROUNDS, steps=FLOW_STEPS,
+                    mala_chains=MALA_CHAINS, mala_warmup=MALA_WARMUP,
+                    mala_thin=MALA_THIN, mala_dt=MALA_DT,
+                    field_plot_samples=FIELD_PLOT_SAMPLES,
                     viscosity=VISCOSITY, T=T, dt=DT, n_times=N_TIMES,
                     n_sensors=4, noise_std=NOISE_STD, diagnostics=diagnostics,
                     sampler_configs=configs))
