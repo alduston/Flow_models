@@ -23,10 +23,18 @@ to this nonlinear inverse problem, with no mixture inserted into the prior.
 Four spatial sensors, rather than the paper's 16, are necessary for this exact
 pointwise symmetry; all 60 temporal observations and the paper's noise remain.
 
+The default physical amplitude (0.08 initial, 0.005 forcing) is a calibrated
+weak-flow case: the 48-dimensional Gaussian prior remains inside the stable
+time-step regime while the chosen truth still has distinct symmetric posterior
+branches and an informative likelihood.  The original harder amplitudes can be
+restored with NSM_INITIAL_STD=1 NSM_FORCING_STD=0.1
+NSM_ODD_TRUTH_SCALE=0.003, but the 256-reference GAD bootstrap is not expected
+to handle that regime.  No tail clipping or likelihood alteration is used.
+
 Use NSM_N_REF, NSM_N_GEN, NSM_ROUNDS, NSM_STEPS for work budget; NSM_N=32
-controls grid resolution (even >= 16).  The script prints an actual posterior
-midpoint barrier, a Gauss--Newton curvature spectrum, and mode masses.  A
-visible two-mode Figure-8-style plot is not, by itself, proof of GAD mixing.
+controls grid resolution (even >= 16).  The script prints a posterior midpoint
+barrier, a Gauss--Newton curvature spectrum, and mode masses.  Any nonfinite
+PDE output or escaped latent state is treated as an error, never a white plot.
 """
 
 import os
@@ -46,7 +54,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from sampling import (GaussianPrior, configure_sampling, get_valid_samples,
+from sampling import (GaussianPrior, configure_sampling,
                       init_run_results, make_physics_likelihood,
                       run_standard_sampler_pipeline, save_reproducibility_log,
                       summarize_sampler_run, zip_run_results_dir)
@@ -66,8 +74,10 @@ DT = 0.025
 STEPS_PER_OBS = 10
 NOISE_STD = 0.05
 LENGTH_SCALE = np.pi / 5
-FORCING_POINT_STD = float(os.environ.get("NSM_FORCING_STD", "0.10"))
-ODD_TRUTH_SCALE = float(os.environ.get("NSM_ODD_TRUTH_SCALE", "0.003"))
+INITIAL_POINT_STD = float(os.environ.get("NSM_INITIAL_STD", "0.08"))
+FORCING_POINT_STD = float(os.environ.get("NSM_FORCING_STD", "0.005"))
+ODD_TRUTH_SCALE = float(os.environ.get("NSM_ODD_TRUTH_SCALE", "0.4"))
+MAX_LATENT_NORM = float(os.environ.get("NSM_MAX_LATENT_NORM", str(3*np.sqrt(DIM))))
 N_REF = int(os.environ.get("NSM_N_REF", "256"))
 N_GEN = int(os.environ.get("NSM_N_GEN", str(N_REF)))
 ROUNDS = int(os.environ.get("NSM_ROUNDS", "3"))
@@ -75,6 +85,8 @@ FLOW_STEPS = int(os.environ.get("NSM_STEPS", "128"))
 VALIDATE_ONLY = os.environ.get("NSM_VALIDATE_ONLY", "0") == "1"
 if min(N_REF, N_GEN, ROUNDS, FLOW_STEPS) < 1:
     raise ValueError("All work-budget settings must be positive")
+if min(INITIAL_POINT_STD, FORCING_POINT_STD, ODD_TRUTH_SCALE, MAX_LATENT_NORM) <= 0:
+    raise ValueError("Physical scales and the latent-norm diagnostic must be positive")
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -133,7 +145,8 @@ def rotate_latent(z):
 
 
 def fields_at_zero(z):
-    omega = jnp.einsum("c,cij->ij", z[:N_INITIAL], INITIAL_BASIS)
+    omega = INITIAL_POINT_STD * jnp.einsum(
+        "c,cij->ij", z[:N_INITIAL], INITIAL_BASIS)
     forcing = FORCING_POINT_STD * jnp.einsum(
         "c,cij->ij", z[N_INITIAL:], FORCING_BASIS)
     return omega, forcing
@@ -195,9 +208,8 @@ def log_posterior(z, y):
 def choose_truth():
     """Choose a supported Gaussian-prior state with a resolvable two-mode valley.
 
-    The small odd component curates the synthetic trajectory for a *moderate*
-    barrier at T=15; a generic draw has barriers of order 1e5 here.  No change
-    is made to the Gaussian prior used by GAD or to the likelihood.
+    The odd component curates the trajectory for a moderate barrier at T=15.
+    No change is made to the Gaussian prior used by GAD or to the likelihood.
     """
     rng = np.random.default_rng(SEED)
     best = None
@@ -240,6 +252,68 @@ def stiffness_and_pair_diagnostics(z, y):
     return out
 
 
+class CheckedLikelihood:
+    """Detect failed fluid solves before shared sampler sanitizers can hide them."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def check_input(self, x, stage):
+        v = np.asarray(x.detach().cpu(), dtype=np.float64)
+        norms = np.linalg.norm(v, axis=-1)
+        if not np.all(np.isfinite(v)) or np.any(norms > MAX_LATENT_NORM):
+            raise FloatingPointError(
+                f"{stage}: latent left the diagnostic range; max ||z||="
+                f"{np.max(norms):.4g}, limit={MAX_LATENT_NORM:.4g}. "
+                "The GAD reference law has escaped the Gaussian prior scale. "
+                "Do not interpret further rounds as posterior samples.")
+
+    @staticmethod
+    def check_output(result, stage):
+        values = result if isinstance(result, tuple) else (result,)
+        for value in values:
+            arr = np.asarray(value.detach().cpu() if isinstance(value, torch.Tensor)
+                             else value)
+            if not np.all(np.isfinite(arr)) or np.max(np.abs(arr)) > 1e12:
+                raise FloatingPointError(
+                    f"{stage}: nonfinite or extreme PDE likelihood/derivative. "
+                    "Increase fluid resolution or reduce flow amplitude; "
+                    "the shared sampler would otherwise conceal these values.")
+        return result
+
+    def log_likelihood(self, x, batch_size=None):
+        self.check_input(x, 'log likelihood')
+        return self.check_output(self.base.log_likelihood(x, batch_size),
+                                 'log likelihood')
+
+    def grad_log_likelihood(self, x, batch_size=None):
+        self.check_input(x, 'likelihood gradient')
+        return self.check_output(self.base.grad_log_likelihood(x, batch_size),
+                                 'likelihood gradient')
+
+    def log_likelihood_and_grad(self, x, batch_size=None):
+        self.check_input(x, 'likelihood and gradient')
+        return self.check_output(self.base.log_likelihood_and_grad(x, batch_size),
+                                 'likelihood and gradient')
+
+    def hess_log_likelihood(self, x, batch_size=None):
+        self.check_input(x, 'Gauss--Newton curvature')
+        return self.check_output(self.base.hess_log_likelihood(x, batch_size),
+                                 'Gauss--Newton curvature')
+
+
+def raw_particles(samples):
+    """Keep all particles; robust outlier filtering would hide instability."""
+    values = np.asarray(samples.detach().cpu() if isinstance(samples, torch.Tensor)
+                        else samples, dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise FloatingPointError("GAD produced nonfinite latent samples")
+    return values
+
+
 def main():
     truth_barrier, z_true, y_clean = choose_truth()
     rng = np.random.default_rng(SEED + 1)
@@ -253,6 +327,8 @@ def main():
     diagnostics.update(dict(clean_midpoint_barrier=float(truth_barrier),
                             symmetry_observation_max_error=float(equiv),
                             dim=DIM, grid=N, n_sensors=4, n_times=N_TIMES,
+                            initial_point_std=INITIAL_POINT_STD,
+                            forcing_point_std=FORCING_POINT_STD,
                             odd_truth_scale=ODD_TRUTH_SCALE,
                             noise_std=NOISE_STD, seed=SEED))
     print(json.dumps(diagnostics, indent=2))
@@ -272,9 +348,10 @@ def main():
                         forcing_pairs=FORCING_PAIRS)
 
     prior = GaussianPrior(dim=DIM)
-    likelihood, _ = make_physics_likelihood(
+    raw_likelihood, _ = make_physics_likelihood(
         solve_forward, y_obs, NOISE_STD, use_gauss_newton_hessian=True,
         log_batch_size=8, grad_batch_size=4, hess_batch_size=1)
+    likelihood = CheckedLikelihood(raw_likelihood)
     configs = OrderedDict()
     for k in range(1, ROUNDS+1):
         label = f"GAD{k}"
@@ -291,11 +368,41 @@ def main():
     odd = z_true - other
     odd /= np.linalg.norm(odd)
 
+    # Save a full-particle audit before making any visual summary.  Sample
+    # finiteness alone is insufficient: the PDE can overflow on finite z.
+    round_diagnostics = {}
+    for label, samples in pipeline['samples'].items():
+        z = raw_particles(samples)
+        norms = np.linalg.norm(z, axis=1)
+        fit = []
+        nonfinite = 0
+        for a in z[:min(len(z), 24)]:
+            pred = np.asarray(solve_forward(jnp.asarray(a)))
+            if not np.all(np.isfinite(pred)):
+                nonfinite += 1
+            else:
+                fit.append(float(np.sqrt(np.mean((pred - y_obs)**2))))
+        round_diagnostics[label] = dict(
+            n_particles=len(z), latent_norm_median=float(np.median(norms)),
+            latent_norm_max=float(np.max(norms)),
+            probed_nonfinite_forward=nonfinite,
+            probed_sensor_rmse_median=float(np.median(fit)) if fit else None,
+            score_norm_max=float(pipeline['sampler_run_info'][label].get('score_norm_max', np.nan)),
+        )
+    (outdir / "round_diagnostics.json").write_text(json.dumps(round_diagnostics, indent=2))
+    print("Round diagnostics:", json.dumps(round_diagnostics, indent=2))
+    if any(row['probed_nonfinite_forward'] > 0 or
+           row['latent_norm_max'] > MAX_LATENT_NORM
+           for row in round_diagnostics.values()):
+        raise FloatingPointError(
+            "A GAD round left the resolved PDE/prior range. See round_diagnostics.json; "
+            "Figure-8 panels are intentionally withheld rather than plotting NaNs.")
+
     # Histograms expose both symmetry-related basins and mode collapse.
     fig, axes = plt.subplots(1, ROUNDS, figsize=(4.3*ROUNDS, 3.5), squeeze=False)
     stats = {}
     for ax, (label, samples) in zip(axes[0], pipeline['samples'].items()):
-        z = np.asarray(get_valid_samples(samples))
+        z = raw_particles(samples)
         if len(z) == 0:
             raise RuntimeError(f"No finite particles in {label}")
         projection = z @ odd
@@ -316,10 +423,15 @@ def main():
 
     # Figure 8 analogue: truth, two draws, posterior mean, std, |mean-truth|.
     for label, samples in pipeline['samples'].items():
-        z = np.asarray(get_valid_samples(samples))
+        z = raw_particles(samples)
         f = []
         for a in z:
-            f.append(np.asarray(final_field(jnp.asarray(a))))
+            field = np.asarray(final_field(jnp.asarray(a)))
+            if not np.all(np.isfinite(field)):
+                raise FloatingPointError(
+                    f"{label}: terminal PDE field is nonfinite at latent norm "
+                    f"{np.linalg.norm(a):.3g}. No blank plot was saved.")
+            f.append(field)
         fields = np.asarray(f)
         mean, std = fields.mean(axis=0), fields.std(axis=0)
         pick = [int(np.argmin(z @ odd)), int(np.argmax(z @ odd))]
@@ -327,7 +439,7 @@ def main():
                   mean, std, abs(mean-true_final)]
         titles = ["True terminal", "Draw: negative basin", "Draw: positive basin",
                   "Posterior mean", "Posterior std", "|mean - truth|"]
-        clim = max(np.max(abs(a)) for a in panels[:4])
+        clim = max(float(np.max(abs(a))) for a in panels[:4])
         fig, axes = plt.subplots(1, 6, figsize=(20, 3.7), constrained_layout=True)
         for i, (ax, image, title) in enumerate(zip(axes, panels, titles)):
             im = ax.imshow(image, origin="lower", cmap="RdBu_r" if i<4 else "magma",
@@ -345,7 +457,8 @@ def main():
     save_reproducibility_log(
         title="Rotation-ambiguous Navier--Stokes GAD benchmark",
         config=dict(seed=SEED, grid=N, latent_dim=DIM, initial_dim=N_INITIAL,
-                    forcing_dim=N_FORCING, forcing_std=FORCING_POINT_STD,
+                    forcing_dim=N_FORCING, initial_std=INITIAL_POINT_STD,
+                    forcing_std=FORCING_POINT_STD,
                     odd_truth_scale=ODD_TRUTH_SCALE,
                     n_ref=N_REF, n_gen=N_GEN, rounds=ROUNDS, steps=FLOW_STEPS,
                     viscosity=VISCOSITY, T=T, dt=DT, n_times=N_TIMES,
