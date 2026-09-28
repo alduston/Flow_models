@@ -19,10 +19,11 @@ ALL_PROBLEMS=(
   "helmholtz_alt"
   "known_z_calibration"
   "known_z_calibration2"
+  "ns_multimodal"
 )
 
 PROBLEMS=(
-"navier_stokes"
+"ns_multimodal"
 )
 
 for p in "${PROBLEMS[@]}"; do
