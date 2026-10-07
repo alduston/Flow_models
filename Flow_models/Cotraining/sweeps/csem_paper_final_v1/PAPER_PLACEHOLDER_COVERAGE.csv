@@ -1,0 +1,11 @@
+paper_placeholder,cells,compiled_output,notes
+Main quantitative table (CIFAR),0-3,main_final_metrics_aggregate.csv,"Independent pair cells each produce both fixed-VAE baselines"
+Main quantitative table (FashionMNIST),4-5,main_final_metrics_aggregate.csv,"Independent pair cell produces both fixed-VAE baselines"
+Epoch FID/KID/SW2 curves,0-5,main_epoch_curves_long.csv,"plotter emits separate dataset/metric PNGs"
+Scale-anchor ablation,0;6;7,scale_anchor_final.csv,"terminal row reuses main CIFAR seed-42 cell"
+Scale-anchor dynamics,0;6;7,all_loss_history.csv,"plotter emits reconstruction/CSEM/K_TK/RMS/posterior-var traces"
+Estimator swap vs representation learning,0-5,main_final_metrics_aggregate.csv,"Independent Tweedie vs Independent CSEM vs Co-trained CSEM"
+Terminal horizon and lambda_K,0;8-11,terminal_horizon_anchor_sensitivity.csv,"compact cross rather than dense 2D grid"
+Sampler order,0;12,solver_order_comparison.csv,"matched 20-step Heun-SDE and RK4-ODE on final CSEM and collapse control"
+Naive Tweedie collapse table,12,naive_tweedie_collapse_final.csv,"CIFAR only; 100 epochs"
+Naive Tweedie collapse traces,12,all_loss_history.csv,"plotter emits posterior-std and latent-RMS traces"

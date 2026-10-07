@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import copy
+import json
+import math
+import os
+from pathlib import Path
+from typing import Any, Dict
+
+import csem_paper_core_v1 as core
+
+
+def _preset(dataset: str):
+    name, p = core.resolve_model_preset(dataset, "auto")
+    return name, p
+
+
+def build_base_config(*, dataset: str, seed: int, epochs: int, refine_epochs: int,
+                      T_K: float, T_full: float, csem_w: float, terminal_kl_w: float,
+                      eval_every: int, eval_samples: int, cfg_scale: float,
+                      results_dir: str, score_time_weighting: str = "canonical",
+                      score_head_time_weighting: str = "unweighted-eps",
+                      rk4_steps: int = 25, paper_solver_suite: bool = False,
+                      paper_solver_steps: int = 20) -> Dict[str, Any]:
+    preset_name, preset = _preset(dataset)
+    t_min = float(preset.get("t_min", 3e-5))
+    if T_K < 0 or T_full < T_K:
+        raise ValueError(f"Require 0 <= T_K <= T; got {T_K}, {T_full}")
+    if 0 < T_K <= t_min:
+        raise ValueError(f"Nonzero T_K must exceed t_min={t_min}")
+
+    base_lr_vae = float(preset["lr_vae"])
+    base_lr_ldm = float(preset["lr_ldm"])
+    lr_refine = float(preset["lr_refine"])
+    lr_schedule_epochs = int(preset["lr_schedule_epochs"]) if preset.get("lr_schedule_epochs") is not None else int(epochs)
+    use_bespoke = core.resolve_bespoke_fid_classifier(dataset, None)
+
+    cfg = {
+        "dataset": dataset,
+        "batch_size": int(preset["batch_size"]),
+        "num_workers": 2,
+        "latent_channels": int(preset["latent_channels"]),
+        "cond_emb_dim": int(preset["cond_emb_dim"]),
+        "dit_patch_size": int(preset["dit_patch_size"]),
+        "dit_hidden_dim": int(preset["dit_hidden_dim"]),
+        "dit_depth": int(preset["dit_depth"]),
+        "dit_num_heads": int(preset["dit_num_heads"]),
+        "dit_mlp_ratio": float(preset["dit_mlp_ratio"]),
+        "dit_dropout": float(preset["dit_dropout"]),
+        "adam_beta2": 0.95,
+        "vae_grad_clip": 1.0,
+        "score_grad_clip": 1.0,
+        "disc_grad_clip": 1.0,
+        "encoder_score_warmup_epochs": 0,
+        "csem_ramp_epochs": 0,
+        "score_tracking_steps": 0,
+        "score_tracking_every": 1,
+        "grad_diagnostics_every": 0,
+        "time_diagnostic_bins": 4,
+        # Match the certified fresh-training audit: do not abort merely because a
+        # diagnostic scalar goes nonfinite; the training code still logs it.
+        "fail_on_nonfinite": False,
+        "cosine_w": 0.0,
+        "aux_head_w": 0.0025,
+        "score_w_vae": float(csem_w),
+        "score_head_loss_w": 1.0,
+        "aux_d": 0,
+        "base_ch": int(preset["base_ch"]),
+        "num_res_blocks": int(preset["num_res_blocks"]),
+        "decoder_attn_half": bool(preset["decoder_attn_half"]),
+        "latent_proj_depth": int(preset["latent_proj_depth"]),
+        "encoder_attn_half": bool(preset["encoder_attn_half"]),
+        "decoder_extra_block": bool(preset["decoder_extra_block"]),
+        "conv3x3_proj": bool(preset["conv3x3_proj"]),
+        "use_tanh_out": bool(preset["use_tanh_out"]),
+        "clamp_logvar": bool(preset["clamp_logvar"]),
+        "attn_zero_init": bool(preset["attn_zero_init"]),
+        "logvar_min": -30.0,
+        "logvar_max": 20.0,
+        "base_lr_vae": base_lr_vae,
+        "base_lr_ldm": base_lr_ldm,
+        "canonical_lr_scale": 1.0,
+        "lr_vae": base_lr_vae,
+        "lr_ldm": base_lr_ldm,
+        "lr_score_head": base_lr_ldm,
+        "kl_w": float(terminal_kl_w),
+        "perc_w": 0.85,
+        "gan_w": 0.0025,
+        "disc_start_epoch": 25,
+        "disc_ndf": 64,
+        "disc_n_layers": 2,
+        "lr_disc": 1.0e-4,
+        "time_schedule": str(preset.get("time_schedule", "log_t")),
+        "use_ddim_times": bool(preset.get("use_ddim_times", True)),
+        "t_min": t_min,
+        "T_terminal": float(T_K),
+        "t_max": float(T_full),
+        "eval_tk_vs_t_comparison": True,
+        "deployment_only": False,
+        "deployment_cfg_grid": [float(cfg_scale)],
+        "deployment_temperature_grid": [1.0],
+        "deployment_rk4_step_grid": [int(rk4_steps)],
+        "skip_lsi_gap": False,
+        "save_eval_sample_panels": True,
+        "eval_rk4_steps_tk": int(rk4_steps),
+        "eval_rk4_steps_t": int(rk4_steps),
+        "num_train_timesteps": int(preset.get("num_train_timesteps", 1000)),
+        "score_time_weighting": score_time_weighting,
+        "score_head_time_weighting": score_head_time_weighting,
+        "train_on_mu": False,
+        "cosine_t_min": 2e-4,
+        "cosine_t_max": 0.9999,
+        "cosine_s": 0.008,
+        "cfg_label_dropout": 0.1,
+        "cfg_eval_scale": float(cfg_scale),
+        "eval_class_labels": [],
+        "use_fixed_eval_banks": True,
+        "sw2_n_projections": 1000,
+        "ema_decay": 0.9997,
+        "eval_max_samples": int(eval_samples),
+        "eval_lsi_gap_samples": min(2500, int(eval_samples)),
+        "eval_lsi_gap_time_points": 50,
+        "eval_oracle": False,
+        "eval_sampling_init": "gaussian",
+        "eval_oracle_diagnostics": False,
+        "eval_oracle_full_train_reference": True,
+        "oracle_profile_query_samples": 256,
+        "oracle_profile_time_points": 24,
+        "oracle_profile_batch_size": 16,
+        "oracle_reference_batch_size": 2048,
+        "oracle_sampling_samples": 512,
+        "oracle_sampling_batch_size": 32,
+        "oracle_sampling_steps": 25,
+        "oracle_sampling_step_grid": [20, 40, 100],
+        "oracle_sampling_method": "rk4_ode",
+        "eval_oracle_transport_decomposition": False,
+        "eval_oracle_standard_samplers": False,
+        "kid_num_subsets": 100,
+        "kid_subset_size": min(1000, int(eval_samples)),
+        "use_bespoke_fid_classifier": use_bespoke,
+        "generate_visualizations": False,
+        "mechanism_diagnostics": False,
+        "seed": int(seed),
+        "load_from_checkpoint": False,
+        "ckpt_load_dir": None,
+        "evaluation_only": False,
+        "oracle_nfe_eval_only": False,
+        "oracle_eval_epoch_label": 0,
+        "ckpt_dir": str(Path(results_dir) / "checkpoints"),
+        "master_results_dir": str(results_dir),
+        "overwrite_results": False,
+        "model_preset": preset_name,
+        "epochs_vae": int(epochs),
+        "epochs_refine": int(refine_epochs),
+        "lr_schedule_epochs": lr_schedule_epochs,
+        "lr_refine": lr_refine,
+        "factored_head": True,
+        "freeze_score_in_cotrain": False,
+        "cotrain_head": "lsi",
+        "use_latent_norm": False,
+        "use_cond_encoder": False,
+        "kl_reg_type": "terminal",
+        "stiff_w": 0.0,
+        "score_w": 1.0,
+        "train_tracking_head": False,
+        "time_cond_decoder": True,
+        "dec_time_emb_dim": 128,
+        "decode_time": preset.get("decode_time", None),
+        "eval_freq_cotrain": int(eval_every) if int(eval_every) > 0 else int(epochs),
+        "eval_freq_refine": int(eval_every) if int(eval_every) > 0 else max(1, int(refine_epochs)),
+        "results_dir": str(results_dir),
+        "comparison_arm": "paper",
+        "paper_solver_suite": bool(paper_solver_suite),
+        "paper_solver_steps": int(paper_solver_steps),
+    }
+    return cfg
+
+
+def configure_mode(cfg: Dict[str, Any], mode: str, *, beta0: float = 0.07) -> Dict[str, Any]:
+    cfg = copy.deepcopy(cfg)
+    mode = str(mode)
+    cfg["paper_mode"] = mode
+    cfg["comparison_arm"] = mode
+
+    if mode in {"cotrained_csem", "anchor_terminal", "sensitivity"}:
+        cfg.update({
+            "use_latent_norm": False,
+            "kl_reg_type": "terminal",
+            "freeze_score_in_cotrain": False,
+            "cotrain_head": "lsi",
+            "train_tracking_head": False,
+        })
+    elif mode == "anchor_norm":
+        cfg.update({
+            "use_latent_norm": True,
+            "kl_reg_type": "normal",
+            "kl_w": 0.0,
+            "freeze_score_in_cotrain": False,
+            "cotrain_head": "lsi",
+            "train_tracking_head": False,
+        })
+    elif mode == "anchor_none":
+        cfg.update({
+            "use_latent_norm": False,
+            "kl_reg_type": "normal",
+            "kl_w": 0.0,
+            "freeze_score_in_cotrain": False,
+            "cotrain_head": "lsi",
+            "train_tracking_head": False,
+        })
+    elif mode == "independent_pair":
+        # Exact two-stage limit of the two-horizon code. T_K=0 removes every
+        # diffusion-derived encoder gradient; K_0 is ordinary VAE KL. The VAE
+        # trains first with both score networks frozen, then the fixed VAE is
+        # used to train CSEM and Tweedie heads side-by-side on identical batches.
+        refine_eval_freq = int(cfg.get("eval_freq_refine", max(1, int(cfg["epochs_refine"]))))
+        cfg.update({
+            "T_terminal": 0.0,
+            "score_w_vae": 0.0,
+            "kl_reg_type": "terminal",
+            "kl_w": float(beta0),
+            "use_latent_norm": False,
+            "freeze_score_in_cotrain": True,
+            "cotrain_head": "lsi",
+            "train_tracking_head": True,
+            "factored_head": True,
+            # Only one expensive evaluation during the VAE-only stage; the
+            # paper epoch curves come from the score-only refinement stage.
+            "eval_freq_cotrain": int(cfg["epochs_vae"]),
+            "eval_freq_refine": refine_eval_freq,
+        })
+    elif mode == "naive_tweedie_cotrain":
+        # Standard DSM/Tweedie epsilon target is the active encoder-shaping loss.
+        # No CSEM-specific terminal anchor is used here: this is the collapse
+        # control requested by the paper, not a proposed stabilized DSM method.
+        cfg.update({
+            "T_terminal": float(cfg["t_max"]),
+            "score_time_weighting": "unweighted-eps",
+            "score_head_time_weighting": "unweighted-eps",
+            "score_w_vae": 1.0,
+            "score_head_loss_w": 1.0,
+            "use_latent_norm": False,
+            "kl_reg_type": "normal",
+            "kl_w": 0.0,
+            "freeze_score_in_cotrain": False,
+            "cotrain_head": "control",
+            "train_tracking_head": False,
+            "factored_head": True,
+        })
+    else:
+        raise ValueError(f"Unknown paper mode: {mode}")
+    return cfg
+
+
+def run_cell(row: Dict[str, str], base_dir: Path):
+    result_root = base_dir / "csem_paper_results_v1" / row["result_name"]
+    result_root.parent.mkdir(parents=True, exist_ok=True)
+
+    mode = row["mode"]
+    cfg = build_base_config(
+        dataset=row["dataset"], seed=int(row["seed"]),
+        epochs=int(row["epochs_joint"]), refine_epochs=int(row["epochs_refine"]),
+        T_K=float(row["T_K"]), T_full=float(row["T_full"]),
+        csem_w=float(row["csem_w"]), terminal_kl_w=float(row["terminal_kl_w"]),
+        eval_every=int(row["eval_every"]), eval_samples=int(row["eval_samples"]),
+        cfg_scale=float(row["cfg_scale"]), results_dir=str(result_root),
+        score_time_weighting=row["score_time_weighting"],
+        score_head_time_weighting=row["score_head_time_weighting"],
+        rk4_steps=int(row["rk4_steps"]),
+        paper_solver_suite=row.get("paper_solver_suite", "0") in {"1", "true", "True"},
+        paper_solver_steps=int(row.get("paper_solver_steps", "20") or 20),
+    )
+    cfg = configure_mode(cfg, mode, beta0=float(row.get("beta0", 0.07) or 0.07))
+    cfg["paper_cell_id"] = int(row["cell_id"])
+    cfg["paper_family"] = row["family"]
+    cfg["paper_result_name"] = row["result_name"]
+
+    # Independent pair uses a VAE stage followed by equally long score-only stage.
+    # Its manifest row explicitly supplies epochs_refine=epochs_joint.
+    if result_root.exists():
+        raise FileExistsError(f"Refusing to overwrite existing result directory: {result_root}")
+    core.seed_everything(int(cfg["seed"]))
+    loss_df, eval_df = core.train_vae_cotrained_cond(cfg)
+    (result_root / "paper_cell_config.json").write_text(json.dumps(cfg, indent=2, default=str) + "\n")
+    return loss_df, eval_df, cfg

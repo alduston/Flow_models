@@ -1,0 +1,14 @@
+cell_id,family,dataset,mode,seed,epochs_joint,epochs_refine,T_K,T_full,csem_w,terminal_kl_w,beta0,score_time_weighting,score_head_time_weighting,cfg_scale,rk4_steps,eval_every,eval_samples,paper_solver_suite,paper_solver_steps,result_name,notes
+0,main,CIFAR,cotrained_csem,42,500,0,1.05,1.35,0.05,0.60,0.07,canonical,unweighted-eps,2.5,18,100,10000,1,20,cifar_main_csem_s42,current certified raw-mean terminal-KL geometry
+1,main,CIFAR,cotrained_csem,43,500,0,1.05,1.35,0.05,0.60,0.07,canonical,unweighted-eps,2.5,18,100,10000,1,20,cifar_main_csem_s43,current certified raw-mean terminal-KL geometry
+2,main,CIFAR,independent_pair,42,500,500,0.0,1.35,0.0,0.07,0.07,canonical,unweighted-eps,2.5,18,100,10000,0,20,cifar_main_independent_pair_s42,same fixed VAE trains both independent CSEM and Tweedie heads
+3,main,CIFAR,independent_pair,43,500,500,0.0,1.35,0.0,0.07,0.07,canonical,unweighted-eps,2.5,18,100,10000,0,20,cifar_main_independent_pair_s43,same fixed VAE trains both independent CSEM and Tweedie heads
+4,main,FMNIST,cotrained_csem,42,400,0,1.50,1.50,0.10,0.60,0.07,canonical,unweighted-eps,3.0,25,50,5000,1,20,fmnist_main_csem_s42,FMNIST WHY-v3 canonical representation weight with terminal anchor decoupled/strengthened
+5,main,FMNIST,independent_pair,42,400,400,0.0,1.50,0.0,0.07,0.07,canonical,unweighted-eps,3.0,25,50,5000,0,20,fmnist_main_independent_pair_s42,same fixed VAE trains both independent CSEM and Tweedie heads
+6,scale_anchor,CIFAR,anchor_norm,42,500,0,1.05,1.35,0.05,0.0,0.07,canonical,unweighted-eps,2.5,18,100,10000,0,20,cifar_anchor_norm_s42,legacy per-sample mean normalization no terminal KL
+7,scale_anchor,CIFAR,anchor_none,42,500,0,1.05,1.35,0.05,0.0,0.07,canonical,unweighted-eps,2.5,18,100,10000,0,20,cifar_anchor_none_s42,raw mean no normalization no terminal anchor
+8,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.25,0.05,0.60,0.07,canonical,unweighted-eps,2.5,18,0,5000,0,20,cifar_T1p25_wK0p60_s42,T sweep lower point
+9,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.45,0.05,0.60,0.07,canonical,unweighted-eps,2.5,18,0,5000,0,20,cifar_T1p45_wK0p60_s42,T sweep upper point
+10,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.40,0.07,canonical,unweighted-eps,2.5,18,0,5000,0,20,cifar_T1p35_wK0p40_s42,terminal-anchor lower point
+11,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.80,0.07,canonical,unweighted-eps,2.5,18,0,5000,0,20,cifar_T1p35_wK0p80_s42,terminal-anchor upper point
+12,tweedie_collapse,CIFAR,naive_tweedie_cotrain,42,100,0,1.35,1.35,1.0,0.0,0.07,unweighted-eps,unweighted-eps,2.5,20,10,2000,1,20,cifar_naive_tweedie_cotrain_s42,collapse control shortened because failure is expected early
