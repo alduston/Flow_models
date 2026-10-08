@@ -1,0 +1,9 @@
+paper_item,source_cells,compiled_output,notes
+Main three-regime final table,"0-7",main_final_metrics_aggregate.csv,"CIFAR and FMNIST; independent CSEM/Tweedie share one VAE per seed"
+Main epoch curves,"0-7",main_epoch_curves_long.csv,"Co-trained vs Independent CSEM vs Independent Tweedie"
+FMNIST recovered-run provenance,"8",all_eval_records.csv,"CFG3 oracle-q_T replication target ~4.97 RK4-25"
+Scale-anchor ablation,"0,9,10,16,17",scale_anchor_final.csv,"optimized OU-partial+KL, raw KL, historical GN0, no-anchor"
+Scale dynamics,"0,9,10,16",all_loss_history.csv,"epochwise recon/CSEM/K_T/latent scale"
+T and lambda_K sensitivity,"0,11-14",terminal_horizon_anchor_sensitivity.csv,"compact cross around optimized CIFAR point"
+Sampler order comparison,"0,15",solver_order_comparison.csv,"matched Heun/RK4 paper suite"
+Naive Tweedie co-training collapse,"15",naive_tweedie_collapse_final.csv,"intentional collapse control"
