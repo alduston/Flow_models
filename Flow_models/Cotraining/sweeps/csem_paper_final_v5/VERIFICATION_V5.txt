@@ -1,0 +1,30 @@
+OK cell  0 cifar_main_csem_oupartial_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell  1 cifar_main_csem_oupartial_s43_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell  2 cifar_main_independent_pair_s42_v4_v5_800_frozen | lr_head=1.0e-04 | beta/K=0.07
+OK cell  3 cifar_main_independent_pair_s43_v4_v5_800_frozen | lr_head=1.0e-04 | beta/K=0.07
+OK cell  4 fmnist_main_csem_aug13_gaussian_v4_s42_v5_paper | lr_head=3.3e-04 | beta/K=1
+OK cell  5 fmnist_main_csem_aug13_gaussian_v4_s43_v5_paper | lr_head=3.3e-04 | beta/K=1
+OK cell  6 fmnist_main_independent_pair_v4_s42_frozen | lr_head=8.0e-04 | beta/K=0.01
+OK cell  7 fmnist_main_independent_pair_v4_s43_frozen | lr_head=8.0e-04 | beta/K=0.01
+OK cell  8 fmnist_aug18_shared_cfg3_replication_v4_s42 | lr_head=8.0e-04 | beta/K=0.3
+OK cell  9 cifar_anchor_norm_s42_v5_800 | lr_head=1.0e-04 | beta/K=0
+OK cell 10 cifar_anchor_none_s42_v5_800 | lr_head=1.0e-04 | beta/K=0
+OK cell 11 cifar_oupartial_T1p25_wK0p60_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell 12 cifar_oupartial_T1p45_wK0p60_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell 13 cifar_oupartial_T1p35_wK0p40_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.4
+OK cell 14 cifar_oupartial_T1p35_wK0p80_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.8
+OK cell 15 cifar_naive_tweedie_cotrain_s42 | lr_head=1.0e-04 | beta/K=0
+OK cell 16 cifar_raw_terminal_kl_control_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell 17 cifar_raw_terminal_kl_control_s43_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell 18 cifar_raw_TK0p95_K0p6_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell 19 cifar_raw_TK1p15_K0p6_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.6
+OK cell 20 cifar_raw_TK1p05_K0p4_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.4
+OK cell 21 cifar_raw_TK1p05_K0p8_s42_v5_800 | lr_head=1.0e-04 | beta/K=0.8
+Validated 22 cells.
+PASS: 22 resolved configs; Gaussian/T_K/oracle/NaN/solver filtering; both independent regimes; actual full-horizon Tweedie tracking target.
+Torch/CUDA training and FID reproduction require the cluster GPU environment.
+Compiled outputs -> /tmp/tmpzqwtj2qz/csem_paper_compiled_v1
+Figures -> /tmp/tmpzqwtj2qz/csem_paper_figures_v1; missing main regimes: []
+Compiled outputs -> /tmp/tmpzqwtj2qz/csem_paper_compiled_v1
+PASS: all 22 configurations; legacy evaluation adapter; six main regimes; strict CFG/RK4-20 selection; score/feature/latent units; controlled ablations; all plot families in PNG/PDF; raw-method/old-paper switches.
+Fixtures are synthetic and deleted; no training or measured FID is asserted by this test.

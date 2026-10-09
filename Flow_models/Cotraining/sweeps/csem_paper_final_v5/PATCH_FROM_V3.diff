@@ -1,0 +1,563 @@
+--- v3/OPTIMIZED_SETTINGS_PROVENANCE.md
++++ v4/OPTIMIZED_SETTINGS_PROVENANCE.md
+@@ -1,62 +1,11 @@
+-# CSEM paper-final V3: optimized-settings provenance
++# V4 dataset settings
+ 
+-## Why V3 exists
+-V1/V2 accidentally mixed the most recent CIFAR recipe with a non-optimal FMNIST score-head configuration and an obsolete freeze-then-refine implementation of the independent baselines. V3 resolves those issues by using dataset-specific settings supported by the most recent completed sweeps.
++See `FMNIST_CONFIGURATION_AUDIT.md` for the source evidence, settings comparison, fixes, and limitations.
+ 
+-## Located FMNIST ~FID-5 run
+-The latest exact FMNIST artifact located in the August lineage is the Aug-18 `canonical_oracleqt_v1` run. The included provenance files are exact snapshots of its source/evaluation/loss outputs.
++FMNIST main cells4/5 now execute the recovered August13 Gaussian-start terminal-KL training implementation at T2, w_C=.6 (unweighted epsilon), w_K=1, 700 epochs, head LR2e-4/.6 with joint coefficient.6, CFG3, N10000, RK4-25. The recovered log reaches5.13 Heun and5.24 final RK4. An exact terminal-KL FID5.04 is not certified.
+ 
+-At epoch 400 its reported metrics are:
+-- VAE reconstruction FID: 4.08320453
+-- Heun-50, CFG 3, oracle-q_T-class init FID: 5.07160008
+-- RK4-25, CFG 3, oracle-q_T-class init FID: 4.97398564
++The Aug18 canonical .1/.3 T1.5 run produced oracle-q_T-class FID4.97; it was the wrong source for a deployable ~5 Gaussian-start recipe. It is retained only as optional replication cell8, with shared samples and N10000 restored.
+ 
+-Important: **4.97399 is an oracle-q_T-class initialization result, not Gaussian-start FID.** The old CSEM-main headline of ~5.03 was a separate Gaussian-start, CFG-1.5 comparison. V3 therefore does two things: (1) cell 8 reproduces the Aug-18 evaluation contract at CFG 3 as a provenance check; (2) main FMNIST cells 4-5 use the same recovered training recipe but the old-main comparison CFG 1.5, so the paper comparison remains deployable and directly comparable across regimes.
++CIFAR main remains the Aug29 recipe: T_K1.05/T1.35, canonical w_C=.05, w_K=.60, OU-partial anchor, 500 epochs, score LR1e-4, CFG2.5, RK4-25. Independent baselines retain beta0=.07 CIFAR/.01 FMNIST. Their tracking head uses the full-horizon input, receives the same configured LR as its peer, and is evaluated at every checkpoint.
+ 
+-### Recovered training settings
+-- dataset/preset: FMNIST / `fmnist_reference`
+-- architecture: latent channels 4; VAE base channels 32; DiT 192 x 8, 6 heads, patch 1; batch 128
+-- horizon: T_K = T = 1.5; log-t OU; t_min = 2e-5
+-- joint epochs: 400; no score-only refinement
+-- representation time weighting: canonical
+-- score-head time weighting: unweighted-eps
+-- CSEM representation coefficient: w_C = 0.10
+-- terminal component KL coefficient: w_K = 0.30
+-- score-head loss coefficient: 1.0
+-- score-head LR: 8e-4
+-- VAE LR: 5e-4 with cosine schedule over the run
+-- perceptual weight: 0.85
+-- PatchGAN generator weight: 0.0025; discriminator starts epoch 25; discriminator LR 1e-4
+-- no encoder-mean GroupNorm; no OU-partial anchor; terminal KL is the scale anchor
+-- fixed eval banks
+-
+-The terminal coefficient w_K=.30 is recoverable directly from the stored first-epoch objective: `loss - recon - .85*perc - .10*score_lsi = .30*terminal_kl` to floating-point error.
+-
+-## Optimized CIFAR co-training
+-The Aug-29 state-of-knowledge recommendation is used unchanged:
+-- T_K=1.05, T=1.35 (detached tail .30)
+-- w_C=.05, w_K=.60
+-- OU-partial GroupNorm at T_K, rho_m=alpha_K^2 and rho_v=alpha_K^4
+-- canonical representation weighting; unweighted-eps score-head weighting
+-- 500 joint epochs, no refinement
+-- score-head LR 1e-4
+-- CFG 2.5; RK4-25 = 100 NFE headline evaluation
+-- seeds 42 and 43
+-
+-## Independent baseline protocol
+-V3 no longer uses the V1/V2 `VAE stage + equally long score-only refine` workaround. It uses the exact T_K=0 standard-LDM path already present in the modern core:
+-- no diffusion/CSEM gradient reaches the VAE
+-- K_0 is ordinary VAE KL
+-- the analytic-CSEM and Tweedie heads are trained side-by-side on detached latents from the **same VAE and same minibatches** during the same epoch clock
+-- no score-only refinement phase
+-
+-This is the protocol used by the later true two-stage Pareto audit and gives a cleaner estimator comparison.
+-
+-### CIFAR independent VAE
+-The modern two-seed Pareto sweep tested beta0={.01,.03,.07,.15,.30}; beta0=.07 gave the best mean Gaussian-start FID among those regularized two-stage cells (12.40, essentially tied with .01/.15) while remaining a well-regularized interior point. V3 uses beta0=.07, 500 epochs, T=1.35, score LR 1e-4, CFG2.5.
+-
+-### FMNIST independent VAE
+-The historical FMNIST comparison code used standard q0 KL beta0=.01. V3 keeps beta0=.01 but updates the score-head optimization to the later FMNIST-supported LR 8e-4, trains both heads simultaneously on the same detached representation, uses 400 epochs and evaluates at CFG1.5.
+-
+-## Intentional non-optimized controls
+-Cells `anchor_none` and `naive_tweedie_cotrain` are intentionally pathological ablations. A scale explosion in `anchor_none` or collapse in `naive_tweedie_cotrain` is expected and must not be interpreted as a main-method failure.
++Historical evidence is included verbatim under `provenance/`; these results are not fresh V4 measurements.
+--- v3/README_CSEM_PAPER_FINAL_V1.txt
++++ v4/README_CSEM_PAPER_FINAL_V1.txt
+@@ -1,84 +1,39 @@
+-CSEM PAPER-FINAL COMPARISON SWEEP -- V3
+-=======================================
++CSEM PAPER-FINAL COMPARISON SWEEP — V4 FMNIST repair
++==================================================
+ 
+-Purpose
+--------
+-Generate the paper's matched three-regime comparisons and the remaining scale/
+-horizon/sampler/collapse ablations using the best-supported dataset-specific
+-settings rather than forcing one recipe across FMNIST and CIFAR.
++Read FMNIST_CONFIGURATION_AUDIT.md first. The exact recalled terminal-KL FID5.04
++was not recovered. The included original Gaussian-start FMNIST log reaches
++Heun5.13 and final RK4-25 FID5.24. The separate Aug18 FID4.97 is oracle-start.
+ 
+-IMPORTANT PATH NOTE
+--------------------
+-This bundle is path-independent. The submitter resolves BASE_DIR from the
+-location of submit_csem_paper_final_v1.py itself. Recommended install:
++Extract this bundle into a fresh csem_paper_final_v4 directory. Runner filenames
++retain the _v1 suffix for interface compatibility; the folder is path-independent.
++New names protect changed jobs from being mistaken for completed V3 jobs.
+ 
+-  /work/10812/ald4435/frontera/Flow_models/Flow_models/Cotraining/sweeps/csem_paper_final_v3/
++GPU environment: PyTorch/torchvision/CUDA, lpips, NumPy, Pandas, SciPy, matplotlib,
++tqdm; the Slurm launcher uses $SCRATCH/venvs/hlsi as before. LPIPS is required to
++match the perceptual objective. The launcher checks it before training.
+ 
+-but the directory name is not hard-coded.
++python verify_fmnist_v4.py                       # CPU configuration/routing checks
++python validate_csem_paper_final_v1.py            # real Torch-environment preflight
++python submit_csem_paper_final_v1.py --cells 4-7 --dry-run
++python submit_csem_paper_final_v1.py --cells 4-7   # repaired FMNIST comparison
+ 
+-Main comparison jobs
+---------------------
+-CIFAR:
+-  cells 0-1  optimized co-trained CSEM, seeds 42/43
+-  cells 2-3  exact T_K=0 independent VAE with paired CSEM/Tweedie heads, seeds 42/43
++0-1: CIFAR co-trained, original Aug29 settings
++2-3: CIFAR repaired independent CSEM/Tweedie pair; rerun to get Tweedie results
++4-5: FMNIST recovered Aug13 Gaussian-start terminal-KL joint trainer, seeds42/43
++6-7: FMNIST repaired independent pair, matched T2/700epochs/CFG3/N10000
++8: optional Aug18 canonical shared-sample/oracle provenance check
++9-17: original CIFAR anchor/horizon/collapse controls
+ 
+-FMNIST:
+-  cells 4-5  recovered Aug-18 co-trained recipe, seeds 42/43, evaluated at old-main CFG 1.5
+-  cells 6-7  standard beta0=.01 independent VAE with paired CSEM/Tweedie heads, seeds 42/43
+-  cell 8     exact Aug-18 CFG3 replication/provenance check
++python submit_csem_paper_final_v1.py --cells 2-3   # repaired CIFAR baseline
++python submit_csem_paper_final_v1.py --cells 8     # optional provenance check
++python compile_csem_paper_final_v1.py
++python plot_csem_paper_final_v1.py
+ 
+-CIFAR paper ablations:
+-  cell 9     historical hard-GN scale anchor
+-  cell 10    no-anchor failure control (scale explosion expected)
+-  cells 11-14  T / terminal-KL sensitivity around optimized OU-partial recipe
+-  cell 15    naive Tweedie co-training collapse control
+-  cells 16-17 raw-mean + terminal-KL paired controls
++No Slurm arrays. Do not resume changed cells from V3 checkpoints. Historical
++source/log/evaluation records and source-config capture are under provenance/.
++FMNIST main produces Gaussian RK4-25 and Heun-SDE-50 with the original evaluator;
++CIFAR keeps its existing modern solver suite. Independent heads share one VAE,
++minibatches and detached full-horizon draws, and both EMAs are evaluated.
+ 
+-The exact settings/provenance and the important distinction between the
+-Aug-18 oracle-q_T FID 4.97399 and the old-main Gaussian FID ~5.03 are documented
+-in OPTIMIZED_SETTINGS_PROVENANCE.md.
+-
+-Validation
+-----------
+-From this directory:
+-
+-  "$SCRATCH/venvs/hlsi/bin/python" validate_csem_paper_final_v1.py
+-  "$SCRATCH/venvs/hlsi/bin/python" submit_csem_paper_final_v1.py --dry-run
+-
+-Submit all:
+-
+-  "$SCRATCH/venvs/hlsi/bin/python" submit_csem_paper_final_v1.py
+-
+-Submit only main comparison:
+-
+-  "$SCRATCH/venvs/hlsi/bin/python" submit_csem_paper_final_v1.py --cells main
+-
+-Submit selected cells, e.g. FMNIST main only:
+-
+-  "$SCRATCH/venvs/hlsi/bin/python" submit_csem_paper_final_v1.py --cells 4-7
+-
+-Compile after jobs finish:
+-
+-  "$SCRATCH/venvs/hlsi/bin/python" compile_csem_paper_final_v1.py
+-  "$SCRATCH/venvs/hlsi/bin/python" plot_csem_paper_final_v1.py
+-
+-Primary outputs
+----------------
+-  csem_paper_compiled_v1/main_final_metrics_by_seed.csv
+-  csem_paper_compiled_v1/main_final_metrics_aggregate.csv
+-  csem_paper_compiled_v1/main_epoch_curves_long.csv
+-  csem_paper_compiled_v1/scale_anchor_final.csv
+-  csem_paper_compiled_v1/terminal_horizon_anchor_sensitivity.csv
+-  csem_paper_compiled_v1/solver_order_comparison.csv
+-  csem_paper_compiled_v1/naive_tweedie_collapse_final.csv
+-  csem_paper_figures_v1/
+-
+-Main-comparison semantics
+--------------------------
+-Each independent-pair job produces BOTH Independent CSEM and Independent
+-Tweedie from the same exact standard-VAE representation. The score heads see
+-identical minibatches/latent samples and are trained over the same epoch clock.
+-This is preferable to comparing two separately trained VAEs.
+-
+-Do not interpret the deliberate no-anchor/Tweedie-collapse controls as main
+-models. See OPTIMIZED_SETTINGS_PROVENANCE.md for expected failure signatures.
++This bundle has not been trained here; CPU verification and syntax checks pass.
+--- v3/SOURCE_LINEAGE_AND_DECISIONS.md
++++ v4/SOURCE_LINEAGE_AND_DECISIONS.md
+@@ -1,18 +1,7 @@
+-# Source lineage and V3 decisions
++# V4 source decisions
+ 
+-The runnable core descends from the late-August two-horizon CSEM code and retains the V2 dataset-lock, OU-partial anchor, solver-suite, and oracle-loader fixes.
++V3 selected a canonical oracle-initialized FMNIST experiment to reproduce a Gaussian-start headline. V4 replaces FMNIST main with the closest recovered deployable terminal-KL experiment, retaining its archived joint trainer instead of transplanting hyperparameters into a changed two-horizon trainer. All source configuration values were compared against an intercepted execution of the recovered CLI.
+ 
+-## Changes from V2
++This does not establish an exact 5.04 reproduction: the recovered Gaussian log reaches Heun5.13/RK4 final5.24, whereas the separate oracle log reaches4.97. The older paper5.03 is a third experiment.
+ 
+-1. **FMNIST co-trained main settings were corrected.** V2 had `w_K=.60` and score-head LR `2e-4`, neither of which matches the located Aug-18 ~FID-5 run. V3 uses `w_C=.10`, `w_K=.30`, canonical outer weighting, unweighted-eps head, score-head LR `8e-4`, T=1.5, 400 joint epochs, no refinement.
+-2. **Independent baselines now use the exact T_K=0 modern two-stage path.** There is no diffusion-derived VAE gradient; q0 KL is the VAE regularizer; both CSEM and Tweedie heads train on the same detached latent stream during the same epoch clock. The obsolete equal-length freeze-then-refine stage is removed.
+-3. **Dataset-specific two-stage KL is used.** CIFAR beta0=.07 from the modern two-stage Pareto sweep; FMNIST beta0=.01 from the historical independent-VAE comparison lineage.
+-4. **Dataset-specific score-head LR is used.** CIFAR 1e-4; FMNIST 8e-4.
+-5. **FMNIST paper comparison returns to CFG1.5**, matching the old CSEM-main comparison. A separate provenance cell evaluates the recovered Aug-18 model contract at CFG3.
+-6. CIFAR main remains the Aug-29 optimized OU-partial+terminal-KL recipe: `(T_K,T,w_C,w_K)=(1.05,1.35,.05,.60)`, CFG2.5, 100 NFE.
+-
+-## What the located FID ~5 actually was
+-
+-The exact Aug-18 `eval_metrics.csv` reaches RK4-25 FID `4.973985635966699` at epoch 400, but the metric key is `...cfg3_0_initoracleqtclass`: this is oracle-q_T-class initialization. It is not the same quantity as the old CSEM-main Gaussian-start headline FID 5.03 at CFG1.5. V3 preserves that distinction rather than silently conflating the two.
+-
+-Exact source/eval/loss snapshots are bundled under `provenance/`.
++The modern CIFAR co-training route is retained. Modern independent-pair tracking input, tracking LR, evaluation, and compiler selection bugs are repaired. Detailed evidence and rerun instructions are in `FMNIST_CONFIGURATION_AUDIT.md`. `PATCH_FROM_V3.diff` records the source changes.
+--- v3/compile_csem_paper_final_v1.py
++++ v4/compile_csem_paper_final_v1.py
+@@ -24,22 +24,19 @@
+     return df.sort_values('epoch').iloc[-1]
+ 
+ def _find_metric(row, prefix, steps=None, init='initgaussianT'):
+-    cols=list(row.index)
+-    cand=[]
+-    for c in cols:
++    import re
++    candidates=[]
++    for c in row.index:
+         if not c.startswith(prefix): continue
+-        if init and init not in c: continue
++        # T_K names share the string prefix: exclude them explicitly.
++        if init and (init not in c or (init=='initgaussianT' and 'initgaussianTK' in c)): continue
+         if steps is not None and f'_{int(steps)}_' not in c: continue
+-        cand.append(c)
+-    if not cand and steps is not None:
+-        for c in cols:
+-            if c.startswith(prefix) and (not init or init in c): cand.append(c)
+-    if not cand: return (None, float('nan'))
+-    # Prefer the shortest name, which normally corresponds to the ordinary T sampler.
+-    c=sorted(cand,key=lambda x:(len(x),x))[0]
+-    try: val=float(row[c])
+-    except Exception: val=float('nan')
+-    return c,val
++        try: value=float(row[c])
++        except (TypeError, ValueError): continue
++        if not math.isfinite(value): continue
++        candidates.append((c,value))
++    if not candidates: return (None,float('nan'))
++    return sorted(candidates,key=lambda x:(len(x[0]),x[0]))[0]
+ 
+ def _main_regime(eval_df, mode):
+     if eval_df.empty: return []
+@@ -61,7 +58,7 @@
+             if not sub.empty:
+                 sub['regime']=reg; rr.append(sub); seen.add(reg)
+         return rr
+-    if mode in {'cotrained_csem','fmnist_aug18_recovered','cotrained_csem_norm'}:
++    if mode in {'cotrained_csem','fmnist_aug18_recovered','fmnist_aug13_gaussian','cotrained_csem_norm'}:
+         sub=eval_df[eval_df.get('tag','').astype(str).str.fullmatch('LSI_Diff',na=False)].copy()
+         if sub.empty:
+             sub=eval_df[eval_df.get('tag','').astype(str).str.contains('LSI_Diff',na=False)].copy()
+--- v3/csem_paper_core_v1.py
++++ v4/csem_paper_core_v1.py
+@@ -6362,36 +6362,44 @@
+             mu_head = mu.detach()
+             logvar_head = logvar.detach()
+ 
+-            t_head_idx = None
+-            if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
+-                t_head = sample_logit_normal_times(
+-                    B, cfg["t_min"], cfg["t_max"], device
+-                )
+-                alpha_head, sigma_head = get_flow_params(
+-                    t_head.view(B, 1, 1, 1)
+-                )
++            if cfg.get("score_head_sample_mode", "independent") == "shared":
++                if standard_two_stage or not math.isclose(float(T_K), float(cfg["t_max"])):
++                    raise ValueError("Shared score sample requires 0 < T_K == T")
++                t_head_idx = t_idx
++                t_head, alpha_head, sigma_head = t, alpha, sigma
++                noise_head = noise.detach()
++                z_t_head = z_t.detach()
+             else:
+-                t_head = sample_log_uniform_times(
+-                    B, cfg["t_min"], cfg["t_max"], device
+-                )
+-                alpha_head, sigma_head = get_ou_params(
+-                    t_head.view(B, 1, 1, 1)
+-                )
+-
+-            if use_ddim_times:
+-                t_head_idx = torch.randint(
+-                    0, T_score_steps, (B,), device=device, dtype=torch.long
+-                )
+-                t_head = score_sched["times"].gather(0, t_head_idx).float()
+-                alpha_head = extract_schedule(
+-                    score_sched["alpha"], t_head_idx, z0_head.shape
+-                )
+-                sigma_head = extract_schedule(
+-                    score_sched["sigma"], t_head_idx, z0_head.shape
+-                )
+-
+-            noise_head = torch.randn_like(z0_head)
+-            z_t_head = alpha_head * z0_head + sigma_head * noise_head
++                t_head_idx = None
++                if str(cfg.get("time_schedule", "")).lower() in ("flow", "flow_matching"):
++                    t_head = sample_logit_normal_times(
++                        B, cfg["t_min"], cfg["t_max"], device
++                    )
++                    alpha_head, sigma_head = get_flow_params(
++                        t_head.view(B, 1, 1, 1)
++                    )
++                else:
++                    t_head = sample_log_uniform_times(
++                        B, cfg["t_min"], cfg["t_max"], device
++                    )
++                    alpha_head, sigma_head = get_ou_params(
++                        t_head.view(B, 1, 1, 1)
++                    )
++
++                if use_ddim_times:
++                    t_head_idx = torch.randint(
++                        0, T_score_steps, (B,), device=device, dtype=torch.long
++                    )
++                    t_head = score_sched["times"].gather(0, t_head_idx).float()
++                    alpha_head = extract_schedule(
++                        score_sched["alpha"], t_head_idx, z0_head.shape
++                    )
++                    sigma_head = extract_schedule(
++                        score_sched["sigma"], t_head_idx, z0_head.shape
++                    )
++
++                noise_head = torch.randn_like(z0_head)
++                z_t_head = alpha_head * z0_head + sigma_head * noise_head
+             var0_head = torch.exp(logvar_head)
+             mu_t_head = alpha_head * mu_head
+             var_t_head = (alpha_head ** 2) * var0_head + (sigma_head ** 2)
+@@ -7171,15 +7179,15 @@
+ 
+                 if train_tracking_head:
+                     # --- Tracking head (trains on detached latents) ---
+-                    z_t_detached = z_t.detach()
+-                    z_mu_t_detached = z_mu_t.detach()
+-                    eps_target_control_det = eps_target_control.detach()
+-                    eps_target_lsi_det = eps_target_lsi.detach()
++                    z_t_detached = z_t_head.detach()
++                    z_mu_t_detached = (alpha_head * mu_head + sigma_head * noise_head).detach()
++                    eps_target_control_det = eps_target_control_head.detach()
++                    eps_target_lsi_det = eps_target_lsi_head.detach()
+ 
+                     if cotrain_head == "lsi":
+                         # Control head tracks the velocity baseline
+                         x_in = z_mu_t_detached if cfg.get("train_on_mu", False) else z_t_detached
+-                        eps_pred_control_tracking = unet_control(x_in, t, y_in)
++                        eps_pred_control_tracking = unet_control(x_in, t_head, y_in)
+                         loss_mse, loss_cos = weighted_score_prediction_losses(
+                             eps_pred_control_tracking,
+                             eps_target_control_det,
+@@ -7191,16 +7199,16 @@
+                         use_factored = bool(getattr(unet_lsi, "factored_head", False))
+                         if use_factored:
+                             eps_pred_lsi_tracking, lam_pred, nu_pred = unet_lsi(
+-                                z_t_detached, t, y_in,
++                                z_t_detached, t_head, y_in,
+                                 return_components=True,
+                                 detach_components=True,
+                             )
+-                            lam_tgt = (sigma / (var_t + 1e-8)).detach()
+-                            nu_tgt  = (lam_tgt * mu_t.detach())
++                            lam_tgt = (sigma_head / (var_t_head + 1e-8)).detach()
++                            nu_tgt  = (lam_tgt * mu_t_head.detach())
+                             aux_loss_lam_tr = F.mse_loss(lam_pred, lam_tgt)
+                             aux_loss_nu_tr  = F.mse_loss(nu_pred,  nu_tgt)
+                         else:
+-                            eps_pred_lsi_tracking = unet_lsi(z_t_detached, t, y_in)
++                            eps_pred_lsi_tracking = unet_lsi(z_t_detached, t_head, y_in)
+                             aux_loss_lam_tr = torch.tensor(0.0, device=device)
+                             aux_loss_nu_tr  = torch.tensor(0.0, device=device)
+ 
+@@ -7566,6 +7574,23 @@
+                 results_active["tag"] = eval_prefix
+                 eval_records.append(results_active)
+ 
++            if train_tracking_head:
++                tracking_prefix = "Ctrl_Diff" if cotrain_head == "lsi" else "LSI_Diff"
++                tracking_model = unet_control_ema if cotrain_head == "lsi" else unet_lsi_ema
++                results_tracking = evaluate_current_state(
++                    ldm_epoch, tracking_prefix, vae, tracking_model, test_l, cfg,
++                    device, lpips_fn,
++                    fixed_noise_bank=fixed_noise_bank,
++                    fixed_posterior_eps_bank_A=fixed_posterior_eps_bank_A,
++                    fixed_posterior_eps_bank_B=fixed_posterior_eps_bank_B,
++                    fixed_sw2_theta=fixed_sw2_theta, results_dir=results_dir,
++                    fid_model=fid_model, use_lenet_fid=use_lenet_fid,
++                    oracle_reference_loader=train_l,
++                )
++                if results_tracking is not None:
++                    results_tracking.update(epoch=ldm_epoch, stage="cotrain", tag=tracking_prefix)
++                    eval_records.append(results_tracking)
++
+             if eval_records:
+                 in_progress_eval_path = os.path.join(
+                     results_dir,
+--- v3/csem_paper_final_v1_cell_job.slurm
++++ v4/csem_paper_final_v1_cell_job.slurm
+@@ -39,12 +39,13 @@
+ done
+ 
+ "$PY" - <<'PYENV'
+-import sys, numpy as np, torch
++import sys, numpy as np, torch, torchvision, lpips
+ print('Python:', sys.executable)
+ print('NumPy:', np.__version__)
+ print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda)
+ print('CUDA available:', torch.cuda.is_available())
+ if not torch.cuda.is_available(): raise SystemExit('[error] CUDA GPU is not visible')
++print('Perceptual objective: LPIPS available')
+ print('GPU:', torch.cuda.get_device_name(0))
+ print('GPU GiB:', torch.cuda.get_device_properties(0).total_memory/2**30)
+ PYENV
+--- v3/csem_paper_final_v1_manifest.csv
++++ v4/csem_paper_final_v1_manifest.csv
+@@ -1,19 +1,19 @@
+ cell_id,family,dataset,mode,seed,epochs_joint,epochs_refine,T_K,T_full,csem_w,terminal_kl_w,latent_anchor_mode,beta0,score_time_weighting,score_head_time_weighting,lr_score_head,lr_refine,cfg_scale,rk4_steps,eval_every,eval_samples,paper_solver_suite,paper_solver_steps,result_name,notes
+-0,main,CIFAR,cotrained_csem,42,500,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,1,20,cifar_main_csem_oupartial_s42,"optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL"
+-1,main,CIFAR,cotrained_csem,43,500,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,1,20,cifar_main_csem_oupartial_s43,"optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL"
+-2,main,CIFAR,independent_pair,42,500,0,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_main_independent_pair_s42,"exact T_K=0 standard VAE; beta0=.07; CSEM and Tweedie heads trained simultaneously on same detached latent stream"
+-3,main,CIFAR,independent_pair,43,500,0,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_main_independent_pair_s43,"exact T_K=0 standard VAE; beta0=.07; CSEM and Tweedie heads trained simultaneously on same detached latent stream"
+-4,main,FMNIST,fmnist_aug18_recovered,42,400,0,1.5,1.5,0.10,0.30,none,0.01,canonical,unweighted-eps,0.0008,0.00001,1.5,25,50,5000,1,20,fmnist_main_csem_aug18_s42,"recovered Aug-18 good-FID training recipe; paper comparison evaluated at old-main CFG=1.5"
+-5,main,FMNIST,fmnist_aug18_recovered,43,400,0,1.5,1.5,0.10,0.30,none,0.01,canonical,unweighted-eps,0.0008,0.00001,1.5,25,50,5000,1,20,fmnist_main_csem_aug18_s43,"seed replicate of recovered Aug-18 recipe; paper comparison evaluated at old-main CFG=1.5"
+-6,main,FMNIST,independent_pair,42,400,0,0.0,1.5,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.00001,1.5,25,50,5000,0,20,fmnist_main_independent_pair_s42,"historical standard-VAE beta0=.01; CSEM/Tweedie heads trained simultaneously on same detached representation"
+-7,main,FMNIST,independent_pair,43,400,0,0.0,1.5,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.00001,1.5,25,50,5000,0,20,fmnist_main_independent_pair_s43,"historical standard-VAE beta0=.01; CSEM/Tweedie heads trained simultaneously on same detached representation"
+-8,replication,FMNIST,fmnist_aug18_recovered,42,400,0,1.5,1.5,0.10,0.30,none,0.01,canonical,unweighted-eps,0.0008,0.00001,3.0,25,50,2000,0,20,fmnist_aug18_exact_cfg3_replication_s42,"exact evaluation-side reconstruction of Aug-18 file: CFG3; expected oracle-q_T-class RK4-25 around 4.97"
+-9,scale_anchor,CIFAR,anchor_norm,42,500,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_anchor_norm_s42,"historical hard GN0 no terminal KL; ablation control"
+-10,scale_anchor,CIFAR,anchor_none,42,500,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_anchor_none_s42,"intentional no-anchor failure control; scale blow-up is expected"
+-11,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.25,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p25_wK0p60_s42,"T sensitivity lower point with optimized OU-partial anchor held on"
+-12,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.45,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p45_wK0p60_s42,"T sensitivity upper point with optimized OU-partial anchor held on"
+-13,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.40,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p35_wK0p40_s42,"terminal-KL sensitivity lower point with optimized OU-partial anchor held on"
+-14,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.80,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p35_wK0p80_s42,"terminal-KL sensitivity upper point with optimized OU-partial anchor held on"
+-15,tweedie_collapse,CIFAR,naive_tweedie_cotrain,42,100,0,1.35,1.35,1.0,0.0,none,0.07,unweighted-eps,unweighted-eps,0.0001,0.000015,2.5,20,10,2000,1,20,cifar_naive_tweedie_cotrain_s42,"intentional collapse control; not an optimized generation arm"
+-16,scale_anchor,CIFAR,raw_terminal_control,42,500,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_raw_terminal_kl_control_s42,"paired raw-mean terminal-KL-only control for OU-partial gain"
+-17,scale_anchor,CIFAR,raw_terminal_control,43,500,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_raw_terminal_kl_control_s43,"paired raw-mean terminal-KL-only control for OU-partial gain"
++0,main,CIFAR,cotrained_csem,42,500,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,1,20,cifar_main_csem_oupartial_s42,optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL
++1,main,CIFAR,cotrained_csem,43,500,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,1,20,cifar_main_csem_oupartial_s43,optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL
++2,main,CIFAR,independent_pair,42,500,0,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_main_independent_pair_s42_v4,exact T_K=0 standard VAE; beta0=.07; CSEM and Tweedie heads trained simultaneously on same detached latent stream
++3,main,CIFAR,independent_pair,43,500,0,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_main_independent_pair_s43_v4,exact T_K=0 standard VAE; beta0=.07; CSEM and Tweedie heads trained simultaneously on same detached latent stream
++4,main,FMNIST,fmnist_aug13_gaussian,42,700,0,2.0,2.0,0.60,1.0,none,0.01,unweighted-eps,unweighted-eps,0.0003333333333333334,0.00001,3.0,25,50,10000,0,20,fmnist_main_csem_aug13_gaussian_v4_s42,Aug13 recovered Gaussian-start terminal KL run; legacy joint optimizer/head loss .6; source and log included; exact 5.04 not located
++5,main,FMNIST,fmnist_aug13_gaussian,43,700,0,2.0,2.0,0.60,1.0,none,0.01,unweighted-eps,unweighted-eps,0.0003333333333333334,0.00001,3.0,25,50,10000,0,20,fmnist_main_csem_aug13_gaussian_v4_s43,Aug13 recovered Gaussian-start terminal KL run; legacy joint optimizer/head loss .6; source and log included; exact 5.04 not located
++6,main,FMNIST,independent_pair,42,700,0,0.0,2.0,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.00001,3.0,25,50,10000,0,20,fmnist_main_independent_pair_v4_s42,Matched FMNIST 700 epochs/T2/CFG3/10000 eval; detached two-stage heads; tracking and evaluation fixes; beta0=.01; head LR8e-4
++7,main,FMNIST,independent_pair,43,700,0,0.0,2.0,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.00001,3.0,25,50,10000,0,20,fmnist_main_independent_pair_v4_s43,Matched FMNIST 700 epochs/T2/CFG3/10000 eval; detached two-stage heads; tracking and evaluation fixes; beta0=.01; head LR8e-4
++8,replication,FMNIST,fmnist_aug18_recovered,42,400,0,1.5,1.5,0.10,0.30,none,0.01,canonical,unweighted-eps,0.0008,0.00001,3.0,25,50,10000,0,20,fmnist_aug18_shared_cfg3_replication_v4_s42,Aug18 same-sample routing restored; oracle-qT-class result4.97; not deployable headline; N10000 from original launch log
++9,scale_anchor,CIFAR,anchor_norm,42,500,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_anchor_norm_s42,historical hard GN0 no terminal KL; ablation control
++10,scale_anchor,CIFAR,anchor_none,42,500,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_anchor_none_s42,intentional no-anchor failure control; scale blow-up is expected
++11,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.25,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p25_wK0p60_s42,T sensitivity lower point with optimized OU-partial anchor held on
++12,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.45,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p45_wK0p60_s42,T sensitivity upper point with optimized OU-partial anchor held on
++13,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.40,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p35_wK0p40_s42,terminal-KL sensitivity lower point with optimized OU-partial anchor held on
++14,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.80,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p35_wK0p80_s42,terminal-KL sensitivity upper point with optimized OU-partial anchor held on
++15,tweedie_collapse,CIFAR,naive_tweedie_cotrain,42,100,0,1.35,1.35,1.0,0.0,none,0.07,unweighted-eps,unweighted-eps,0.0001,0.000015,2.5,20,10,2000,1,20,cifar_naive_tweedie_cotrain_s42,intentional collapse control; not an optimized generation arm
++16,scale_anchor,CIFAR,raw_terminal_control,42,500,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_raw_terminal_kl_control_s42,paired raw-mean terminal-KL-only control for OU-partial gain
++17,scale_anchor,CIFAR,raw_terminal_control,43,500,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_raw_terminal_kl_control_s43,paired raw-mean terminal-KL-only control for OU-partial gain
+--- v3/csem_paper_suite_v1.py
++++ v4/csem_paper_suite_v1.py
+@@ -188,7 +188,7 @@
+     cfg["paper_mode"] = mode
+     cfg["comparison_arm"] = mode
+ 
+-    if mode in {"cotrained_csem", "anchor_terminal", "sensitivity", "raw_terminal_control", "fmnist_aug18_recovered"}:
++    if mode in {"cotrained_csem", "anchor_terminal", "sensitivity", "raw_terminal_control", "fmnist_aug18_recovered", "fmnist_aug13_gaussian"}:
+         cfg.update({
+             "use_latent_norm": False,
+             "kl_reg_type": "terminal",
+@@ -272,6 +272,26 @@
+         })
+     else:
+         raise ValueError(f"Unknown paper mode: {mode}")
++    if mode == "fmnist_aug13_gaussian":
++        cfg.update({
++            "training_engine": "aug13_joint",
++            "first_arm": "norm",
++            "resolved_outer_score_time_weighting": "unweighted-eps",
++            "resolved_score_head_time_weighting": "unweighted-eps",
++            "resolved_split_score_gradient_routing": False,
++            "score_head_loss_w": float(cfg["score_w_vae"]),
++            "lr_ldm": float(cfg["lr_score_head"]) * float(cfg["score_w_vae"]),
++            "base_lr_ldm": float(cfg["lr_score_head"]) * float(cfg["score_w_vae"]),
++            "evaluation_contract": "gaussian_randtoken_cfg3_heun50_rk4_25_inception_10000",
++            "paper_solver_suite": False,
++            "eval_tk_vs_t_comparison": False,
++            "generate_visualizations": False,
++        })
++    elif mode == "fmnist_aug18_recovered":
++        cfg["score_head_sample_mode"] = "shared"
++    if mode == "independent_pair":
++        # Equal tracking LR for the two independently trained heads.
++        cfg["lr_ldm"] = cfg["lr_score_head"]
+     return cfg
+ 
+ 
+@@ -305,6 +325,29 @@
+     if result_root.exists():
+         raise FileExistsError(f"Refusing to overwrite existing result directory: {result_root}")
+     core.seed_everything(int(cfg["seed"]))
+-    loss_df, eval_df = core.train_vae_cotrained_cond(cfg)
++    if mode == "fmnist_aug13_gaussian":
++        import importlib.util
++        source = base_dir / "provenance" / "csem_new_fmnist_aug13.py"
++        spec = importlib.util.spec_from_file_location("csem_fmnist_aug13", source)
++        historical = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(historical)
++        # Reuse the dataset-lock fix without changing transforms/minibatches.
++        historical.make_dataloaders = lambda batch_size, num_workers, dataset_key="FMNIST": core.make_dataloaders(
++            batch_size, num_workers, dataset_key, cfg["data_root"])
++        if historical.torch.cuda.is_available():
++            historical.torch.backends.cuda.matmul.allow_tf32 = True
++            historical.torch.backends.cudnn.allow_tf32 = True
++            historical.torch.set_float32_matmul_precision("high")
++        loss_df, eval_df = historical.train_vae_cotrained_cond(cfg)
++        # The recovered source starts from N(0,I) but uses legacy column names.
++        # Explicitly label that contract for the existing paper compiler.
++        renamed = {}
++        for c in eval_df.columns:
++            if "_randtok_cfg3_0" in c:
++                renamed[c] = c.replace("_randtok_cfg3_0", "_randtok_cfg3_0_temp1_initgaussianT2")
++        eval_df = eval_df.rename(columns=renamed)
++        eval_df.to_csv(result_root / "dataframes" / "eval_metrics.csv", index=False)
++    else:
++        loss_df, eval_df = core.train_vae_cotrained_cond(cfg)
+     (result_root / "paper_cell_config.json").write_text(json.dumps(cfg, indent=2, default=str) + "\n")
+     return loss_df, eval_df, cfg
+--- v3/validate_csem_paper_final_v1.py
++++ v4/validate_csem_paper_final_v1.py
+@@ -29,12 +29,25 @@
+         if r['mode']=='independent_pair':
+             assert cfg['T_terminal']==0 and not cfg['freeze_score_in_cotrain'] and cfg['train_tracking_head']
+             assert cfg['epochs_refine']==0 and cfg['score_w_vae']==0
++            assert close(cfg['lr_ldm'],cfg['lr_score_head'])
+             assert close(cfg['kl_w'],r['beta0']) and cfg['kl_reg_type']=='terminal'
+         if r['mode']=='naive_tweedie_cotrain':
+             assert cfg['cotrain_head']=='control' and cfg['kl_w']==0 and not cfg['use_latent_norm']
+         if r['mode']=='cotrained_csem':
+             assert cfg['cotrain_head']=='lsi' and cfg['kl_reg_type']=='terminal' and not cfg['use_latent_norm']
+             if r['dataset']=='CIFAR': assert cfg['latent_anchor_mode']=='ou_partial'
++        if r['mode']=='fmnist_aug13_gaussian':
++            assert r['dataset']=='FMNIST'
++            assert cfg['training_engine']=='aug13_joint'
++            assert not cfg['resolved_split_score_gradient_routing']
++            assert close(cfg['score_w_vae'],.60) and close(cfg['kl_w'],1.0)
++            assert close(cfg['T_terminal'],2.0) and close(cfg['t_max'],2.0)
++            assert close(cfg['lr_score_head'],2e-4/.6) and close(cfg['lr_ldm'],2e-4)
++            assert close(cfg['score_head_loss_w'],.6)
++            assert cfg['epochs_vae']==700 and cfg['lr_schedule_epochs']==700
++            assert cfg['cfg_eval_scale']==3 and cfg['eval_max_samples']==10000
++            assert cfg['score_time_weighting']=='unweighted-eps'
++            assert not cfg['use_latent_norm'] and cfg['latent_anchor_mode']=='none'
+         if r['mode']=='fmnist_aug18_recovered':
+             assert r['dataset']=='FMNIST'
+             assert close(cfg['score_w_vae'],.10) and close(cfg['kl_w'],.30)
+@@ -43,6 +56,7 @@
+             assert cfg['score_head_time_weighting']=='unweighted-eps'
+             assert close(cfg['lr_score_head'],8e-4)
+             assert not cfg['use_latent_norm'] and cfg['latent_anchor_mode']=='none'
++            assert cfg['score_head_sample_mode']=='shared'
+         if r['mode']=='sensitivity':
+             assert cfg['latent_anchor_mode']=='ou_partial' and cfg['kl_reg_type']=='terminal'
+         if r['mode']=='raw_terminal_control':

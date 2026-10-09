@@ -1,0 +1,8 @@
+paper_item,source_cells,compiled_output,figure_stem,notes
+Main table and estimator swap,"0-7 or raw16-17 plus2-7",main_final_metrics_aggregate.csv,main_dataset_metric_vs_epoch,"frozen VAE baselines; exact RK4-20 common selectedCFG"
+Old-paper Figure1,"0-7",main_epoch_curves_long.csv,main_old_paper_epoch_comparison,"solid cotrain dashed independents; optional exact oldCFG"
+Scale table/dynamics,"9-10 and16",scale_anchor_final.csv,scale_anchor_dynamics,"rawKL GN and none held fixed; OU-partial separate"
+Optimized sampling horizon/weight,"0 and11-14",terminal_horizon_anchor_sensitivity.csv,sensitivity_T and sensitivity_lambdaK,"T_full varies separately from T_K"
+Raw boundary horizon/weight,"16 and18-21",raw_anchor_sensitivity.csv,raw_sensitivity_TK and raw_sensitivity_lambdaK,"actual anchor-time force test"
+Solver order,"0 and4-5 and15-17",solver_order_comparison.csv,solver_mode_dataset,"matched steps and checkpoint; distinct NFEs"
+DSM collapse,"15",naive_tweedie_collapse_final.csv,tweedie_collapse_mean_variance,"posterior meanRMS and variance; Heun/RK4 generation table"

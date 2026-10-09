@@ -1,0 +1,865 @@
+--- v4/PAPER_PLACEHOLDER_COVERAGE.csv
++++ v5/PAPER_PLACEHOLDER_COVERAGE.csv
+@@ -1,9 +1,8 @@
+-paper_item,source_cells,compiled_output,notes
+-Main three-regime final table,"0-7",main_final_metrics_aggregate.csv,"CIFAR and FMNIST; independent CSEM/Tweedie share one VAE per seed"
+-Main epoch curves,"0-7",main_epoch_curves_long.csv,"Co-trained vs Independent CSEM vs Independent Tweedie"
+-FMNIST recovered-run provenance,"8",all_eval_records.csv,"CFG3 oracle-q_T replication target ~4.97 RK4-25"
+-Scale-anchor ablation,"0,9,10,16,17",scale_anchor_final.csv,"optimized OU-partial+KL, raw KL, historical GN0, no-anchor"
+-Scale dynamics,"0,9,10,16",all_loss_history.csv,"epochwise recon/CSEM/K_T/latent scale"
+-T and lambda_K sensitivity,"0,11-14",terminal_horizon_anchor_sensitivity.csv,"compact cross around optimized CIFAR point"
+-Sampler order comparison,"0,15",solver_order_comparison.csv,"matched Heun/RK4 paper suite"
+-Naive Tweedie co-training collapse,"15",naive_tweedie_collapse_final.csv,"intentional collapse control"
++paper_item,source_cells,compiled_output,figure_stem,notes
++Main table and estimator swap,"0-7 or raw16-17 plus2-7",main_final_metrics_aggregate.csv,main_dataset_metric_vs_epoch,"frozen VAE baselines; exact RK4-20 common selectedCFG"
++Old-paper Figure1,"0-7",main_epoch_curves_long.csv,main_old_paper_epoch_comparison,"solid cotrain dashed independents; optional exact oldCFG"
++Scale table/dynamics,"9-10 and16",scale_anchor_final.csv,scale_anchor_dynamics,"rawKL GN and none held fixed; OU-partial separate"
++Optimized sampling horizon/weight,"0 and11-14",terminal_horizon_anchor_sensitivity.csv,sensitivity_T and sensitivity_lambdaK,"T_full varies separately from T_K"
++Raw boundary horizon/weight,"16 and18-21",raw_anchor_sensitivity.csv,raw_sensitivity_TK and raw_sensitivity_lambdaK,"actual anchor-time force test"
++Solver order,"0 and4-5 and15-17",solver_order_comparison.csv,solver_mode_dataset,"matched steps and checkpoint; distinct NFEs"
++DSM collapse,"15",naive_tweedie_collapse_final.csv,tweedie_collapse_mean_variance,"posterior meanRMS and variance; Heun/RK4 generation table"
+--- v4/README_CSEM_PAPER_FINAL_V1.txt
++++ v5/README_CSEM_PAPER_FINAL_V1.txt
+@@ -1,39 +1,68 @@
+-CSEM PAPER-FINAL COMPARISON SWEEP — V4 FMNIST repair
+-==================================================
++CSEM PAPER-FINAL V5 — paper figures and CIFAR continuation
++=========================================================
++Read PAPER_AND_CIFAR_AUDIT_V5.md for evidence, limitations, and plot mappings.
++Runner filenames retain _v1 for compatibility; extract to a fresh V5 folder.
++No arrays. Every changed run has a new result name and refuses overwrites.
+ 
+-Read FMNIST_CONFIGURATION_AUDIT.md first. The exact recalled terminal-KL FID5.04
+-was not recovered. The included original Gaussian-start FMNIST log reaches
+-Heun5.13 and final RK4-25 FID5.24. The separate Aug18 FID4.97 is oracle-start.
++GPU environment: PyTorch/torchvision/CUDA, lpips, numpy, pandas, scipy,
++matplotlib, tqdm. Slurm uses $SCRATCH/venvs/hlsi. LPIPS preflight is mandatory.
+ 
+-Extract this bundle into a fresh csem_paper_final_v4 directory. Runner filenames
+-retain the _v1 suffix for interface compatibility; the folder is path-independent.
+-New names protect changed jobs from being mistaken for completed V3 jobs.
++python verify_paper_v5.py                       # CPU static/fixture checks
++python validate_csem_paper_final_v1.py          # real Torch config preflight
++python submit_csem_paper_final_v1.py --cells 0-7 --dry-run
++python submit_csem_paper_final_v1.py --cells 0-7 # main comparison, both datasets
++python submit_csem_paper_final_v1.py --cells 9-21 # all controls/sensitivity
+ 
+-GPU environment: PyTorch/torchvision/CUDA, lpips, NumPy, Pandas, SciPy, matplotlib,
+-tqdm; the Slurm launcher uses $SCRATCH/venvs/hlsi as before. LPIPS is required to
+-match the perceptual objective. The launcher checks it before training.
++0-1  CIFAR optimized OU-partial + terminal KL; 800 epochs, original800 cosine
++2-3  CIFAR independent VAE800 then frozen-VAE priors800; CSEM+Tweedie paired
++4-5  FMNIST recovered Aug13 Gaussian terminal-KL joint trainer; 700 epochs
++6-7  FMNIST independent VAE700 then frozen-VAE priors700; CSEM+Tweedie paired
++8    optional Aug18 shared-sample configuration check; historical4.97 was oracle
++9-10 matched per-mean GN/no-anchor CIFAR controls, 800 epochs
++11-14 sampling-horizon T_full / KL-weight sensitivity for optimized OU-partial
++15   naive unweighted DSM co-training collapse diagnostic, 100epochs
++16-17 raw-mean terminal-KL CIFAR controls, 800epochs; match the main tex definition
++18-21 raw-mean T_K / KL-weight controls; separate anchor horizon from sampling T
+ 
+-python verify_fmnist_v4.py                       # CPU configuration/routing checks
+-python validate_csem_paper_final_v1.py            # real Torch-environment preflight
+-python submit_csem_paper_final_v1.py --cells 4-7 --dry-run
+-python submit_csem_paper_final_v1.py --cells 4-7   # repaired FMNIST comparison
+-
+-0-1: CIFAR co-trained, original Aug29 settings
+-2-3: CIFAR repaired independent CSEM/Tweedie pair; rerun to get Tweedie results
+-4-5: FMNIST recovered Aug13 Gaussian-start terminal-KL joint trainer, seeds42/43
+-6-7: FMNIST repaired independent pair, matched T2/700epochs/CFG3/N10000
+-8: optional Aug18 canonical shared-sample/oracle provenance check
+-9-17: original CIFAR anchor/horizon/collapse controls
+-
+-python submit_csem_paper_final_v1.py --cells 2-3   # repaired CIFAR baseline
+-python submit_csem_paper_final_v1.py --cells 8     # optional provenance check
+ python compile_csem_paper_final_v1.py
+ python plot_csem_paper_final_v1.py
+ 
+-No Slurm arrays. Do not resume changed cells from V3 checkpoints. Historical
+-source/log/evaluation records and source-config capture are under provenance/.
+-FMNIST main produces Gaussian RK4-25 and Heun-SDE-50 with the original evaluator;
+-CIFAR keeps its existing modern solver suite. Independent heads share one VAE,
+-minibatches and detached full-horizon draws, and both EMAs are evaluated.
++Default compiler: RK4-20; selects among the EVALUATED CFG candidates on final
++co-trained seed-mean FID, then holds CFG fixed for every epoch and all priors.
++Candidates: FMNIST3/1.5; CIFAR2.5/3. These are not an exhaustive optimization.
++PNG and vector PDF figures land in csem_paper_figures_v1. selected_cfg.json
++records selection; figure_coverage.json reports unavailable data/curves.
++Original RK4-25 and FMNIST Heun50 metrics are retained in all_eval_records.csv.
+ 
+-This bundle has not been trained here; CPU verification and syntax checks pass.
++To use exactly the old paper's fixed CFG values (FMNIST1.5, CIFAR3):
++python compile_csem_paper_final_v1.py --cfg-policy old-paper
++python plot_csem_paper_final_v1.py
++
++The new tex's main method explicitly has RAW means. Optimized CIFAR is OU-partial.
++For a main table/figure faithful to that raw-method definition (cells16/17):
++python compile_csem_paper_final_v1.py --cifar-treatment raw
++python plot_csem_paper_final_v1.py
++Do not label the default optimized CIFAR treatment as unnormalized raw means.
++Use separate base directories if retaining figures from multiple compiler policies.
++
++CONTINUE THE EXISTING CIFAR500 RUN (GPU python in an allocated cluster job):
++python continue_cifar_v5.py --source-results /absolute/path/to/cifar_main_csem_oupartial_s43 --seed 43 --allow-weight-only
++
++This uses the NEW seed43 main result name and cannot coexist with a fresh job
++for that same cell in the same destination. It continues epochs501-800 along
++the existing800 cosine tail, starting VAE LR~7.79e-5 and score LR~3.16e-5.
++V3 saves only EMA prior/VAE weights: AdamW moments, online score, discriminator
++and RNG cannot be recovered. This is an approximate warm start, prominently
++labeled in CONTINUATION_PROVENANCE.txt. Older rows cannot acquire new alternate
++CFG/SW2/gap metrics retroactively. Use a fresh0-7 sweep for complete comparable
++curves at all epochs. Choose --cfg-policy recipe to retain historical CIFAR2.5
++curves when comparing an approximate continuation with the existing run.
++
++V5 modern co-training saves training_state_latest.pt and training_state_best_fid.pt
++plus best_fid.json at evaluation checkpoints. To continue an unfinished V5 main
++CIFAR run into a fresh V5 destination, use continue_cifar_v5.py without the
++--allow-weight-only flag; the full-state path restores online/EMA models, AdamW,
++discriminator, cosine phase and RNG. It is a continuation, not score-only refine.
++
++No training or FID reproduction was run here: Torch/CUDA are absent. CPU config,
++actual tracking-target, evaluator-adapter, compiler and plot fixture checks pass.
+--- v4/compile_csem_paper_final_v1.py
++++ v5/compile_csem_paper_final_v1.py
+@@ -23,11 +23,14 @@
+     if df is None or df.empty: return None
+     return df.sort_values('epoch').iloc[-1]
+ 
+-def _find_metric(row, prefix, steps=None, init='initgaussianT'):
++def _find_metric(row, prefix, steps=None, init='initgaussianT', cfg=None):
+     import re
+     candidates=[]
+     for c in row.index:
+         if not c.startswith(prefix): continue
++        if cfg is not None:
++            m=re.search(r'_cfg([0-9]+(?:_[0-9]+)?)_',c)
++            if not m or not math.isclose(float(m.group(1).replace('_','.')),float(cfg)): continue
+         # T_K names share the string prefix: exclude them explicitly.
+         if init and (init not in c or (init=='initgaussianT' and 'initgaussianTK' in c)): continue
+         if steps is not None and f'_{int(steps)}_' not in c: continue
+@@ -58,7 +61,7 @@
+             if not sub.empty:
+                 sub['regime']=reg; rr.append(sub); seen.add(reg)
+         return rr
+-    if mode in {'cotrained_csem','fmnist_aug18_recovered','fmnist_aug13_gaussian','cotrained_csem_norm'}:
++    if mode in {'cotrained_csem','fmnist_aug18_recovered','fmnist_aug13_gaussian','cotrained_csem_norm','raw_terminal_control'}:
+         sub=eval_df[eval_df.get('tag','').astype(str).str.fullmatch('LSI_Diff',na=False)].copy()
+         if sub.empty:
+             sub=eval_df[eval_df.get('tag','').astype(str).str.contains('LSI_Diff',na=False)].copy()
+@@ -68,6 +71,8 @@
+ 
+ def main():
+     ap=argparse.ArgumentParser(); ap.add_argument('--base-dir',type=Path,default=Path.cwd())
++    ap.add_argument('--cifar-treatment',choices=['optimized','raw'],default='optimized')
++    ap.add_argument('--cfg-policy', choices=['best-final','recipe','old-paper'], default='best-final')
+     a=ap.parse_args(); base=a.base_dir.resolve(); out=base/OUT_ROOT; out.mkdir(parents=True,exist_ok=True)
+     rows=_read_manifest(base)
+     all_loss=[]; all_eval=[]; statuses=[]; completed=[]
+@@ -89,33 +94,63 @@
+     ev.to_csv(out/'all_eval_records.csv',index=False)
+     pd.DataFrame(statuses).to_csv(out/'run_status.csv',index=False)
+ 
++    def is_main(row):
++        if row['dataset']=='FMNIST':return row['family']=='main'
++        if row['mode']=='independent_pair':return row['family']=='main'
++        if a.cifar_treatment=='optimized':return row['family']=='main' and row['mode']=='cotrained_csem'
++        return row['mode']=='raw_terminal_control' and row['family']=='scale_anchor'
++    # Select CFG on co-trained endpoints, then freeze it across epochs and priors.
++    # All candidates must be Gaussian-start at the EXACT paper RK4-20 budget.
++    import re
++    selected={}; candidates=[]
++    for row,ldf,edf in completed:
++        if not is_main(row) or row['mode']=='independent_pair': continue
++        last=_last(edf)
++        if last is None: continue
++        for c in last.index:
++            if not c.startswith('fid_rk4_20_') or 'initgaussianTK' in c or 'initgaussianT' not in c: continue
++            m=re.search(r'_cfg([0-9]+(?:_[0-9]+)?)_',c)
++            if m and pd.notna(last[c]): candidates.append(dict(dataset=row['dataset'],cfg=float(m.group(1).replace('_','.')),fid=float(last[c])))
++    for dataset in ['FMNIST','CIFAR']:
++        default=3.0 if dataset=='FMNIST' else 2.5
++        if a.cfg_policy=='old-paper': selected[dataset]=1.5 if dataset=='FMNIST' else 3.0
++        elif a.cfg_policy=='recipe': selected[dataset]=default
++        else:
++            cs=pd.DataFrame([r for r in candidates if r['dataset']==dataset])
++            selected[dataset]=float(cs.groupby('cfg').fid.mean().idxmin()) if not cs.empty else default
++    (out/'selected_cfg.json').write_text(json.dumps(dict(policy=a.cfg_policy,cifar_treatment=a.cifar_treatment,selected=selected,selection='mean final co-trained FID, RK4-20, Gaussian start; candidate grid only'),indent=2)+'\n')
+     # Main comparison long curves + endpoint table.
+     curve=[]; endpoints=[]
+     for row,ldf,edf in completed:
+-        if row['family']!='main': continue
++        if not is_main(row): continue
+         for sub in _main_regime(edf,row['mode']):
+-            steps=int(row['rk4_steps'])
++            steps=20; cfg_value=selected[row['dataset']]
+             paper_fid=[]; paper_kid=[]; paper_sw2=[]
+             for _, rr in sub.iterrows():
+-                paper_fid.append(_find_metric(rr,'fid_rk4_',steps)[1])
+-                paper_kid.append(_find_metric(rr,'kid_rk4_',steps)[1])
+-                paper_sw2.append(_find_metric(rr,'sw2_rk4_',steps)[1])
+-            sub=sub.copy()
++                paper_fid.append(_find_metric(rr,'fid_rk4_',steps,cfg=cfg_value)[1])
++                paper_kid.append(_find_metric(rr,'kid_rk4_',steps,cfg=cfg_value)[1])
++                paper_sw2.append(_find_metric(rr,'feature_sw2_rk4_',steps,cfg=cfg_value)[1])
++            sub=_add_meta(sub,row)
+             sub['paper_fid']=paper_fid; sub['paper_kid']=paper_kid; sub['paper_sw2']=paper_sw2
++            sub['paper_latent_sw2']=[_find_metric(rr,'sw2_rk4_',steps,cfg=cfg_value)[1] for _,rr in sub.iterrows()]
++            sub['paper_csem_gap']=pd.to_numeric(sub.get('csem_gap_score_uncond',float('nan')),errors='coerce')
++            sub['paper_cfg']=cfg_value; sub['paper_steps']=steps
+             curve.append(sub)
+             last=_last(sub)
+             if last is None: continue
+-            steps=int(row['rk4_steps'])
+-            fid_col,fid=_find_metric(last,'fid_rk4_',steps)
+-            kid_col,kid=_find_metric(last,'kid_rk4_',steps)
+-            sw_col,sw=_find_metric(last,'sw2_rk4_',steps)
+-            gap=float(last.get('lsi_gap_unet_uncond',float('nan')))
++            steps=20; cfg_value=selected[row['dataset']]
++            fid_col,fid=_find_metric(last,'fid_rk4_',steps,cfg=cfg_value)
++            kid_col,kid=_find_metric(last,'kid_rk4_',steps,cfg=cfg_value)
++            sw_col,sw=_find_metric(last,'feature_sw2_rk4_',steps,cfg=cfg_value)
++            gap=float(last.get('csem_gap_score_uncond',float('nan')))
+             endpoints.append({
+                 'dataset':row['dataset'],'seed':int(row['seed']),'regime':last['regime'],
+-                'epoch':float(last['epoch']),'sampler_steps':steps,'cfg_scale':float(row['cfg_scale']),
++                'epoch':float(last['epoch']),'sampler_steps':steps,'cfg_scale':cfg_value,
+                 'fid':fid,'kid':kid,'sw2':sw,'csem_gap':gap,
+                 'fid_column':fid_col,'kid_column':kid_col,'sw2_column':sw_col,
+                 'recon_fid':float(last.get('fid_vae_recon',float('nan'))),
++                'recon_kid':float(last.get('kid_vae_recon',float('nan'))),
++                'recon_sw2':float(last.get('feature_sw2_vae_recon',float('nan'))),
+             })
+     curves=pd.concat(curve,ignore_index=True,sort=False) if curve else pd.DataFrame()
+     curves.to_csv(out/'main_epoch_curves_long.csv',index=False)
+@@ -125,22 +160,22 @@
+         agg=enddf.groupby(['dataset','regime'],as_index=False).agg(
+             n=('seed','count'),fid_mean=('fid','mean'),fid_sd=('fid','std'),
+             kid_mean=('kid','mean'),kid_sd=('kid','std'),sw2_mean=('sw2','mean'),sw2_sd=('sw2','std'),
+-            csem_gap_mean=('csem_gap','mean'),recon_fid_mean=('recon_fid','mean'))
++            csem_gap_mean=('csem_gap','mean'),recon_fid_mean=('recon_fid','mean'),recon_kid_mean=('recon_kid','mean'),recon_sw2_mean=('recon_sw2','mean'))
+         agg.to_csv(out/'main_final_metrics_aggregate.csv',index=False)
+ 
+     # Scale anchor table: terminal arm is main CIFAR CSEM seed 42; other rows are dedicated cells.
+     scale_rows=[]
+     for row,ldf,edf in completed:
+         if row['dataset']!='CIFAR' or int(row['seed'])!=42: continue
+-        if row['mode']=='cotrained_csem' and row['family']=='main': label='OU-partial + terminal K_TK'
+-        elif row['mode']=='raw_terminal_control': label='Raw mean + terminal K_TK'
++        if row['mode']=='cotrained_csem' and row['family']=='main': continue  # OU-partial is a separate architectural intervention
++        elif row['mode']=='raw_terminal_control' and row['family']=='scale_anchor': label='Raw mean + terminal K_TK'
+         elif row['mode']=='anchor_norm': label='Historical hard GN0'
+         elif row['mode']=='anchor_none': label='No anchor'
+         else: continue
+         le=_last(edf); ll=_last(ldf[ldf.get('stage','')=='cotrain'] if 'stage' in ldf.columns else ldf)
+         if le is None or ll is None: continue
+-        _,fid=_find_metric(le,'fid_rk4_',int(row['rk4_steps']))
+-        _,kid=_find_metric(le,'kid_rk4_',int(row['rk4_steps']))
++        _,fid=_find_metric(le,'fid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))
++        _,kid=_find_metric(le,'kid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))
+         scale_rows.append({'scale_treatment':label,'cell_id':int(row['cell_id']),'recon_loss':float(ll.get('recon',float('nan'))),
+                            'recon_fid':float(le.get('fid_vae_recon',float('nan'))),'csem_loss':float(ll.get('score_mse_weighted',ll.get('score_lsi',float('nan')))),
+                            'terminal_kl':float(ll.get('terminal_kl',float('nan'))),'latent_rms':float(ll.get('latent_rms',float('nan'))),
+@@ -154,35 +189,48 @@
+         if not use: continue
+         le=_last(edf); ll=_last(ldf[ldf.get('stage','')=='cotrain'] if 'stage' in ldf.columns else ldf)
+         if le is None or ll is None: continue
+-        _,fid=_find_metric(le,'fid_rk4_',int(row['rk4_steps']))
+-        _,kid=_find_metric(le,'kid_rk4_',int(row['rk4_steps']))
++        _,fid=_find_metric(le,'fid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))
++        _,kid=_find_metric(le,'kid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))
+         sens.append({'cell_id':int(row['cell_id']),'T_K':float(row['T_K']),'T':float(row['T_full']),'lambda_K':float(row['terminal_kl_w']),
+-                     'csem_w':float(row['csem_w']),'recon_fid':float(le.get('fid_vae_recon',float('nan'))),
+-                     'csem_gap':float(le.get('lsi_gap_unet_uncond',float('nan'))),'terminal_kl':float(ll.get('terminal_kl',float('nan'))),
++                     'csem_w':float(row['csem_w']),'recon_loss':float(ll.get('recon',float('nan'))),'csem_loss':float(ll.get('score_mse_weighted',float('nan'))),'recon_fid':float(le.get('fid_vae_recon',float('nan'))),
++                     'csem_gap':float(le.get('csem_gap_score_uncond',float('nan'))),'terminal_kl':float(ll.get('terminal_kl',float('nan'))),
+                      'latent_rms':float(ll.get('latent_rms',float('nan'))),'posterior_var':float(ll.get('posterior_var',float('nan'))),'fid':fid,'kid':kid})
+     sensdf=pd.DataFrame(sens)
+     if not sensdf.empty: sensdf=sensdf.sort_values(['lambda_K','T'])
+     sensdf.to_csv(out/'terminal_horizon_anchor_sensitivity.csv',index=False)
+ 
++    raw=[]
++    for row,ldf,edf in completed:
++        if row['mode']!='raw_terminal_control' or int(row['seed'])!=42: continue
++        le=_last(edf); ll=_last(ldf[ldf.stage=='cotrain'])
++        if le is None or ll is None: continue
++        raw.append(dict(cell_id=int(row['cell_id']),T_K=float(row['T_K']),T=float(row['T_full']),lambda_K=float(row['terminal_kl_w']),
++            fid=_find_metric(le,'fid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))[1],
++            kid=_find_metric(le,'kid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))[1],
++            latent_rms=ll.get('latent_rms'),terminal_kl=ll.get('terminal_kl'),recon_loss=ll.get('recon'),
++            csem_loss=ll.get('score_mse_weighted'),csem_gap=le.get('csem_gap_score_uncond')))
++    pd.DataFrame(raw).to_csv(out/'raw_anchor_sensitivity.csv',index=False)
++
+     # Naive Tweedie collapse tables and solver-order extraction.
+     collapse=[]; solver=[]
+     for row,ldf,edf in completed:
+-        if row['mode'] not in {'naive_tweedie_cotrain','cotrained_csem'}: continue
++        if row['mode'] not in {'naive_tweedie_cotrain','cotrained_csem','fmnist_aug13_gaussian','raw_terminal_control'}: continue
+         if row['mode']=='cotrained_csem' and not (row['dataset']=='CIFAR' and int(row['seed'])==42 and row['family']=='main'): continue
++        if row['mode']=='raw_terminal_control' and row['family']!='scale_anchor':continue
+         le=_last(edf)
+         if le is None: continue
+         if row['mode']=='naive_tweedie_cotrain':
+             ll=_last(ldf[ldf.get('stage','')=='cotrain'] if 'stage' in ldf.columns else ldf)
+-            _,fid=_find_metric(le,'fid_rk4_',int(row['rk4_steps']))
+-            _,kid=_find_metric(le,'kid_rk4_',int(row['rk4_steps']))
++            _,fid=_find_metric(le,'fid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))
++            _,kid=_find_metric(le,'kid_rk4_',int(row['rk4_steps']),cfg=float(row['cfg_scale']))
+             collapse.append({'dataset':row['dataset'],'seed':int(row['seed']),'epoch':float(le['epoch']),'fid':fid,'kid':kid,
+                              'latent_rms':float(ll.get('latent_rms',float('nan'))) if ll is not None else float('nan'),
+                              'posterior_std':float(ll.get('posterior_std',float('nan'))) if ll is not None else float('nan'),
+                              'posterior_var':float(ll.get('posterior_var',float('nan'))) if ll is not None else float('nan')})
+-        hcol,hfid=_find_metric(le,'fid_heun_',int(row.get('paper_solver_steps',20)))
+-        rcol,rfid=_find_metric(le,'fid_rk4_',int(row.get('paper_solver_steps',20)))
+-        hkcol,hkid=_find_metric(le,'kid_heun_',int(row.get('paper_solver_steps',20)))
+-        rkcol,rkid=_find_metric(le,'kid_rk4_',int(row.get('paper_solver_steps',20)))
++        hcol,hfid=_find_metric(le,'fid_heun_',int(row.get('paper_solver_steps',20)),cfg=float(row['cfg_scale']))
++        rcol,rfid=_find_metric(le,'fid_rk4_',int(row.get('paper_solver_steps',20)),cfg=float(row['cfg_scale']))
++        hkcol,hkid=_find_metric(le,'kid_heun_',int(row.get('paper_solver_steps',20)),cfg=float(row['cfg_scale']))
++        rkcol,rkid=_find_metric(le,'kid_rk4_',int(row.get('paper_solver_steps',20)),cfg=float(row['cfg_scale']))
+         solver.append({'mode':row['mode'],'dataset':row['dataset'],'seed':int(row['seed']),'steps':int(row.get('paper_solver_steps',20)),
+                        'heun_fid':hfid,'heun_kid':hkid,'rk4_fid':rfid,'rk4_kid':rkid,
+                        'heun_fid_column':hcol,'rk4_fid_column':rcol})
+--- v4/csem_paper_core_v1.py
++++ v5/csem_paper_core_v1.py
+@@ -1126,7 +1126,7 @@
+ 
+     if checkpoint_path and os.path.exists(checkpoint_path):
+         print(f"  Loading FID classifier from {checkpoint_path}")
+-        model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
++        model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=bool(cfg.get("paper_weight_only_continuation", False)))
+         model.eval()
+         return model
+ 
+@@ -4546,6 +4546,16 @@
+                         "sampler_t_max": T_eval,
+                     },
+                 ])
++    if cfg.get("paper_cfg_grid") and unet is not None:
++        for g in dict.fromkeys(float(x) for x in cfg["paper_cfg_grid"]):
++            for method, steps in [("rk4_ode", 20), ("rk4_ode", 25), ("heun_sde", 20)]:
++                if not any(c.get("method")==method and c.get("steps")==steps and
++                           c.get("cfg_level")==g and c.get("init_mode")=="gaussian-T"
++                           for c in configs):
++                    configs.append(dict(method=method, steps=steps, desc="Paper Gaussian comparison",
++                        use_rand_token=True, cfg_level=g, init_mode="gaussian-T",
++                        init_temperature=1.0, sampler_t_max=float(cfg["t_max"])))
++
+     results = []
+ 
+     # -----------------------------------------------------------------------
+@@ -4749,6 +4759,8 @@
+             )
+         fake_features = fake_features.to(device)
+ 
++        from paper_eval_extensions_v5 import feature_sw2
++        feature_w2 = feature_sw2(real_features, fake_features, cfg, compute_sw2)
+         fid = compute_fid_from_features(real_features, fake_features)
+         kid = compute_kid(
+             real_features,
+@@ -4772,6 +4784,7 @@
+             "fid": fid,
+             "kid": kid,
+             "w2": w2,
++            "feature_w2": feature_w2,
+             "div": div,
+             "lsi_gap": lsi_gap,
+             "mse_gap_eps": mse_gap_eps if not use_oracle else 0.0,
+@@ -4841,6 +4854,9 @@
+     output_dict: Dict[str, Any] = {}
+     output_dict["lsi_gap_oracle_uncond"] = lsi_gap_oracle
+     output_dict["lsi_gap_unet_uncond"] = lsi_gap_unet
++    from paper_eval_extensions_v5 import score_unit_gap
++    output_dict["csem_gap_score_uncond"] = score_unit_gap(
++        compute_lsi_gap, unet, encoder_mus, encoder_logvars, cfg, device)
+     output_dict["mse_gap_eps_uncond"] = mse_gap_eps
+     output_dict["mse_gap_score_uncond"] = mse_gap_score
+     output_dict.update(oracle_profile_summary)
+@@ -4851,6 +4867,7 @@
+             output_dict["fid_vae_recon"] = r["fid"]
+             output_dict["kid_vae_recon"] = r["kid"]
+             output_dict["sw2_vae_recon"] = r["w2"]
++            output_dict["feature_sw2_vae_recon"] = r["feature_w2"]
+             output_dict["div_vae_recon"] = r["div"]
+         elif "rk4" in config.lower():
+             # Extract everything after @ (e.g., "20_randtok_cfg1.5")
+@@ -4859,6 +4876,7 @@
+             output_dict[f"fid_rk4_{col_suffix}"] = r["fid"]
+             output_dict[f"kid_rk4_{col_suffix}"] = r["kid"]
+             output_dict[f"sw2_rk4_{col_suffix}"] = r["w2"]
++            output_dict[f"feature_sw2_rk4_{col_suffix}"] = r["feature_w2"]
+             output_dict[f"div_rk4_{col_suffix}"] = r["div"]
+             output_dict[f"lsi_gap_rk4_{col_suffix}"] = r["lsi_gap"]
+             output_dict[f"mse_gap_eps_rk4_{col_suffix}"] = r["mse_gap_eps"]
+@@ -4869,6 +4887,7 @@
+             output_dict[f"fid_heun_{col_suffix}"] = r["fid"]
+             output_dict[f"kid_heun_{col_suffix}"] = r["kid"]
+             output_dict[f"sw2_heun_{col_suffix}"] = r["w2"]
++            output_dict[f"feature_sw2_heun_{col_suffix}"] = r["feature_w2"]
+             output_dict[f"div_heun_{col_suffix}"] = r["div"]
+             output_dict[f"lsi_gap_heun_{col_suffix}"] = r["lsi_gap"]
+             output_dict[f"mse_gap_eps_heun_{col_suffix}"] = r["mse_gap_eps"]
+@@ -5977,7 +5996,7 @@
+         ckpt_load_dir = cfg.get("ckpt_load_dir", cfg["ckpt_dir"])
+         if not ckpt_load_dir:
+             raise ValueError("load_from_checkpoint=True but ckpt_load_dir is empty")
+-        if bool(cfg.get("evaluation_only", False)):
++        if bool(cfg.get("evaluation_only", False)) or cfg.get("paper_weight_only_continuation", False):
+             required = [
+                 os.path.join(ckpt_load_dir, "vae_cotrained.pt"),
+                 os.path.join(ckpt_load_dir, "unet_lsi.pt"),
+@@ -5990,15 +6009,17 @@
+                 )
+         print(f"--> Loading checkpoints from {ckpt_load_dir}...")
+         try:
+-            vae.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "vae_cotrained.pt"), map_location=device), strict=False)
++            vae.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "vae_cotrained.pt"), map_location=device), strict=bool(cfg.get("paper_weight_only_continuation", False)))
+             print("    Loaded VAE.")
+         except Exception as e:
++            if cfg.get("paper_weight_only_continuation", False): raise
+             print(f"    Warning: Could not load VAE ({e})")
+ 
+         try:
+             unet_lsi.load_state_dict(torch.load(os.path.join(ckpt_load_dir, "unet_lsi.pt"), map_location=device), strict=False)
+             print("    Loaded UNet LSI.")
+         except Exception as e:
++            if cfg.get("paper_weight_only_continuation", False): raise
+             print(f"    Warning: Could not load UNet LSI ({e})")
+ 
+         try:
+@@ -6225,8 +6246,71 @@
+         f"split_routing={split_score_gradient_routing}"
+     )
+ 
++    start_epoch = int(cfg.get("paper_start_epoch", 0))
++    if not 0 <= start_epoch < int(cfg["epochs_vae"]):
++        raise ValueError("Start epoch must be below the training endpoint")
++    if start_epoch:
++        # V3 saves EMA weights only. Continue the original cosine tail explicitly;
++        # AdamW and discriminator start afresh, so this is a labeled warm start.
++        for group, base_lr in zip(opt_joint.param_groups, sched_joint.base_lrs):
++            group["lr"] = 1e-6 + (base_lr-1e-6)*(1+math.cos(math.pi*start_epoch/lr_schedule_epochs))/2
++        sched_joint.last_epoch=start_epoch
++        sched_joint._last_lr=[g["lr"] for g in opt_joint.param_groups]
++        source_frames=cfg.get("paper_source_dataframes")
++        if source_frames:
++            old_loss=os.path.join(source_frames,"loss_history.csv")
++            old_eval=os.path.join(source_frames,"eval_metrics.csv")
++            if os.path.isfile(old_loss): loss_records=pd.read_csv(old_loss).to_dict("records")
++            if os.path.isfile(old_eval): eval_records=pd.read_csv(old_eval).to_dict("records")
++    def save_paper_training_state(epoch):
++        if not cfg.get("paper_cfg_grid") or freeze_score_in_cotrain: return
++        import random as _random
++        state=dict(epoch=int(epoch),cfg=dict(cfg),vae=vae.state_dict(),
++            score=unet_lsi.state_dict(),score_ema=unet_lsi_ema.state_dict(),
++            control=unet_control.state_dict(),control_ema=unet_control_ema.state_dict(),
++            joint_optimizer=opt_joint.state_dict(),joint_scheduler=sched_joint.state_dict(),
++            discriminator=disc.state_dict() if disc is not None else None,
++            discriminator_optimizer=opt_disc.state_dict() if opt_disc is not None else None,
++            torch_rng=torch.get_rng_state(),cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
++            numpy_rng=np.random.get_state(),python_rng=_random.getstate(),loss_records=loss_records,eval_records=eval_records,
++            global_cotrain_batch=global_cotrain_batch)
++        os.makedirs(cfg["ckpt_dir"],exist_ok=True)
++        dest=os.path.join(cfg["ckpt_dir"],"training_state_latest.pt")
++        torch.save(state,dest+".tmp");os.replace(dest+".tmp",dest)
++        # Retain the best recipe-CFG Gaussian RK4-20 checkpoint as well as latest.
++        import json as _json
++        token=str(float(cfg["cfg_eval_scale"])).replace(".","_")
++        key=f"fid_rk4_20_randtok_cfg{token}_temp1_initgaussianT"
++        active=[r for r in eval_records if r.get("tag")=="LSI_Diff"]
++        if active:
++            metric=next((k for k in active[-1] if k.startswith(key) and "initgaussianTK" not in k),None)
++            if metric is not None:
++                current=float(active[-1].get(metric,float("nan")))
++                earlier=[float(r.get(metric,float("nan"))) for r in active[:-1]]
++                previous=min((v for v in earlier if math.isfinite(v)),default=math.inf)
++                if math.isfinite(current) and current<previous:
++                    best=os.path.join(cfg["ckpt_dir"],"training_state_best_fid.pt")
++                    torch.save(state,best+".tmp");os.replace(best+".tmp",best)
++                    with open(os.path.join(cfg["ckpt_dir"],"best_fid.json"),"w") as f:
++                        _json.dump(dict(epoch=int(epoch),fid=current,metric=metric,cfg=cfg["cfg_eval_scale"],sampler="RK4-20 Gaussian"),f,indent=2)
++
++    resume_path=cfg.get("paper_resume_state")
++    if resume_path:
++        import random as _random
++        state=torch.load(resume_path,map_location=device,weights_only=False)
++        for key in ['dataset','seed','T_terminal','t_max','latent_anchor_mode','lr_schedule_epochs','score_w_vae','kl_w','lr_score_head','lr_vae']:
++            if state['cfg'].get(key)!=cfg.get(key): raise ValueError(f"Resume configuration mismatch: {key}")
++        vae.load_state_dict(state['vae']);unet_lsi.load_state_dict(state['score']);unet_lsi_ema.load_state_dict(state['score_ema'])
++        unet_control.load_state_dict(state['control']);unet_control_ema.load_state_dict(state['control_ema'])
++        opt_joint.load_state_dict(state['joint_optimizer']);sched_joint.load_state_dict(state['joint_scheduler'])
++        if disc is not None: disc.load_state_dict(state['discriminator']);opt_disc.load_state_dict(state['discriminator_optimizer'])
++        start_epoch=int(state['epoch']);loss_records=state['loss_records'];eval_records=state['eval_records'];global_cotrain_batch=state['global_cotrain_batch']
++        torch.set_rng_state(state['torch_rng'].cpu())
++        if torch.cuda.is_available(): torch.cuda.set_rng_state_all([x.cpu() for x in state['cuda_rng']])
++        np.random.set_state(state['numpy_rng']);_random.setstate(state['python_rng'])
++        if start_epoch>=cfg['epochs_vae']:raise ValueError("Checkpoint already reached requested endpoint")
+     print("--> Starting Dual Co-training...")
+-    for ep in range(cfg["epochs_vae"]):
++    for ep in range(start_epoch, cfg["epochs_vae"]):
+         epoch_t0 = time.perf_counter()
+         vae.train(); unet_lsi.train(); unet_control.train()
+         if ep < encoder_score_warmup_epochs:
+@@ -7605,6 +7689,8 @@
+                 os.replace(in_progress_eval_tmp_path, in_progress_eval_path)
+ 
+ 
++        if should_eval_cotrain: save_paper_training_state(ep + 1)
++
+     # ===========================================================================
+     # REFINEMENT STAGE: Freeze VAE, train only score networks
+     # ===========================================================================
+@@ -7812,6 +7898,7 @@
+                 "perc": 0.0,
+             }
+             loss_records.append(epoch_metrics)
++            pd.DataFrame(loss_records).to_csv(os.path.join(results_dir, "dataframes", "loss_history.csv"), index=False)
+ 
+             print(f"Refine Ep {ep+1} | LSI: {epoch_metrics['score_lsi']:.4f} | "
+                   f"Ctrl: {epoch_metrics['score_control']:.4f} | AuxLam: {epoch_metrics['aux_lam']:.4f} | AuxNu: {epoch_metrics['aux_nu']:.4f}")
+@@ -7821,7 +7908,7 @@
+             if sched_control_refine is not None:
+                 sched_control_refine.step()
+ 
+-            if (ep + 1) % eval_freq_refine == 0:
++            if (ep + 1) % eval_freq_refine == 0 or (ep + 1) == epochs_refine:
+                 # For refine phase:
+                 # - Cotrain mode: LDM epoch = epochs_vae + refine_epoch
+                 # - Indep mode: LDM epoch = refine_epoch (VAE phase had no LDM training)
+@@ -7878,6 +7965,7 @@
+                         results_ctrl["stage"] = "refine"
+                         results_ctrl["tag"] = "Ctrl_Diff_Refine"
+                         eval_records.append(results_ctrl)
++                pd.DataFrame(eval_records).to_csv(os.path.join(results_dir, "dataframes", "eval_metrics_in_progress.csv"), index=False)
+ 
+     # --- Save Checkpoints ---
+     save_checkpoint(vae.state_dict(), os.path.join(cfg["ckpt_dir"], "vae_cotrained.pt"))
+--- v4/csem_paper_final_v1_manifest.csv
++++ v5/csem_paper_final_v1_manifest.csv
+@@ -1,19 +1,23 @@
+ cell_id,family,dataset,mode,seed,epochs_joint,epochs_refine,T_K,T_full,csem_w,terminal_kl_w,latent_anchor_mode,beta0,score_time_weighting,score_head_time_weighting,lr_score_head,lr_refine,cfg_scale,rk4_steps,eval_every,eval_samples,paper_solver_suite,paper_solver_steps,result_name,notes
+-0,main,CIFAR,cotrained_csem,42,500,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,1,20,cifar_main_csem_oupartial_s42,optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL
+-1,main,CIFAR,cotrained_csem,43,500,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,1,20,cifar_main_csem_oupartial_s43,optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL
+-2,main,CIFAR,independent_pair,42,500,0,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_main_independent_pair_s42_v4,exact T_K=0 standard VAE; beta0=.07; CSEM and Tweedie heads trained simultaneously on same detached latent stream
+-3,main,CIFAR,independent_pair,43,500,0,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_main_independent_pair_s43_v4,exact T_K=0 standard VAE; beta0=.07; CSEM and Tweedie heads trained simultaneously on same detached latent stream
+-4,main,FMNIST,fmnist_aug13_gaussian,42,700,0,2.0,2.0,0.60,1.0,none,0.01,unweighted-eps,unweighted-eps,0.0003333333333333334,0.00001,3.0,25,50,10000,0,20,fmnist_main_csem_aug13_gaussian_v4_s42,Aug13 recovered Gaussian-start terminal KL run; legacy joint optimizer/head loss .6; source and log included; exact 5.04 not located
+-5,main,FMNIST,fmnist_aug13_gaussian,43,700,0,2.0,2.0,0.60,1.0,none,0.01,unweighted-eps,unweighted-eps,0.0003333333333333334,0.00001,3.0,25,50,10000,0,20,fmnist_main_csem_aug13_gaussian_v4_s43,Aug13 recovered Gaussian-start terminal KL run; legacy joint optimizer/head loss .6; source and log included; exact 5.04 not located
+-6,main,FMNIST,independent_pair,42,700,0,0.0,2.0,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.00001,3.0,25,50,10000,0,20,fmnist_main_independent_pair_v4_s42,Matched FMNIST 700 epochs/T2/CFG3/10000 eval; detached two-stage heads; tracking and evaluation fixes; beta0=.01; head LR8e-4
+-7,main,FMNIST,independent_pair,43,700,0,0.0,2.0,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.00001,3.0,25,50,10000,0,20,fmnist_main_independent_pair_v4_s43,Matched FMNIST 700 epochs/T2/CFG3/10000 eval; detached two-stage heads; tracking and evaluation fixes; beta0=.01; head LR8e-4
++0,main,CIFAR,cotrained_csem,42,800,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,1,20,cifar_main_csem_oupartial_s42_v5_800,optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL
++1,main,CIFAR,cotrained_csem,43,800,0,1.05,1.35,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,1,20,cifar_main_csem_oupartial_s43_v5_800,optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL
++2,main,CIFAR,independent_pair,42,800,800,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.0001,2.5,25,50,10000,1,20,cifar_main_independent_pair_s42_v4_v5_800_frozen,VAE-only training followed by equally long paired CSEM/Tweedie prior training on ONE frozen VAE; score-training epoch clock
++3,main,CIFAR,independent_pair,43,800,800,0.0,1.35,0.0,0.07,none,0.07,disabled-two-stage,unweighted-eps,0.0001,0.0001,2.5,25,50,10000,1,20,cifar_main_independent_pair_s43_v4_v5_800_frozen,VAE-only training followed by equally long paired CSEM/Tweedie prior training on ONE frozen VAE; score-training epoch clock
++4,main,FMNIST,fmnist_aug13_gaussian,42,700,0,2.0,2.0,0.60,1.0,none,0.01,unweighted-eps,unweighted-eps,0.0003333333333333334,0.00001,3.0,25,50,10000,1,20,fmnist_main_csem_aug13_gaussian_v4_s42_v5_paper,Aug13 recovered Gaussian-start terminal KL run; legacy joint optimizer/head loss .6; source and log included; exact 5.04 not located
++5,main,FMNIST,fmnist_aug13_gaussian,43,700,0,2.0,2.0,0.60,1.0,none,0.01,unweighted-eps,unweighted-eps,0.0003333333333333334,0.00001,3.0,25,50,10000,1,20,fmnist_main_csem_aug13_gaussian_v4_s43_v5_paper,Aug13 recovered Gaussian-start terminal KL run; legacy joint optimizer/head loss .6; source and log included; exact 5.04 not located
++6,main,FMNIST,independent_pair,42,700,700,0.0,2.0,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.0008,3.0,25,50,10000,1,20,fmnist_main_independent_pair_v4_s42_frozen,VAE-only training followed by equally long paired CSEM/Tweedie prior training on ONE frozen VAE; score-training epoch clock
++7,main,FMNIST,independent_pair,43,700,700,0.0,2.0,0.0,0.01,none,0.01,disabled-two-stage,unweighted-eps,0.0008,0.0008,3.0,25,50,10000,1,20,fmnist_main_independent_pair_v4_s43_frozen,VAE-only training followed by equally long paired CSEM/Tweedie prior training on ONE frozen VAE; score-training epoch clock
+ 8,replication,FMNIST,fmnist_aug18_recovered,42,400,0,1.5,1.5,0.10,0.30,none,0.01,canonical,unweighted-eps,0.0008,0.00001,3.0,25,50,10000,0,20,fmnist_aug18_shared_cfg3_replication_v4_s42,Aug18 same-sample routing restored; oracle-qT-class result4.97; not deployable headline; N10000 from original launch log
+-9,scale_anchor,CIFAR,anchor_norm,42,500,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_anchor_norm_s42,historical hard GN0 no terminal KL; ablation control
+-10,scale_anchor,CIFAR,anchor_none,42,500,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_anchor_none_s42,intentional no-anchor failure control; scale blow-up is expected
+-11,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.25,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p25_wK0p60_s42,T sensitivity lower point with optimized OU-partial anchor held on
+-12,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.45,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p45_wK0p60_s42,T sensitivity upper point with optimized OU-partial anchor held on
+-13,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.40,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p35_wK0p40_s42,terminal-KL sensitivity lower point with optimized OU-partial anchor held on
+-14,horizon_anchor,CIFAR,sensitivity,42,500,0,1.05,1.35,0.05,0.80,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,0,5000,0,20,cifar_oupartial_T1p35_wK0p80_s42,terminal-KL sensitivity upper point with optimized OU-partial anchor held on
++9,scale_anchor,CIFAR,anchor_norm,42,800,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_anchor_norm_s42_v5_800,historical hard GN0 no terminal KL; ablation control
++10,scale_anchor,CIFAR,anchor_none,42,800,0,1.05,1.35,0.05,0.0,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_anchor_none_s42_v5_800,intentional no-anchor failure control; scale blow-up is expected
++11,horizon_anchor,CIFAR,sensitivity,42,800,0,1.05,1.25,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,5000,0,20,cifar_oupartial_T1p25_wK0p60_s42_v5_800,T sensitivity lower point with optimized OU-partial anchor held on
++12,horizon_anchor,CIFAR,sensitivity,42,800,0,1.05,1.45,0.05,0.60,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,5000,0,20,cifar_oupartial_T1p45_wK0p60_s42_v5_800,T sensitivity upper point with optimized OU-partial anchor held on
++13,horizon_anchor,CIFAR,sensitivity,42,800,0,1.05,1.35,0.05,0.40,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,5000,0,20,cifar_oupartial_T1p35_wK0p40_s42_v5_800,terminal-KL sensitivity lower point with optimized OU-partial anchor held on
++14,horizon_anchor,CIFAR,sensitivity,42,800,0,1.05,1.35,0.05,0.80,ou_partial,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,5000,0,20,cifar_oupartial_T1p35_wK0p80_s42_v5_800,terminal-KL sensitivity upper point with optimized OU-partial anchor held on
+ 15,tweedie_collapse,CIFAR,naive_tweedie_cotrain,42,100,0,1.35,1.35,1.0,0.0,none,0.07,unweighted-eps,unweighted-eps,0.0001,0.000015,2.5,20,10,2000,1,20,cifar_naive_tweedie_cotrain_s42,intentional collapse control; not an optimized generation arm
+-16,scale_anchor,CIFAR,raw_terminal_control,42,500,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_raw_terminal_kl_control_s42,paired raw-mean terminal-KL-only control for OU-partial gain
+-17,scale_anchor,CIFAR,raw_terminal_control,43,500,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,100,10000,0,20,cifar_raw_terminal_kl_control_s43,paired raw-mean terminal-KL-only control for OU-partial gain
++16,scale_anchor,CIFAR,raw_terminal_control,42,800,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_raw_terminal_kl_control_s42_v5_800,paired raw-mean terminal-KL-only control for OU-partial gain
++17,scale_anchor,CIFAR,raw_terminal_control,43,800,0,1.05,1.35,0.05,0.60,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_raw_terminal_kl_control_s43_v5_800,paired raw-mean terminal-KL-only control for OU-partial gain
++18,raw_anchor_sensitivity,CIFAR,raw_terminal_control,42,800,0,0.95,1.35,0.05,0.6,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_raw_TK0p95_K0p6_s42_v5_800,Controlled raw-mean terminal boundary/weight sweep; no architecture normalization; T_full fixed1.35
++19,raw_anchor_sensitivity,CIFAR,raw_terminal_control,42,800,0,1.15,1.35,0.05,0.6,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_raw_TK1p15_K0p6_s42_v5_800,Controlled raw-mean terminal boundary/weight sweep; no architecture normalization; T_full fixed1.35
++20,raw_anchor_sensitivity,CIFAR,raw_terminal_control,42,800,0,1.05,1.35,0.05,0.4,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_raw_TK1p05_K0p4_s42_v5_800,Controlled raw-mean terminal boundary/weight sweep; no architecture normalization; T_full fixed1.35
++21,raw_anchor_sensitivity,CIFAR,raw_terminal_control,42,800,0,1.05,1.35,0.05,0.8,none,0.07,canonical,unweighted-eps,0.0001,0.000015,2.5,25,50,10000,0,20,cifar_raw_TK1p05_K0p8_s42_v5_800,Controlled raw-mean terminal boundary/weight sweep; no architecture normalization; T_full fixed1.35
+--- v4/csem_paper_suite_v1.py
++++ v5/csem_paper_suite_v1.py
+@@ -214,7 +214,7 @@
+         cfg.update({
+             "use_latent_norm": True,
+             "latent_anchor_mode": "none",
+-            "kl_reg_type": "normal",
++            "kl_reg_type": "terminal",
+             "kl_w": 0.0,
+             "freeze_score_in_cotrain": False,
+             "cotrain_head": "lsi",
+@@ -224,29 +224,23 @@
+         cfg.update({
+             "use_latent_norm": False,
+             "latent_anchor_mode": "none",
+-            "kl_reg_type": "normal",
++            "kl_reg_type": "terminal",
+             "kl_w": 0.0,
+             "freeze_score_in_cotrain": False,
+             "cotrain_head": "lsi",
+             "train_tracking_head": False,
+         })
+     elif mode == "independent_pair":
+-        # Exact standard two-stage limit, using the newer Aug-24 Pareto protocol.
+-        # T_K=0 removes every diffusion-derived gradient to the VAE and K_0 is
+-        # ordinary time-zero VAE KL.  Crucially, the two score heads train during
+-        # the same 500/400 epochs on detached latents from ONE shared VAE, so the
+-        # independent CSEM and Tweedie comparisons receive the same representation,
+-        # batches, optimizer horizon and evaluation checkpoints.  There is no
+-        # wasteful second equally-long score-only phase.
++        # Paper baseline: VAE-only stage, then both priors on the same frozen VAE.
+         cfg.update({
+             "T_terminal": 0.0,
+-            "epochs_refine": 0,
++            "epochs_refine": int(cfg["epochs_refine"] or cfg["epochs_vae"]),
+             "score_w_vae": 0.0,
+             "kl_reg_type": "terminal",
+             "kl_w": float(beta0),
+             "use_latent_norm": False,
+             "latent_anchor_mode": "none",
+-            "freeze_score_in_cotrain": False,
++            "freeze_score_in_cotrain": True,
+             "cotrain_head": "lsi",
+             "train_tracking_head": True,
+             "factored_head": True,
+@@ -282,7 +276,7 @@
+             "score_head_loss_w": float(cfg["score_w_vae"]),
+             "lr_ldm": float(cfg["lr_score_head"]) * float(cfg["score_w_vae"]),
+             "base_lr_ldm": float(cfg["lr_score_head"]) * float(cfg["score_w_vae"]),
+-            "evaluation_contract": "gaussian_randtoken_cfg3_heun50_rk4_25_inception_10000",
++            "evaluation_contract": "original_gaussian_cfg3_heun50_rk4_25_plus_paper_rk4_20_cfg3_1p5_heun20_and_feature_sw2_score_gap",
+             "paper_solver_suite": False,
+             "eval_tk_vs_t_comparison": False,
+             "generate_visualizations": False,
+@@ -292,6 +286,8 @@
+     if mode == "independent_pair":
+         # Equal tracking LR for the two independently trained heads.
+         cfg["lr_ldm"] = cfg["lr_score_head"]
++        cfg["lr_refine"] = cfg["lr_score_head"]
++        cfg["eval_tk_vs_t_comparison"] = False
+     return cfg
+ 
+ 
+@@ -317,6 +313,9 @@
+         lr_refine_override=(float(row["lr_refine"]) if row.get("lr_refine", "").strip() else None),
+     )
+     cfg = configure_mode(cfg, mode, beta0=float(row.get("beta0", 0.07) or 0.07))
++    cfg["paper_cfg_grid"] = [float(row["cfg_scale"])]
++    if row["family"] == "main" or (mode == "raw_terminal_control" and row["family"] == "scale_anchor"):
++        cfg["paper_cfg_grid"].append(1.5 if row["dataset"] == "FMNIST" else 3.0)
+     cfg["paper_cell_id"] = int(row["cell_id"])
+     cfg["paper_family"] = row["family"]
+     cfg["paper_result_name"] = row["result_name"]
+@@ -338,13 +337,16 @@
+             historical.torch.backends.cuda.matmul.allow_tf32 = True
+             historical.torch.backends.cudnn.allow_tf32 = True
+             historical.torch.set_float32_matmul_precision("high")
++        from paper_eval_extensions_v5 import install_historical_evaluator
++        install_historical_evaluator(historical, source)
+         loss_df, eval_df = historical.train_vae_cotrained_cond(cfg)
+         # The recovered source starts from N(0,I) but uses legacy column names.
+         # Explicitly label that contract for the existing paper compiler.
+         renamed = {}
++        import re
+         for c in eval_df.columns:
+-            if "_randtok_cfg3_0" in c:
+-                renamed[c] = c.replace("_randtok_cfg3_0", "_randtok_cfg3_0_temp1_initgaussianT2")
++            if "_randtok_cfg" in c and "_init" not in c:
++                renamed[c] = re.sub(r"(_randtok_cfg[0-9]+_[0-9]+)", r"_temp1_initgaussianT2", c)
+         eval_df = eval_df.rename(columns=renamed)
+         eval_df.to_csv(result_root / "dataframes" / "eval_metrics.csv", index=False)
+     else:
+--- v4/plot_csem_paper_final_v1.py
++++ v5/plot_csem_paper_final_v1.py
+@@ -1,88 +1,90 @@
+ #!/usr/bin/env python3
+-from __future__ import annotations
+-import argparse
++"""Publication PNG/PDF figures for every experimental placeholder."""
+ from pathlib import Path
++import argparse,json
+ import numpy as np
+ import pandas as pd
++import matplotlib
++matplotlib.use('Agg')
++import matplotlib.pyplot as plt
+ from pandas.errors import EmptyDataError
+-import matplotlib.pyplot as plt
++OUT_ROOT='csem_paper_compiled_v1';FIG_ROOT='csem_paper_figures_v1'
++STYLES={'Co-trained CSEM':('#1f77b4','-','o'),'Independent CSEM':('#1f77b4','--','o'),'Independent Tweedie':('#d62728','--','s')}
++plt.rcParams.update({'font.size':10,'pdf.fonttype':42,'ps.fonttype':42})
+ 
+-OUT_ROOT='csem_paper_compiled_v1'
+-FIG_ROOT='csem_paper_figures_v1'
++def read(p):
++    if not p.is_file(): return pd.DataFrame()
++    try:return pd.read_csv(p)
++    except EmptyDataError:return pd.DataFrame()
+ 
+-def save_line(df,x,y,group,title,ylabel,path):
+-    if df.empty or y not in df.columns: return
+-    plt.figure(figsize=(7.2,4.8))
+-    for name,g in df.groupby(group):
+-        gg=g.sort_values(x)
+-        if gg[y].notna().any(): plt.plot(gg[x],gg[y],marker='o',label=str(name))
+-    plt.xlabel(x.replace('_',' ')); plt.ylabel(ylabel); plt.title(title); plt.grid(alpha=.25); plt.legend(); plt.tight_layout(); plt.savefig(path,dpi=220); plt.close()
++def save(fig,p):
++    fig.tight_layout();fig.savefig(p.with_suffix('.png'),dpi=240,bbox_inches='tight');fig.savefig(p.with_suffix('.pdf'),bbox_inches='tight');plt.close(fig)
++
++def lines(ax,d,x,y,group,ylabel,main=False):
++    if d.empty or not {x,y,group}.issubset(d.columns):return False
++    drawn=False
++    for name,g in d.groupby(group,sort=False):
++        q=g[[x,y]].copy();q[x]=pd.to_numeric(q[x],errors='coerce');q[y]=pd.to_numeric(q[y],errors='coerce');q=q.dropna()
++        if q.empty:continue
++        stats=q.groupby(x)[y].agg(['mean','std','count']).sort_index();color,style,marker=STYLES.get(name,(None,'-','o'))
++        ax.plot(stats.index,stats['mean'],label=name,color=color,linestyle=style,marker=marker if main else None,markersize=4)
++        band=stats[stats['count']>1]
++        if len(band):ax.fill_between(band.index,band['mean']-band['std'],band['mean']+band['std'],color=color,alpha=.12)
++        drawn=True
++    ax.set_xlabel('LDM training epoch' if main else x.replace('_',' '));ax.set_ylabel(ylabel);ax.grid(alpha=.22)
++    if drawn:ax.legend(fontsize=8)
++    else:ax.text(.5,.5,'Awaiting finite results',ha='center',transform=ax.transAxes)
++    return drawn
+ 
+ def main():
+-    ap=argparse.ArgumentParser(); ap.add_argument('--base-dir',type=Path,default=Path.cwd())
+-    a=ap.parse_args(); base=a.base_dir.resolve(); comp=base/OUT_ROOT; figs=base/FIG_ROOT; figs.mkdir(parents=True,exist_ok=True)
+-
+-    curves_path=comp/'main_epoch_curves_long.csv'
+-    if curves_path.is_file():
+-        try: d=pd.read_csv(curves_path)
+-        except EmptyDataError: d=pd.DataFrame()
+-        for dataset in sorted(d['dataset'].dropna().unique()) if 'dataset' in d.columns else []:
+-            q=d[d['dataset']==dataset].copy()
+-            # Average seeds at each regime/epoch when multiple seeds exist.
+-            agg=q.groupby(['regime','epoch'],as_index=False).agg(paper_fid=('paper_fid','mean'),paper_kid=('paper_kid','mean'),paper_sw2=('paper_sw2','mean'))
+-            save_line(agg,'epoch','paper_fid','regime',f'{dataset}: generation FID vs score-training epoch','FID ↓',figs/f'main_{dataset.lower()}_fid_vs_epoch.png')
+-            save_line(agg,'epoch','paper_kid','regime',f'{dataset}: generation KID vs score-training epoch','KID ↓',figs/f'main_{dataset.lower()}_kid_vs_epoch.png')
+-            save_line(agg,'epoch','paper_sw2','regime',f'{dataset}: latent SW2 vs score-training epoch','SW2 ↓',figs/f'main_{dataset.lower()}_sw2_vs_epoch.png')
+-
+-    loss_path=comp/'all_loss_history.csv'
+-    if loss_path.is_file():
+-        try: l=pd.read_csv(loss_path)
+-        except EmptyDataError: l=pd.DataFrame()
+-        # CIFAR scale-anchor dynamics: certified terminal arm + dedicated norm/no-anchor cells.
+-        ids={'cifar_main_csem_oupartial_s42':'OU-partial + terminal K_TK','cifar_raw_terminal_kl_control_s42':'Raw mean + terminal K_TK','cifar_anchor_norm_s42':'Historical hard GN0','cifar_anchor_none_s42':'No anchor'}
+-        s=l[l['result_name'].isin(ids)].copy() if 'result_name' in l.columns else pd.DataFrame()
+-        if not s.empty:
+-            s['scale_treatment']=s['result_name'].map(ids)
+-            s=s[s['stage']=='cotrain']
+-            for metric,label,fn in [
+-                ('recon','reconstruction loss','scale_anchor_reconstruction.png'),
+-                ('score_mse_weighted','CSEM loss','scale_anchor_csem_loss.png'),
+-                ('terminal_kl','terminal K_TK','scale_anchor_terminal_kl.png'),
+-                ('latent_rms','latent RMS','scale_anchor_latent_rms.png'),
+-                ('posterior_var','posterior variance','scale_anchor_posterior_variance.png'),
+-            ]:
+-                if metric in s.columns: save_line(s,'epoch',metric,'scale_treatment',f'Scale-anchor ablation: {label}',label,figs/fn)
+-
+-        n=l[l['result_name']=='cifar_naive_tweedie_cotrain_s42'].copy() if 'result_name' in l.columns else pd.DataFrame()
+-        if not n.empty:
+-            n=n[n['stage']=='cotrain']
+-            if 'posterior_std' in n.columns: save_line(n,'epoch','posterior_std','result_name','Naive Tweedie co-training: posterior scale','mean posterior std',figs/'tweedie_collapse_posterior_std.png')
+-            if 'latent_rms' in n.columns: save_line(n,'epoch','latent_rms','result_name','Naive Tweedie co-training: latent RMS','latent RMS',figs/'tweedie_collapse_latent_rms.png')
+-
+-    sens_path=comp/'terminal_horizon_anchor_sensitivity.csv'
+-    if sens_path.is_file():
+-        try: s=pd.read_csv(sens_path)
+-        except EmptyDataError: s=pd.DataFrame()
+-        if not s.empty:
+-            q=s[np.isclose(s['lambda_K'],0.60)].sort_values('T')
+-            if len(q):
+-                plt.figure(figsize=(6.6,4.6)); plt.plot(q['T'],q['fid'],marker='o'); plt.xlabel('Full horizon T'); plt.ylabel('FID ↓'); plt.title('Terminal horizon sensitivity (lambda_K=0.60)'); plt.grid(alpha=.25); plt.tight_layout(); plt.savefig(figs/'sensitivity_T_fid.png',dpi=220); plt.close()
+-            q=s[np.isclose(s['T'],1.35)].sort_values('lambda_K')
+-            if len(q):
+-                plt.figure(figsize=(6.6,4.6)); plt.plot(q['lambda_K'],q['fid'],marker='o'); plt.xlabel('lambda_K'); plt.ylabel('FID ↓'); plt.title('Terminal-anchor weight sensitivity (T=1.35)'); plt.grid(alpha=.25); plt.tight_layout(); plt.savefig(figs/'sensitivity_lambdaK_fid.png',dpi=220); plt.close()
+-
+-    solver_path=comp/'solver_order_comparison.csv'
+-    if solver_path.is_file():
+-        try: s=pd.read_csv(solver_path)
+-        except EmptyDataError: s=pd.DataFrame()
+-        if not s.empty and {'heun_fid','rk4_fid'}.issubset(s.columns):
+-            s=s.dropna(subset=['heun_fid','rk4_fid'],how='all')
+-        else:
+-            s=pd.DataFrame()
+-        for _,r in s.iterrows():
+-            vals=[r.get('heun_fid',np.nan),r.get('rk4_fid',np.nan)]
+-            plt.figure(figsize=(5.6,4.4)); plt.bar(['Heun SDE','RK4 ODE'],vals); plt.ylabel('FID ↓'); plt.title(f"{r['mode']} solver comparison ({int(r['steps'])} steps)"); plt.tight_layout(); plt.savefig(figs/f"solver_{r['mode']}_{r['dataset'].lower()}_fid.png",dpi=220); plt.close()
+-
+-    print(f'Figures -> {figs}')
++    ap=argparse.ArgumentParser();ap.add_argument('--base-dir',type=Path,default=Path.cwd());a=ap.parse_args();base=a.base_dir.resolve();comp=base/OUT_ROOT;figs=base/FIG_ROOT;figs.mkdir(parents=True,exist_ok=True)
++    d=read(comp/'main_epoch_curves_long.csv');l=read(comp/'all_loss_history.csv');coverage={};missing=[]
++    for dataset in ['FMNIST','CIFAR']:
++        q=d[d.dataset==dataset].copy() if 'dataset' in d else pd.DataFrame()
++        found=set(q.regime.dropna()) if 'regime' in q else set()
++        missing.extend(f'{dataset}: {r}' for r in STYLES if r not in found)
++        for metric,label,tag in [('paper_fid','FID ↓','fid'),('paper_kid','KID ↓','kid'),('paper_sw2','Feature SW2 ↓','sw2'),('paper_latent_sw2','Latent SW2² ↓','latent_sw2'),('paper_csem_gap','CSEM gap (score units) ↓','csem_gap')]:
++            fig,ax=plt.subplots(figsize=(6.3,4.3));ok=lines(ax,q,'epoch',metric,'regime',label,True)
++            cfg=q.paper_cfg.iloc[0] if 'paper_cfg' in q and len(q) else '?'
++            ax.set_title(f'{dataset}: RK4-20, CFG={cfg}');stem=f'main_{dataset.lower()}_{tag}_vs_epoch';save(fig,figs/stem);coverage[stem]=ok
++    fig,axs=plt.subplots(1,2,figsize=(11,4))
++    for ax,dataset,metric,label in [(axs[0],'FMNIST','paper_fid','FID ↓'),(axs[1],'CIFAR','paper_kid','KID ↓')]:
++        q=d[d.dataset==dataset] if 'dataset' in d else pd.DataFrame();lines(ax,q,'epoch',metric,'regime',label,True)
++        cfg=q.paper_cfg.iloc[0] if 'paper_cfg' in q and len(q) else '?';ax.set_title(f'{dataset}: RK4-20, CFG={cfg}')
++    save(fig,figs/'main_old_paper_epoch_comparison')
++    # Only the controlled raw/GN/no-anchor treatments enter the central panel.
++    if 'mode' in l and 'stage' in l:
++        s=l[(l.seed.astype(str)=='42')&(l.stage=='cotrain')&l['mode'].isin(['raw_terminal_control','anchor_norm','anchor_none'])].copy()
++        s['treatment']=s['mode'].map({'raw_terminal_control':'Raw mean + terminal KL','anchor_norm':'Per-sample mean normalization','anchor_none':'No anchor'})
++        fig,axs=plt.subplots(2,2,figsize=(10,7))
++        for ax,m,label in zip(axs.flat,['recon','score_mse_weighted','terminal_kl','latent_rms'],['Reconstruction loss','CSEM training loss','Terminal K_TK','Mean latent RMS']):
++            lines(ax,s,'epoch',m,'treatment',label);ax.set_title(label)
++            f,aa=plt.subplots(figsize=(6.3,4.3));coverage['scale_'+m]=lines(aa,s,'epoch',m,'treatment',label);save(f,figs/('scale_anchor_'+m))
++        save(fig,figs/'scale_anchor_dynamics')
++        n=l[(l['mode']=='naive_tweedie_cotrain')&(l.stage=='cotrain')]
++        fig,axs=plt.subplots(1,2,figsize=(10,4))
++        for ax,m,label in zip(axs,['latent_rms','posterior_var'],['Posterior mean RMS','Mean posterior variance']):lines(ax,n,'epoch',m,'result_name',label)
++        save(fig,figs/'tweedie_collapse_mean_variance')
++        for m in ['posterior_var','posterior_std','latent_rms']:
++            f,ax=plt.subplots(figsize=(6.3,4.3));coverage['collapse_'+m]=lines(ax,n,'epoch',m,'result_name',m.replace('_',' '));save(f,figs/('tweedie_collapse_'+m))
++        c=l[(l['mode']=='cotrained_csem')&(l.dataset=='CIFAR')&(l.stage=='cotrain')]
++        for m in ['lr_vae_current','lr_score_current','recon','score_mse_weighted']:
++            f,ax=plt.subplots(figsize=(6.3,4.3));lines(ax,c,'epoch',m,'result_name',m.replace('_',' '));save(f,figs/('cifar_training_'+m))
++    # Sampling horizon T and anchor weight, plus raw-mean anchor-horizon controls.
++    for filename,axis,center,center_val,stem in [('terminal_horizon_anchor_sensitivity.csv','T','lambda_K',.6,'sensitivity_T'),('terminal_horizon_anchor_sensitivity.csv','lambda_K','T',1.35,'sensitivity_lambdaK'),('raw_anchor_sensitivity.csv','T_K','lambda_K',.6,'raw_sensitivity_TK'),('raw_anchor_sensitivity.csv','lambda_K','T_K',1.05,'raw_sensitivity_lambdaK')]:
++        s=read(comp/filename)
++        if {axis,center}.issubset(s):s=s[np.isclose(s[center],center_val)].copy();s['series']='Matched controls'
++        fig,axs=plt.subplots(2,3,figsize=(12,7))
++        for ax,m,label in zip(axs.flat,['fid','kid','latent_rms','terminal_kl','recon_loss','csem_gap'],['FID ↓','KID ↓','Latent RMS','Terminal K_TK','Reconstruction loss','CSEM gap (score units) ↓']):
++            lines(ax,s,axis,m,'series',label);ax.set_title(label)
++        save(fig,figs/stem);coverage[stem]=not s.empty
++    s=read(comp/'solver_order_comparison.csv')
++    for _,r in s.iterrows():
++        fig,axs=plt.subplots(1,2,figsize=(9,4))
++        for ax,m,label in zip(axs,['fid','kid'],['FID ↓','KID ↓']):ax.bar(['Heun SDE','RK4 ODE'],[r.get('heun_'+m,np.nan),r.get('rk4_'+m,np.nan)]);ax.set_ylabel(label)
++        fig.suptitle(f"{r['dataset']}: {r['mode']}, {int(r['steps'])} steps (different NFEs)")
++        save(fig,figs/f"solver_{r['mode']}_{r['dataset'].lower()}")
++    (figs/'figure_coverage.json').write_text(json.dumps(dict(figures_with_data=coverage,missing_regimes=missing,note='Missing curves are never fabricated; bands are across-seed SD where n>1.'),indent=2)+'\n')
++    print(f'Figures -> {figs}; missing main regimes: {missing}')
+     return 0
+-if __name__=='__main__': raise SystemExit(main())
++if __name__=='__main__':raise SystemExit(main())
+--- v4/validate_csem_paper_final_v1.py
++++ v5/validate_csem_paper_final_v1.py
+@@ -27,8 +27,8 @@
+         assert cfg['t_max'] >= cfg['T_terminal'] >= 0
+         assert close(cfg['lr_score_head'],r['lr_score_head'])
+         if r['mode']=='independent_pair':
+-            assert cfg['T_terminal']==0 and not cfg['freeze_score_in_cotrain'] and cfg['train_tracking_head']
+-            assert cfg['epochs_refine']==0 and cfg['score_w_vae']==0
++            assert cfg['T_terminal']==0 and cfg['freeze_score_in_cotrain'] and cfg['train_tracking_head']
++            assert cfg['epochs_refine']==int(r['epochs_refine']) and cfg['epochs_refine']>0 and cfg['score_w_vae']==0
+             assert close(cfg['lr_ldm'],cfg['lr_score_head'])
+             assert close(cfg['kl_w'],r['beta0']) and cfg['kl_reg_type']=='terminal'
+         if r['mode']=='naive_tweedie_cotrain':
+--- v4/verify_fmnist_v4.py
++++ v5/verify_fmnist_v4.py
+@@ -62,6 +62,6 @@
+ assert np.allclose(seen[0][0],scope['z_t_head'])
+ assert np.allclose(seen[0][1],scope['t_head'])
+ assert math.isclose(scope['tracking_loss'],2.5)
+-assert '_randtok_cfg3_0' in (base/'csem_paper_suite_v1.py').read_text()
+-print('PASS: 18 resolved configs; Gaussian/T_K/oracle/NaN/solver filtering; both independent regimes; actual full-horizon Tweedie tracking target.')
++assert '_randtok_cfg' in (base/'csem_paper_suite_v1.py').read_text()
++print('PASS: 22 resolved configs; Gaussian/T_K/oracle/NaN/solver filtering; both independent regimes; actual full-horizon Tweedie tracking target.')
+ print('Torch/CUDA training and FID reproduction require the cluster GPU environment.')
