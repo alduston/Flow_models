@@ -469,7 +469,20 @@ def prepare_data(base, datasets):
     return 0
 
 
-def submit_jobs(base, spec, dry_run=False, restart=False):
+def parse_sbatch_job_id(output):
+    """Vista adds a site banner even with --parsable; accept only ID lines."""
+    import re
+    matches=[]
+    for line in output.splitlines():
+        match=re.fullmatch(r'\s*(?:Submitted batch job\s+)?([1-9][0-9]*)(?:;[A-Za-z0-9_.-]+)?\s*',line)
+        if match: matches.append(match.group(1))
+    ids=set(matches)
+    if len(ids)!=1:
+        raise RuntimeError(f'Cannot uniquely parse submitted Slurm job ID: {output!r}')
+    return matches[-1]
+
+
+def submit_jobs(base, spec, dry_run=False, restart=False, prepare_job_id=None):
     rows=_read_manifest(base);by={int(r['cell_id']):r for r in rows}
     selected=parse_cells(spec,rows)
     # Every command skips completed validated cells; missing is the safe default.
@@ -496,12 +509,18 @@ def submit_jobs(base, spec, dry_run=False, restart=False):
     datasets=','.join(dict.fromkeys(by[c]['dataset'] for c in pending))
     prep=['sbatch','--parsable','--job-name=csem_prepare','--time=02:00:00',
           f'--export=ALL,TASK=prepare,DATASETS={datasets.replace(",",":")},BASE_DIR={base}',str(base/'job.slurm')]
-    print(' '.join(prep))
     prep_id='PREP_JOB_ID'
-    if not dry_run:
+    if prepare_job_id is not None:
+        prep_id=parse_sbatch_job_id(str(prepare_job_id))
+        print(f'[reuse] preparation job {prep_id}; training depends on its successful completion')
+    else:
+        print(' '.join(prep))
+    if not dry_run and prepare_job_id is None:
         q=subprocess.run(prep,cwd=base,text=True,capture_output=True,check=True)
-        prep_id=q.stdout.strip().split(';')[0]
-        if not prep_id.isdigit(): raise RuntimeError(f'Cannot parse preparation job ID: {q.stdout!r}')
+        receipt=dict(stdout=q.stdout,stderr=q.stderr,submitted_utc=datetime.now(timezone.utc).isoformat(),datasets=datasets)
+        write_json(base/STATUS_ROOT/'preparation_submission.json',receipt)
+        prep_id=parse_sbatch_job_id(q.stdout)
+        write_json(base/STATUS_ROOT/'preparation_submission.json',dict(receipt,slurm_job_id=prep_id))
     for cid in pending:
         row=by[cid]
         cmd=['sbatch','--parsable',f'--dependency=afterok:{prep_id}',
@@ -509,11 +528,10 @@ def submit_jobs(base, spec, dry_run=False, restart=False):
         print(' '.join(cmd),f'# {row["dataset"]}: {row["outputs"]}, seed={row["seed"]}')
         if not dry_run:
             q=subprocess.run(cmd,cwd=base,text=True,capture_output=True,check=True)
-            jobid=q.stdout.strip().split(';')[0]
-            if not jobid.isdigit(): raise RuntimeError(f'Cannot parse job ID: {q.stdout!r}')
+            jobid=parse_sbatch_job_id(q.stdout)
             current=read_status(base,row)
             if not (str(current.get('slurm_job_id'))==jobid and current.get('started_utc')):
-                write_json(base/STATUS_ROOT/f'cell_{cid:03d}.json',dict(row,returncode=None,slurm_job_id=jobid,config_hash=config_hash(row),queued_utc=datetime.now(timezone.utc).isoformat()))
+                write_json(base/STATUS_ROOT/f'cell_{cid:03d}.json',dict(row,returncode=None,slurm_job_id=jobid,prepare_job_id=prep_id,config_hash=config_hash(row),queued_utc=datetime.now(timezone.utc).isoformat()))
     return 0
 
 
@@ -588,6 +606,7 @@ def main():
         if name=='submit':
             p.add_argument('--cells',default='missing',help='missing, all, main, independent, family, 2-3,6-7')
             p.add_argument('--dry-run',action='store_true');p.add_argument('--restart-incomplete',action='store_true')
+            p.add_argument('--prepare-job-id',help='Reuse an already submitted preparation job covering these datasets')
         if name=='run':
             p.add_argument('--cell-id',type=int,required=True);p.add_argument('--resume',action='store_true');p.add_argument('--restart',action='store_true')
         if name=='import-v5':p.add_argument('--source',type=Path,required=True)
@@ -599,7 +618,7 @@ def main():
         import tests
         return tests.run(base)
     if a.command=='prepare-data':return prepare_data(base,a.datasets.split(','))
-    if a.command=='submit':return submit_jobs(base,a.cells,a.dry_run,a.restart_incomplete)
+    if a.command=='submit':return submit_jobs(base,a.cells,a.dry_run,a.restart_incomplete,a.prepare_job_id)
     if a.command=='run':return run_job(base,a.cell_id,a.resume,a.restart)
     if a.command=='import-v5':return import_v5(base,a.source)
     if a.command=='plot':return plot_results(['--base-dir',str(base)])
