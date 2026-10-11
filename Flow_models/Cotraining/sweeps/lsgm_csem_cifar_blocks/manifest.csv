@@ -1,0 +1,27 @@
+cell_id,phase,family,groups,latent_per_group,num_nf,vae_cell,objective,prior_factorization,csem_band,csem_terminal,rep_horizon,csem_lambda_K,dae_channels_per_head,epochs,batch_size,seed,result_name,notes
+A0,A,calibration,4,45,2,,lsgm,joint,1,1,1.0,1.0,0,400,256,42,A0,Published best-NLL reproduction backbone
+A1,A,main,1,180,0,,lsgm,joint,1,1,1.0,1.0,0,400,256,42,A1,"Shared stage-1 checkpoint, best validation"
+A2,A,main,2,90,0,,lsgm,joint,1,1,1.0,1.0,0,400,256,42,A2,"Shared stage-1 checkpoint, best validation"
+A4,A,main,4,45,0,,lsgm,joint,1,1,1.0,1.0,0,400,256,42,A4,"Shared stage-1 checkpoint, best validation"
+B0,B,calibration,4,45,2,A0,lsgm,joint,1,1,1.0,1.0,0,1000,128,42,B0,"Published ablation calibration, nf=2"
+B1-L,B,main,1,180,0,A1,lsgm,joint,1,1,1.0,1.0,0,1000,128,42,B1-L,"Matched joint LSGM baseline, nf=0"
+B1-C,B,main,1,180,0,A1,csem,joint,1,1,1.0,1.0,0,1000,128,42,B1-C,CSEM + terminal KL + small-time band
+B2-L,B,main,2,90,0,A2,lsgm,joint,1,1,1.0,1.0,0,1000,128,42,B2-L,"Matched joint LSGM baseline, nf=0"
+B2-C,B,main,2,90,0,A2,csem,cascade,1,1,1.0,1.0,352,1000,128,42,B2-C,CSEM + terminal KL + small-time band
+B4-L,B,main,4,45,0,A4,lsgm,joint,1,1,1.0,1.0,0,1000,128,42,B4-L,"Matched joint LSGM baseline, nf=0"
+B4-C,B,main,4,45,0,A4,csem,cascade,1,1,1.0,1.0,256,1000,128,42,B4-C,CSEM + terminal KL + small-time band
+B2-LC,B,cascade_control,2,90,0,A2,lsgm,cascade,1,1,1.0,1.0,352,1000,128,42,B2-LC,DSM cascade isolates prior factorization
+B4-LC,B,cascade_control,4,45,0,A4,lsgm,cascade,1,1,1.0,1.0,256,1000,128,42,B4-LC,DSM cascade isolates prior factorization
+B1-Cnb,B,ablation,1,180,0,A1,csem,joint,0,1,1.0,1.0,0,1000,128,42,B1-Cnb,Band-off ablation
+B1-C2H,B,ablation,1,180,0,A1,csem,joint,1,1,0.4544,12,0,1000,128,42,B1-C2H,"Short representation horizon, full head horizon"
+C0,C,calibration,4,45,2,B0,lsgm,joint,1,1,1.0,1.0,0,0,128,42,C0,50k final-checkpoint ODE FID and test NLL
+C1-L,C,main,1,180,0,B1-L,lsgm,joint,1,1,1.0,1.0,0,0,128,42,C1-L,50k final-checkpoint ODE FID and test NLL
+C1-C,C,main,1,180,0,B1-C,csem,joint,1,1,1.0,1.0,0,0,128,42,C1-C,50k final-checkpoint ODE FID and test NLL
+C2-L,C,main,2,90,0,B2-L,lsgm,joint,1,1,1.0,1.0,0,0,128,42,C2-L,50k final-checkpoint ODE FID and test NLL
+C2-C,C,main,2,90,0,B2-C,csem,cascade,1,1,1.0,1.0,352,0,128,42,C2-C,50k final-checkpoint ODE FID and test NLL
+C4-L,C,main,4,45,0,B4-L,lsgm,joint,1,1,1.0,1.0,0,0,128,42,C4-L,50k final-checkpoint ODE FID and test NLL
+C4-C,C,main,4,45,0,B4-C,csem,cascade,1,1,1.0,1.0,256,0,128,42,C4-C,50k final-checkpoint ODE FID and test NLL
+C2-LC,C,cascade_control,2,90,0,B2-LC,lsgm,cascade,1,1,1.0,1.0,352,0,128,42,C2-LC,50k final-checkpoint ODE FID and test NLL
+C4-LC,C,cascade_control,4,45,0,B4-LC,lsgm,cascade,1,1,1.0,1.0,256,0,128,42,C4-LC,50k final-checkpoint ODE FID and test NLL
+C1-Cnb,C,ablation,1,180,0,B1-Cnb,csem,joint,0,1,1.0,1.0,0,0,128,42,C1-Cnb,50k final-checkpoint ODE FID and test NLL
+C1-C2H,C,ablation,1,180,0,B1-C2H,csem,joint,1,1,0.4544,12,0,0,128,42,C1-C2H,50k final-checkpoint ODE FID and test NLL

@@ -1,0 +1,199 @@
+{
+  "torch": "2.7.1+cpu",
+  "cuda_available": false,
+  "model_smokes": [
+    {
+      "cell": "B1-L",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19420.66015625,
+      "p_loss_first": 155.6210479736328,
+      "seconds": 2.501002311706543,
+      "vae_parameters": 86232,
+      "prior_parameters": 940804,
+      "prior_parameters_per_head": [
+        940804
+      ]
+    },
+    {
+      "cell": "B1-C",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19439.98046875,
+      "p_loss_first": 4.4057769775390625,
+      "seconds": 0.9574110507965088,
+      "vae_parameters": 86232,
+      "prior_parameters": 940804,
+      "prior_parameters_per_head": [
+        940804
+      ]
+    },
+    {
+      "cell": "B2-C",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19402.052734375,
+      "p_loss_first": 4.4765167236328125,
+      "seconds": 1.7325146198272705,
+      "vae_parameters": 127632,
+      "prior_parameters": 1882216,
+      "prior_parameters_per_head": [
+        940804,
+        941412
+      ]
+    },
+    {
+      "cell": "B4-C",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19414.701171875,
+      "p_loss_first": 4.556591987609863,
+      "seconds": 3.657996892929077,
+      "vae_parameters": 210432,
+      "prior_parameters": 3766768,
+      "prior_parameters_per_head": [
+        940804,
+        941412,
+        941988,
+        942564
+      ]
+    },
+    {
+      "cell": "B2-LC",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19353.90234375,
+      "p_loss_first": 289.4150695800781,
+      "seconds": 1.608255386352539,
+      "vae_parameters": 127632,
+      "prior_parameters": 1882216,
+      "prior_parameters_per_head": [
+        940804,
+        941412
+      ]
+    },
+    {
+      "cell": "B0",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19412.646484375,
+      "p_loss_first": 556.8941650390625,
+      "seconds": 1.466907262802124,
+      "vae_parameters": 219520,
+      "prior_parameters": 944272,
+      "prior_parameters_per_head": [
+        944272
+      ]
+    },
+    {
+      "cell": "B1-C2H",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19431.869140625,
+      "p_loss_first": 4.4057769775390625,
+      "seconds": 1.0050737857818604,
+      "vae_parameters": 86232,
+      "prior_parameters": 940804,
+      "prior_parameters_per_head": [
+        940804
+      ]
+    },
+    {
+      "cell": "B1-Cnb",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19439.615234375,
+      "p_loss_first": 4.4057769775390625,
+      "seconds": 0.8956897258758545,
+      "vae_parameters": 86232,
+      "prior_parameters": 940804,
+      "prior_parameters_per_head": [
+        940804
+      ]
+    },
+    {
+      "cell": "B2-L",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19354.49609375,
+      "p_loss_first": 290.0607604980469,
+      "seconds": 2.228595733642578,
+      "vae_parameters": 127632,
+      "prior_parameters": 941960,
+      "prior_parameters_per_head": [
+        941960
+      ]
+    },
+    {
+      "cell": "B4-L",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19374.474609375,
+      "p_loss_first": 552.627685546875,
+      "seconds": 1.3550243377685547,
+      "vae_parameters": 210432,
+      "prior_parameters": 944272,
+      "prior_parameters_per_head": [
+        944272
+      ]
+    },
+    {
+      "cell": "B4-LC",
+      "device": "cpu",
+      "full_size": false,
+      "five_training_steps": true,
+      "gradient_routing": true,
+      "prior_gradients_p_only": true,
+      "q_loss_first": 19379.537109375,
+      "p_loss_first": 555.0328979492188,
+      "seconds": 3.5235824584960938,
+      "vae_parameters": 210432,
+      "prior_parameters": 3766768,
+      "prior_parameters_per_head": [
+        940804,
+        941412,
+        941988,
+        942564
+      ]
+    }
+  ],
+  "numeric_checks": true,
+  "cascade_contract_checks": true,
+  "production_cuda_training": "not run; no CUDA GPU in this workspace",
+  "real_RK45_cascade_sampling": true,
+  "real_conditional_ODE_NLL": true,
+  "real_NVAE_decoding": true,
+  "source_and_configuration_validation": true,
+  "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+  "production_parameter_counts": "architecture_counts.json"
+}
