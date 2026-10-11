@@ -195,16 +195,6 @@ def select_cells(spec, rows):
     return [r for r in rows if int(r['cell_id']) in ids]
 
 
-def parse_slurm_job_id(output):
-    """Read the final job-ID record, ignoring site banners and diagnostics."""
-    for line in reversed(output.splitlines()):
-        match = re.fullmatch(r'(?:Submitted batch job\s+)?([0-9]+)(?:;[^\s;]+)?', line.strip())
-        if match:
-            return match.group(1)
-    raise RuntimeError(f'Cannot parse Slurm job ID: {output!r}. '
-                       'sbatch succeeded, so check squeue before submitting again.')
-
-
 def submit_jobs(base, spec='all', *, dry_run=False, restart=False, data_root=None):
     selected = select_cells(spec, manifest(base))
     pending, active_jobs = [], None
@@ -238,7 +228,9 @@ def submit_jobs(base, spec='all', *, dry_run=False, restart=False, data_root=Non
         print(shlex.join(cmd))
         if not dry_run:
             q = subprocess.run(cmd, cwd=base, text=True, capture_output=True, check=True)
-            jobid = parse_slurm_job_id(q.stdout)
+            jobid = q.stdout.strip().split(';')[0]
+            if not jobid.isdigit():
+                raise RuntimeError(f'Cannot parse Slurm job ID: {q.stdout!r}')
             current = status(base, row)
             if not (str(current.get('slurm_job_id')) == jobid and current.get('started_utc')):
                 atomic_json(status_path(base, row), dict(row, returncode=None,
