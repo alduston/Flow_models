@@ -446,6 +446,9 @@ def run_job(base, cid, resume=False, restart=False):
         write_json(status_path,payload);started=time.time()
         try:
             print(f'Cell {cid}: {row["dataset"]}, {row["outputs"]}, seed={row["seed"]}')
+            # Preparation is inside this job, so no external Slurm dependency can strand it.
+            # Shared staging/locks in paper_io preserve a valid cache across simultaneous jobs.
+            prepare_data(base,[row['dataset']])
             loss,evaluation,cfg=run_cell(row,base,resume=resume)
             validate_evaluation(row,evaluation)
             payload.update(returncode=0,loss_rows=len(loss),eval_rows=len(evaluation),resolved_config=cfg)
@@ -482,12 +485,12 @@ def parse_sbatch_job_id(output):
     return matches[-1]
 
 
-def submit_jobs(base, spec, dry_run=False, restart=False, prepare_job_id=None):
+def submit_jobs(base, spec, dry_run=False, restart=False, prepare_job_id=None, recover_stalled=False):
     rows=_read_manifest(base);by={int(r['cell_id']):r for r in rows}
     selected=parse_cells(spec,rows)
-    # Every command skips completed validated cells; missing is the safe default.
-    pending=[]
-    active_jobs=None
+    pending=[];active_jobs=None;recovered=[];blocked=[]
+    if prepare_job_id is not None:
+        print('[info] Preparation now runs inside each training job; --prepare-job-id is no longer used.')
     for cid in selected:
         row=by[cid];st=read_status(base,row)
         if st.get('returncode')==0:
@@ -497,33 +500,46 @@ def submit_jobs(base, spec, dry_run=False, restart=False, prepare_job_id=None):
         if st.get('returncode') is None and st.get('slurm_job_id'):
             if active_jobs is None:
                 import getpass
-                q=subprocess.run(['squeue','-h','-u',getpass.getuser(),'-o','%i'],capture_output=True,text=True)
-                if q.returncode: raise RuntimeError('Could not check existing Slurm jobs')
-                active_jobs=set(q.stdout.split())
-            if str(st['slurm_job_id']) in active_jobs:
-                print(f'[skip] active cell {cid}, Slurm job {st["slurm_job_id"]}');continue
+                q=subprocess.run(['squeue','-h','-u',getpass.getuser(),'-o','%i|%T|%r|%Z'],capture_output=True,text=True)
+                if q.returncode: raise RuntimeError(f'Could not check existing Slurm jobs: {q.stderr}')
+                active_jobs={}
+                for line in q.stdout.splitlines():
+                    fields=line.strip().split('|',3)
+                    if len(fields)==4 and fields[0].strip().isdigit():
+                        job,state,reason,directory=(v.strip() for v in fields)
+                        active_jobs[job]=dict(state=state,reason=reason,workdir=directory)
+            jobid=str(st['slurm_job_id']);job=active_jobs.get(jobid)
+            if job is not None:
+                if job['state']=='PENDING' and job['reason'].strip('()')=='DependencyNeverSatisfied':
+                    if not recover_stalled:
+                        blocked.append(cid)
+                        print(f'[blocked] cell {cid}, job {jobid}: DependencyNeverSatisfied; use --recover-stalled')
+                        continue
+                    if Path(job['workdir']).resolve()!=base.resolve():
+                        raise ValueError(f'Refusing to modify job {jobid}: its working directory is {job["workdir"]}')
+                    if st.get('config_hash')!=config_hash(row):
+                        raise ValueError(f'Refusing to recover cell {cid}: queued configuration differs from manifest')
+                    cmd=['scontrol','update',f'JobId={jobid}','Dependency=']
+                    print('[recover] '+' '.join(cmd)+f' # cell {cid}; dataset preparation runs inside the job')
+                    if not dry_run:
+                        subprocess.run(cmd,capture_output=True,text=True,check=True)
+                        write_json(base/STATUS_ROOT/f'recovered_job_{jobid}.json',dict(cell_id=cid,slurm_job_id=jobid,
+                            previous_prepare_job_id=st.get('prepare_job_id'),action='cleared failed dependency',
+                            recovered_utc=datetime.now(timezone.utc).isoformat()))
+                    recovered.append(cid)
+                else:
+                    print(f'[skip] active cell {cid}, Slurm job {jobid}: {job["state"]} ({job["reason"]})')
+                continue
         pending.append(cid)
-    print(f'Selected {len(pending)} unfinished jobs: {pending}')
+    print(f'Selected {len(pending)} new training jobs: {pending}; recovered {len(recovered)} stalled jobs: {recovered}')
+    if blocked:
+        raise RuntimeError(f'Cells {blocked} are stranded. Rerun submit with --recover-stalled.')
     if not pending:return 0
     (base/'slurm_logs').mkdir(exist_ok=True)
-    datasets=','.join(dict.fromkeys(by[c]['dataset'] for c in pending))
-    prep=['sbatch','--parsable','--job-name=csem_prepare','--time=02:00:00',
-          f'--export=ALL,TASK=prepare,DATASETS={datasets.replace(",",":")},BASE_DIR={base}',str(base/'job.slurm')]
-    prep_id='PREP_JOB_ID'
-    if prepare_job_id is not None:
-        prep_id=parse_sbatch_job_id(str(prepare_job_id))
-        print(f'[reuse] preparation job {prep_id}; training depends on its successful completion')
-    else:
-        print(' '.join(prep))
-    if not dry_run and prepare_job_id is None:
-        q=subprocess.run(prep,cwd=base,text=True,capture_output=True,check=True)
-        receipt=dict(stdout=q.stdout,stderr=q.stderr,submitted_utc=datetime.now(timezone.utc).isoformat(),datasets=datasets)
-        write_json(base/STATUS_ROOT/'preparation_submission.json',receipt)
-        prep_id=parse_sbatch_job_id(q.stdout)
-        write_json(base/STATUS_ROOT/'preparation_submission.json',dict(receipt,slurm_job_id=prep_id))
+    print('Dataset preparation/validation runs inside each job under the shared cache lock; no preparation-job dependency.')
     for cid in pending:
         row=by[cid]
-        cmd=['sbatch','--parsable',f'--dependency=afterok:{prep_id}',
+        cmd=['sbatch','--parsable',f'--job-name=csem_c{cid:02d}',
              f'--export=ALL,TASK=run,CELL_ID={cid},BASE_DIR={base},RESTART={int(restart)}',str(base/'job.slurm')]
         print(' '.join(cmd),f'# {row["dataset"]}: {row["outputs"]}, seed={row["seed"]}')
         if not dry_run:
@@ -531,7 +547,10 @@ def submit_jobs(base, spec, dry_run=False, restart=False, prepare_job_id=None):
             jobid=parse_sbatch_job_id(q.stdout)
             current=read_status(base,row)
             if not (str(current.get('slurm_job_id'))==jobid and current.get('started_utc')):
-                write_json(base/STATUS_ROOT/f'cell_{cid:03d}.json',dict(row,returncode=None,slurm_job_id=jobid,prepare_job_id=prep_id,config_hash=config_hash(row),queued_utc=datetime.now(timezone.utc).isoformat()))
+                write_json(base/STATUS_ROOT/f'cell_{cid:03d}.json',dict(row,returncode=None,slurm_job_id=jobid,
+                    preparation='inside training job under cache lock',config_hash=config_hash(row),
+                    queued_utc=datetime.now(timezone.utc).isoformat()))
+            print(f'[submitted] cell {cid}: job {jobid}')
     return 0
 
 
@@ -606,7 +625,8 @@ def main():
         if name=='submit':
             p.add_argument('--cells',default='missing',help='missing, all, main, independent, family, 2-3,6-7')
             p.add_argument('--dry-run',action='store_true');p.add_argument('--restart-incomplete',action='store_true')
-            p.add_argument('--prepare-job-id',help='Reuse an already submitted preparation job covering these datasets')
+            p.add_argument('--prepare-job-id',help='Deprecated; preparation now runs inside training jobs')
+            p.add_argument('--recover-stalled',action='store_true',help='Clear failed dependencies on pending jobs belonging to this sweep')
         if name=='run':
             p.add_argument('--cell-id',type=int,required=True);p.add_argument('--resume',action='store_true');p.add_argument('--restart',action='store_true')
         if name=='import-v5':p.add_argument('--source',type=Path,required=True)
@@ -618,7 +638,7 @@ def main():
         import tests
         return tests.run(base)
     if a.command=='prepare-data':return prepare_data(base,a.datasets.split(','))
-    if a.command=='submit':return submit_jobs(base,a.cells,a.dry_run,a.restart_incomplete,a.prepare_job_id)
+    if a.command=='submit':return submit_jobs(base,a.cells,a.dry_run,a.restart_incomplete,a.prepare_job_id,a.recover_stalled)
     if a.command=='run':return run_job(base,a.cell_id,a.resume,a.restart)
     if a.command=='import-v5':return import_v5(base,a.source)
     if a.command=='plot':return plot_results(['--base-dir',str(base)])

@@ -269,28 +269,114 @@ def report_checks(base,rows):
 
 def submission_checks(base, rows):
     import paper
+    banner='''
+-----------------------------------------------------------------
+          Welcome to the Vista Supercomputer
+-----------------------------------------------------------------
+
+No reservation for this job
+--> Verifying valid submit host (login1)...OK
+--> Verifying valid jobname...OK
+--> Verifying valid ssh keys...OK
+--> Verifying access to desired queue (gh)...OK
+--> Checking available allocation (DMS22021)...OK
+--> Quotas are not currently enabled for filesystem /home1/10812/ald4435...OK
+'''
+    assert paper.parse_sbatch_job_id(banner+'1063217\n')=='1063217'
+    assert paper.parse_sbatch_job_id(banner+'1063217;vista\n')=='1063217'
+    assert paper.parse_sbatch_job_id('Submitted batch job 1063217\n')=='1063217'
+    for bad in [banner,banner+'123\n456\n',banner+'not submitted\n']:
+        try:paper.parse_sbatch_job_id(bad)
+        except RuntimeError:pass
+        else:raise AssertionError('Ambiguous/missing Slurm ID accepted')
     with tempfile.TemporaryDirectory() as temp:
         root=Path(temp);(root/'manifest.csv').write_bytes((base/'manifest.csv').read_bytes())
-        paper.write_json(root/'status'/'cell_006.json',dict(returncode=None,slurm_job_id='123'))
-        paper.write_json(root/'status'/'cell_007.json',dict(returncode=None,slurm_job_id='124'))
-        calls=[];next_id=2000
-        original=paper.subprocess.run
+        states={2:('202','PENDING','DependencyNeverSatisfied'),3:('203','RUNNING','None'),
+                6:('206','PENDING','Resources'),7:('207','PENDING','DependencyNeverSatisfied')}
+        for cid,(job,_,_) in states.items():
+            paper.write_json(root/'status'/f'cell_{cid:03d}.json',dict(rows[cid],returncode=None,
+                slurm_job_id=job,prepare_job_id='1063217',config_hash=paper.config_hash(rows[cid])))
+        calls=[];next_id=2000;original=paper.subprocess.run
         def mocked(cmd,**kw):
             nonlocal next_id
             calls.append(cmd)
-            if cmd[0]=='squeue':return types.SimpleNamespace(returncode=0,stdout='123\n',stderr='')
+            if cmd[0]=='squeue':
+                text='\n'.join(f'{job}|{state}|{reason}|{root}' for job,state,reason in states.values())+'\n'
+                return types.SimpleNamespace(returncode=0,stdout=text,stderr='')
+            if cmd[0]=='scontrol':return types.SimpleNamespace(returncode=0,stdout='',stderr='')
             assert cmd[0]=='sbatch';next_id+=1
-            return types.SimpleNamespace(returncode=0,stdout=str(next_id)+'\n',stderr='')
+            return types.SimpleNamespace(returncode=0,stdout=banner+str(next_id)+';vista\n',stderr='')
         paper.subprocess.run=mocked
-        try:paper.submit_jobs(root,'independent')
+        try:
+            # Pending failed-dependency jobs must not silently be considered healthy active jobs.
+            try:paper.submit_jobs(root,'2')
+            except RuntimeError as exc:assert '--recover-stalled' in str(exc)
+            else:raise AssertionError('Stranded job silently skipped')
+            assert not any(c[0] in {'scontrol','sbatch'} for c in calls)
+            calls.clear();paper.submit_jobs(root,'2,3,6',recover_stalled=True)
+            assert [c for c in calls if c[0]=='scontrol']==[['scontrol','update','JobId=202','Dependency=']]
+            assert not any(c[0]=='sbatch' for c in calls)
+            assert paper.read_status(root,rows[2])['slurm_job_id']=='202'
+            assert (root/'status'/'recovered_job_202.json').is_file()
+            # New/missing jobs have no preparation dependency or separate preparation submission.
+            states.clear();calls.clear()
+            paper.submit_jobs(root,'independent')
+            sbatch=[c for c in calls if c[0]=='sbatch']
+            assert len(sbatch)==4
+            assert all(not any('--dependency' in arg or 'TASK=prepare' in arg for arg in c) for c in sbatch)
+            assert {int(arg.split('CELL_ID=')[1].split(',')[0]) for cmd in sbatch for arg in cmd if 'CELL_ID=' in arg}=={2,3,6,7}
+            # Old --prepare-job-id calls cannot recreate dependency on the failed job.
+            calls.clear();paper.submit_jobs(root,'2',prepare_job_id='1063217')
+            assert all(not any('--dependency' in arg for arg in c) for c in calls if c[0]=='sbatch')
+            states[2]=('2005','PENDING','DependencyNeverSatisfied')
+            calls.clear();paper.submit_jobs(root,'2',dry_run=True,recover_stalled=True)
+            assert not any(c[0] in {'scontrol','sbatch'} for c in calls)
+            # Refuse to alter an ID belonging to a different working directory.
+            wrong=paper.read_status(root,rows[2]);wrong['slurm_job_id']='999';paper.write_json(root/'status'/'cell_002.json',wrong)
+            def foreign(cmd,**kw):
+                calls.append(cmd)
+                if cmd[0]=='squeue':return types.SimpleNamespace(returncode=0,stdout='999|PENDING|DependencyNeverSatisfied|/another/sweep\n',stderr='')
+                raise AssertionError('Foreign job modified')
+            paper.subprocess.run=foreign;calls.clear()
+            try:paper.submit_jobs(root,'2',recover_stalled=True)
+            except ValueError as exc:assert 'working directory' in str(exc)
+            else:raise AssertionError('Foreign working directory accepted')
         finally:paper.subprocess.run=original
-        sbatch=[c for c in calls if c[0]=='sbatch']
-        assert len(sbatch)==4 # One preparation + three priors, with live cell 6 skipped.
-        assert any('TASK=prepare' in c for c in sbatch[0])
-        assert all('--dependency=afterok:2001' in c for c in sbatch[1:])
-        assert {int(c.split('CELL_ID=')[1].split(',')[0]) for cmd in sbatch[1:] for c in cmd if 'CELL_ID=' in c}=={2,3,7}
-        assert paper.read_status(root,rows[6])['slurm_job_id']=='123'
-        assert paper.read_status(root,rows[7])['slurm_job_id']=='2004'
+
+
+def run_preparation_checks(base, rows):
+    import paper
+    with tempfile.TemporaryDirectory() as temp:
+        root=Path(temp);(root/'manifest.csv').write_bytes((base/'manifest.csv').read_bytes())
+        row=rows[15] # Small collapse fixture: validation requires the final Gaussian FID.
+        fakecore=types.ModuleType('core');fakecore.DATASET_INFO={'CIFAR':{'class':TinyDataset}}
+        fakesuite=types.ModuleType('suite');seen=[]
+        def train(r,base,resume=False):
+            pair=load_prepared_pair(TinyDataset,base/'data_cache_v6','CIFAR')
+            assert tuple(map(len,pair))==(3,3);seen.append('prepared before training')
+            frame=pd.DataFrame([dict(epoch=100,stage='cotrain',tag='Ctrl_Diff',
+                fid_rk4_20_randtok_cfg2_5_temp1_initgaussianT1p35=5.)])
+            return pd.DataFrame([dict(epoch=100,stage='cotrain')]),frame,{}
+        fakesuite.run_cell=train
+        previous={name:sys.modules.get(name) for name in ['core','suite']}
+        sys.modules.update(core=fakecore,suite=fakesuite)
+        try:
+            assert paper.run_job(root,15)==0
+            assert seen==['prepared before training']
+            assert paper.read_status(root,row)['returncode']==0
+            # Preparation errors are recorded by the job, not a permanent queue dependency.
+            class FailingDataset:
+                def __init__(self,*a,**k):raise RuntimeError('injected download failure')
+            fakecore.DATASET_INFO['CIFAR']['class']=FailingDataset
+            paper.write_json(root/'status'/'cell_015.json',dict(row,returncode=1))
+            import contextlib,io
+            with contextlib.redirect_stderr(io.StringIO()):assert paper.run_job(root,15)==1
+            assert 'Could not prepare CIFAR' in paper.read_status(root,row)['error']
+            assert seen==['prepared before training']
+        finally:
+            for name,old in previous.items():
+                if old is None:sys.modules.pop(name,None)
+                else:sys.modules[name]=old
 
 
 def run(base=None):
@@ -299,8 +385,13 @@ def run(base=None):
     for path in base.glob('*.py'):ast.parse(path.read_text())
     tree=ast.parse((base/'core.py').read_text())
     rows=config_checks(base,tree)
-    sampler_checks(tree);header_checks();data_checks();checkpoint_checks(tree);report_checks(base,rows);submission_checks(base,rows)
+    sampler_checks(tree);header_checks();data_checks();checkpoint_checks(tree)
+    # Fixture paths/Slurm IDs are internal regression data, not actual submissions.
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()):
+        report_checks(base,rows);submission_checks(base,rows);run_preparation_checks(base,rows)
     print('PASS: 22 resolved configs; four paired baseline jobs; actual evaluator plan; CFG recovery; concurrent dataset preparation; corrupt-cache repair; VAE/prior checkpoints and interrupted paired evaluation; complete/partial compilation; all three paper curves and PNG/PDF rendering.')
     print('CPU contract tests passed. GPU training, torchvision downloads and numerical FID reproduction must be checked on the cluster; they were not run here.')
+    print('PASS: Vista job-ID parser; dependency-free submission; targeted stalled-job recovery; healthy/foreign jobs preserved; in-job preparation and failure logging. No actual Slurm jobs were modified by validation.')
     return 0
 if __name__=='__main__':raise SystemExit(run())
