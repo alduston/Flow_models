@@ -230,16 +230,23 @@ def recipe_checks(base):
                 old = {k: v for k, v in row.items() if k not in {'tmin_band_weight', 'hierarchy_variant', 'block_spatial_sizes'}}
                 assert paper.config_hash(row) == paper.config_hash(old)
             print(f'OK cell {row["cell_id"]}: blocks={row["block_channels"]}, depths={row["score_depths"]}, CIFAR / 800 epochs')
-    text = io.StringIO()
-    with contextlib.redirect_stdout(text):
-        paper.submit_jobs(base, dry_run=True)
-    assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 6
-    assert '--dependency=' not in text.getvalue() and 'TASK=prepare' not in text.getvalue()
-    text = io.StringIO()
-    with contextlib.redirect_stdout(text):
-        paper.submit_jobs(base, spec='new', dry_run=True)
-    assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 3
-    assert 'CELL_ID=3' in text.getvalue() and 'CELL_ID=4' in text.getvalue() and 'CELL_ID=5' in text.getvalue()
+    # Test the launch plan independently of this sweep's real job statuses.
+    # submit_jobs correctly skips completed/active cells even in dry-run mode;
+    # running this assertion against a live sweep therefore undercounts jobs.
+    with tempfile.TemporaryDirectory(prefix='csem_launcher_check_') as tmp:
+        launch_base = Path(tmp)
+        for name in ('manifest.csv', 'job.slurm'):
+            (launch_base/name).write_bytes((base/name).read_bytes())
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text):
+            paper.submit_jobs(launch_base, dry_run=True)
+        assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 6
+        assert '--dependency=' not in text.getvalue() and 'TASK=prepare' not in text.getvalue()
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text):
+            paper.submit_jobs(launch_base, spec='new', dry_run=True)
+        assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 3
+        assert 'CELL_ID=3' in text.getvalue() and 'CELL_ID=4' in text.getvalue() and 'CELL_ID=5' in text.getvalue()
     print('OK six total / exactly three new training submissions; original status hashes preserved')
 
 
