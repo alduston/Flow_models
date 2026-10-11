@@ -1,0 +1,40 @@
+{
+  "source_files": {
+    "core(1).py": "052e642bbb34bddc9b34a572a4d843da85f71ae99ab2c7df045ec1ca6841a8d3",
+    "suite(1).py": "c8b33af4177e914397b78ebd7d7dcd91d4c92db1249b9765270d11004d8b6e04",
+    "paper_io(1).py": "f722565529679a2aa363402c3b7720d7c6275790af2020943338b32c52791f15",
+    "manifest(1).csv": "9e2b4f43dab78e624b8255ea6284c83ed2c2b5635eb8658b5914f3c31145d85f"
+  },
+  "baseline_source_cell": {
+    "cell_id": "0",
+    "family": "main",
+    "dataset": "CIFAR",
+    "mode": "cotrained_csem",
+    "seed": "42",
+    "epochs_joint": "800",
+    "epochs_refine": "0",
+    "T_K": "1.05",
+    "T_full": "1.35",
+    "csem_w": "0.05",
+    "terminal_kl_w": "0.60",
+    "latent_anchor_mode": "ou_partial",
+    "beta0": "0.07",
+    "score_time_weighting": "canonical",
+    "score_head_time_weighting": "unweighted-eps",
+    "lr_score_head": "0.0001",
+    "lr_refine": "0.000015",
+    "cfg_scale": "2.5",
+    "rk4_steps": "25",
+    "eval_every": "50",
+    "eval_samples": "10000",
+    "paper_solver_suite": "1",
+    "paper_solver_steps": "20",
+    "result_name": "cifar_cotrained_csem_s42_cell00",
+    "notes": "optimized Aug-29 recipe: OU-partial GroupNorm at T_K + terminal KL",
+    "source_v5_result_name": "cifar_main_csem_oupartial_s42_v5_800",
+    "outputs": "Cotrained CSEM"
+  },
+  "core_import_repair": "setup_run_results_dir default wipe=True; callers already pass explicit wipe. No changes to VAE, DiT, trainer, evaluation or mathematical loss.",
+  "flat_uses_original_trainer": true,
+  "baseline_fid": "User reports about 8.85; attached files contain recipe, not result logs."
+}
