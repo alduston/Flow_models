@@ -36,5 +36,39 @@
   },
   "core_import_repair": "setup_run_results_dir default wipe=True; callers already pass explicit wipe. No changes to VAE, DiT, trainer, evaluation or mathematical loss.",
   "flat_uses_original_trainer": true,
-  "baseline_fid": "User reports about 8.85; attached files contain recipe, not result logs."
+  "baseline_fid": "User reports about 8.85; attached files contain recipe, not result logs.",
+  "sweep_extension": {
+    "new_cell_ids": [
+      3,
+      4,
+      5
+    ],
+    "tmin_band_weight": 0.05,
+    "matching": "canonical encoder representation coefficient",
+    "optimized_root_shape": [
+      8,
+      4,
+      4
+    ],
+    "optimized_child_innovation_shape": [
+      6,
+      8,
+      8
+    ],
+    "total_latent_coordinates": 512,
+    "original_cells_unchanged": true,
+    "parser_patch_source": "paper(3).py",
+    "core_suite_paper_io_unchanged": true,
+    "validation": {
+      "offline_validation": "passed",
+      "real_torch_cpu_smoke_cells": [
+        3,
+        4,
+        5
+      ],
+      "synthetic_trainer_integration": "two optimizer steps per new cell; matched band, coordinate weighting, logging, checkpoint save/reload passed",
+      "cuda_800_epoch_training": "not run",
+      "numerical_cifar_quality": "not measured"
+    }
+  }
 }

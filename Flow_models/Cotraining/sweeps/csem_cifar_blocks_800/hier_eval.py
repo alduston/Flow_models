@@ -128,6 +128,7 @@ def evaluate_hierarchy(epoch_idx, prefix, vae, unet, loader, cfg, device, lpips_
             method, steps = scfg['method'], int(scfg['steps'])
             level = float(scfg['cfg_level'])
             suffix = metric_suffix(method, steps, level, cfg['t_max'])
+            sampling_started = time.perf_counter()
             generated, generated_latents = [], []
             for off in range(0, N, bs):
                 start = noise[off:off+bs].to(device)
@@ -137,6 +138,7 @@ def evaluate_hierarchy(epoch_idx, prefix, vae, unet, loader, cfg, device, lpips_
                 t_dec = torch.full((len(z),), decode_time, device=device)
                 generated.append(vae.decode(z, t=t_dec).cpu()); generated_latents.append(z.cpu())
             fake, zfake = torch.cat(generated), torch.cat(generated_latents)
+            rows[f'sampling_seconds_{suffix}'] = time.perf_counter() - sampling_started
             for key, value in measure(fake, zfake).items():
                 rows[f'{key}_{suffix}'] = float(value)
             save_panel(fake, suffix)
@@ -159,6 +161,9 @@ def evaluate_hierarchy(epoch_idx, prefix, vae, unet, loader, cfg, device, lpips_
         rows['conditional_csem_gap_score_uncond'] = conditional_score_gap(unet, mu, lv, zpost, cfg, device)
         rows['eval_samples'] = N
         rows['blocks'] = len(unet.block_channels)
+        rows['hierarchy_variant'] = cfg.get('hierarchy_variant', 'standard')
+        rows['latent_coordinates'] = int(zpost[0].numel())
+        rows['block_spatial_sizes'] = ':'.join(str(v) for v in cfg.get('block_spatial_sizes', [8]*len(unet.block_channels)))
         rows['evaluation_seconds'] = time.perf_counter()-started
         rows['sampling_definition'] = 'sequential learned conditional diffusion; fixed clean parents'
         rows['fid_backend'] = 'legacy torchvision Inception; same as flat'

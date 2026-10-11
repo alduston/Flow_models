@@ -1,231 +1,182 @@
-# CIFAR-10 CSEM: one, two and three latent blocks
+# CIFAR-10 CSEM: six 800-epoch cascade runs
 
-Exactly **three training jobs**, all on RGB CIFAR-10, seed 42, with **800
-cotraining epochs**. No FMNIST, extra seed, independent-prior phase, refinement
-phase or separate dataset-preparation job is submitted.
+This extends the original one/two/three-block CIFAR-10 sweep with exactly three
+new runs. Every run uses RGB CIFAR-10, seed 42, 800 cotraining epochs and no
+head-only refinement. Original cells 0–2 retain their scientific settings,
+result directory names and status/config hashes.
 
-| Cell | Model | Latent channels at 8 x 8 | DiT depth per head | Epochs |
+| Cell | Model | Latents | Score depths | Band coefficient |
 |---|---|---|---|---:|
-| 0 | Original flat CIFAR CSEM | 8 | 12 | 800 |
-| 1 | Two-block conditional CSEM | 4 + 4 | 6 + 6 | 800 |
-| 2 | Three-block conditional CSEM | 3 + 3 + 2 | 4 + 4 + 4 | 800 |
+| 0 | Original one-block CSEM | 8 x 8 x 8 | 12 | 0 |
+| 1 | Original two-block conditional CSEM | 4 x 8 x 8 + 4 x 8 x 8 | 6 + 6 | 0 |
+| 2 | Original three-block conditional CSEM | 3 x 8 x 8 + 3 x 8 x 8 + 2 x 8 x 8 | 4 + 4 + 4 | 0 |
+| 3 | One-block CSEM + B | 8 x 8 x 8 | 12 | 0.05 |
+| 4 | Two-block CSEM + B | 4 x 8 x 8 + 4 x 8 x 8 | 6 + 6 | 0.05 |
+| 5 | Optimized two-block CSEM + B | root 8 x 4 x 4 + residual child 6 x 8 x 8 | 6 + 6 | 0.05 |
 
-Eight total latent channels and twelve total DiT layers are held fixed. The
-VAE's image encoder/decoder backbone is the original CIFAR architecture in all
-three arms. Hierarchical arms add small ancestor-to-posterior adapters and one
-score context projection per descendant. Separate time/class embeddings and
-head modules add parameter overhead, so matched total depth is not an exactly
-matched parameter count. Actual counts are printed by the smoke test and saved
-for hierarchical training in `paper_cell_config.json`.
+All arms have **512 stochastic latent coordinates** and twelve total DiT layers.
+The optimized arm adds VAE posterior/top-down modules; it is a fixed latent
+budget/depth comparison, not an exactly matched parameter-count experiment.
+Actual VAE and score parameter counts are printed by smoke tests and recorded
+for hierarchical training. Both optimized blocks have learned diffusion priors.
 
-## Run on Vista / Frontera
+## Add the three new runs to an existing sweep
 
-Extract the archive under your existing sweeps directory:
+The full archive contains the `csem_cifar_blocks_800/` folder. The smaller
+`csem_cifar_blocks_800_update.zip` contains only changed/new files at its root;
+extract that archive **inside** your existing `csem_cifar_blocks_800` directory.
+Then activate your existing `hlsi` environment:
 
 ```bash
-unzip csem_cifar_blocks_800.zip
-cd csem_cifar_blocks_800
-module purge
-module load gcc/13.2.0
-module load python3/3.11.8
-source "$SCRATCH/venvs/hlsi/bin/activate"
 python paper.py validate
-python paper.py submit --dry-run
-python paper.py submit
+python paper.py submit --cells new --dry-run
+python paper.py submit --cells new
 ```
 
-The dry run prints exactly three `sbatch` commands. Jobs use the supplied
-`gh` partition, one node/task and 48-hour walltime from your attached launcher.
-Each job first runs a real CUDA graph/sampling smoke test in a separate process,
-then validates/prepares the shared CIFAR cache under the original dataset lock.
-Only one job downloads/extracts if the data is missing. Existing complete splits
-are reused; training never downloads or modifies a live cache.
+`new`, `band`, and `3-5` all select cells 3, 4, 5. `baseline` selects 0–2;
+`all`/`main` select all six. Existing completed/active jobs are skipped using the
+same status files. The three new result directories are distinct from the old
+ones. Existing old checkpoints remain compatible; new band runs start fresh.
 
-To reuse the CIFAR cache of the existing V6 sweep, substitute:
+The complete archive can alternatively be extracted as a standalone sweep.
+To reuse an existing prepared dataset cache:
 
 ```bash
-python paper.py submit --data-root ../csem_paper_final_v6/data_cache_v6
+python paper.py submit --cells new --data-root ../csem_paper_final_v6/data_cache_v6
 ```
 
-Use the actual path of your already-prepared cache if that folder differs. The
-cache parent must contain the `CIFAR/` subdirectory. Checkpoints, status files,
-results and Slurm logs remain isolated in this new sweep directory. The old
-sweep's results and checkpoints are not imported or modified.
+The cache parent contains `CIFAR/`. Each selected training job validates/prepares
+it under the shared lock. No separate preparation job is submitted. The original
+Vista/Frontera launcher uses the `gh` partition, one node/task, and 48-hour limit.
+It runs a real CUDA smoke check of its exact cell before training. The updated
+Slurm job-ID parser accepts site banners and standard/parsable output.
 
-Direct commands are also available:
+Useful commands:
 
 ```bash
-python paper.py run --cell-id 0 --resume
-python paper.py run --cell-id 1 --resume
-python paper.py run --cell-id 2 --resume
-python paper.py smoke --device cuda
-python paper.py prepare-data
+python paper.py smoke --cell-id 3 --device cuda
+python paper.py smoke --cell-id 4 --device cuda
+python paper.py smoke --cell-id 5 --device cuda
+python paper.py run --cell-id 5 --resume
 python paper.py report --cfg 2.5
 python paper.py report --cfg 3.0
 ```
 
-`report` can read live in-progress evaluation histories. It writes measured
-curves/latest tables and PNG/PDF FID plots under `compiled/`; missing results
-are left missing. These commands do not submit additional jobs.
+Reports separate curves by **cell ID**, including the different two-block runs.
+They use measured results only and can read in-progress histories.
 
-## The one-block baseline is the attached CIFAR main cell 0
+## Matched analytic lower-boundary penalty
 
-Cell 0 calls the original `suite.run_cell` and original
-`core.train_vae_cotrained_cond`, with the same config resolver, model classes,
-training objective, initialization, optimizer, scheduler and evaluator. With
-an explicit cache path it calls the same trainer with only `data_root` changed.
-This is the attached optimized 800-epoch recipe requested as the approximately
-8.85-FID reference. That number is the supplied historical reference; the
-attachments contain configuration/source, not a new numerical reproduction.
+For the actual representation schedule's first node, define
 
-| Setting | Value in all three jobs |
+    floor = log(sigma_min^2 / alpha_min^2)
+    B_prime = 0.5 * mean_coordinates softplus(floor - conditional_logvar)
+    band_objective = active_encoder_csem_coefficient * B_prime
+
+Cells 3–5 set `tmin_band_weight=matched`: the resolved coefficient is **0.05**,
+matching representation CSEM. It is independent of the **0.60 terminal KL**
+coefficient and the **1.0 detached score-head** coefficient. There is no
+additional time-proposal factor: the canonical CSEM estimator already estimates
+the physical-time integral. The original recipe has no coefficient warm-up.
+
+The nonnegative B_prime differs from the conditional entropy change B by an
+encoder-independent constant. It conservatively completes the missing
+information charge below the cutoff; it does not restore omitted score-error
+terms. Its mean over all 512 coordinates uses the same normalization as CSEM/KL.
+Larger blocks therefore contribute in proportion to their coordinate counts.
+
+The correction is deterministic given posterior log variances. It reaches the
+encoder and ancestral posterior dependencies, with no score-head gradient.
+Original score-gradient replacement, optimizers, clipping, EMA and checkpoints
+remain in place. The original core, suite and paper_io files remain unchanged;
+guarded AST adapters add the band term only to new cells and refuse to adapt a
+trainer with an unexpected shape. Resume guards reject changed band, cutoff,
+block-layout or architecture settings.
+
+Loss histories add:
+
+- `band`: coordinate-mean unweighted B_prime.
+- `band_objective`, `band_weight`: its actual weighted contribution/coefficient.
+- `band_i`: conditional band penalty for each block.
+- `below_i`: fraction with log variance below the effective diffusion-noise floor.
+- `deep_i`: fraction with standard deviation more than tenfold below that floor.
+
+The effective standard-deviation floor is sigma_min/alpha_min and is recorded
+in the resolved configuration. With OU t_min=3e-5 it is approximately 0.007746.
+
+## Optimized two-block architecture (cell 5)
+
+1. The original bottom-up image backbone extracts 8 x 8 image features. A new
+   downsampling posterior head produces the root Gaussian at 4 x 4.
+2. Sample the clean root once. A shared generative top-down path maps it from
+   4 x 4 to 8 x 8. Child posterior parameters combine those ancestral features
+   with the bottom-up image features; they remain conditionally diagonal Gaussian.
+3. The child score head models an innovation u_2 conditional on the complete
+   clean root. The generative path predicts location b(root) and positive scale
+   d(root), and reconstructs the raw child as z_2 = b(root) + d(root) * u_2.
+4. Inject root information at 4 x 4 and the child at 8 x 8. The inherited residual
+   decoder then proceeds to 16 x 16 and 32 x 32. Image features enter posterior
+   parameter computation; generation reconstructs all decoder features from latents.
+5. Apply CSEM, terminal KL and B to the innovation coordinates. Generation solves
+   the root diffusion first and the child conditional diffusion second, using
+   fixed generated root context. Encoded-root/generated-child diagnostics use
+   the same conditional model.
+
+For compatibility with the pinned trainer/noise banks, an invertible pixel
+permutation packs the 8-channel 4 x 4 root as 2 channels at 8 x 8. The root DiT
+actually uses 4 x 4 (16 patch-1 tokens), while the child uses 8 x 8 (64 tokens).
+This permutation preserves Gaussian targets, coordinate norms, KL and the
+512-coordinate budget exactly. It is not upsampling the root stochastic state
+or adding more latent variables.
+
+Keep six DiT layers per head, the full root as side information, and the original
+sampler grids in this first experiment. This reduces root network spatial work
+without changing solver accuracy budgets. Hierarchical evaluation records
+per-sampler generation-plus-decoding seconds and actual block spatial sizes.
+The measurements include the same ancestral/root and decoder work used by FID.
+
+Class conditioning/CFG, label dropout, loss strengths and training horizons are
+held at the original settings to make the architectural comparison interpretable.
+Coarse/detail roles are architectural biases, not a guaranteed semantic split.
+
+## Shared recipe and evaluation
+
+| Setting | Value |
 |---|---|
 | Dataset / seed / batch | CIFAR RGB / 42 / 256 |
-| Representation horizon / score-sampling horizon | T_K = 1.05 / T = 1.35 |
-| Diffusion schedule | OU, log_t; t_min = 3e-5; 1000 discrete training nodes |
-| Mean-scale anchor | OU-partial, anchor time 1.05 |
-| Encoder CSEM weight / terminal KL weight | 0.05 / 0.60 |
-| Representation / inner-head time weights | canonical / unweighted-eps |
-| VAE / head learning rates | 2.5e-4 / 1e-4 |
-| LR schedule | Cosine over 800 epochs, minimum 1e-6 |
-| Joint optimizer / clipping | AdamW, weight decay 1e-4, betas (0.9, 0.95); one joint norm-1 clip |
-| Gradient routing | Original representation gradients; independent full-horizon head gradients replace head grads |
-| Precision auxiliary / cosine loss | 0.0025 / 0 |
-| LPIPS / GAN weights | 0.85 / 0.0025 |
-| Discriminator | Original PatchGAN; starts at epoch 25; Adam LR 1e-4 |
-| DiT width / attention heads / factored head | 384 / 6 / enabled |
-| VAE base width / residual blocks | 64 / 2; original encoder/decoder attention and projection options |
+| Representation / score-sampling horizon | T_K=1.05 / T=1.35 |
+| Schedule | OU log_t, t_min=3e-5, 1000 discrete nodes |
+| Mean anchor | OU-partial, anchor time 1.05; per factor in cascades |
+| Encoder CSEM / terminal KL | 0.05 / 0.60 |
+| Representation / head time weighting | canonical / unweighted-eps |
+| VAE / head LR | 2.5e-4 / 1e-4 |
+| LR schedule | 800-epoch cosine, minimum 1e-6 |
+| Optimizer / clipping | Original AdamW and one combined norm-1 clip |
+| Precision auxiliary / cosine | 0.0025 / 0 |
+| LPIPS / GAN | 0.85 / 0.0025; discriminator starts at epoch 25 |
+| DiT hidden width / attention heads | 384 / 6; factored head |
 | EMA / label dropout | 0.9997 / 0.10 |
-| Reconstruction | Original time-conditioned decoding of OU-corrupted latents |
-| Evaluation | Every 50 epochs and endpoint; 10,000 CIFAR test examples |
-| Gaussian sampling grid | CFG 2.5 and 3.0; RK4-20, RK4-25, Heun-20; temperature 1 |
-| Head-only refinement | 0 epochs |
+| Reconstruction | Original time-conditioned decoding of corrupted latents |
+| Evaluation | Every 50 epochs, including epoch 800; 10,000 test images |
+| Generation grids | CFG 2.5/3.0; RK4-20, RK4-25, Heun-20 per block |
 
-The uploaded `core.py` had an import-time error: the default value of
-`setup_run_results_dir(..., wipe=...)` referenced undefined `cfg`. This copy
-changes that default to `True`. The training function already passes `wipe`
-explicitly. This is the only change to the original engine file; all model,
-training and evaluation code remains unchanged. Validation restores the old
-default in memory and checks the complete source hash against the attachment.
-`suite.py` and `paper_io.py` are unchanged byte for byte. `provenance.json` and
-`baseline_manifest.csv` record the exact source and baseline row.
+Cascades cost sequential reverse solves. The same step count per block is not
+matched total sampling cost to a flat model; use the timing columns alongside
+FID. The original evaluation backend is legacy torchvision Inception, not an
+assertion of equivalence to every external FID implementation.
 
-## What “hierarchical” means in this sweep
+## Validation
 
-This extends the two-block FMNIST experiment, rather than using unmatched
-Gaussian priors for descendant latents. At one fixed spatial scale:
+`paper.py validate` checks original source hashes and recipes, six-cell
+selection, old status-hash compatibility, the exact band formula/slope, guarded
+trainer adaptation, fixed-draw conditional coupling, dimension weighting,
+sequential sampling, resume guards and endpoint completeness. `paper.py smoke`
+uses real PyTorch model/autograd graphs and reverse sampling, including the
+optimized spatial packing and band-only gradient routing. CUDA/800-epoch
+training and numerical endpoint FID require the cluster run.
 
-    q(z1,...,zB | x) = q1(z1 | x) prod_{i=2}^B qi(zi | x,z<i).
-
-Each factor is a diagonal Gaussian. The original eight-channel encoder emits
-base means/logvariances, partitioned into the indicated blocks. For i > 1, a
-small adapter of the realized clean ancestors changes that factor's mean and
-logvariance. Descendant adapters are zero-initialized. OU-partial normalization
-is applied to each final conditional mean **before** that block is drawn.
-Global normalization after drawing ancestors would otherwise invalidate the
-root's Gaussian sampling interpretation. Blockwise normalization is therefore
-an explicit architectural difference in the hierarchical arms.
-
-Generation is:
-
-    learned root reverse diffusion -> learned conditional reverse diffusion
-    for block 2 -> learned conditional reverse diffusion for block 3 -> decoder.
-
-Every modeled block gets a CSEM-trained diffusion prior; no clean downstream
-aggregate is replaced with an assumed Gaussian. There are no image-feature
-skip connections into the decoder or score heads. Image information enters
-reconstruction only through sampled modeled latents. Later posterior factors
-may see x, because their conditional aggregate distribution is itself learned
-by a conditional diffusion head.
-
-For a fixed image and realized clean ancestors, the exact epsilon target is:
-
-    C_i = sigma_t (y_i - alpha_t mu_i) /
-          (alpha_t^2 exp(logvar_i) + sigma_t^2).
-
-Head i sees only (y_i, t, class label, clean z<i). It never sees x or later
-latents. Regression over images at fixed clean parents identifies the
-conditional aggregate score. The CSEM representation loss differentiates
-through parameters, target variance, noisy sample and clean-parent context.
-The independent full-horizon inner regression detaches all these encoder
-quantities, including the parent context, before replacing score-parameter
-gradients. Auxiliary factored-head precision loss is preserved.
-
-Concatenating block outputs before coordinate-mean MSE/KL reproduces the
-original normalization: each block receives weight C_i/8. The CSEM/KL weights
-are not multiplied by the number of blocks. Each conditional diffusion starts
-from Gaussian noise at T=1.35, with the corresponding conditional terminal
-anchor at T_K=1.05. As in the flat diffusion baseline, these finite-horizon
-Gaussian starts are approximations; terminal KL does not prove exact endpoint
-matching. Here that diffusion-truncation approximation is present for **each**
-conditional head, not solely the root. It is not a Gaussian prior substitution
-at a clean descendant layer.
-
-This is a small fixed-resolution stochastic hierarchy, not a reproduction of
-NVAE's multiscale hierarchy or LSGM's jointly diffused top-scale group set.
-The experiment measures the effect of this conditional factorization at
-matched total latent width and transformer depth. It does not claim to capture
-all possible hierarchical-VAE improvements.
-
-## Evaluation and compute interpretation
-
-The flat cell keeps the original evaluator, including its existing T_K/full-T
-and oracle-initialization diagnostics. Hierarchical cells evaluate the shared
-full-T Gaussian grid with the original torchvision Inception feature extractor
-and FID/KID/SW2 functions. Full generated images use the same fixed Gaussian
-bank and uniformly sampled label bank as the flat evaluator. Hierarchical
-posterior reconstructions use fixed posterior draws with correct parent-child
-coupling. Joint Gaussian oracle initialization is not asserted for the hierarchy.
-
-All arms report full generated FID and posterior reconstruction FID. The two
-hierarchical arms additionally encode the root and generate **every descendant**
-from its learned prior, reporting `fid_encoded_root_generated_children_cfg...`.
-This distinguishes decoder improvements from reliance on posterior-only detail.
-Per-block training `score_i`, `kl_i` and `var_i` are logged. The conditional
-score-risk diagnostic has its own column and is not equated to a flat joint
-score functional.
-
-All plots use a single chosen CFG across all three arms, and identify RK4-20
-as **20 reverse steps per block**. Hierarchy therefore has sequential sampling
-cost: 20/40/60 total block steps, respectively, although the per-head DiT depths
-are split 12 / 6+6 / 4+4+4. This is not equal sampling latency. Both evaluated
-CFG values remain available; the report does not independently pick each
-model's best CFG. Legacy Inception FID here preserves your existing metric
-convention and should not be silently compared with a different FID backend.
-
-## Resume, failures and checks
-
-Full-state checkpoints are atomic and written every ten epochs and around
-evaluations. They include online/EMA heads, VAE, discriminator, optimizers,
-scheduler, RNG state and histories. Interrupted evaluation is retried before
-the next training epoch. Hierarchy additionally rejects changed block splits,
-head depths and hierarchy versions. Completed and active Slurm jobs are skipped.
-
-Rerun `python paper.py submit` after a walltime interruption or failure to
-resume unfinished cells. For an attempt without a usable checkpoint:
-
-```bash
-python paper.py submit --cells 1 --restart-incomplete
-```
-
-The previous attempt is archived under `failed_attempts/`. Completed cells are
-not overwritten. `--cells 0`, `--cells 1`, `--cells 2`, and `--cells 0-2` select
-individual cells; `all`, `main`, and `missing` select all unfinished cells.
-
-Offline validation checks source/config equivalence, exactly three submissions,
-preserved mathematical loss/optimizer/routing/clipping statements, posterior
-ancestor coupling and fixed noise, learned-prior ancestral sampling, coordinate
-weighting, resume compatibility and 800-epoch evaluation completeness. Python
-files compile and the Slurm launcher passes shell syntax validation.
-
-Torch and CUDA were unavailable in the artifact-creation environment, so real
-model/autograd smoke tests, cluster execution and numerical FID reproduction
-were not run there. Every cluster job runs the supplied CUDA smoke test before
-training. You can also run it manually; it uses synthetic images only and does
-not produce experimental FID results. The standard `hlsi` environment must
-contain the same torch, torchvision, lpips, numpy, scipy, pandas, matplotlib
-and tqdm dependencies used by your attached sweep.
-
-Files: `paper.py`, `manifest.csv`, `job.slurm`, unchanged `suite.py` and
-`paper_io.py`, minimally repaired `core.py`, `hier_models.py`, `hier_engine.py`,
-`hier_eval.py`, `tests.py`, `baseline_manifest.csv`, `provenance.json`, this README.
+Before delivery, all three new cells passed full-size CPU autograd/sampling
+smokes. Separate reduced-width synthetic-data trainer checks executed two real
+optimizer steps per new cell and verified the band coefficient, coordinate
+weighting, loss-history logging, checkpoint save and checkpoint reload. These
+checks validate implementation; they do not measure CIFAR quality.

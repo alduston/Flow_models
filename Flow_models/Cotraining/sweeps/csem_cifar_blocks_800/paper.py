@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exactly three CIFAR CSEM cotraining cells: 1, 2 and 3 blocks, 800 epochs."""
+"""Six CIFAR CSEM cells: original 1/2/3 blocks plus three band-corrected runs, 800 epochs."""
 from __future__ import annotations
 import argparse
 import csv
@@ -22,8 +22,15 @@ import traceback
 def manifest(base):
     with (Path(base)/'manifest.csv').open(newline='') as f:
         rows = list(csv.DictReader(f))
-    if [int(r['blocks']) for r in rows] != [1, 2, 3] or any(r['dataset'] != 'CIFAR' for r in rows):
-        raise ValueError('Expected exactly three CIFAR-only cells in block order')
+    if ([int(r['cell_id']) for r in rows] != list(range(6)) or
+            [int(r['blocks']) for r in rows] != [1, 2, 3, 1, 2, 2] or
+            any(r['dataset'] != 'CIFAR' or int(r['epochs_joint']) != 800 for r in rows)):
+        raise ValueError('Expected six CIFAR-only 800-epoch cells, IDs 0 through 5')
+    for row in rows:
+        expected_band = 'matched' if int(row['cell_id']) >= 3 else ''
+        expected_variant = 'optimized' if int(row['cell_id']) == 5 else ''
+        if row.get('tmin_band_weight', '') != expected_band or row.get('hierarchy_variant', '') != expected_variant:
+            raise ValueError('Unexpected band/architecture settings in manifest')
     return rows
 
 
@@ -33,6 +40,10 @@ def split_ints(value):
 
 def config_hash(row):
     science = {k: v for k, v in row.items() if k not in {'notes', 'result_name', 'outputs', 'source_v5_result_name'}}
+    # Empty extension columns preserve the original rows' existing status hashes.
+    for key in ('tmin_band_weight', 'hierarchy_variant', 'block_spatial_sizes'):
+        if not science.get(key):
+            science.pop(key, None)
     return hashlib.sha256(json.dumps(science, sort_keys=True).encode()).hexdigest()
 
 
@@ -45,6 +56,14 @@ def config_for(row, base, data_root=None):
         cfg.update(block_channels=split_ints(row['block_channels']),
                    score_depths=split_ints(row['score_depths']), hierarchy_version=1,
                    training_engine='conditional_csem_hierarchy_v1')
+    if row.get('tmin_band_weight') == 'matched':
+        cfg.update(tmin_band_weight='matched', resolved_tmin_band_weight=float(cfg['score_w_vae']))
+        if int(row['blocks']) == 1:
+            cfg['training_engine'] = 'flat_csem_with_matched_band_v1'
+    if row.get('hierarchy_variant') == 'optimized':
+        cfg.update(hierarchy_variant='optimized', block_spatial_sizes=split_ints(row['block_spatial_sizes']),
+                   hierarchy_version=2, training_engine='conditional_residual_multiscale_csem_v2',
+                   innovation_channels=[8, 6], latent_coordinates=512)
     return cfg
 
 
@@ -150,7 +169,7 @@ def run_job(base, cid, *, resume=False, restart=False, data_root=None):
             prepare_data(base, data_root)
             print(f'[RUN] CIFAR, blocks={row["block_channels"]}, DiT depths={row["score_depths"]}, '
                   '800 cotraining epochs; no frozen-VAE or refinement stage', flush=True)
-            if int(row['blocks']) == 1 and data_root is None:
+            if int(row['blocks']) == 1 and data_root is None and not row.get('tmin_band_weight'):
                 # Original flat route, original config resolver and original evaluator.
                 loss, evaluation, cfg = run_cell(row, Path(base), resume=resume)
             else:
@@ -161,7 +180,11 @@ def run_job(base, cid, *, resume=False, restart=False, data_root=None):
                 atomic_json(dest/'paper_cell_config.json', cfg)
                 core.seed_everything(int(cfg['seed']))
                 if int(row['blocks']) == 1:
-                    loss, evaluation = core.train_vae_cotrained_cond(cfg)
+                    if cfg.get('tmin_band_weight') == 'matched':
+                        from band_regularizer import train_flat_band
+                        loss, evaluation = train_flat_band(cfg)
+                    else:
+                        loss, evaluation = core.train_vae_cotrained_cond(cfg)
                 else:
                     from hier_engine import train_hierarchy
                     loss, evaluation = train_hierarchy(cfg)
@@ -184,6 +207,10 @@ def run_job(base, cid, *, resume=False, restart=False, data_root=None):
 def select_cells(spec, rows):
     if spec in ('all', 'main', 'missing'):
         return rows
+    if spec in ('new', 'band'):
+        return [r for r in rows if int(r['cell_id']) >= 3]
+    if spec == 'baseline':
+        return [r for r in rows if int(r['cell_id']) < 3]
     ids = set()
     for part in spec.split(','):
         if '-' in part:
@@ -191,8 +218,18 @@ def select_cells(spec, rows):
         else:
             ids.add(int(part))
     if ids - {int(r['cell_id']) for r in rows}:
-        raise ValueError('Only cells 0, 1, 2 exist')
+        raise ValueError('Only cells 0 through 5 exist')
     return [r for r in rows if int(r['cell_id']) in ids]
+
+
+def parse_slurm_job_id(output):
+    """Read the final job-ID record, ignoring site banners and diagnostics."""
+    for line in reversed(output.splitlines()):
+        match = re.fullmatch(r'(?:Submitted batch job\s+)?([0-9]+)(?:;[^\s;]+)?', line.strip())
+        if match:
+            return match.group(1)
+    raise RuntimeError(f'Cannot parse Slurm job ID: {output!r}. '
+                       'sbatch succeeded, so check squeue before submitting again.')
 
 
 def submit_jobs(base, spec='all', *, dry_run=False, restart=False, data_root=None):
@@ -223,14 +260,14 @@ def submit_jobs(base, spec='all', *, dry_run=False, restart=False, data_root=Non
             exports['CSEM_DATA_ROOT'] = str(Path(data_root).resolve())
         if any(',' in v or '\n' in v for v in exports.values()):
             raise ValueError('Slurm export values cannot contain commas or newlines')
-        cmd = ['sbatch', '--parsable', f'--job-name=cifar_csem_b{row["blocks"]}',
+        suffix = ('_optband' if row.get('hierarchy_variant') == 'optimized' else
+                  '_band' if row.get('tmin_band_weight') else '')
+        cmd = ['sbatch', '--parsable', f'--job-name=cifar_csem_b{row["blocks"]}{suffix}',
                '--export=ALL,'+','.join(f'{k}={v}' for k, v in exports.items()), str(Path(base)/'job.slurm')]
         print(shlex.join(cmd))
         if not dry_run:
             q = subprocess.run(cmd, cwd=base, text=True, capture_output=True, check=True)
-            jobid = q.stdout.strip().split(';')[0]
-            if not jobid.isdigit():
-                raise RuntimeError(f'Cannot parse Slurm job ID: {q.stdout!r}')
+            jobid = parse_slurm_job_id(q.stdout)
             current = status(base, row)
             if not (str(current.get('slurm_job_id')) == jobid and current.get('started_utc')):
                 atomic_json(status_path(base, row), dict(row, returncode=None,
@@ -262,14 +299,16 @@ def report(base, level=2.5):
             if not math.isfinite(float(item.get(key, 'nan'))):
                 continue
             diag = f'fid_encoded_root_generated_children_cfg{str(float(level)).replace(".", "_")}'
-            record = dict(blocks=int(row['blocks']), channels=row['block_channels'],
+            record = dict(cell_id=int(row['cell_id']), model=row['outputs'], blocks=int(row['blocks']), channels=row['block_channels'],
+                          band_weight=float(row['csem_w']) if row.get('tmin_band_weight') else 0.0,
+                          hierarchy_variant=row.get('hierarchy_variant') or 'standard',
                           score_depths=row['score_depths'], epoch=int(float(item['epoch'])),
                           fid=float(item[key]), fid_posterior_recon=float(item.get('fid_vae_recon', 'nan')),
                           fid_encoded_root_generated_children=float(item.get(diag, 'nan')),
                           cfg=float(level), steps_per_block=20, seed=int(row['seed']),
                           completed=status(base, row).get('returncode') == 0)
             curves.append(record)
-        block_rows = [c for c in curves if c['blocks'] == int(row['blocks'])]
+        block_rows = [c for c in curves if c['cell_id'] == int(row['cell_id'])]
         if block_rows:
             endpoints.append(max(block_rows, key=lambda r: r['epoch']))
     df = pd.DataFrame(curves); last = pd.DataFrame(endpoints)
@@ -277,11 +316,11 @@ def report(base, level=2.5):
     last.to_csv(compiled/f'latest_cfg{level:g}.csv', index=False)
     if not df.empty:
         fig, ax = plt.subplots(figsize=(7.2, 4.4))
-        for block, group in df.groupby('blocks'):
+        for cell, group in df.groupby('cell_id'):
             group = group.sort_values('epoch')
-            ax.plot(group.epoch, group.fid, marker='o', ms=3, label=f'{block} block'+('s' if block != 1 else ' (flat)'))
+            ax.plot(group.epoch, group.fid, marker='o', ms=3, label=group.iloc[0]['model'])
         ax.set(xlabel='Cotraining epoch', ylabel='Legacy Inception FID',
-               title=f'CIFAR-10 CSEM: 8 latent channels, CFG={level:g}, RK4-20 per block')
+               title=f'CIFAR-10 CSEM: 512 latent coordinates, CFG={level:g}, RK4-20 per block')
         ax.legend(); fig.tight_layout()
         fig.savefig(compiled/f'fid_cfg{level:g}.png', dpi=180)
         fig.savefig(compiled/f'fid_cfg{level:g}.pdf'); plt.close(fig)
@@ -307,6 +346,7 @@ def main(argv=None):
             p.add_argument('--cfg', type=float, choices=(2.5, 3.0), default=2.5)
         if name == 'smoke':
             p.add_argument('--blocks', type=int, choices=(1, 2, 3), default=None)
+            p.add_argument('--cell-id', type=int, choices=range(6), default=None)
             p.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     a = parser.parse_args(argv); base = a.base_dir.resolve()
     if a.command == 'validate':
@@ -314,7 +354,7 @@ def main(argv=None):
         return tests.run(base)
     if a.command == 'smoke':
         import tests
-        return tests.torch_smoke(base, a.blocks, a.device)
+        return tests.torch_smoke(base, a.blocks, a.device, cell_id=a.cell_id)
     if a.command == 'prepare-data':
         prepare_data(base, a.data_root); return 0
     if a.command == 'submit':

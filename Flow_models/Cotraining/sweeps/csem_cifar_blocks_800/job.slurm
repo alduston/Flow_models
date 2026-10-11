@@ -34,6 +34,6 @@ if [ -n "${CSEM_DATA_ROOT:-}" ]; then ARGS+=(--data-root "$CSEM_DATA_ROOT"); fi
 echo "Start CIFAR cell=$CELL_ID job=${SLURM_JOB_ID:-unknown} $(date)"
 # Exercise real model graphs before committing to a long cluster run. This is a
 # separate process and does not alter the training initialization/RNG stream.
-"$PY" -u paper.py smoke --blocks "$((CELL_ID + 1))" --device cuda
-# Each of exactly three jobs performs locked cache validation/preparation itself.
+"$PY" -u paper.py smoke --cell-id "$CELL_ID" --device cuda
+# Each selected training job performs locked cache validation/preparation itself.
 "$PY" -u paper.py run "${ARGS[@]}"

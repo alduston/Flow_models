@@ -199,11 +199,13 @@ def recipe_checks(base):
         baseline = next(csv.DictReader((base/'baseline_manifest.csv').open()))
         original = resolve_config(baseline, base)
         rows = paper.manifest(base)
-        assert len({r['result_name'] for r in rows}) == 3
+        assert len({r['result_name'] for r in rows}) == 6
         for row in rows:
             cfg = paper.config_for(row, base)
             strip = {'results_dir', 'master_results_dir', 'ckpt_dir', 'paper_cell_id', 'paper_result_name',
-                     'block_channels', 'score_depths', 'hierarchy_version', 'training_engine'}
+                     'block_channels', 'score_depths', 'hierarchy_version', 'training_engine',
+                     'tmin_band_weight', 'resolved_tmin_band_weight', 'hierarchy_variant',
+                     'block_spatial_sizes', 'innovation_channels', 'latent_coordinates'}
             assert {k: v for k, v in cfg.items() if k not in strip} == {k: v for k, v in original.items() if k not in strip}
             assert cfg['epochs_vae'] == cfg['lr_schedule_epochs'] == 800
             assert cfg['epochs_refine'] == 0 and cfg['dataset'] == 'CIFAR'
@@ -218,13 +220,27 @@ def recipe_checks(base):
             assert cfg['score_time_weighting'] == 'canonical' and cfg['score_head_time_weighting'] == 'unweighted-eps'
             assert sum(paper.split_ints(row['block_channels'])) == 8
             assert sum(paper.split_ints(row['score_depths'])) == 12
+            if int(row['cell_id']) >= 3:
+                assert cfg['tmin_band_weight'] == 'matched'
+                assert cfg['resolved_tmin_band_weight'] == cfg['score_w_vae'] == .05
+            if int(row['cell_id']) == 5:
+                assert cfg['block_channels'] == [2, 6] and cfg['block_spatial_sizes'] == [4, 8]
+                assert 8 * 4 * 4 + 6 * 8 * 8 == cfg['latent_coordinates'] == 512
+            if int(row['cell_id']) < 3:
+                old = {k: v for k, v in row.items() if k not in {'tmin_band_weight', 'hierarchy_variant', 'block_spatial_sizes'}}
+                assert paper.config_hash(row) == paper.config_hash(old)
             print(f'OK cell {row["cell_id"]}: blocks={row["block_channels"]}, depths={row["score_depths"]}, CIFAR / 800 epochs')
     text = io.StringIO()
     with contextlib.redirect_stdout(text):
         paper.submit_jobs(base, dry_run=True)
-    assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 3
+    assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 6
     assert '--dependency=' not in text.getvalue() and 'TASK=prepare' not in text.getvalue()
-    print('OK exactly three training submissions; no extra preparation job')
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        paper.submit_jobs(base, spec='new', dry_run=True)
+    assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 3
+    assert 'CELL_ID=3' in text.getvalue() and 'CELL_ID=4' in text.getvalue() and 'CELL_ID=5' in text.getvalue()
+    print('OK six total / exactly three new training submissions; original status hashes preserved')
 
 
 def io_checks(base):
@@ -257,25 +273,67 @@ def io_checks(base):
     print('OK hierarchy resume guards and endpoint/evaluation completeness')
 
 
+def band_checks(base):
+    import band_regularizer as band
+    source = (base/'core.py').read_text()
+    trainer = function(ast.parse(source), 'train_vae_cotrained_cond')
+    from hier_engine import adapt_trainer_source
+    for raw in (ast.get_source_segment(source, trainer), adapt_trainer_source(ast.get_source_segment(source, trainer))[0]):
+        adapted, counts = band.adapt_band_source(raw)
+        compile(adapted, '<band>', 'exec')
+        assert counts == dict(setup=1, penalty=1, loss=2, epoch=1, resume=1)
+        assert 'band_objective = active_score_w_vae * band_penalty' in adapted
+        assert 'loss_joint.backward()' in adapted and 'replace_parameter_gradients' in adapted
+    # Execute the actual analytic penalty with a minimal functional shim.
+    saved = {k: sys.modules.get(k) for k in ('torch', 'torch.nn')}
+    torch_stub = types.ModuleType('torch'); nn_stub = types.ModuleType('torch.nn')
+    nn_stub.functional = types.SimpleNamespace(softplus=lambda x: np.logaddexp(0., x))
+    sys.modules.update({'torch': torch_stub, 'torch.nn': nn_stub})
+    try:
+        t = 3e-5
+        floor = band.tmin_band_logvar_floor(dict(alpha=np.array([np.exp(-t)]),
+                                            sigma=np.array([np.sqrt(-np.expm1(-2*t))])))
+        lv = np.array([-30., -10., -2., 0., 20.])
+        actual = band.tmin_band_penalty(lv, floor)
+        np.testing.assert_allclose(actual, .5*np.logaddexp(0., np.log(np.expm1(2*t))-lv).mean())
+        for v in lv:
+            step = 1e-5
+            slope = (band.tmin_band_penalty(np.array([v+step]), floor)-
+                     band.tmin_band_penalty(np.array([v-step]), floor))/(2*step)
+            expected = -.5/(1+np.exp(v-floor))
+            np.testing.assert_allclose(slope, expected, atol=2e-10)
+    finally:
+        for k, v in saved.items():
+            if v is None: sys.modules.pop(k, None)
+            else: sys.modules[k] = v
+    assert '--cell-id "$CELL_ID"' in (base/'job.slurm').read_text()
+    assert '$((CELL_ID + 1))' not in (base/'job.slurm').read_text()
+    print('OK analytic band value/gradient, matched representation routing, both guarded adapters and six-cell launcher')
+
+
 def run(base):
     base = Path(base)
     for file in base.glob('*.py'):
         compile(file.read_text(), str(file), 'exec')
-    source_checks(base); recipe_checks(base); posterior_coupling_checks(base); sampling_checks(base); io_checks(base)
+    source_checks(base); recipe_checks(base); posterior_coupling_checks(base); sampling_checks(base); io_checks(base); band_checks(base)
     print('Offline validation passed. Real Torch/CUDA and numerical FID are separate cluster checks.')
     return 0
 
 
-def torch_smoke(base, blocks=None, device='cpu'):
+def torch_smoke(base, blocks=None, device='cpu', cell_id=None):
     import torch
     import core
     from hier_models import HierarchicalVAE, HierarchicalHeads, sample_hierarchy
+    from optimized_models import OptimizedHierarchicalVAE, OptimizedHierarchicalHeads, pack_root, unpack_root
+    from band_regularizer import tmin_band_penalty, tmin_band_logvar_floor
     from paper import config_for, manifest
     torch.set_num_threads(min(torch.get_num_threads(), 2))
     dev = torch.device(device)
     if dev.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA requested but unavailable')
     for row in manifest(base):
+        if cell_id is not None and int(row['cell_id']) != cell_id:
+            continue
         if blocks is not None and int(row['blocks']) != blocks:
             continue
         cfg = config_for(row, base); core.seed_everything(42)
@@ -287,8 +345,11 @@ def torch_smoke(base, blocks=None, device='cpu'):
         h_opts = dict(in_channels=8, hidden_dim=384, depth=12, num_heads=6, patch_size=1,
                       latent_size=8, num_classes=10, mlp_ratio=4.0, dropout=0.0, factored_head=True)
         hierarchical = int(row['blocks']) > 1
-        vae = (HierarchicalVAE(block_channels=cfg['block_channels'], **opts) if hierarchical else core.VAE(**opts)).to(dev)
-        heads = (HierarchicalHeads(block_channels=cfg['block_channels'], score_depths=cfg['score_depths'], **h_opts)
+        optimized = cfg.get('hierarchy_variant') == 'optimized'
+        vae_class = OptimizedHierarchicalVAE if optimized else HierarchicalVAE
+        head_class = OptimizedHierarchicalHeads if optimized else HierarchicalHeads
+        vae = (vae_class(block_channels=cfg['block_channels'], **opts) if hierarchical else core.VAE(**opts)).to(dev)
+        heads = (head_class(block_channels=cfg['block_channels'], score_depths=cfg['score_depths'], **h_opts)
                  if hierarchical else core.DiTModel(**h_opts)).to(dev)
         x = torch.randn(2, 3, 32, 32, device=dev).clamp(-1, 1)
         y = torch.tensor([1, 7], device=dev)
@@ -307,6 +368,19 @@ def torch_smoke(base, blocks=None, device='cpu'):
         outer = ((pred-target).square().mean()*.05 +
                  .6*core.component_kl_at_ou_time(mu, lv, 1.05) +
                  (vae.decode(noisy, t=t)-x).square().mean())
+        if cfg.get('tmin_band_weight') == 'matched':
+            floor = tmin_band_logvar_floor(core.make_schedule(cfg, dev))
+            band = .05 * tmin_band_penalty(lv, floor)
+            bg = torch.autograd.grad(band, (*vae.parameters(), *heads.parameters()), allow_unused=True, retain_graph=True)
+            nvae = len(tuple(vae.parameters()))
+            assert any(g is not None and g.abs().sum()>0 for g in bg[:nvae])
+            assert all(g is None for g in bg[nvae:])
+            outer = outer + band
+        if optimized:
+            real_root = unpack_root(z[:, :2])
+            assert real_root.shape == (2, 8, 4, 4)
+            torch.testing.assert_close(pack_root(real_root), z[:, :2])
+            assert heads.heads[0].model.pos_embed.shape[1] == 16
         detached_noisy = a*z.detach()+s*torch.randn_like(z)
         detached_target = s*(detached_noisy-a*mu.detach())/(a.square()*lv.detach().exp()+s.square()+1e-8)
         inner_ctx = {'context': z.detach()} if hierarchical else {}
@@ -323,8 +397,9 @@ def torch_smoke(base, blocks=None, device='cpu'):
             # Explicitly verify clean-ancestor dependence rather than relying on
             # zero-initialized adapters to happen to be active in a smoke pass.
             with torch.no_grad():
-                for adapter in vae.conditions:
-                    adapter[-1].weight.fill_(.001)
+                if not optimized:
+                    for adapter in vae.conditions:
+                        adapter[-1].weight.fill_(.001)
             eps = torch.randn_like(z, requires_grad=True)
             mm, ll, zz = vae.encode_sample(x, eps=eps)
             dm = torch.autograd.grad(mm[:, cfg['block_channels'][0]:].mean(), eps)[0]
@@ -336,7 +411,7 @@ def torch_smoke(base, blocks=None, device='cpu'):
                 anchored = sample_hierarchy(heads, noise=noise, y=y, cfg=cfg, steps=2, cfg_scale=2.5,
                                              root=zz[:, :cfg['block_channels'][0]])
                 torch.testing.assert_close(anchored[:, :cfg['block_channels'][0]], zz[:, :cfg['block_channels'][0]])
-        print(f'OK real Torch {row["blocks"]}-block: exact conditional targets, independent inner graph, finite routed gradients'
+        print(f'OK real Torch cell {row["cell_id"]}, {row["outputs"]}: exact conditional targets, independent inner graph, finite routed gradients'
               f'; VAE params={sum(p.numel() for p in vae.parameters()):,}, score params={sum(p.numel() for p in heads.parameters()):,}')
         del vae, heads
         if dev.type == 'cuda':

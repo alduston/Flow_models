@@ -106,6 +106,9 @@ def validate_hierarchy_resume(saved, current):
     for key in ('block_channels', 'score_depths', 'hierarchy_version'):
         if saved.get(key) != current.get(key):
             raise ValueError(f'Resume configuration mismatch: {key}')
+    for key, default in (('hierarchy_variant', 'standard'), ('block_spatial_sizes', None)):
+        if saved.get(key, default) != current.get(key, default):
+            raise ValueError(f'Resume configuration mismatch: {key}')
 
 
 def accumulate_block_metrics(totals, cfg, mu, logvar, prediction, target, weights, kl_schedule):
@@ -127,10 +130,18 @@ def train_hierarchy(cfg):
     import core
     from hier_models import HierarchicalVAE, HierarchicalHeads
     from hier_eval import evaluate_hierarchy
+    if cfg.get('hierarchy_variant') == 'optimized':
+        from optimized_models import OptimizedHierarchicalVAE, OptimizedHierarchicalHeads
+        HierarchicalVAE, HierarchicalHeads = OptimizedHierarchicalVAE, OptimizedHierarchicalHeads
     if len(cfg['block_channels']) not in (2, 3) or cfg['epochs_refine'] != 0:
         raise ValueError('The hierarchy adapter supports only 2/3-block cotraining with no refinement')
     source, counts = adapt_trainer_source(inspect.getsource(core.train_vae_cotrained_cond))
     namespace = dict(core.__dict__)
+    if cfg.get('tmin_band_weight') == 'matched':
+        from band_regularizer import adapt_band_source, band_namespace
+        source, band_counts = adapt_band_source(source)
+        namespace.update(band_namespace())
+        cfg['band_adapter_counts'] = band_counts
     namespace.update(HierarchicalVAE=HierarchicalVAE, HierarchicalHeads=HierarchicalHeads,
                      evaluate_current_state=evaluate_hierarchy,
                      accumulate_block_metrics=accumulate_block_metrics,
