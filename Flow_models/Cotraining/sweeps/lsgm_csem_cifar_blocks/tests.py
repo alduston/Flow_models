@@ -89,7 +89,61 @@ def offline_checks(base):
         atomic_json(Path(tmp)/'status'/'A1.json',{'state':'completed','returncode':0,'config_hash':config_hash(dep)})
         path=Path(tmp)/'results'/'A1';path.mkdir(parents=True);(path/'checkpoint.pt').touch()
         assert prerequisite(tmp,row,rows) is None
+    scheduler_checks(base)
     print('OK all 26 CLI configurations, 1/2/4 groups, paired parity, SLURM parser and phase gating')
+
+
+def scheduler_checks(base):
+    """Expired queue records must not block resubmission or mask outages."""
+    import subprocess
+    from unittest.mock import patch
+    from contextlib import redirect_stdout
+    from io import StringIO
+    import paper
+    expired = subprocess.CompletedProcess([], 1, '',
+        'slurm_load_jobs error: Invalid job id specified\n')
+    with patch.object(paper.shutil, 'which', return_value='/usr/bin/squeue'):
+        for response, expected in (
+                (expired, False),
+                (subprocess.CompletedProcess([], 1, '',
+                    'squeue: slurm_load_jobs error: Invalid job id specified\n'), False),
+                (subprocess.CompletedProcess([], 0, '', ''), False),
+                (subprocess.CompletedProcess([], 0, '12345\n', ''), True)):
+            with patch.object(paper.subprocess, 'run', return_value=response):
+                assert paper.job_active('12345') is expected
+        for error in ('Unable to contact slurm controller', 'Permission denied',
+                      'slurm_load_jobs error: Invalid job id specified\nConnection refused'):
+            response = subprocess.CompletedProcess([], 1, '', error)
+            with patch.object(paper.subprocess, 'run', return_value=response):
+                try: paper.job_active('12345')
+                except RuntimeError: pass
+                else: raise AssertionError('Scheduler error was masked: '+error)
+
+        rows = paper.manifest(base)
+        chosen = paper.select(rows, 'csem', 'A')
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, row in enumerate(chosen):
+                paper.atomic_json(paper.status_path(tmp, row), {
+                    'state': 'submitted', 'job_id': str(100+i),
+                    'config_hash': paper.config_hash(row), 'returncode': None})
+            calls = []
+            def scheduler(cmd, **kw):
+                calls.append(cmd)
+                if cmd[0] == 'squeue':
+                    if cmd[3] == '101':
+                        return subprocess.CompletedProcess(cmd, 0, '101\n', '')
+                    return expired
+                return subprocess.CompletedProcess(cmd, 0, str(900+len(calls))+'\n', '')
+            with patch.object(paper.subprocess, 'run', side_effect=scheduler), redirect_stdout(StringIO()):
+                paper.submit(tmp, chosen, rows)
+                # B/C remain gated until prerequisites actually complete.
+                paper.submit(tmp, paper.select(rows, 'csem', 'B'), rows)
+                paper.submit(tmp, paper.select(rows, 'csem', 'C'), rows)
+            assert len([cmd for cmd in calls if cmd[0] == 'sbatch']) == 2
+            assert paper.status(tmp, chosen[0])['job_id'] != '100'
+            assert paper.status(tmp, chosen[1])['job_id'] == '101'
+            assert paper.status(tmp, chosen[2])['job_id'] != '102'
+    print('OK expired SLURM IDs resubmit, active jobs skip, outages fail, B/C gating preserved')
 
 
 @contextmanager
