@@ -95,6 +95,33 @@ def evaluate_hierarchy(epoch_idx, prefix, vae, unet, loader, cfg, device, lpips_
         reconstructed = torch.cat(recs)
         if len(real) != N:
             raise RuntimeError('Evaluator did not collect the requested sample count')
+        # Quantify posterior-child dependence, not merely generated FID.
+        # Zeroing/shuffling the innovation at fixed encoded root exposed the
+        # old FMNIST cascade's otherwise invisible child-collapse failure.
+        if cfg.get('hierarchy_variant') == 'optimized_v3':
+            m = min(128, N)
+            original = zpost[:m].to(device)
+            root = original[:, :unet.block_channels[0]]
+            child = original[:, unet.block_channels[0]:]
+            t_probe = torch.full((m,), decode_time, device=device)
+            reference = reconstructed[:m].to(device)
+            target = real[:m].to(device)
+            def mse(a, b):
+                return float((a-b).square().mean().item())
+            baseline_mse = mse(reference, target)
+            zero_rec = vae.decode(torch.cat((root, torch.zeros_like(child)), dim=1), t=t_probe)
+            shuffle_rec = vae.decode(torch.cat((root, child.roll(1, 0)), dim=1), t=t_probe)
+            noise_rec = vae.decode(torch.cat((root, torch.randn_like(child)), dim=1), t=t_probe)
+            rows.update(child_use_probe_samples=m, child_use_posterior_mse=baseline_mse,
+                        child_use_zero_mse=mse(zero_rec, target),
+                        child_use_shuffle_mse=mse(shuffle_rec, target),
+                        child_use_noise_mse=mse(noise_rec, target),
+                        child_use_zero_delta=mse(zero_rec, reference),
+                        child_use_shuffle_delta=mse(shuffle_rec, reference),
+                        child_use_noise_delta=mse(noise_rec, reference))
+            print(f'[CHILD USE] epoch={epoch_idx} posterior_mse={baseline_mse:.6f} '
+                  f'zero_delta={rows["child_use_zero_delta"]:.6f} '
+                  f'shuffle_delta={rows["child_use_shuffle_delta"]:.6f}', flush=True)
         feature_bs = int(cfg.get('fid_batch_size', bs))
         real_features, fid_model = core.extract_inception_features(real, device, feature_bs, fid_model)
 

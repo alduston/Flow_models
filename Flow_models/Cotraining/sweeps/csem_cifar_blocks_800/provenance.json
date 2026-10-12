@@ -36,7 +36,7 @@
   },
   "core_import_repair": "setup_run_results_dir default wipe=True; callers already pass explicit wipe. No changes to VAE, DiT, trainer, evaluation or mathematical loss.",
   "flat_uses_original_trainer": true,
-  "baseline_fid": "User reports about 8.85; attached files contain recipe, not result logs.",
+  "baseline_fid": "User supplied flat epoch-250 FID 11.23 (RK4-25 CFG 2.5) and optimized v2 epoch-200 FID 82.34; these are pre-v3 logs.",
   "sweep_extension": {
     "new_cell_ids": [
       3,
@@ -62,13 +62,22 @@
     "validation": {
       "offline_validation": "passed",
       "real_torch_cpu_smoke_cells": [
-        3,
-        4,
         5
       ],
-      "synthetic_trainer_integration": "two optimizer steps per new cell; matched band, coordinate weighting, logging, checkpoint save/reload passed",
-      "cuda_800_epoch_training": "not run",
-      "numerical_cifar_quality": "not measured"
-    }
+      "synthetic_trainer_integration": "previous bundle only; not rerun for v3",
+      "cuda_800_epoch_training": "not run for v3",
+      "numerical_cifar_quality": "not measured for v3"
+    },
+    "new_optimized_cascade_version": "v3, fresh model and status namespace",
+    "removed_cell_ids": [
+      2
+    ],
+    "final_cell_ids": [
+      0,
+      1,
+      3,
+      4,
+      5
+    ]
   }
 }

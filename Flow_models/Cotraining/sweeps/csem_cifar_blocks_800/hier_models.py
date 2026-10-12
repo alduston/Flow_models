@@ -155,8 +155,13 @@ class BoundConditionalHead(nn.Module):
         super().__init__()
         self.head = head
         self.context = context
+        # Cached full-root tokens for the optimized conditional transformer.
+        # The legacy conditional head still uses the original uncached route.
+        self.context_cache = head.prepare_context(context) if hasattr(head, 'prepare_context') else None
 
     def forward(self, x, t, y=None):
+        if self.context_cache is not None:
+            return self.head(x, t, y, context=self.context, context_cache=self.context_cache)
         return self.head(x, t, y, context=self.context)
 
 

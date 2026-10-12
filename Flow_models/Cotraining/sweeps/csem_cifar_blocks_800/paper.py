@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Six CIFAR CSEM cells: original 1/2/3 blocks plus three band-corrected runs, 800 epochs."""
+"""Five CIFAR CSEM cells: 1/2 blocks +/- B and one repaired residual cascade."""
 from __future__ import annotations
 import argparse
 import csv
@@ -22,13 +22,13 @@ import traceback
 def manifest(base):
     with (Path(base)/'manifest.csv').open(newline='') as f:
         rows = list(csv.DictReader(f))
-    if ([int(r['cell_id']) for r in rows] != list(range(6)) or
-            [int(r['blocks']) for r in rows] != [1, 2, 3, 1, 2, 2] or
+    if ([int(r['cell_id']) for r in rows] != [0, 1, 3, 4, 5] or
+            [int(r['blocks']) for r in rows] != [1, 2, 1, 2, 2] or
             any(r['dataset'] != 'CIFAR' or int(r['epochs_joint']) != 800 for r in rows)):
-        raise ValueError('Expected six CIFAR-only 800-epoch cells, IDs 0 through 5')
+        raise ValueError('Expected five CIFAR 800-epoch cells with historical IDs 0,1,3,4,5')
     for row in rows:
         expected_band = 'matched' if int(row['cell_id']) >= 3 else ''
-        expected_variant = 'optimized' if int(row['cell_id']) == 5 else ''
+        expected_variant = 'optimized_v3' if int(row['cell_id']) == 5 else ''
         if row.get('tmin_band_weight', '') != expected_band or row.get('hierarchy_variant', '') != expected_variant:
             raise ValueError('Unexpected band/architecture settings in manifest')
     return rows
@@ -60,9 +60,9 @@ def config_for(row, base, data_root=None):
         cfg.update(tmin_band_weight='matched', resolved_tmin_band_weight=float(cfg['score_w_vae']))
         if int(row['blocks']) == 1:
             cfg['training_engine'] = 'flat_csem_with_matched_band_v1'
-    if row.get('hierarchy_variant') == 'optimized':
-        cfg.update(hierarchy_variant='optimized', block_spatial_sizes=split_ints(row['block_spatial_sizes']),
-                   hierarchy_version=2, training_engine='conditional_residual_multiscale_csem_v2',
+    if row.get('hierarchy_variant') == 'optimized_v3':
+        cfg.update(hierarchy_variant='optimized_v3', block_spatial_sizes=split_ints(row['block_spatial_sizes']),
+                   hierarchy_version=3, training_engine='conditional_residual_multiscale_csem_v3',
                    innovation_channels=[8, 6], latent_coordinates=512)
     return cfg
 
@@ -75,7 +75,11 @@ def atomic_json(path, value):
 
 
 def status_path(base, row):
-    return Path(base)/'status'/f'cell_{int(row["cell_id"]):03d}.json'
+    # Cell 5 has a new incompatible cascade architecture. Do not allow the
+    # still-running/finished old optimized job to suppress its submission or
+    # overwrite its status in an existing cluster sweep directory.
+    suffix = '_v3' if row.get('hierarchy_variant') == 'optimized_v3' else ''
+    return Path(base)/'status'/f'cell_{int(row["cell_id"]):03d}{suffix}.json'
 
 
 def status(base, row):
@@ -218,7 +222,7 @@ def select_cells(spec, rows):
         else:
             ids.add(int(part))
     if ids - {int(r['cell_id']) for r in rows}:
-        raise ValueError('Only cells 0 through 5 exist')
+        raise ValueError('Available cells are 0, 1, 3, 4, 5 (the three-block cell 2 was removed)')
     return [r for r in rows if int(r['cell_id']) in ids]
 
 
@@ -260,7 +264,7 @@ def submit_jobs(base, spec='all', *, dry_run=False, restart=False, data_root=Non
             exports['CSEM_DATA_ROOT'] = str(Path(data_root).resolve())
         if any(',' in v or '\n' in v for v in exports.values()):
             raise ValueError('Slurm export values cannot contain commas or newlines')
-        suffix = ('_optband' if row.get('hierarchy_variant') == 'optimized' else
+        suffix = ('_optv3band' if row.get('hierarchy_variant') == 'optimized_v3' else
                   '_band' if row.get('tmin_band_weight') else '')
         cmd = ['sbatch', '--parsable', f'--job-name=cifar_csem_b{row["blocks"]}{suffix}',
                '--export=ALL,'+','.join(f'{k}={v}' for k, v in exports.items()), str(Path(base)/'job.slurm')]
@@ -345,8 +349,8 @@ def main(argv=None):
         if name == 'report':
             p.add_argument('--cfg', type=float, choices=(2.5, 3.0), default=2.5)
         if name == 'smoke':
-            p.add_argument('--blocks', type=int, choices=(1, 2, 3), default=None)
-            p.add_argument('--cell-id', type=int, choices=range(6), default=None)
+            p.add_argument('--blocks', type=int, choices=(1, 2), default=None)
+            p.add_argument('--cell-id', type=int, choices=(0, 1, 3, 4, 5), default=None)
             p.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     a = parser.parse_args(argv); base = a.base_dir.resolve()
     if a.command == 'validate':

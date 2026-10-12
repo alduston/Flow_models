@@ -83,7 +83,7 @@ def posterior_coupling_checks(base):
     extract(function(ast.parse((base/'core.py').read_text()), 'ou_partial_groupnorm'), ns)
     core.ou_partial_groupnorm = ns['ou_partial_groupnorm']
     extract(sampler, ns)
-    for widths in ((4, 4), (3, 3, 2)):
+    for widths in ((4, 4),):
         B, H, W = 2, 2, 2
         m = tensor(rng.normal(size=(B, 8, H, W)))
         lv = tensor(rng.normal(scale=.1, size=m.shape))
@@ -139,7 +139,11 @@ def source_checks(base):
     for call in calls:
         context = next(k.value for k in call.keywords if k.arg == 'context')
         outer = ast.unparse(call.args[0]) in ('z_t_for_score', 'z_mu_t_for_score')
-        assert ast.unparse(context) == ('z0' if outer else 'z0.detach()')
+        if outer:
+            assert ast.unparse(context) == ("canonical_stability_scale_gradient(z0, encoder_csem_gradient_multiplier) "
+                "if cfg.get('hierarchy_variant') == 'optimized_v3' else z0")
+        else:
+            assert ast.unparse(context) == 'z0.detach()'
     # Objective, gradient replacement, clipping and optimizer statements remain.
     mathematical_targets = {'loss_joint', 'active_score_inner_objective', 'score_time_weights',
                             'score_head_time_weights', 'routed_score_gradients', 'kl', 'opt_joint',
@@ -171,23 +175,21 @@ def sampling_checks(base):
     extract(next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'BoundConditionalHead'), ns)
     fn = function(tree, 'sample_hierarchy'); fn.decorator_list = []
     extract(fn, ns)
-    widths = (3, 3, 2)
-    heads = types.SimpleNamespace(heads=[object(), object(), object()], block_channels=widths)
+    widths = (4, 4)
+    heads = types.SimpleNamespace(heads=[object(), object()], block_channels=widths)
     bank = tensor(np.arange(2*8*2*2).reshape(2, 8, 2, 2)/50)
     cfg = dict(t_min=.00003, t_max=1.35, time_schedule='log_t')
     z = ns['sample_hierarchy'](heads, noise=bank, y=None, cfg=cfg)
-    assert len(calls) == 3 and calls[0] is None
-    np.testing.assert_allclose(calls[1], z[:, :3])
-    np.testing.assert_allclose(calls[2], z[:, :6])
+    assert len(calls) == 2 and calls[0] is None
+    np.testing.assert_allclose(calls[1], z[:, :4])
     calls.clear()
-    root = tensor(np.ones((2, 3, 2, 2))*7)
+    root = tensor(np.ones((2, 4, 2, 2))*7)
     z = ns['sample_hierarchy'](heads, noise=bank, y=None, cfg=cfg, root=root)
-    assert len(calls) == 2
-    np.testing.assert_allclose(z[:, :3], root)
+    assert len(calls) == 1
+    np.testing.assert_allclose(z[:, :4], root)
     np.testing.assert_allclose(calls[0], root)
-    np.testing.assert_allclose(calls[1], z[:, :6])
     residual = np.linspace(-1, 1, 8*4).reshape(8, 2, 2)
-    weighted = sum(c/8*np.mean(v*v) for c, v in zip(widths, np.split(residual, [3, 6], axis=0)))
+    weighted = sum(c/8*np.mean(v*v) for c, v in zip(widths, np.split(residual, [4], axis=0)))
     np.testing.assert_allclose(weighted, np.mean(residual*residual))
     print('OK actual ancestral sampler: every child uses learned reverse diffusion and generated clean parents; dimension weighting')
 
@@ -199,7 +201,9 @@ def recipe_checks(base):
         baseline = next(csv.DictReader((base/'baseline_manifest.csv').open()))
         original = resolve_config(baseline, base)
         rows = paper.manifest(base)
-        assert len({r['result_name'] for r in rows}) == 6
+        assert len({r['result_name'] for r in rows}) == 5
+        assert paper.status_path(base, rows[-1]).name == 'cell_005_v3.json'
+        assert paper.status_path(base, rows[0]).name == 'cell_000.json'
         for row in rows:
             cfg = paper.config_for(row, base)
             strip = {'results_dir', 'master_results_dir', 'ckpt_dir', 'paper_cell_id', 'paper_result_name',
@@ -230,24 +234,17 @@ def recipe_checks(base):
                 old = {k: v for k, v in row.items() if k not in {'tmin_band_weight', 'hierarchy_variant', 'block_spatial_sizes'}}
                 assert paper.config_hash(row) == paper.config_hash(old)
             print(f'OK cell {row["cell_id"]}: blocks={row["block_channels"]}, depths={row["score_depths"]}, CIFAR / 800 epochs')
-    # Test the launch plan independently of this sweep's real job statuses.
-    # submit_jobs correctly skips completed/active cells even in dry-run mode;
-    # running this assertion against a live sweep therefore undercounts jobs.
-    with tempfile.TemporaryDirectory(prefix='csem_launcher_check_') as tmp:
-        launch_base = Path(tmp)
-        for name in ('manifest.csv', 'job.slurm'):
-            (launch_base/name).write_bytes((base/name).read_bytes())
-        text = io.StringIO()
-        with contextlib.redirect_stdout(text):
-            paper.submit_jobs(launch_base, dry_run=True)
-        assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 6
-        assert '--dependency=' not in text.getvalue() and 'TASK=prepare' not in text.getvalue()
-        text = io.StringIO()
-        with contextlib.redirect_stdout(text):
-            paper.submit_jobs(launch_base, spec='new', dry_run=True)
-        assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 3
-        assert 'CELL_ID=3' in text.getvalue() and 'CELL_ID=4' in text.getvalue() and 'CELL_ID=5' in text.getvalue()
-    print('OK six total / exactly three new training submissions; original status hashes preserved')
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        paper.submit_jobs(base, dry_run=True)
+    assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 5
+    assert '--dependency=' not in text.getvalue() and 'TASK=prepare' not in text.getvalue()
+    text = io.StringIO()
+    with contextlib.redirect_stdout(text):
+        paper.submit_jobs(base, spec='new', dry_run=True)
+    assert len([l for l in text.getvalue().splitlines() if l.startswith('sbatch ')]) == 3
+    assert 'CELL_ID=3' in text.getvalue() and 'CELL_ID=4' in text.getvalue() and 'CELL_ID=5' in text.getvalue()
+    print('OK five total / three B-arm training submissions; original status hashes preserved')
 
 
 def io_checks(base):
@@ -315,7 +312,7 @@ def band_checks(base):
             else: sys.modules[k] = v
     assert '--cell-id "$CELL_ID"' in (base/'job.slurm').read_text()
     assert '$((CELL_ID + 1))' not in (base/'job.slurm').read_text()
-    print('OK analytic band value/gradient, matched representation routing, both guarded adapters and six-cell launcher')
+    print('OK analytic band value/gradient, matched representation routing, both guarded adapters and five-cell launcher')
 
 
 def run(base):
@@ -352,7 +349,7 @@ def torch_smoke(base, blocks=None, device='cpu', cell_id=None):
         h_opts = dict(in_channels=8, hidden_dim=384, depth=12, num_heads=6, patch_size=1,
                       latent_size=8, num_classes=10, mlp_ratio=4.0, dropout=0.0, factored_head=True)
         hierarchical = int(row['blocks']) > 1
-        optimized = cfg.get('hierarchy_variant') == 'optimized'
+        optimized = cfg.get('hierarchy_variant') == 'optimized_v3'
         vae_class = OptimizedHierarchicalVAE if optimized else HierarchicalVAE
         head_class = OptimizedHierarchicalHeads if optimized else HierarchicalHeads
         vae = (vae_class(block_channels=cfg['block_channels'], **opts) if hierarchical else core.VAE(**opts)).to(dev)
@@ -383,11 +380,6 @@ def torch_smoke(base, blocks=None, device='cpu', cell_id=None):
             assert any(g is not None and g.abs().sum()>0 for g in bg[:nvae])
             assert all(g is None for g in bg[nvae:])
             outer = outer + band
-        if optimized:
-            real_root = unpack_root(z[:, :2])
-            assert real_root.shape == (2, 8, 4, 4)
-            torch.testing.assert_close(pack_root(real_root), z[:, :2])
-            assert heads.heads[0].model.pos_embed.shape[1] == 16
         detached_noisy = a*z.detach()+s*torch.randn_like(z)
         detached_target = s*(detached_noisy-a*mu.detach())/(a.square()*lv.detach().exp()+s.square()+1e-8)
         inner_ctx = {'context': z.detach()} if hierarchical else {}
@@ -400,6 +392,31 @@ def torch_smoke(base, blocks=None, device='cpu', cell_id=None):
         assert all(p.grad is None or torch.isfinite(p.grad).all() for p in (*vae.parameters(), *heads.parameters()))
         assert any(p.grad is not None and p.grad.abs().sum()>0 for p in vae.parameters())
         assert any(g is not None and g.abs().sum()>0 for g in gradients)
+        if optimized:
+            # Verify the decoder cannot reconstruct from a cached clean root
+            # when passed independently corrupted coordinates. Both root and
+            # child must genuinely affect this forward graph.
+            probe = noisy.detach().clone().requires_grad_(True)
+            probe_output = vae.decode(probe, t=t).square().mean()
+            probe_grad = torch.autograd.grad(probe_output, probe)[0]
+            assert probe_grad[:, :2].abs().sum().item() > 1e-9
+            assert probe_grad[:, 2:].abs().sum().item() > 1e-9
+            # The original factored DiT intentionally zero-initializes nu_proj,
+            # so its output cannot yet depend on *any* token/context. Activate
+            # the projection only inside this isolated smoke process.
+            original_nu = heads.heads[1].nu_proj.weight.detach().clone()
+            with torch.no_grad():
+                heads.heads[1].nu_proj.weight.normal_(std=1e-3)
+            root_ctx = z[:, :2].detach().clone().requires_grad_(True)
+            child_pred = heads.heads[1](noisy[:, 2:].detach(), t, y, context=root_ctx)
+            child_ctx_grad = torch.autograd.grad(child_pred.square().mean(), root_ctx)[0]
+            assert child_ctx_grad.abs().sum().item() > 1e-9
+            with torch.no_grad():
+                heads.heads[1].nu_proj.weight.copy_(original_nu)
+            real_root = unpack_root(z[:, :2])
+            assert real_root.shape == (2, 8, 4, 4)
+            torch.testing.assert_close(pack_root(real_root), z[:, :2])
+            assert heads.heads[0].model.pos_embed.shape[1] == 16
         if hierarchical:
             # Explicitly verify clean-ancestor dependence rather than relying on
             # zero-initialized adapters to happen to be active in a smoke pass.

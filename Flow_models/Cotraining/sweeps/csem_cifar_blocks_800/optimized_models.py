@@ -1,17 +1,17 @@
-"""Two-resolution residual cascade with the original 512-coordinate budget.
+"""FMNIST-informed CIFAR two-stage residual cascade, architecture v3.
 
-Root: 8 x 4 x 4 (128 coordinates). Child innovation: 6 x 8 x 8 (384).
-An orthogonal pixel permutation packs the root as 2 x 8 x 8 for the pinned
-trainer's tensor interface. The root network and decoder actually operate at
-4 x 4. Gaussian targets, coordinate means, noise banks and KL are invariant
-under this permutation. It introduces no stochastic posterior dependency.
+Root: eight channels at 4x4 (128 coords); child: six innovation channels at
+8x8 (384 coords). Root pixel shuffle is an exact isometric packing to the
+pinned trainer's 2+6 channels at 8x8. Both training reconstruction and
+sampling ALWAYS recompute top-down features from the supplied (possibly noisy)
+root. Child CSEM inference/score use the same CLEAN posterior root instead.
 """
 from __future__ import annotations
 import torch
 from torch import nn
 from torch.nn import functional as F
 import core
-from hier_models import HierarchicalHeads, ConditionalDiT
+from hier_models import HierarchicalHeads
 
 
 def pack_root(root):
@@ -24,41 +24,50 @@ def unpack_root(packed):
 
 class OptimizedHierarchicalVAE(core.VAE):
     def __init__(self, *, block_channels, **kwargs):
-        self.block_channels = tuple(int(c) for c in block_channels)
+        self.block_channels = tuple(map(int, block_channels))
         if self.block_channels != (2, 6) or int(kwargs['latent_channels']) != 8:
-            raise ValueError('Optimized cascade requires packed channels 2:6, total width 8')
+            raise ValueError('FMNIST-inspired cascade expects packed 2:6 channels (512 coordinates)')
         if int(kwargs.get('img_size', 32)) != 32 or kwargs.get('aux_d', 0):
-            raise ValueError('Optimized cascade is the CIFAR-32 non-mixture encoder')
+            raise ValueError('Only CIFAR-32, aux_d=0 is supported')
         if kwargs.get('use_norm', False) or kwargs.get('num_classes') is not None:
-            raise ValueError('Use OU-partial means and the original unconditional encoder')
+            raise ValueError('Use conditional OU-partial posterior means and unconditional VAE encoder')
         self.block_anchor_mode = kwargs.get('latent_anchor_mode', 'none')
         self.block_anchor_time = float(kwargs.get('latent_anchor_time', 0.0))
         kwargs['latent_anchor_mode'] = 'none'
         super().__init__(**kwargs)
         ch = 4 * self.base_ch
-        # Replace the original flat posterior and decoder input projections.
+        # Remove unused posterior maps and replace with two actual spatial stages.
         self.enc_norm_out = self.enc_conv_out = self.mu = self.logvar = None
-        self.root_down = nn.Sequential(nn.Conv2d(ch, ch, 3, 2, 1), core.VAEResBlock(ch, ch))
+        self.root_down = nn.Sequential(
+            nn.Conv2d(ch, ch, 3, stride=2, padding=1),
+            core.VAEResBlock(ch, ch), core.VAEAttentionBlock(ch, zero_init=False),
+            core.VAEResBlock(ch, ch))
         self.root_moments = nn.Sequential(core.make_group_norm(ch), nn.SiLU(), nn.Conv2d(ch, 16, 3, padding=1))
-        self.dec_conv_in = nn.Conv2d(8, ch, 3, padding=1)
-        self.root_decode = core.VAEResBlock(ch, ch)
-        self.root_upsample = nn.Sequential(nn.Upsample(scale_factor=2, mode='nearest'), nn.Conv2d(ch, ch, 3, padding=1))
-        self.child_moments = nn.Sequential(core.make_group_norm(2 * ch), nn.SiLU(),
-            nn.Conv2d(2 * ch, ch, 3, padding=1), nn.SiLU(), nn.Conv2d(ch, 12, 3, padding=1))
+        self.root_in = nn.Conv2d(8, ch, 3, padding=1)
+        self.root_blocks = nn.Sequential(
+            core.VAEResBlock(ch, ch), core.VAEAttentionBlock(ch, zero_init=False),
+            core.VAEResBlock(ch, ch))
+        self.root_up = nn.Sequential(nn.Upsample(scale_factor=2, mode='nearest'),
+                                     nn.Conv2d(ch, ch, 3, padding=1), core.VAEResBlock(ch, ch))
+        self.child_moments = nn.Sequential(
+            core.VAEResBlock(2*ch, ch), core.VAEResBlock(ch, ch),
+            core.make_group_norm(ch), nn.SiLU(), nn.Conv2d(ch, 12, 3, padding=1))
+        nn.init.normal_(self.child_moments[-1].weight, std=1e-3)
+        nn.init.zeros_(self.child_moments[-1].bias)
         self.child_baseline = nn.Conv2d(ch, 12, 3, padding=1)
         nn.init.zeros_(self.child_baseline.weight)
         nn.init.zeros_(self.child_baseline.bias)
-        self.child_inject = nn.Conv2d(6, ch, 3, padding=1)
+        self.child_in = nn.Conv2d(6, ch, 3, padding=1)
+        self.child_fusion = core.VAEResBlock(ch, ch)
+        # The original decoder starts at 8x8: now fed by the fused 4->8 path.
+        self.dec_conv_in = None
 
-    def coarse_features(self, root):
-        h = self.dec_conv_in(root)
-        if self.dec_post_proj is not None:
-            h = self.dec_post_proj(h)
-        return self.root_upsample(self.root_decode(h))
+    def ancestor_features(self, root):
+        return self.root_up(self.root_blocks(self.root_in(root)))
 
-    def child_location_scale(self, context_features):
-        location, log_scale = self.child_baseline(context_features).chunk(2, dim=1)
-        return location, log_scale.clamp(-4.0, 4.0).exp()
+    def baseline(self, features):
+        location, raw_log_scale = self.child_baseline(features).chunk(2, dim=1)
+        return location, 2.0 * torch.tanh(raw_log_scale / 2.0)
 
     def anchor(self, mean):
         if self.block_anchor_mode == 'ou_partial':
@@ -72,42 +81,40 @@ class OptimizedHierarchicalVAE(core.VAE):
         if self.enc_pre_proj is not None:
             h = self.enc_pre_proj(h)
         mr, lr = self.root_moments(self.root_down(h)).chunk(2, dim=1)
-        mr, lr = self.anchor(mr), lr.clamp(-30.0, 20.0)
-        if eps is None:
-            er = torch.randn_like(mr)
-        else:
+        mr, lr = self.anchor(mr), lr.clamp(-30., 20.)
+        if eps is not None:
             if eps.shape != (len(x), 8, 8, 8):
-                raise ValueError('Posterior noise bank must have packed shape B x 8 x 8 x 8')
+                raise ValueError('Posterior noise bank must be B x 8 x 8 x 8')
             er = unpack_root(eps[:, :2])
-        root = mr + (0.5 * lr).exp() * er
-        context = self.coarse_features(root)
-        mc, lc = self.child_moments(torch.cat((h, context), dim=1)).chunk(2, dim=1)
-        mc, lc = self.anchor(mc), lc.clamp(-30.0, 20.0)
-        ec = torch.randn_like(mc) if eps is None else eps[:, 2:]
-        child = mc + (0.5 * lc).exp() * ec
-        return (torch.cat((pack_root(mr), mc), dim=1),
-                torch.cat((pack_root(lr), lc), dim=1),
-                torch.cat((pack_root(root), child), dim=1))
+        else:
+            er = torch.randn_like(mr)
+        root = mr + (0.5*lr).exp()*er
+        # Crucial: conditional inference is given the CLEAN sampled root.
+        top = self.ancestor_features(root)
+        mc, lc = self.child_moments(torch.cat((h, top), dim=1)).chunk(2, dim=1)
+        mc, lc = self.anchor(mc), lc.clamp(-30., 20.)
+        ec = eps[:, 2:] if eps is not None else torch.randn_like(mc)
+        child = mc + (0.5*lc).exp()*ec
+        return torch.cat((pack_root(mr), mc), 1), torch.cat((pack_root(lr), lc), 1), torch.cat((pack_root(root), child), 1)
 
     def encode(self, x, y=None):
-        raise RuntimeError('Use encode_sample: child moments require the SAME clean root draw')
+        raise RuntimeError('Conditional child moments require encode_sample with the same clean root draw')
 
     def decode(self, packed, t=None):
         root, innovation = unpack_root(packed[:, :2]), packed[:, 2:]
-        h = self.coarse_features(root)
-        location, scale = self.child_location_scale(h)
-        child = location + scale * innovation
-        # Root enters at 4 x 4, child at 8 x 8, before the inherited 8->16->32 path.
-        h = h + self.child_inject(child)
+        # DO NOT cache clean-root features here. Training supplies (z1_t,u2_t).
+        top = self.ancestor_features(root)
+        loc, log_scale = self.baseline(top)
+        raw_child = loc + log_scale.exp()*innovation
+        h = self.child_fusion(top + self.child_in(raw_child))
         t_emb = None
         if self.time_cond_decoder and t is not None:
             t_emb = self.dec_time_mlp(core.timestep_embedding(t, self.dec_time_emb_dim))
         for i, block in enumerate(self.dec_blocks):
             h = block(h)
             if t_emb is not None:
-                scale_shift = self.dec_film_layers[i](t_emb)
-                scale_t, shift_t = scale_shift.chunk(2, dim=1)
-                h = h * (1.0 + scale_t[:, :, None, None]) + shift_t[:, :, None, None]
+                scale, shift = self.dec_film_layers[i](t_emb).chunk(2, dim=1)
+                h = h * (1. + scale[:, :, None, None]) + shift[:, :, None, None]
         out = self.dec_out(h)
         return torch.tanh(out) if self.use_tanh_out else out
 
@@ -119,41 +126,93 @@ class OptimizedHierarchicalVAE(core.VAE):
 class PackedRootDiT(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
-        opts = dict(kwargs, in_channels=8, latent_size=4)
-        self.model = core.DiTModel(**opts)
+        self.model = core.DiTModel(**dict(kwargs, in_channels=8, latent_size=4))
         self.num_classes = self.model.num_classes
         self.null_label = self.model.null_label
         self.factored_head = self.model.factored_head
 
     def forward(self, x, t, y=None, **kwargs):
-        result = self.model(unpack_root(x), t, y, **kwargs)
-        if isinstance(result, tuple):
-            return tuple(pack_root(value) for value in result)
-        return pack_root(result)
+        answer = self.model(unpack_root(x), t, y, **kwargs)
+        return tuple(pack_root(v) for v in answer) if isinstance(answer, tuple) else pack_root(answer)
 
 
-class ResidualConditionalDiT(ConditionalDiT):
+class OptimizedConditionalDiT(core.DiTModel):
+    """Full-root spatial injection plus per-block root-token cross-attention.
+
+    Maintains the original factored natural-parameter epsilon prediction and
+    detached auxiliary (lambda,nu) branch required by CIFAR gradient routing.
+    """
     def __init__(self, **kwargs):
-        super().__init__(context_channels=8, **kwargs)
+        super().__init__(**dict(kwargs, in_channels=6, latent_size=8))
+        self.context_channels = 8
+        self.context_proj = nn.Conv2d(8, self.hidden_dim, 1)
+        nn.init.normal_(self.context_proj.weight, std=.02)
+        nn.init.zeros_(self.context_proj.bias)
+        self.register_buffer('context_pos', self._build_2d_sincos_pos_embed(self.hidden_dim, 4), persistent=False)
+        self.context_norm = nn.ModuleList([nn.LayerNorm(self.hidden_dim) for _ in self.blocks])
+        self.context_attn = nn.ModuleList([
+            nn.MultiheadAttention(self.hidden_dim, kwargs['num_heads'], batch_first=True)
+            for _ in self.blocks])
+        self.context_gate = nn.Parameter(torch.full((len(self.blocks),), .1))
 
-    def forward(self, x, t, y=None, *, context, **kwargs):
-        # Preserve the entire clean root; nearest upsampling is injective.
-        parents = F.interpolate(unpack_root(context), size=x.shape[-2:], mode='nearest')
-        return super().forward(x, t, y, context=parents, **kwargs)
+    def prepare_context(self, packed_clean_root):
+        if packed_clean_root.ndim != 4 or packed_clean_root.shape[1:] != (2, 8, 8):
+            raise ValueError('Expected packed clean ancestor [B,2,8,8]')
+        root = unpack_root(packed_clean_root)
+        features = self.context_proj(root)
+        return (F.interpolate(features, size=(8, 8), mode='nearest'),
+                features.flatten(2).transpose(1, 2) + self.context_pos)
+
+    def forward(self, x, t, y=None, *, context, context_cache=None,
+                return_components=False, detach_components=False):
+        B, _, _, _ = x.shape
+        spatial, root_tokens = self.prepare_context(context) if context_cache is None else context_cache
+        if spatial.shape[0] != B:
+            raise ValueError('Mismatched clean-ancestor batch')
+        tokens = self.patch_embed(x) + spatial
+        ht, wt = tokens.shape[2:]
+        tokens = tokens.flatten(2).transpose(1, 2) + self.pos_embed
+        c = self.time_mlp(core.timestep_embedding(t.view(-1), self.hidden_dim))
+        if self.label_emb is not None:
+            ids = (torch.full((B,), self.null_label, device=x.device, dtype=torch.long)
+                   if y is None else y.to(x.device).long().view(-1))
+            c = c + self.label_emb(ids)
+        for i, blk in enumerate(self.blocks):
+            tokens = blk(tokens, c)
+            update = self.context_attn[i](self.context_norm[i](tokens), root_tokens,
+                                          root_tokens, need_weights=False)[0]
+            tokens = tokens + torch.tanh(self.context_gate[i])*update
+        gamma, beta = self.final_modulation(c).unsqueeze(1).chunk(2, dim=-1)
+        tokens = self.final_norm(tokens)*(1.+gamma) + beta
+        if not self.factored_head:
+            if return_components:
+                raise ValueError('Auxiliary outputs require factored head')
+            return self.unpatchify(self.final_proj(tokens), ht, wt)
+        nu = self.unpatchify(self.nu_proj(tokens), ht, wt)
+        lam = self.unpatchify(self.prec_proj(tokens), ht, wt).clamp(-20., 20.).exp()
+        out = lam*x - nu
+        if return_components:
+            if detach_components:
+                aux = tokens.detach()
+                nu_aux = self.unpatchify(self.nu_proj(aux), ht, wt)
+                lam_aux = self.unpatchify(self.prec_proj(aux), ht, wt).clamp(-20., 20.).exp()
+                return out, lam_aux, nu_aux
+            return out, lam, nu
+        return out
 
 
 class OptimizedHierarchicalHeads(HierarchicalHeads):
     def __init__(self, *, block_channels, score_depths, **kwargs):
         nn.Module.__init__(self)
-        self.block_channels = tuple(int(c) for c in block_channels)
-        self.score_depths = tuple(int(d) for d in score_depths)
+        self.block_channels = tuple(map(int, block_channels))
+        self.score_depths = tuple(map(int, score_depths))
         if self.block_channels != (2, 6) or len(self.score_depths) != 2:
-            raise ValueError('Optimized heads require two blocks with packed widths 2:6')
+            raise ValueError('Expected 2:6 widths and two DiT depths')
         self.in_channels = 8
         self.factored_head = bool(kwargs.get('factored_head', False))
         self.num_classes = kwargs.get('num_classes')
         self.null_label = self.num_classes
         self.heads = nn.ModuleList([
             PackedRootDiT(**dict(kwargs, depth=self.score_depths[0])),
-            ResidualConditionalDiT(**dict(kwargs, in_channels=6, latent_size=8, depth=self.score_depths[1])),
+            OptimizedConditionalDiT(**dict(kwargs, depth=self.score_depths[1])),
         ])

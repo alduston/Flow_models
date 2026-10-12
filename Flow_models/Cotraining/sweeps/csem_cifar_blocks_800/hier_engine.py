@@ -36,7 +36,10 @@ def adapt_trainer_source(source):
                 counts['heads'] += 1
             elif name in {'unet_lsi', 'unet_control'}:
                 outer = ast.unparse(node.args[0]) in {'z_t_for_score', 'z_mu_t_for_score'}
-                value = ast.parse('z0' if outer else 'z0.detach()', mode='eval').body
+                value = ast.parse(
+                    "(canonical_stability_scale_gradient(z0, encoder_csem_gradient_multiplier) "
+                    "if cfg.get('hierarchy_variant') == 'optimized_v3' else z0)"
+                    if outer else 'z0.detach()', mode='eval').body
                 node.keywords.append(ast.keyword(arg='context', value=value))
                 counts['context'] += 1
             return node
@@ -130,11 +133,11 @@ def train_hierarchy(cfg):
     import core
     from hier_models import HierarchicalVAE, HierarchicalHeads
     from hier_eval import evaluate_hierarchy
-    if cfg.get('hierarchy_variant') == 'optimized':
+    if cfg.get('hierarchy_variant') == 'optimized_v3':
         from optimized_models import OptimizedHierarchicalVAE, OptimizedHierarchicalHeads
         HierarchicalVAE, HierarchicalHeads = OptimizedHierarchicalVAE, OptimizedHierarchicalHeads
-    if len(cfg['block_channels']) not in (2, 3) or cfg['epochs_refine'] != 0:
-        raise ValueError('The hierarchy adapter supports only 2/3-block cotraining with no refinement')
+    if len(cfg['block_channels']) != 2 or cfg['epochs_refine'] != 0:
+        raise ValueError('The hierarchy adapter supports only two-block cotraining with no refinement')
     source, counts = adapt_trainer_source(inspect.getsource(core.train_vae_cotrained_cond))
     namespace = dict(core.__dict__)
     if cfg.get('tmin_band_weight') == 'matched':
