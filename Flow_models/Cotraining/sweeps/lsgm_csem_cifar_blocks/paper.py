@@ -146,7 +146,16 @@ def parse_slurm_job_id(stdout):
 def job_active(job_id):
     if not job_id or not shutil.which('squeue'): return False
     p = subprocess.run(['squeue','-h','-j',str(job_id),'-o','%i'], capture_output=True,text=True)
-    if p.returncode != 0: raise RuntimeError('squeue failed: '+p.stderr.strip())
+    if p.returncode != 0:
+        error = p.stderr.strip()
+        # Slurm can reject IDs that have already left its queue records.
+        # Only this specific response means inactive; controller/network errors
+        # must still stop submission to avoid launching duplicate jobs.
+        if not p.stdout.strip() and re.fullmatch(
+                r'(?:squeue:\s*)?slurm_load_jobs error:\s*Invalid job id specified',
+                error, re.IGNORECASE):
+            return False
+        raise RuntimeError('squeue failed: '+error)
     return any(line.strip()==str(job_id) for line in p.stdout.splitlines())
 
 
