@@ -1,0 +1,76 @@
+[
+  {
+    "cell": "B1-L",
+    "groups": 1,
+    "latent_per_group": 180,
+    "vae_parameters": 41592384,
+    "prior_parameters": 137883496,
+    "prior_parameters_per_head": [
+      137883496
+    ]
+  },
+  {
+    "cell": "B1-C",
+    "groups": 1,
+    "latent_per_group": 180,
+    "vae_parameters": 41592384,
+    "prior_parameters": 137883496,
+    "prior_parameters_per_head": [
+      137883496
+    ]
+  },
+  {
+    "cell": "B2-L",
+    "groups": 2,
+    "latent_per_group": 90,
+    "vae_parameters": 70508920,
+    "prior_parameters": 137883496,
+    "prior_parameters_per_head": [
+      137883496
+    ]
+  },
+  {
+    "cell": "B2-C",
+    "groups": 2,
+    "latent_per_group": 90,
+    "vae_parameters": 70508920,
+    "prior_parameters": 132958024,
+    "prior_parameters_per_head": [
+      66336276,
+      66621748
+    ]
+  },
+  {
+    "cell": "B4-L",
+    "groups": 4,
+    "latent_per_group": 45,
+    "vae_parameters": 128560692,
+    "prior_parameters": 137883496,
+    "prior_parameters_per_head": [
+      137883496
+    ]
+  },
+  {
+    "cell": "B4-C",
+    "groups": 4,
+    "latent_per_group": 45,
+    "vae_parameters": 128560692,
+    "prior_parameters": 144273000,
+    "prior_parameters_per_head": [
+      35912538,
+      36016474,
+      36120154,
+      36223834
+    ]
+  },
+  {
+    "cell": "B0",
+    "groups": 4,
+    "latent_per_group": 45,
+    "vae_parameters": 130622772,
+    "prior_parameters": 137883496,
+    "prior_parameters_per_head": [
+      137883496
+    ]
+  }
+]

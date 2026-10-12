@@ -1,0 +1,868 @@
+--- a/evaluate_diffusion.py
++++ b/evaluate_diffusion.py
+@@ -6,11 +6,13 @@
+ # ---------------------------------------------------------------
+ 
+ import os
++import json
+ import numpy as np
+ import torch
+ from timeit import default_timer as timer
+ 
+ from util import utils
++import csem_lsgm
+ from fid.fid_score import compute_statistics_of_generator, load_statistics, calculate_frechet_distance
+ from fid.inception import InceptionV3
+ from torch.cuda.amp import autocast
+@@ -21,15 +23,27 @@
+ def create_generator_vada(dae, diffusion, vae, batch_size, num_total_samples, enable_autocast, ode_param_dict, prior_var, temp, vae_temp):
+     num_iters = int(np.ceil(num_total_samples / batch_size))
+     shape = [dae.num_input_channels, dae.input_size, dae.input_size]
++    dae._sampling_stats = []
+     for i in range(num_iters):
+         with torch.no_grad():
+             if ode_param_dict is None:
++                if isinstance(dae, csem_lsgm.CascadeDAE):
++                    raise NotImplementedError('Cascade evaluation uses ODE sampling only')
+                 eps = diffusion.run_denoising_diffusion(dae, batch_size, shape, temp, enable_autocast, is_image=False, prior_var=prior_var)
+             else:
+-                eps, _, _ = diffusion.sample_model_ode(dae, batch_size, shape, ode_param_dict['ode_eps'],
++                start = timer()
++                if isinstance(dae, csem_lsgm.CascadeDAE):
++                    eps, k, _ = csem_lsgm.sample_cascade_ode(diffusion, dae, batch_size, ode_param_dict['ode_eps'],
++                                                           ode_param_dict['ode_solver_tol'], enable_autocast, temp)
++                    nfes = dae.last_sampling_nfe_per_head
++                else:
++                    eps, k, _ = diffusion.sample_model_ode(dae, batch_size, shape, ode_param_dict['ode_eps'],
+                                                          ode_param_dict['ode_solver_tol'], enable_autocast, temp)
++                    nfes = [k]
+             decomposed_eps = vae.decompose_eps(eps)
+             image = vae.sample(batch_size, vae_temp, decomposed_eps, enable_autocast)
++            if ode_param_dict is not None:
++                dae._sampling_stats.append({'seconds': timer() - start, 'nfe': nfes})
+         yield image.float()
+ 
+ 
+@@ -42,9 +56,14 @@
+             assert ode_eps is not None, 'ODE-based sampling requires integration cutoff ode_eps!'
+             assert ode_solver_tol is not None, 'ODE-based sampling requires ode solver tolerance!'
+             start = timer()
+-            eps, nfe, time_ode_solve = diffusion.sample_model_ode(dae, num_samples, shape, ode_eps, ode_solver_tol, enable_autocast, temp, noise)
++            if isinstance(dae, csem_lsgm.CascadeDAE):
++                eps, nfe, time_ode_solve = csem_lsgm.sample_cascade_ode(diffusion, dae, num_samples, ode_eps, ode_solver_tol, enable_autocast, temp, noise)
++            else:
++                eps, nfe, time_ode_solve = diffusion.sample_model_ode(dae, num_samples, shape, ode_eps, ode_solver_tol, enable_autocast, temp, noise)
+         else:
+-            assert isinstance(diffusion, DiffusionDiscretized), 'Regular sampling requires disc. diffusion!'
++            if isinstance(dae, csem_lsgm.CascadeDAE):
++                raise NotImplementedError('Cascade evaluation uses ODE sampling only')
++            assert isinstance(diffusion, DiffusionDiscretized), 'Regular sampling requires disc. diffusion!' 
+             assert noise is None, 'Noise is not used in ancestral sampling.'
+             nfe = diffusion._diffusion_steps
+             time_ode_solve = 999.999  # Yeah I know...
+@@ -102,7 +121,8 @@
+                 if ode_eval:
+                     assert isinstance(diffusion, DiffusionBase), 'ODE-based NLL evaluation requires cont. diffusion!'
+                     assert ode_param_dict is not None
+-                    nelbo_prior, nfe, stddev_batch, stderror_batch = diffusion.compute_ode_nll(
++                    nll_fn = (lambda **kw: csem_lsgm.cascade_ode_nll(diffusion, **kw)) if isinstance(dae, csem_lsgm.CascadeDAE) else diffusion.compute_ode_nll
++                    nelbo_prior, nfe, stddev_batch, stderror_batch = nll_fn(
+                         dae=dae, eps=eps, ode_eps=ode_param_dict['ode_eps'],
+                         ode_solver_tol=ode_param_dict['ode_solver_tol'], enable_autocast=args.autocast_eval,
+                         no_autograd=args.no_autograd_jvp, num_samples=num_inner_samples, report_std=report_std)
+@@ -113,7 +133,9 @@
+                         stddev_avg.update(stddev_batch, x.size(0))
+                         stderror_avg.update(stderror_batch, x.size(0))
+                 else:
+-                    assert isinstance(diffusion, DiffusionDiscretized), 'Regular NLL evaluation requires disc. diffusion!'
++                    if isinstance(dae, csem_lsgm.CascadeDAE):
++                        raise NotImplementedError('Cascade evaluation uses ODE likelihood only')
++                    assert isinstance(diffusion, DiffusionDiscretized), 'Regular NLL evaluation requires disc. diffusion!' 
+                     assert num_inner_samples == 1, 'inner_samples more than one is not implemented'
+                     nelbo_prior = diffusion.compute_nelbo(dae, eps, enable_autocast=args.autocast_eval, is_image=False,
+                                                           prior_var=args.sigma2_max if args.sde_type == 'vesde' else 1.0)
+@@ -160,6 +182,7 @@
+                                   prior_var, temp, vae_temp)
+     else:
+         raise NotImplementedError('vae cannot be None.')
++    prior_model = model
+     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+     model = InceptionV3([block_idx], model_dir=args.fid_dir).to(device)
+     m, s = compute_statistics_of_generator(g, model, args.batch_size, dims, device, max_samples=num_sample_per_gpu)
+@@ -180,4 +203,10 @@
+     m0, s0 = load_statistics(path)
+ 
+     fid = calculate_frechet_distance(m0, s0, m, s)
++    stats = getattr(prior_model, '_sampling_stats', [])
++    if stats:
++        per_head = np.mean([s['nfe'] for s in stats], axis=0).tolist()
++        args._last_fid_perf = {'sampling_seconds': sum(s['seconds'] for s in stats),
++                               'sampling_nfe_total': sum(per_head),
++                               'sampling_nfe_per_head': json.dumps(per_head)}
+     return fid
+--- a/evaluate_vada.py
++++ b/evaluate_vada.py
+@@ -16,6 +16,7 @@
+ from torch.multiprocessing import Process
+ 
+ from nvae import NVAE
++import csem_lsgm
+ from diffusion_discretized import DiffusionDiscretized
+ from diffusion_continuous import make_diffusion
+ try:
+@@ -71,7 +72,7 @@
+ 
+     # load DAE
+     num_input_channels = vae.latent_structure()[0]
+-    dae = utils.get_dae_model(args, num_input_channels)
++    dae = csem_lsgm.build_prior(args, vae)
+     dae.load_state_dict(checkpoint['dae_state_dict'])
+     diffusion_cont = make_diffusion(args)
+     diffusion_disc = DiffusionDiscretized(args, diffusion_cont.var)
+@@ -100,7 +101,11 @@
+     # set vae to train mode if the arg says
+     vae.train(mode=eval_args.vae_train_mode)
+ 
++    if isinstance(dae, csem_lsgm.CascadeDAE) and (eval_args.fid_disc_eval or eval_args.elbo_eval):
++        raise ValueError('Cascade evaluation requires ODE flags')
+     if eval_args.eval_mode == 'evaluate':
++        final_metrics = {'epoch': epoch, 'num_fid_samples': eval_args.num_fid_samples}
++        final_metrics.update(csem_lsgm.parameter_counts(vae, dae))
+         # replace a few fields in args based on eval_args
+         # this will allow train/evaluate on different systems
+         args.num_proc_node = eval_args.num_proc_node
+@@ -134,6 +139,8 @@
+                 logging.info('valid ODE-based prior prob std. error: {} bpd ({} nats)'.format(stderror * bpd_coeff, stderror))
+                 logging.info('valid ODE-based prior prob variance (based on std. deviation): {} bpd ({} nats)'.format(stddev * stddev * bpd_coeff, stddev * stddev))
+                 logging.info('valid ODE-based prior prob variance (based on std. error): {} bpd ({} nats)'.format(stderror * stderror * bpd_coeff, stderror * stderror))
++            final_metrics.update(ode_nelbo_bpd=csem_lsgm.scalar(nelbo_ode * bpd_coeff),
++                                 ode_nll_bpd=csem_lsgm.scalar(neg_log_p_ode * bpd_coeff), nll_nfe=csem_lsgm.scalar(nfe_nll_ode))
+             writer.add_scalar('val/final_ode_nelbo_bpd', nelbo_ode * bpd_coeff, 1)
+             writer.add_scalar('val/final_ode_neg_log_p_bpd', neg_log_p_ode * bpd_coeff, 1)
+             writer.add_scalar('val/final_ode_nfe', nfe_nll_ode, 1)
+@@ -157,6 +164,8 @@
+                                            ode_param_dict, eval_args.temp, eval_args.vae_temp)
+             logging.info('valid ODE-based FID: {} (ode error tol. {}, ode eps {})'
+                          .format(val_fid_ema_ode, ode_param_dict['ode_solver_tol'], ode_param_dict['ode_eps']))
++            final_metrics['ode_fid_50000'] = float(val_fid_ema_ode)
++            final_metrics.update(getattr(args, '_last_fid_perf', {}))
+             writer.add_scalar('val/final_fid_ode_samples', val_fid_ema_ode, 1)
+ 
+         # compute FID using samples from regular fixed discretization sampling
+@@ -194,6 +203,8 @@
+                          .format(num_iter * args.num_process_per_node * args.num_proc_node, args.batch_size, odetime_sum / num_iter))
+             writer.add_scalar('ode_sampling_nfe/final_average', nfe_sum / num_iter, 1)
+ 
++        if eval_args.global_rank == 0:
++            csem_lsgm.write_json(os.path.join(eval_args.save, 'final_metrics.json'), final_metrics)
+         writer.close()
+ 
+     elif eval_args.eval_mode == 'sample':
+--- a/fid/fid_score.py
++++ b/fid/fid_score.py
+@@ -195,7 +195,10 @@
+     diff = mu1 - mu2
+ 
+     # Product might be almost singular
+-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
++    try:
++        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
++    except TypeError:  # SciPy >= 1.18
++        covmean = linalg.sqrtm(sigma1.dot(sigma2))
+     if not np.isfinite(covmean).all():
+         msg = ('fid calculation produces singular product; '
+                'adding %s to diagonal of cov estimates') % eps
+--- a/nvae.py
++++ b/nvae.py
+@@ -296,6 +296,7 @@
+ 
+         logits = self.image_conditional(s)
+ 
++        self.last_q = all_q  # conditionally Gaussian moments, in decoder order
+         return logits, all_log_q, all_eps
+ 
+     def sample(self, num_samples, t, eps_z=None, enable_autocast=False):
+--- a/score_sde/op/fused_act.py
++++ b/score_sde/op/fused_act.py
+@@ -16,13 +16,24 @@
+ 
+ 
+ module_path = os.path.dirname(__file__)
+-fused = load(
+-    "fused",
+-    sources=[
+-        os.path.join(module_path, "fused_bias_act.cpp"),
+-        os.path.join(module_path, "fused_bias_act_kernel.cu"),
+-    ],
+-)
++fused = None
++_native_only = os.environ.get('LSGM_OP_BACKEND', 'auto') == 'native'
++
++def _ensure_extension():
++    global fused, _native_only
++    if _native_only:
++        return False
++    if fused is None:
++        try:
++            fused = load('fused', sources=[os.path.join(module_path, s) for s in ['fused_bias_act.cpp', 'fused_bias_act_kernel.cu']])
++            print('LSGM op fused: CUDA extension', flush=True)
++        except Exception as exc:
++            if os.environ.get('LSGM_OP_BACKEND', 'auto') == 'cuda':
++                raise
++            import warnings
++            warnings.warn('LSGM op fused: native PyTorch fallback: ' + repr(exc))
++            _native_only = True
++    return not _native_only
+ 
+ 
+ class FusedLeakyReLUFunctionBackward(Function):
+@@ -92,7 +103,7 @@
+ 
+ 
+ def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
+-    if input.device.type == "cpu":
++    if input.device.type == "cpu" or not _ensure_extension():
+         rest_dim = [1] * (input.ndim - bias.ndim - 1)
+         return (
+             F.leaky_relu(
+--- a/score_sde/op/upfirdn2d.py
++++ b/score_sde/op/upfirdn2d.py
+@@ -15,13 +15,24 @@
+ 
+ 
+ module_path = os.path.dirname(__file__)
+-upfirdn2d_op = load(
+-    "upfirdn2d",
+-    sources=[
+-        os.path.join(module_path, "upfirdn2d.cpp"),
+-        os.path.join(module_path, "upfirdn2d_kernel.cu"),
+-    ],
+-)
++upfirdn2d_op = None
++_native_only = os.environ.get('LSGM_OP_BACKEND', 'auto') == 'native'
++
++def _ensure_extension():
++    global upfirdn2d_op, _native_only
++    if _native_only:
++        return False
++    if upfirdn2d_op is None:
++        try:
++            upfirdn2d_op = load('upfirdn2d', sources=[os.path.join(module_path, s) for s in ['upfirdn2d.cpp', 'upfirdn2d_kernel.cu']])
++            print('LSGM op upfirdn2d: CUDA extension', flush=True)
++        except Exception as exc:
++            if os.environ.get('LSGM_OP_BACKEND', 'auto') == 'cuda':
++                raise
++            import warnings
++            warnings.warn('LSGM op upfirdn2d: native PyTorch fallback: ' + repr(exc))
++            _native_only = True
++    return not _native_only
+ 
+ 
+ class UpFirDn2dBackward(Function):
+@@ -151,10 +162,15 @@
+ 
+ 
+ def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
+-    if input.device.type == "cpu":
+-        out = upfirdn2d_native(
+-            input, kernel, up, up, down, down, pad[0], pad[1], pad[0], pad[1]
+-        )
++    if input.device.type == "cpu" or not _ensure_extension():
++        if input.is_cuda:
++            # The CUDA extension runs in fp32 even under AMP; match that here.
++            with torch.autocast(device_type='cuda', enabled=False):
++                out = upfirdn2d_native(input.float(), kernel.float(), up, up, down, down,
++                                      pad[0], pad[1], pad[0], pad[1])
++        else:
++            out = upfirdn2d_native(input, kernel, up, up, down, down,
++                                  pad[0], pad[1], pad[0], pad[1])
+ 
+     else:
+         out = UpFirDn2d.apply(
+--- a/thirdparty/functions.py
++++ b/thirdparty/functions.py
+@@ -108,9 +108,6 @@
+                 combined, torch.distributed.ReduceOp.SUM, process_group, async_op=False)
+             sum_dy, sum_dy_xmu = torch.split(combined, num_channels)
+ 
+-            divisor = count_tensor.sum()
+-            mean_dy = sum_dy / divisor
+-            mean_dy_xmu = sum_dy_xmu / divisor
+             # backward pass for gradient calculation
+             grad_input = torch.batch_norm_backward_elemt(
+                 grad_output,
+@@ -118,8 +115,9 @@
+                 mean,
+                 invstd,
+                 weight,
+-                mean_dy,
+-                mean_dy_xmu
++                sum_dy,
++                sum_dy_xmu,
++                count_tensor.reshape(-1).to(torch.int32)
+             )
+ 
+         # synchronizing of grad_weight / grad_bias is not needed as distributed
+--- a/train_vada.py
++++ b/train_vada.py
+@@ -14,6 +14,7 @@
+ from torch.cuda.amp import autocast, GradScaler
+ 
+ from nvae import NVAE
++import csem_lsgm
+ from diffusion_discretized import DiffusionDiscretized
+ from diffusion_continuous import make_diffusion
+ try:
+@@ -52,6 +53,7 @@
+         load_vae = True and not args.discard_vae_weights
+         load_dae = args.vada_checkpoint != '' and not args.discard_dae_weights
+ 
++    csem_lsgm.validate_args(args)  # after checkpoint architecture override, including num_nf
+     arch_instance_vae = utils.get_arch_cells(args.arch_instance, args.use_se)
+     logging.info('args = %s', args)
+ 
+@@ -72,7 +74,7 @@
+     # enable mixed prediction for vada
+     args.mixed_prediction = True
+     num_input_channels = vae.latent_structure()[0]
+-    dae = utils.get_dae_model(args, num_input_channels)
++    dae = csem_lsgm.build_prior(args, vae)
+     if load_dae:
+         logging.info('loading weights from dae checkpoint')
+         dae.load_state_dict(checkpoint['dae_state_dict'])
+@@ -86,6 +88,8 @@
+     diffusion_cont = make_diffusion(args)
+     diffusion_disc = DiffusionDiscretized(args, diffusion_cont.var)
+ 
++    if args.global_rank == 0:
++        csem_lsgm.write_json(os.path.join(args.save, 'parameter_counts.json'), csem_lsgm.parameter_counts(vae, dae))
+     logging.info('DAE: param size = %fM ', utils.count_parameters_in_M(dae))
+     # sync all parameters between all gpus by sending param from rank 0 to all gpus.
+     utils.broadcast_params(dae.parameters(), args.distributed)
+@@ -156,6 +160,7 @@
+             dae.mixing_logit.data[0, torch.logical_not(is_active), 0, 0] = -15
+             dae.is_active = is_active.float().view(1, -1, 1, 1)
+ 
++        args.current_epoch = epoch + 1
+         # Logging.
+         logging.info('epoch %d', epoch)
+         if args.disjoint_training:
+@@ -196,11 +201,13 @@
+             # generate samples
+             n = int(np.floor(np.sqrt(min(64, args.batch_size))))  # cannot generate too many samples on big datasets
+             num_samples = n ** 2
+-            samples_disc, _, _, _ = generate_samples_vada(dae, diffusion_disc, vae, num_samples,
+-                                                             enable_autocast=args.autocast_eval,
+-                                                             prior_var=args.sigma2_max if args.sde_type == 'vesde' else 1.0)
+-            samples_disc = utils.tile_image(samples_disc, n)
+-            writer.add_image('generated_disc', samples_disc, global_step)
++            # Cascades implement ODE generation only; joint previews remain upstream.
++            if not isinstance(dae, csem_lsgm.CascadeDAE):
++                samples_disc, _, _, _ = generate_samples_vada(dae, diffusion_disc, vae, num_samples,
++                                                                 enable_autocast=args.autocast_eval,
++                                                                 prior_var=args.sigma2_max if args.sde_type == 'vesde' else 1.0)
++                samples_disc = utils.tile_image(samples_disc, n)
++                writer.add_image('generated_disc', samples_disc, global_step)
+             samples_ode, nfe, _, _ = generate_samples_vada(dae, diffusion_cont, vae, num_samples,
+                                                              enable_autocast=args.autocast_eval,
+                                                              ode_eps=fast_ode_param['ode_eps'],
+@@ -253,6 +260,12 @@
+                                    'dae_state_dict': dae.state_dict(), 'vae_state_dict': vae.state_dict()}
+                         torch.save(content, checkpoint_file_fid)
+ 
++            if getattr(args, 'eval_csv', '') and args.global_rank == 0:
++                row = {'epoch': epoch + 1, 'ode_fid_2500': csem_lsgm.scalar(val_fid_ema),
++                       'ode_nll_bpd': csem_lsgm.scalar(neg_log_p_ode * bpd_coeff),
++                       'nfe': csem_lsgm.scalar(nfe)}
++                row.update(getattr(args, '_last_fid_perf', {}))
++                csem_lsgm.append_csv(args.eval_csv, row, key='epoch')
+             # switch back to original parameters
+             dae_optimizer.swap_parameters_with_ema(store_params_in_ema=True)
+ 
+@@ -484,6 +497,16 @@
+                         help='address for master')
+     parser.add_argument('--seed', type=int, default=1,
+                         help='seed used for initialization')
++    parser.add_argument('--csem', action='store_true')
++    parser.add_argument('--prior_factorization', choices=['joint', 'cascade'], default='joint')
++    parser.add_argument('--no_csem_band', action='store_true')
++    parser.add_argument('--no_csem_terminal', action='store_true')
++    parser.add_argument('--rep_horizon', type=float, default=1.0)
++    parser.add_argument('--csem_lambda_K', type=float, default=1.0)
++    parser.add_argument('--dae_channels_per_head', type=int, default=0)
++    parser.add_argument('--eval_csv', default='')
++    parser.add_argument('--diagnostics_csv', default='')
++    parser.add_argument('--max_steps_per_epoch', type=int, default=0)
+     args = parser.parse_args()
+     args.save = args.root + '/' + args.save
+     utils.create_exp_dir(args.save)
+--- a/training_obj_joint.py
++++ b/training_obj_joint.py
+@@ -8,6 +8,8 @@
+ import torch
+ 
+ from util import utils
++import csem_lsgm
++from timeit import default_timer as timer
+ from torch.cuda.amp import autocast
+ 
+ 
+@@ -21,9 +23,17 @@
+                                       groups_per_scale=vae.groups_per_scale, fun='square')
+     tr_loss_meter, vae_recon_meter, vae_kl_meter, vae_nelbo_meter, kl_per_group_ema = start_meters()
+ 
++    csem = getattr(args, 'csem', False)
++    cascade = getattr(args, 'prior_factorization', 'joint') == 'cascade'
++    surgery = csem or cascade
++    defer_vae_step = surgery or utils.different_p_q_objectives(args.iw_sample_p, args.iw_sample_q)
++    diag_totals, diag_count, iterations = {}, 0, 0
++    epoch_start = timer()
+     dae.train()
+     vae.train()
+     for step, x in enumerate(train_queue):
++        if getattr(args, 'max_steps_per_epoch', 0) and step >= args.max_steps_per_epoch:
++            break
+         # warm-up lr
+         update_lr(args, global_step, warmup_iters, dae_optimizer, vae_optimizer)
+         x = utils.common_x_operations(x, args.num_x_bits)
+@@ -41,6 +51,8 @@
+                 vae_recon_loss = utils.reconstruction_loss(output, x, crop=vae.crop_output)
+                 vae_neg_entropy = utils.sum_log_q(all_log_q)
+ 
++            if csem:
++                mu_q, log_sig_q = csem_lsgm.posterior_moments(vae)
+             kl_T = 0
+ 
+             noise = torch.randn(size=eps.size(), device='cuda')  # note that this noise value is currently shared!
+@@ -52,8 +64,12 @@
+ 
+             # in case we want to train q (vae) with another batch using a different sampling scheme for times t
+             if args.iw_sample_q in ['ll_uniform', 'll_iw']:
+-                t_q, var_t_q, m_t_q, obj_weight_t_q, _, g2_t_q = \
+-                    diffusion.iw_quantities(args.batch_size, args.time_eps, args.iw_sample_q, args.iw_subvp_like_vp_sde)
++                if csem and args.rep_horizon < 1.0:
++                    t_q, var_t_q, m_t_q, obj_weight_t_q = csem_lsgm.q_times_rep(
++                        diffusion, args.batch_size, args.time_eps, args.rep_horizon, eps.device)
++                else:
++                    t_q, var_t_q, m_t_q, obj_weight_t_q, _, g2_t_q = \
++                        diffusion.iw_quantities(args.batch_size, args.time_eps, args.iw_sample_q, args.iw_subvp_like_vp_sde)
+                 eps_t_q = diffusion.sample_q(eps, noise, var_t_q, m_t_q)
+ 
+                 eps_t_p = eps_t_p.detach().requires_grad_(True)
+@@ -67,9 +83,21 @@
+             # run the score model
+             eps_t.requires_grad_(True)
+             mixing_component = diffusion.mixing_component(eps_t, var_t, t, enabled=dae.mixed_prediction)
+-            pred_params = dae(eps_t, t)
++            if cascade:
++                # p context is detached; q context carries ancestor/decoder gradients.
++                context = torch.cat([eps.detach(), eps], 0)
++                pred_params = dae(eps_t, t, context)
++            else:
++                pred_params = dae(eps_t, t)
+             params = utils.get_mixed_prediction(dae.mixed_prediction, pred_params, dae.mixing_logit, mixing_component)
+-            l2_term = torch.square(params - noise)
++            if csem:
++                with autocast(enabled=False):
++                    tgt_p = csem_lsgm.csem_eps_target(eps_t_p, mu_q.detach(), log_sig_q.detach(), m_t_p, var_t_p)
++                    tgt_q = csem_lsgm.csem_eps_target(eps_t_q, mu_q, log_sig_q, m_t_q, var_t_q)
++                    target = torch.cat([tgt_p, tgt_q], 0)
++                    l2_term = torch.square(params.float() - target)
++            else:
++                l2_term = torch.square(params - noise)
+ 
+             # unpack separate objectives, in case we want to train q (vae) using a different sampling scheme for times t
+             if args.iw_sample_q in ['ll_uniform', 'll_iw']:
+@@ -80,12 +108,20 @@
+                 p_objective = torch.sum(obj_weight_t_p * l2_term, dim=[1, 2, 3])
+                 cross_entropy_per_var = obj_weight_t_q * l2_term
+ 
+-            cross_entropy_per_var += diffusion.cross_entropy_const(args.time_eps)
+-            cross_entropy = torch.sum(cross_entropy_per_var, dim=[1, 2, 3])
+-            cross_entropy += remaining_neg_log_p_total  # for remaining scales if there is any
+-            all_neg_log_p = vae.decompose_eps(cross_entropy_per_var)
+-            all_neg_log_p.extend(remaining_neg_log_p_per_ver)  # add the remaining neg_log_p
+-            kl_all_list, kl_vals_per_group, kl_diag_list = utils.kl_per_group_vada(all_log_q, all_neg_log_p)
++            if csem:
++                with autocast(enabled=False):
++                    rep_per_var = cross_entropy_per_var.float()
++                    kl_all_list, kl_vals_per_group, kl_diag_list, K_per_var, B_per_var = csem_lsgm.representation_terms(
++                        vae, mu_q, log_sig_q, rep_per_var, diffusion, args)
++                # CSEM already includes the entropy cancellation; never add all_log_q here.
++                cross_entropy = torch.stack(kl_all_list, 1).sum(1) - vae_neg_entropy
++            else:
++                cross_entropy_per_var += diffusion.cross_entropy_const(args.time_eps)
++                cross_entropy = torch.sum(cross_entropy_per_var, dim=[1, 2, 3])
++                cross_entropy += remaining_neg_log_p_total  # for remaining scales if there is any
++                all_neg_log_p = vae.decompose_eps(cross_entropy_per_var)
++                all_neg_log_p.extend(remaining_neg_log_p_per_ver)  # add the remaining neg_log_p
++                kl_all_list, kl_vals_per_group, kl_diag_list = utils.kl_per_group_vada(all_log_q, all_neg_log_p)
+ 
+             # kl coefficient
+             if args.cont_kl_anneal:
+@@ -120,7 +156,8 @@
+             if args.grad_clip_max_norm > 0.:  # apply gradient clipping
+                 grad_scalar.unscale_(vae_optimizer)
+                 torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=args.grad_clip_max_norm)
+-            grad_scalar.step(vae_optimizer)
++            if not defer_vae_step:
++                grad_scalar.step(vae_optimizer)
+ 
+         # if we use different p and q objectives or are not training the vae, discard gradients and backpropagate p_loss
+         if utils.different_p_q_objectives(args.iw_sample_p, args.iw_sample_q) or not args.train_vae:
+@@ -130,6 +167,11 @@
+ 
+             # compute gradients with unweighted loss
+             grad_scalar.scale(p_loss).backward()
++
++        # The concatenated forward retains a zero-gradient q branch in p_loss.
++        # Do not mutate VAE weights until that backward is finished (modern torch).
++        if args.train_vae and defer_vae_step:
++            grad_scalar.step(vae_optimizer)
+ 
+         # update dae parameters
+         utils.average_gradients(dae.parameters(), args.distributed)
+@@ -179,8 +221,19 @@
+                 writer.add_scalar('kl_coeff_step/layer_%d' % i, kl_coeffs[i], global_step)
+                 writer.add_scalar('kl_vals_step/layer_%d' % i, kl_vals[i], global_step)
+             writer.add_scalar('kl_active_step/total_active', total_active, global_step)
++        iterations += 1
++        if csem and getattr(args, 'diagnostics_csv', '') and step % 200 == 0:
++            row = csem_lsgm.group_diagnostics(vae, dae, log_sig_q, rep_per_var, K_per_var, B_per_var, diffusion, args)
++            for key, val in row.items():
++                diag_totals[key] = diag_totals.get(key, 0.0) + csem_lsgm.scalar(val)
++            diag_count += 1
+         global_step += 1
+ 
++    if getattr(args, 'diagnostics_csv', '') and args.global_rank == 0:
++        row = {k: v / diag_count for k, v in diag_totals.items()} if diag_count else {}
++        row.update(epoch=getattr(args, 'current_epoch', 0), global_step=global_step,
++                   seconds_per_iteration=(timer() - epoch_start) / max(iterations, 1))
++        csem_lsgm.append_csv(args.diagnostics_csv, row, key='epoch')
+     # write at the end of epoch
+     epoch_logging(args, writer, global_step, vae_recon_meter, vae_kl_meter, vae_nelbo_meter, tr_loss_meter, kl_per_group_ema)
+ 
+@@ -241,4 +294,4 @@
+     writer.add_scalar('epoch/total_loss', tr_loss_meter.avg, step)
+     # add kl value per group to tensorboard
+     for i in range(len(kl_per_group_ema.avg)):
+-        writer.add_scalar('kl_value/group_%d' % i, kl_per_group_ema.avg[i], step)
+\ No newline at end of file
++        writer.add_scalar('kl_value/group_%d' % i, kl_per_group_ema.avg[i], step)
+--- a/util/datasets.py
++++ b/util/datasets.py
+@@ -17,7 +17,7 @@
+ from scipy.io import loadmat
+ from torch.utils.data import Dataset
+ from PIL import Image
+-from torch._utils import _accumulate
++from itertools import accumulate as _accumulate
+ 
+ class Binarize(object):
+     """ This class introduces a binarization transformation
+@@ -96,9 +96,9 @@
+         train_transform, valid_transform = _data_transforms_cifar10()
+         train_transform = train_transform if augment else valid_transform
+         train_data = dset.CIFAR10(
+-            root=root, train=True, download=True, transform=train_transform)
++            root=root, train=True, download=False, transform=train_transform)
+         valid_data = dset.CIFAR10(
+-            root=root, train=False, download=True, transform=valid_transform)
++            root=root, train=False, download=False, transform=valid_transform)
+     elif dataset == 'mnist':
+         num_classes = 10
+         train_transform, valid_transform = _data_transforms_mnist(binarize_binary_datasets)
+--- a/util/ema.py
++++ b/util/ema.py
+@@ -13,6 +13,9 @@
+ 
+ class EMA(Optimizer):
+     def __init__(self, opt, ema_decay):
++        # Modern Optimizer needs hook/scheduler metadata initialized. Preserve
++        # the same underlying parameter groups, state and EMA update formula.
++        super().__init__(opt.param_groups, opt.defaults)
+         self.ema_decay = ema_decay
+         self.apply_ema = self.ema_decay > 0.
+         self.optimizer = opt
+@@ -84,4 +87,4 @@
+                     p.data = ema.detach()
+                     self.optimizer.state[p]['ema'] = tmp
+                 else:
+-                    p.data = ema.detach()
+\ No newline at end of file
++                    p.data = ema.detach()
+--- /dev/null
++++ b/csem_lsgm.py
+@@ -0,0 +1,272 @@
++"""CSEM surgery on NVlabs/LSGM. Channels follow NVAE's decoder group order.
++
++The representation route uses likelihood weighting, live posterior moments and
++live clean ancestors. The prior route uses detached inputs/moments/ancestors.
++All losses are sums over latent coordinates, in LSGM's nats-per-image units.
++"""
++import copy
++import csv
++import json
++import math
++import os
++from pathlib import Path
++
++import torch
++from torch import nn
++import torch.nn.functional as F
++
++
++def posterior_moments(vae):
++    return (torch.cat([d.mu for d in vae.last_q], 1).float(),
++            torch.cat([d.log_sigma for d in vae.last_q], 1).float())
++
++
++def csem_eps_target(eps_t, mu, log_sig, m_t, var_t):
++    v = m_t.square() * torch.exp(2 * log_sig) + var_t
++    return torch.sqrt(var_t) * (eps_t.float() - m_t * mu) / v
++
++
++def terminal_component_kl(mu, log_sig, m_K, var_K):
++    v = m_K.square() * torch.exp(2 * log_sig) + var_K
++    return 0.5 * (m_K.square() * mu.square() + v - 1 - torch.log(v))
++
++
++def band_term(log_sig, m_e, var_e):
++    # log-sigma, not log-variance. Stable even for very narrow posteriors.
++    return 0.5 * F.softplus(torch.log(var_e) - 2 * torch.log(m_e) - 2 * log_sig)
++
++
++def diffusion_endpoints(diffusion, args, device):
++    te = torch.tensor(args.time_eps, device=device, dtype=torch.float32)
++    tk = torch.tensor(getattr(args, 'rep_horizon', 1.0), device=device, dtype=torch.float32)
++    return diffusion.e2int_f(te), diffusion.var(te), diffusion.e2int_f(tk), diffusion.var(tk)
++
++
++def q_times_rep(diffusion, size, time_eps, t_K, device='cuda'):
++    t = time_eps + torch.rand(size, device=device) * (t_K - time_eps)
++    var, m, g2 = diffusion.var(t), diffusion.e2int_f(t), diffusion.g2(t)
++    w = g2 / (2 * var) * (t_K - time_eps)
++    return t, var[:, None, None, None], m[:, None, None, None], w[:, None, None, None]
++
++
++def representation_terms(vae, mu, log_sig, rep, diffusion, args):
++    me, ve, mk, vk = diffusion_endpoints(diffusion, args, mu.device)
++    K = (torch.zeros_like(rep) if getattr(args, 'no_csem_terminal', False) else
++         getattr(args, 'csem_lambda_K', 1.0) * terminal_component_kl(mu, log_sig, mk, vk))
++    B = torch.zeros_like(rep) if getattr(args, 'no_csem_band', False) else band_term(log_sig, me, ve)
++    per_group = vae.decompose_eps(rep + K + B)
++    kl_all = [g.sum((1, 2, 3)) for g in per_group]
++    vals = torch.stack(kl_all, 1).mean(0)
++    diag = [g.sum((2, 3)).mean(0) for g in per_group]
++    return kl_all, vals, diag, K, B
++
++
++class _ContextInputConv(nn.Module):
++    def __init__(self, base, ctx_ch, nf):
++        super().__init__()
++        self.base = base
++        self.proj = nn.Conv2d(ctx_ch, nf, 3, padding=1)
++        nn.init.zeros_(self.proj.weight)
++        nn.init.zeros_(self.proj.bias)
++        self.context = None
++
++    def forward(self, x):
++        if self.context is None or self.context.shape[0] != x.shape[0]:
++            raise ValueError('Conditional head requires matching clean-ancestor context')
++        return self.base(x) + self.proj(self.context)
++
++
++class ConditionalNCSNpp(nn.Module):
++    def __init__(self, args, in_ch, ctx_ch, nf):
++        super().__init__()
++        from score_sde.ncsnpp import NCSNpp
++        a = copy.copy(args)
++        a.num_channels_dae = nf
++        self.net = NCSNpp(a, in_ch)
++        self.ctx_ch = ctx_ch
++        if ctx_ch:
++            if a.progressive_input != 'none':
++                raise ValueError('Cascade requires progressive_input=none')
++            self.net.all_modules[2] = _ContextInputConv(self.net.all_modules[2], ctx_ch, nf)
++
++    def forward(self, x, t, context=None):
++        if not self.ctx_ch:
++            return self.net(x, t)
++        conv = self.net.all_modules[2]
++        conv.context = context
++        try:
++            return self.net(x, t)
++        finally:
++            conv.context = None
++
++
++class CascadeDAE(nn.Module):
++    def __init__(self, args, group_channels, nf):
++        super().__init__()
++        self.group_channels = list(group_channels)
++        self.heads = nn.ModuleList([
++            ConditionalNCSNpp(args, c, sum(group_channels[:g]), nf)
++            for g, c in enumerate(group_channels)])
++        self.mixed_prediction = args.mixed_prediction
++        self.num_input_channels = sum(group_channels)
++        self.input_size = self.heads[0].net.input_size
++        self.is_active = None
++
++    @property
++    def mixing_logit(self):
++        return torch.cat([h.net.mixing_logit for h in self.heads], 1)
++
++    def forward(self, x, t, context):
++        if context.shape != x.shape:
++            raise ValueError('Full clean latent context must match the noised latent shape')
++        outs, off = [], 0
++        for head, c in zip(self.heads, self.group_channels):
++            outs.append(head(x[:, off:off+c], t, context[:, :off] if off else None))
++            off += c
++        return torch.cat(outs, 1)
++
++
++class _BoundHead(nn.Module):
++    def __init__(self, head, context):
++        super().__init__()
++        self.head = head
++        self.context = context
++        self.mixed_prediction = head.net.mixed_prediction
++
++    @property
++    def mixing_logit(self):
++        return self.head.net.mixing_logit
++
++    def forward(self, x, t):
++        return self.head(x, t, self.context)
++
++
++def sample_cascade_ode(diffusion, dae, num_samples, ode_eps, tol, enable_autocast, temp, noise=None):
++    if noise is not None and list(noise.shape) != [num_samples, dae.num_input_channels, dae.input_size, dae.input_size]:
++        raise ValueError('Noise bank has the wrong cascade shape')
++    zs, nfes, secs, off = [], [], 0.0, 0
++    for head, c in zip(dae.heads, dae.group_channels):
++        ctx = torch.cat(zs, 1) if zs else None
++        n = None if noise is None else noise[:, off:off+c]
++        z, k, s = diffusion.sample_model_ode(
++            _BoundHead(head, ctx), num_samples, [c, dae.input_size, dae.input_size],
++            ode_eps, tol, enable_autocast, temp, n)
++        zs.append(z)
++        nfes.append(float(k))
++        secs += s
++        off += c
++    dae.last_sampling_nfe_per_head = nfes
++    return torch.cat(zs, 1), sum(nfes), secs
++
++
++def cascade_ode_nll(diffusion, dae, eps, **kw):
++    # Repeat the entire conditional likelihood estimator for honest joint std.
++    num_samples = kw.pop('num_samples', 1)
++    report_std = kw.pop('report_std', False)
++    if len(dae.heads) == 1:
++        return diffusion.compute_ode_nll(
++            dae=_BoundHead(dae.heads[0], None), eps=eps,
++            num_samples=num_samples, report_std=report_std, **kw)
++    estimates, counts = [], []
++    for _ in range(num_samples):
++        total, nfe, off = 0.0, 0.0, 0
++        for head, c in zip(dae.heads, dae.group_channels):
++            ctx = eps[:, :off].detach() if off else None
++            val, k, _, _ = diffusion.compute_ode_nll(
++                dae=_BoundHead(head, ctx), eps=eps[:, off:off+c],
++                num_samples=1, report_std=False, **kw)
++            total, nfe, off = total + val, nfe + k, off + c
++        estimates.append(total)
++        counts.append(nfe)
++    vals = torch.stack(estimates, 1)
++    std = vals.std(1).mean() if num_samples > 1 and report_std else None
++    return vals.mean(1), sum(counts)/len(counts), std, None if std is None else std/math.sqrt(num_samples)
++
++
++def build_prior(args, vae):
++    from util import utils
++    if getattr(args, 'prior_factorization', 'joint') == 'joint':
++        return utils.get_dae_model(args, vae.latent_structure()[0])
++    G = vae.num_groups_per_scale
++    nf = getattr(args, 'dae_channels_per_head', 0) or 32 * int(args.num_channels_dae/math.sqrt(G)//32)
++    return CascadeDAE(args, [vae.num_latent_per_group]*G, nf)
++
++
++def validate_args(args):
++    csem = getattr(args, 'csem', False)
++    cascade = getattr(args, 'prior_factorization', 'joint') == 'cascade'
++    if csem or cascade:
++        if args.num_nf != 0 or args.num_latent_scales != 1:
++            raise ValueError('CSEM/cascade requires num_nf=0 and one latent scale')
++        if getattr(args, 'disjoint_training', False) or getattr(args, 'update_q_ema', False):
++            raise ValueError('Surgery supports the joint trainer only')
++    if csem:
++        if args.iw_sample_q not in {'ll_iw', 'll_uniform'}:
++            raise ValueError('CSEM requires a separately sampled likelihood q-route')
++        if args.sde_type != 'vpsde' or args.sigma2_0 != 0:
++            raise ValueError('This surgery is calibrated for VPSDE with sigma2_0=0')
++        if args.num_groups_per_scale > 1 and not cascade:
++            raise ValueError('Multiple nonlinear NVAE groups require a CSEM cascade')
++        if not args.time_eps < args.rep_horizon <= 1 or args.csem_lambda_K < 0:
++            raise ValueError('Require time_eps < rep_horizon <= 1 and lambda_K >= 0')
++    elif getattr(args, 'rep_horizon', 1.0) != 1.0:
++        raise ValueError('rep_horizon is a CSEM-only option')
++    if cascade and getattr(args, 'drop_inactive_var', False):
++        raise ValueError('In-place mixing_logit writes are unsupported for cascade')
++
++
++def parameter_counts(vae, dae):
++    count = lambda m: sum(p.numel() for p in m.parameters())
++    return {'vae_parameters': count(vae), 'prior_parameters': count(dae),
++            'prior_parameters_per_head': [count(h) for h in dae.heads] if isinstance(dae, CascadeDAE) else [count(dae)]}
++
++
++def scalar(v):
++    return v.detach().cpu().item() if isinstance(v, torch.Tensor) else v
++
++
++def write_json(path, value):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(path.name + '.tmp')
++    tmp.write_text(json.dumps(value, indent=2, default=scalar) + '\n')
++    os.replace(tmp, path)
++
++
++def append_csv(path, row, key=None):
++    if not path:
++        return
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    rows = []
++    if path.exists():
++        with path.open(newline='') as f:
++            rows = list(csv.DictReader(f))
++    row = {k: scalar(v) for k, v in row.items()}
++    if key:
++        rows = [r for r in rows if str(r.get(key)) != str(row[key])]
++    rows.append(row)
++    columns = list(dict.fromkeys(k for r in rows for k in r))
++    tmp = path.with_name(path.name + '.tmp')
++    with tmp.open('w', newline='') as f:
++        writer = csv.DictWriter(f, fieldnames=columns)
++        writer.writeheader()
++        writer.writerows(rows)
++    os.replace(tmp, path)
++
++
++def group_diagnostics(vae, dae, log_sig, rep, K, B, diffusion, args):
++    with torch.no_grad():
++        me, ve, _, _ = diffusion_endpoints(diffusion, args, log_sig.device)
++        floor = torch.sqrt(ve)/me
++        row = {}
++        for i, (ls, r, k, b) in enumerate(zip(*(vae.decompose_eps(v) for v in (log_sig, rep, K, B)))):
++            sig = ls.exp()
++            row.update({f'rep_{i}': r.sum((1,2,3)).mean(), f'K_{i}': k.sum((1,2,3)).mean(),
++                        f'B_{i}': b.sum((1,2,3)).mean(), f'below_{i}': (sig < floor).float().mean(),
++                        f'deep_{i}': (sig < floor/10).float().mean()})
++            for q, val in zip((0.01, 0.5, 0.99), torch.quantile(sig.flatten(), torch.tensor([0.01,0.5,0.99], device=sig.device))):
++                row[f'sigma_q{int(100*q):02d}_{i}'] = val
++        for i, m in enumerate(vae.decompose_eps(torch.sigmoid(dae.mixing_logit))):
++            row[f'mixing_{i}'] = m.mean()
++        return row
