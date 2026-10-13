@@ -14,7 +14,7 @@
     "hier_eval.py": "5decb45dfbb967e81759559a75625076a6cfe23bb0e989f703c64dc5ba57066d",
     "band_regularizer.py": "efa6833e7a20675ef8ff9c5bbe58efea71b4b495b6145d8c506bcbd031c3416c",
     "compile_results.py": "43aa0db09acd101af71f92d69b310ecd375c7c478e9f481a344a34795627a806",
-    "tests.py": "ff7b82a5fc7b51ed5b046a0062deca1381cf1df44ff7d59ef60b33e9db58d289",
+    "tests.py": "752530a03b016f3e572d3284ecadc944e164e71aa39e92dc21a2647846a77217",
     "job.slurm": "7ebbc54f6540a70cd112d34930fe77208b0044f262d36a8bca0f8267e0575334",
     "manifest.csv": "7ae1473b35bcdf9c12493bd96e9fdd057c2c8c3f009034fd85ab30a99ed27455",
     "requirements.txt": "9a7ae3a9b62639e436f9c5d997bbe36647114180d94907a82710027f62fb6680",
@@ -29,5 +29,6 @@
   "architecture_note_sha256": "bfb949acd73a19924f36bbb50deddbf7d6cda533c7f4ce4173f0f48492c383ea",
   "direct_fmnist_trainer_sha256": "11db5d5ca81d9f51f5f361f86e029ecc7e2c83a2b41d424249b3076ee42c568f",
   "scientific_change": "All cascades use direct Z2; noisy-root reconstruction and clean-ancestor conditional CSEM; CIFAR recipe preserved",
-  "validation_scope": "Offline CPU model/trainer/evaluator/compile checks; no real CIFAR training/FID results"
+  "validation_scope": "Offline CPU model/trainer/evaluator/compile checks; no real CIFAR training/FID results",
+  "validation_update": "Name missing runtime files explicitly; documentation/gitignore are optional and never block mathematical validation"
 }

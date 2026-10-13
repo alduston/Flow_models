@@ -12,15 +12,32 @@ import sys
 def run(base):
     import paper
     import tempfile
-    base=Path(base);rows=paper.manifest(base)
-    for p in base.rglob('*.py'): ast.parse(p.read_text(),filename=str(p))
+    base=Path(base)
     required=['core.py','suite.py','paper_io.py','paper.py','job.slurm','manifest.csv',
               'direct_models.py','hier_models.py','hier_engine.py','hier_eval.py',
-              'band_regularizer.py','compile_results.py','README.md','.gitignore','requirements.txt']
-    assert all((base/p).exists() for p in required)
+              'band_regularizer.py','compile_results.py','tests.py','provenance.json']
+    missing=[name for name in required if not (base/name).is_file()]
+    if missing:
+        raise SystemExit(f'Missing required sweep files in {base.resolve()}:\n'
+                         + '\n'.join(f'  - {name}' for name in missing)
+                         + '\nRe-extract the complete bundle into this directory.')
+    optional={'README.md','VALIDATION.md','.gitignore','requirements.txt'}
+    for name in sorted(optional):
+        if not (base/name).is_file():
+            print(f'[WARN] Optional packaging file missing: {name}; training validation continues')
+    rows=paper.manifest(base)
+    for name in required:
+        if name.endswith('.py'):
+            ast.parse((base/name).read_text(),filename=str(base/name))
     info=json.loads((base/'provenance.json').read_text())
     for name,digest in info['source_sha256'].items():
-        assert hashlib.sha256((base/name).read_bytes()).hexdigest()==digest,name
+        path=base/name
+        if not path.is_file():
+            if name in optional: continue
+            raise SystemExit(f'Missing source file listed in provenance.json: {name}')
+        if hashlib.sha256(path.read_bytes()).hexdigest()!=digest:
+            raise SystemExit(f'Source checksum mismatch: {name}\n'
+                             'Restore the matching file and provenance.json from the same bundle.')
     # Core and suite stay exactly at the original optimized CIFAR recipe.
     for name in ('core.py','suite.py'):
         assert hashlib.sha256((base/name).read_bytes()).hexdigest()==info['original_cifar_sha256'][name]
