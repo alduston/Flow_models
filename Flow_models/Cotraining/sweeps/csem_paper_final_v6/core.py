@@ -5043,7 +5043,7 @@ def evaluate_current_state(
 
 
 
-def setup_run_results_dir(base_dir="run_results", wipe=not bool(cfg.get("paper_resume_state")), preserve_checkpoints=True):
+def setup_run_results_dir(base_dir="run_results", wipe=True, preserve_checkpoints=True):
     if os.path.exists(base_dir) and wipe:
         if preserve_checkpoints:
             # delete everything except checkpoints
