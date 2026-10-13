@@ -45,7 +45,7 @@ def offline_checks(base):
         if not rec['modified']: assert rec['upstream_sha256']==rec['patched_sha256']
     allowed={'util/datasets.py','thirdparty/functions.py','fid/fid_score.py','nvae.py',
              'training_obj_joint.py','train_vada.py','evaluate_diffusion.py','evaluate_vada.py',
-             'score_sde/op/upfirdn2d.py','score_sde/op/fused_act.py','util/ema.py'}
+             'score_sde/op/upfirdn2d.py','score_sde/op/fused_act.py','util/ema.py','util/utils.py'}
     assert set(provenance['modified_files'])==allowed
     for name,digest in provenance['new_files_sha256'].items():
         assert sha(base/name)==digest, 'Bundle hash mismatch: '+name
@@ -89,8 +89,42 @@ def offline_checks(base):
         atomic_json(Path(tmp)/'status'/'A1.json',{'state':'completed','returncode':0,'config_hash':config_hash(dep)})
         path=Path(tmp)/'results'/'A1';path.mkdir(parents=True);(path/'checkpoint.pt').touch()
         assert prerequisite(tmp,row,rows) is None
+    parameter_count_checks(base)
     scheduler_checks(base)
     print('OK all 26 CLI configurations, 1/2/4 groups, paired parity, SLURM parser and phase gating')
+
+
+def parameter_count_checks(base):
+    # Execute the exact helper without needing torch/GPU imports on login nodes.
+    import math
+    path=Path(base)/'lsgm'/'util'/'utils.py'
+    tree=ast.parse(path.read_text())
+    fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='count_parameters_in_M')
+    scope={}
+    exec(compile(ast.Module(body=[fn],type_ignores=[]),str(path),'exec'),scope)
+    count=scope['count_parameters_in_M']
+    class Parameter:
+        def __init__(self,shape): self.shape=shape
+        def numel(self): return math.prod(self.shape)
+    class Model:
+        def __init__(self,entries): self.entries=entries
+        def named_parameters(self): return iter(self.entries)
+    entries=[('weight',Parameter((2,3))),('bias',Parameter((3,))),
+             ('scalar',Parameter(())),('empty',Parameter((0,5))),
+             ('auxiliary.weight',Parameter((100,100)))]
+    assert count(Model(entries)) == 10/1e6
+    assert count(Model([])) == 0
+    # Reject the same NumPy generator pattern anywhere in the vendored code.
+    for p in (Path(base)/'lsgm').rglob('*.py'):
+        tree=ast.parse(p.read_text())
+        numpy_names={a.asname or a.name for n in ast.walk(tree) if isinstance(n,ast.Import)
+                     for a in n.names if a.name=='numpy'}
+        for n in ast.walk(tree):
+            if (isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)
+                    and isinstance(n.func.value,ast.Name) and n.func.value.id in numpy_names):
+                assert not any(isinstance(arg,ast.GeneratorExp) for arg in n.args), \
+                    'NumPy generator argument: '+str(p)+':'+str(n.lineno)
+    print('OK parameter logging count, auxiliary exclusion, scalar/empty parameters, NumPy generator scan')
 
 
 def scheduler_checks(base):
@@ -324,6 +358,10 @@ def torch_smoke(base,row,device='cuda',full_size=False):
             torch.manual_seed(42)
             vae=NVAE(args,utils.get_arch_cells(args.arch_instance,args.use_se)).to(device)
             dae=c.build_prior(args,vae).to(device)
+            # Exercise the shared startup logging helper used by A/B/C trainers.
+            for model in (vae,dae):
+                expected=sum(p.numel() for name,p in model.named_parameters() if 'auxiliary' not in name)/1e6
+                assert utils.count_parameters_in_M(model)==expected
             diffusion=make_diffusion(args)
             x=torch.rand(args.batch_size,3,32,32,device=device)
             vae(x*2-1)

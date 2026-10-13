@@ -62,7 +62,7 @@ class DummyDDP(nn.Module):
 
 
 def count_parameters_in_M(model):
-    return np.sum(np.prod(v.size()) for name, v in model.named_parameters() if "auxiliary" not in name) / 1e6
+    return sum(v.numel() for name, v in model.named_parameters() if "auxiliary" not in name) / 1e6
 
 
 def save_checkpoint(state, is_best, save):

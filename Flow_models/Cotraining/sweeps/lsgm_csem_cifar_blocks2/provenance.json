@@ -294,14 +294,14 @@
     },
     "util/utils.py": {
       "upstream_sha256": "ff79ba5119a90073dbe1f54a900411199d57caa27703df4ea2ace12274610a0f",
-      "patched_sha256": "ff79ba5119a90073dbe1f54a900411199d57caa27703df4ea2ace12274610a0f",
-      "modified": false
+      "patched_sha256": "c7b4f8a20ebe69ba2e3db96105e155294ad87cc349571c675c1ce7a3e865908e",
+      "modified": true
     }
   },
   "new_files_sha256": {
     "lsgm/csem_lsgm.py": "a05ee50d76928cf53dc68e05768e1afa31e0ac9ea7334198a6eb5bff76d7cb40",
     "paper.py": "dcfd35d4527de91633e9a75cb0293ccefa6298a4d4ed9089660d50023ca1a9ac",
-    "tests.py": "3ba5a0c7d9d5fd4736c5b08fd634441dd9962a0922ea77ebcbe46b29922762a6",
+    "tests.py": "78ac6a2e88ad81a1ae7c9513b4c791e3df25ddece02355519a7f50ee486d833e",
     "lsgm_runner.py": "d397e59e2b0ad0cf760a579416f930340bcb5db3633dd01047631b26f3d62b16",
     "manifest.csv": "2a929cef6f625adfa5b62da3c3e5ae6893862a20c745ed9404c5aa6eb0001c9b",
     "job.slurm": "4f671a7273c99a33d44b6c3e11d61995d2d1e56814e67114fec113e2d32c7974",
@@ -321,6 +321,7 @@
     "train_vada.py",
     "training_obj_joint.py",
     "util/datasets.py",
-    "util/ema.py"
+    "util/ema.py",
+    "util/utils.py"
   ]
 }

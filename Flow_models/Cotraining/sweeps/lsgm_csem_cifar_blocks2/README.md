@@ -177,6 +177,10 @@ layers and NVAE layers remain unchanged. The new objective is `csem_lsgm.py`.
 * `_accumulate`, SyncBN backward's count argument, and SciPy `sqrtm` are updated
   for current dependencies. On a single GPU NVAE takes its original framework
   BN+Swish path; the synchronized backward branch is used at world size >1.
+* Parameter-count logging uses Python `sum` over tensor `numel()` values. Newer
+  NumPy rejects upstream's `np.sum(generator)` before training starts. The same
+  auxiliary-parameter exclusion is retained, and the GPU smoke now exercises
+  this shared A/B/C startup helper.
 * FIR/fused CUDA extensions are lazy rather than compiled at import. Backend
   `auto` tries CUDA and explicitly warns/logs a native PyTorch fallback if JIT
   fails. Set `LSGM_OP_BACKEND=cuda` for a strict custom-op requirement, or

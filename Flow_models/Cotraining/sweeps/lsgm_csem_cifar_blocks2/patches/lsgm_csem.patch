@@ -591,6 +591,17 @@
 -                    p.data = ema.detach()
 \ No newline at end of file
 +                    p.data = ema.detach()
+--- a/util/utils.py
++++ b/util/utils.py
+@@ -62,7 +62,7 @@
+ 
+ 
+ def count_parameters_in_M(model):
+-    return np.sum(np.prod(v.size()) for name, v in model.named_parameters() if "auxiliary" not in name) / 1e6
++    return sum(v.numel() for name, v in model.named_parameters() if "auxiliary" not in name) / 1e6
+ 
+ 
+ def save_checkpoint(state, is_best, save):
 --- /dev/null
 +++ b/csem_lsgm.py
 @@ -0,0 +1,272 @@
