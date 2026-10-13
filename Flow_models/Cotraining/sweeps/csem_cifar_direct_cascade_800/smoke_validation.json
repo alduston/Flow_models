@@ -1,0 +1,141 @@
+{
+  "scope": "Synthetic full-size CPU checks; no CIFAR quality claim",
+  "torch": "2.14.1+cpu",
+  "torchvision": "0.29.1+cpu",
+  "cells": [
+    {
+      "cell": 0,
+      "device": "cpu",
+      "vae_parameters": 24924191,
+      "score_parameters": 36700066,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        128,
+        384
+      ],
+      "direct_child": true,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    },
+    {
+      "cell": 1,
+      "device": "cpu",
+      "vae_parameters": 24924191,
+      "score_parameters": 36700066,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        128,
+        384
+      ],
+      "direct_child": true,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    },
+    {
+      "cell": 2,
+      "device": "cpu",
+      "vae_parameters": 14184467,
+      "score_parameters": 32540560,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        512
+      ],
+      "direct_child": false,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    },
+    {
+      "cell": 3,
+      "device": "cpu",
+      "vae_parameters": 14184467,
+      "score_parameters": 32540560,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        512
+      ],
+      "direct_child": false,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    },
+    {
+      "cell": 4,
+      "device": "cpu",
+      "vae_parameters": 24965675,
+      "score_parameters": 36710062,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        256,
+        256
+      ],
+      "direct_child": true,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    },
+    {
+      "cell": 5,
+      "device": "cpu",
+      "vae_parameters": 24903449,
+      "score_parameters": 36695068,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        64,
+        448
+      ],
+      "direct_child": true,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    },
+    {
+      "cell": 6,
+      "device": "cpu",
+      "vae_parameters": 24882707,
+      "score_parameters": 36690838,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        128,
+        384
+      ],
+      "direct_child": true,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    },
+    {
+      "cell": 7,
+      "device": "cpu",
+      "vae_parameters": 24924191,
+      "score_parameters": 37884324,
+      "latent_coordinates": 512,
+      "block_coordinates": [
+        128,
+        384
+      ],
+      "direct_child": true,
+      "band_weight": 0.05,
+      "canonical_representation": true,
+      "detached_inner_gradient_routing": true,
+      "forward_backward": true,
+      "sequential_sampling": true
+    }
+  ]
+}

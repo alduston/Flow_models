@@ -1,0 +1,10 @@
+# Reuse the existing CUDA-compatible torch/torchvision pair in hlsi.
+torch>=2.2
+torchvision>=0.17
+numpy>=1.24
+scipy>=1.10
+pandas>=2
+matplotlib>=3.7
+tqdm>=4.65
+pillow>=10
+lpips>=0.1.4
