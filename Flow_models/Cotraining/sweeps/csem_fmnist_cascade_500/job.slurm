@@ -3,7 +3,7 @@
 #SBATCH -p gh
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -t 48:00:00
+#SBATCH -t 24:00:00
 #SBATCH -o slurm_logs/%x_%j.out
 #SBATCH -e slurm_logs/%x_%j.err
 
