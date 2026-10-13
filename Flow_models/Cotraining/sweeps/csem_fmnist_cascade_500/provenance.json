@@ -1,0 +1,47 @@
+{
+  "bundle": "csem_fmnist_cascade_500",
+  "created_utc": "2026-10-13",
+  "cells": 8,
+  "epochs_per_cell": 500,
+  "sources": [
+    {
+      "path": "recovered/train_hier_csem_fmnist(4).py",
+      "purpose": "recovered 77716-byte trainer",
+      "sha256": "126afb97aa474e50670b8fd4ac8f84cecd4186f32c5425d3a48238084a6fd10a"
+    },
+    {
+      "path": "recovered/fmnist_reference.py",
+      "purpose": "recovered FMNIST model/sampler reference",
+      "sha256": "0e4d76e8dae5cae41ec8bd109c2ac76e3dbcfcc795ef55b11386f4723cc258da"
+    },
+    {
+      "path": "upload/csem_cifar_blocks_800(2).zip",
+      "purpose": "cluster template",
+      "sha256": "e2ae7b23690a761ae9ff6eee964ace593224ba26fec1de6bc6ef507873c8298a"
+    },
+    {
+      "path": "upload/compile_results(1).py",
+      "purpose": "cross-cell compiler template",
+      "sha256": "e1e6c5543eee60a49dad6d778a3ea888ae4479b46653abaf80318a4f85ad04a3"
+    }
+  ],
+  "bundle_source_sha256": {
+    "suite.py": "0f2bcf76883edfc39fb48881b21a50930830a4d59e8c85dfe3f69fffdbc23fe2",
+    "core.py": "a7d43d765ffc54b1a0145970110fd357775d00237a9e46b0718c0bec6b3a8866",
+    "train_hier_csem_fmnist.py": "7df8b9330ff5b3b98bfaeeb58059771a4658cb3ad18222c671684dfdb67ee841",
+    "fmnist_reference.py": "a299a017eaecee6e489163a59f0089f8a2616669e008443009fe713d82d4e807",
+    "paper_io.py": "f722565529679a2aa363402c3b7720d7c6275790af2020943338b32c52791f15",
+    "paper.py": "456ed7bfc7af08c0428faf053be52a31b0fca428217da4c1242899baace1d08f",
+    "job.slurm": "d011517be23ec8e0aab098945229a2eb65f7ede15d83ab1f148c62639ff49df3",
+    "tests.py": "b40201a56dd635ebbeca66d8483a95a34269dcadfde4d1b6aaac11372769db0e",
+    "manifest.csv": "c348ed833bde8457edc327e915092c556c5a3032e67a57cc924998ff66e97905",
+    "compile_results.py": "c2e17736c86ce5e71295d88e2ef89637fcf18211b9fa6ea2200713f05377c953",
+    "requirements.txt": "fef01a60c01d0de8cc7ca334f726c7d081a26c1d0d05d6c888fcbdd1354e52f8",
+    ".gitignore": "24acecc7ab432d3edb0b272cd1e566d6b882dcfc2d29be4eec5d281129e3cb94",
+    "pinned/train_hier_csem_fmnist_original.py": "126afb97aa474e50670b8fd4ac8f84cecd4186f32c5425d3a48238084a6fd10a",
+    "pinned/compile_results_cifar_original.py": "e1e6c5543eee60a49dad6d778a3ea888ae4479b46653abaf80318a4f85ad04a3"
+  },
+  "reference_change": "Removed one unused private PyTorch import and clarified optional torchmetrics warning; model/sampler definitions unchanged",
+  "successful_recipe": "Encoder CSEM 0.6 from prior gradient logs; explicit 8+8 score depths preserve per-head default",
+  "scope": "Two paired flat/cascade seeds and four single-seed structural/capacity ablations; no measured FID results in archive"
+}

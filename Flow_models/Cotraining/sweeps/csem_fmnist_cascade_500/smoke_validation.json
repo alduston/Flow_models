@@ -1,0 +1,195 @@
+{
+  "scope": "offline synthetic full-size CPU models; no real FID measurement",
+  "torch": "2.14.1+cpu",
+  "torchvision": "0.29.1+cpu",
+  "cells": [
+    {
+      "cell": 0,
+      "device": "cpu",
+      "loss": 0.5647082924842834,
+      "latent_shapes": [
+        [
+          4,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 3679945,
+      "score_parameters_per_head": [
+        5488836
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    },
+    {
+      "cell": 1,
+      "device": "cpu",
+      "loss": 0.46894022822380066,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          3,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 6375765,
+      "score_parameters_per_head": [
+        5488836,
+        6678283
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    },
+    {
+      "cell": 2,
+      "device": "cpu",
+      "loss": 0.5647082924842834,
+      "latent_shapes": [
+        [
+          4,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 3679945,
+      "score_parameters_per_head": [
+        5488836
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    },
+    {
+      "cell": 3,
+      "device": "cpu",
+      "loss": 0.46894022822380066,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          3,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 6375765,
+      "score_parameters_per_head": [
+        5488836,
+        6678283
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    },
+    {
+      "cell": 4,
+      "device": "cpu",
+      "loss": 0.7306668162345886,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          3,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 6375765,
+      "score_parameters_per_head": [
+        2820548,
+        3415559
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    },
+    {
+      "cell": 5,
+      "device": "cpu",
+      "loss": 0.4178503751754761,
+      "latent_shapes": [
+        [
+          8,
+          4,
+          4
+        ],
+        [
+          2,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 6383833,
+      "score_parameters_per_head": [
+        5490376,
+        6678666
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    },
+    {
+      "cell": 6,
+      "device": "cpu",
+      "loss": 0.506145179271698,
+      "latent_shapes": [
+        [
+          1,
+          8,
+          8
+        ],
+        [
+          3,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 6365391,
+      "score_parameters_per_head": [
+        5487681,
+        6677707
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    },
+    {
+      "cell": 7,
+      "device": "cpu",
+      "loss": 0.42979735136032104,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          3,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 6195157,
+      "score_parameters_per_head": [
+        5488836,
+        6678283
+      ],
+      "band_weight": 0.1035395037091321,
+      "forward_backward": true,
+      "sequential_rk4": true
+    }
+  ]
+}
