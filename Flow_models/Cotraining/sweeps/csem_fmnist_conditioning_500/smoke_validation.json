@@ -1,0 +1,202 @@
+{
+  "oracle": true,
+  "parity": [
+    {
+      "cell": 1,
+      "initialization": true,
+      "rng": true,
+      "losses": true,
+      "reconstruction": true,
+      "all_parameter_gradients": true,
+      "sequential_sampling": true,
+      "comparison": "bitwise",
+      "pinned_source": "train_hier_csem_fmnist_direct_original.py"
+    },
+    {
+      "cell": 2,
+      "initialization": true,
+      "rng": true,
+      "losses": true,
+      "reconstruction": true,
+      "all_parameter_gradients": true,
+      "sequential_sampling": true,
+      "comparison": "bitwise",
+      "pinned_source": "train_hier_csem_fmnist_3block_original.py"
+    }
+  ],
+  "smoke": [
+    {
+      "cell": 0,
+      "device": "cpu",
+      "loss": 0.5647082924842834,
+      "latent_shapes": [
+        [
+          4,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 3679945,
+      "score_parameters_per_head": [
+        5488836
+      ],
+      "forward_backward": true,
+      "sequential_rk4": true,
+      "hybrid_combinations": true,
+      "risk_diagnostics": true,
+      "gradient_alignment": true,
+      "conditioning": "none"
+    },
+    {
+      "cell": 1,
+      "device": "cpu",
+      "loss": 0.4422694742679596,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          3,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 6368847,
+      "score_parameters_per_head": [
+        5488836,
+        6678283
+      ],
+      "forward_backward": true,
+      "sequential_rk4": true,
+      "hybrid_combinations": true,
+      "risk_diagnostics": true,
+      "gradient_alignment": true,
+      "conditioning": "full"
+    },
+    {
+      "cell": 2,
+      "device": "cpu",
+      "loss": 0.4384717345237732,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          1,
+          8,
+          8
+        ],
+        [
+          2,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 7897935,
+      "score_parameters_per_head": [
+        5488836,
+        6677513,
+        6678282
+      ],
+      "forward_backward": true,
+      "sequential_rk4": true,
+      "hybrid_combinations": true,
+      "risk_diagnostics": true,
+      "gradient_alignment": true,
+      "conditioning": "full"
+    },
+    {
+      "cell": 3,
+      "device": "cpu",
+      "loss": 0.5138158202171326,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          1,
+          8,
+          8
+        ],
+        [
+          2,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 7897935,
+      "score_parameters_per_head": [
+        5488836,
+        6677513,
+        6677322
+      ],
+      "forward_backward": true,
+      "sequential_rk4": true,
+      "hybrid_combinations": true,
+      "risk_diagnostics": true,
+      "gradient_alignment": true,
+      "conditioning": "markov"
+    },
+    {
+      "cell": 4,
+      "device": "cpu",
+      "loss": 0.634686291217804,
+      "latent_shapes": [
+        [
+          4,
+          4,
+          4
+        ],
+        [
+          1,
+          8,
+          8
+        ],
+        [
+          2,
+          8,
+          8
+        ]
+      ],
+      "vae_parameters": 7897935,
+      "score_parameters_per_head": [
+        5488836,
+        6677513,
+        6677898
+      ],
+      "forward_backward": true,
+      "sequential_rk4": true,
+      "hybrid_combinations": true,
+      "risk_diagnostics": true,
+      "gradient_alignment": true,
+      "conditioning": "siblings"
+    }
+  ],
+  "smoke_eval_feature_backend": "synthetic eight-dimensional plumbing surrogate",
+  "full_inception_fid_tested": false,
+  "resume": [
+    {
+      "cell": 1,
+      "resume_matches_uninterrupted": true,
+      "atomic_checkpoint": true,
+      "log_rollback": true
+    },
+    {
+      "cell": 2,
+      "resume_matches_uninterrupted": true,
+      "atomic_checkpoint": true,
+      "log_rollback": true
+    }
+  ],
+  "runtime": {
+    "torch": "2.14.1+cpu",
+    "device": "cpu"
+  },
+  "compiler_contract": true
+}

@@ -1,0 +1,55 @@
+{
+  "bundle": "csem_fmnist_conditioning_500",
+  "created_utc": "2026-10-14",
+  "cells": 5,
+  "epochs_per_cell": 500,
+  "input_archive": {
+    "name": "csem_fmnist_cascade_500(2).zip",
+    "sha256": "95f8285e5b656d100aab6e19284be90c4c435cf362ad7caef88320d4b9ada41f"
+  },
+  "recovered_sources": [
+    {
+      "name": "train_hier_csem_fmnist(6).py",
+      "pinned": "pinned/train_hier_csem_fmnist_direct_original.py",
+      "sha256": "11db5d5ca81d9f51f5f361f86e029ecc7e2c83a2b41d424249b3076ee42c568f",
+      "architecture": "coarse_fine_direct_z2_v2"
+    },
+    {
+      "name": "train_hier_csem_fmnist_3block.py",
+      "pinned": "pinned/train_hier_csem_fmnist_3block_original.py",
+      "sha256": "7d3443df68a8137473bf74b22d23dbc017b86c1535fe7854266782e67ae38382",
+      "architecture": "three_block_direct_latent_v3"
+    }
+  ],
+  "reference_note": "Reference model/target/loss/gradient/sampling parity is checked bitwise. The explicit 500-epoch recipe follows recovered scientific defaults; unknown historical CLI overrides are not reconstructed.",
+  "topology_scope": "Three-block posterior and decoder identical; final score-prior ancestors only differ.",
+  "diagnostics": "All E/G masks; finite-reference Bayes/excess risk proxies and reliability; cross-block gradient cosines; independent block CFG; native usage/sampling probes.",
+  "operational_changes": [
+    "prepared data",
+    "strict resume recipe and source guard",
+    "atomic checkpoints after evaluation commit",
+    "CPU RNG-byte restoration",
+    "10-epoch recovery checkpoints"
+  ],
+  "bundle_source_sha256": {
+    ".gitignore": "b97202c8a1411d575417c799bc71f1047b8ca38fb9b1a6fab2566ed2fdbf4c5e",
+    "README.md": "a08239f6cac36f03374e63a47393502d8c153d659f67cf2020dca00d18a59ecf",
+    "VALIDATION.md": "039dc217a074869f448f8280e6c3a6a28670ae1cb708a1251cb442c964cfa435",
+    "compile_results.py": "9ecd972441620e409cb0feb9e37450c0e4e2c5a74f736f8945167b7fd8e29cb6",
+    "core.py": "7c8cd9b2e73d72e265e903cf098bd01ce7236eec03e4cac41f3983891dadfb25",
+    "diagnostics.py": "d3b402eb0e136de827cac6af0b90bc40e36828668be9319404a06b3c3c709855",
+    "fmnist_reference.py": "a299a017eaecee6e489163a59f0089f8a2616669e008443009fe713d82d4e807",
+    "job.slurm": "fe1ac18712ce067c71d8587029d1d19fdd72c7903e64d3d2316df0ac859b1491",
+    "manifest.csv": "40ff2220e2d37be12b8fc4f36625f8d166faf7db87836baaacccba38f0591230",
+    "paper.py": "d50524e756581b75a7b6e0f580263f6e9463f1f4b89cf960c4f6af0b1f23ccc5",
+    "paper_io.py": "f722565529679a2aa363402c3b7720d7c6275790af2020943338b32c52791f15",
+    "pinned/train_hier_csem_fmnist_3block_original.py": "7d3443df68a8137473bf74b22d23dbc017b86c1535fe7854266782e67ae38382",
+    "pinned/train_hier_csem_fmnist_direct_original.py": "11db5d5ca81d9f51f5f361f86e029ecc7e2c83a2b41d424249b3076ee42c568f",
+    "requirements.txt": "fef01a60c01d0de8cc7ca334f726c7d081a26c1d0d05d6c888fcbdd1354e52f8",
+    "smoke_validation.json": "27017b60cc44d65058277cd3e49b7df9216642f00042550356b3b8f52f8b4ccc",
+    "suite.py": "ae146ab0192ad813994e55e29d1b81f86083c24eaa7a5b89ace6e34dae84a446",
+    "tests.py": "cdfde88f165f9e0df9ee86372dadb95e46f73d9a12e801e6252d8e8747e832d1",
+    "train_hier_csem_fmnist.py": "4295ab8e9df6374fbb65d4055cabf7d0a049ed5dc665294159c5cb08f139565a",
+    "train_hier_csem_fmnist_3block.py": "e0527a6421786ef68eef7ae0cff5a127c41bd3b9d2f89ef44de95c1ec7b75fad"
+  }
+}

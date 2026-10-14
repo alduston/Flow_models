@@ -1,0 +1,11 @@
+# Use the cluster's existing hlsi torch/torchvision CUDA pair; do not replace it
+# with CPU wheels. These are the Python packages used by this bundle.
+torch>=2.2
+torchvision>=0.17
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+tqdm>=4.65
+pillow>=10.0
+lpips>=0.1.4
