@@ -1,0 +1,42 @@
+{
+  "python": "3.12.14",
+  "torch": "2.14.1+cpu",
+  "torchvision": "0.29.1+cpu",
+  "device": "CPU",
+  "full_suite": "passed",
+  "final_changed_pressure_grid": "isolation and three-block full/decoupled pipelines rechecked",
+  "checks": [
+    "[PASS] corrected two/three-block teacher identities, DAG zero controls, nonlinear variance derivatives",
+    "[PASS] independent learned-witness lower bound detects known bias and respects zero-bias control",
+    "[PASS] exact original two-block targets/losses/gradients; encoder-only scale leaves head gradients unchanged",
+    "[PASS] real-network decoupled zero correction; lossless 256-coordinate packing in both depths",
+    "[PASS] core and learned-witness evaluations preserve weights, parameter gradients, RNG and modes",
+    "[PASS] bitwise joint/GAN and frozen-corrected interrupted resume; log rollback and final-snapshot crash recovery",
+    "[PASS] full synthetic training/evaluation/witness/checkpoint pipeline: b2_full_r1_s42",
+    "[PASS] full synthetic training/evaluation/witness/checkpoint pipeline: b2_decoupled_r1_s42",
+    "[PASS] full synthetic training/evaluation/witness/checkpoint pipeline: b3_full_r1_s42",
+    "[PASS] full synthetic training/evaluation/witness/checkpoint pipeline: b3_markov_r1_s42",
+    "[PASS] full synthetic training/evaluation/witness/checkpoint pipeline: b3_siblings_r1_s42",
+    "[PASS] full synthetic training/evaluation/witness/checkpoint pipeline: b3_decoupled_r1_s42",
+    "[PASS] three-block finite-bank audit output, both conditioning modes and nested banks",
+    "[PASS] full 192x18 joint-head two/three-block forward/backward and identical head initialization"
+  ],
+  "finite_reference_decoupled_panels": "passed for both depths",
+  "nonempty_result_compiler_and_frozen_pairing": "passed",
+  "slurm_bash_syntax": "passed",
+  "planned_jobs": {
+    "core": 22,
+    "robustness": 8,
+    "frozen": 24,
+    "pilot": 6,
+    "all": 54
+  },
+  "submission_dry_run_jobs": 54,
+  "gaussian_valid_oracle_covariance_max_relative_error": 5.562358123786569e-10,
+  "limitations": [
+    "No cluster jobs submitted",
+    "No real FashionMNIST training or pretrained Inception FID was run locally",
+    "Synthetic pipeline FIDs use an explicitly labeled feature surrogate",
+    "CUDA runtime, cluster allocation and full 500-epoch outcomes remain to be checked on the user cluster"
+  ]
+}

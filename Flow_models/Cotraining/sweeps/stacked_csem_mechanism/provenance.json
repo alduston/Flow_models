@@ -1,0 +1,12 @@
+{
+  "study": "Naive stacked CSEM mechanism study",
+  "source_files": {
+    "uploaded_cluster_bundle": "95b6105800a8e1bdda600f864b056c22507034e65f5b8c03f8f1d681f8df2628",
+    "uploaded_original_joint_trainer": "178d3cf3c1020723dd816404468ca5698873b31d0dc41c16e295aa1a4faeeed9"
+  },
+  "notes": [
+    "Two-block reference is the diagnostic-extended trainer delivered in this conversation.",
+    "Three-block VAE and locked dataset IO adapted from the supplied cluster bundle; all cascade score priors removed.",
+    "This archive contains code and analytic/software validation, not trained cluster results."
+  ]
+}
