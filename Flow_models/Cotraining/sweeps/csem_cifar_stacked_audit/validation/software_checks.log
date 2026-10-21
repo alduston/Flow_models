@@ -1,0 +1,132 @@
+Warning: torchmetrics not available, FID will be -1
+PASS: immutable CIFAR recipe; 24 cells; guarded trainer/evaluator; Slurm parser
+PASS: real posterior/decoder/DiT; r=0/1/4 gradient routing; decoupled zero defect; audit/witness raw exports; RNG
+PASS: real posterior/decoder/DiT; r=0/1/4 gradient routing; decoupled zero defect; audit/witness raw exports; RNG
+PASS: analytic correlated-Gaussian conditional-mean identity [0.09346233767013154, -0.7596286165590811, 0.2008430721632509, 0.6810789165244167] [0.1027267652698829, -0.7671398911324769, 0.1933317975898543, 0.67356764195102]
+--> Time schedule: log_t | representation gradients t<T_K=1.05 (32 nodes) | score/sampling horizon T=1.35 (32 nodes)
+--> Outer/representation time weighting: canonical
+--> Inner/score-head time weighting on t<=T: unweighted-eps
+--> Score gradient routing: blockwise/decoupled (outer gradient to VAE, independent inner gradient to score parameters)
+--> Score-weight grid: mean=5.94482, rms=6.06959, range=[3.21003, 10.6198], CV=0.2060, ESS/N=0.9593, 1/mean=0.168214
+--> B_tmin: weight=0.05 (matched CSEM), std threshold=0.007748256
+--> Canonical stability controls: vae_clip=1, score_clip=1, disc_clip=1, encoder_warmup=0 epochs, encoder_CSEM_grad_ramp=0 epochs, same_head_tracking=0 step(s)/1 batch(es), grad_diag_every=off, outer=canonical, inner=unweighted-eps, rep_csem_w=0.05, head_loss_w=1, head_lr=0.0001, split_routing=True
+--> Starting Dual Co-training...
+Ep 1:   0%|          | 0/2 [00:00<?, ?it/s]Ep 1: 100%|██████████| 2/2 [00:00<00:00, 13.37it/s]                                                   Ep 1 | LSI: 2.1484 | Rec: 1.1700 | KL(loss): 0.00233 | K_T: 0.00233 | mu_rms: 0.1877 | mu_rms_med: 0.1826 | post_var_mean: 1.04473 | post_var_med: 1.01322 | post_std_mean: 1.01776 | logvar_med: 0.0131 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.2s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.2024/2.1479 | head-metric MSE=0.0358 | w mean/rms/max=6.785/7.137/10.620 | grad VAE/score=2.26/2.26 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.00025/0.0001 | same-head updates=0
+Ep 2:   0%|          | 0/2 [00:00<?, ?it/s]Ep 2: 100%|██████████| 2/2 [00:00<00:00, 16.87it/s]                                                   Ep 2 | LSI: 0.2840 | Rec: 1.1447 | KL(loss): 0.00352 | K_T: 0.00352 | mu_rms: 0.2281 | mu_rms_med: 0.2204 | post_var_mean: 1.08483 | post_var_med: 1.03545 | post_std_mean: 1.03429 | logvar_med: 0.0348 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.1s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.0490/0.2839 | head-metric MSE=0.2022 | w mean/rms/max=5.680/5.682/5.901 | grad VAE/score=1.82/1.82 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.000125/5.05e-05 | same-head updates=0
+--> Saved loss history to /tmp/tmpbsqjpitt/full/dataframes/loss_history.csv
+--> Saved eval metrics to /tmp/tmpbsqjpitt/full/dataframes/eval_metrics.csv
+--> Full visualization suite disabled for mechanism run.
+--> Saved configuration to /tmp/tmpbsqjpitt/full/config.txt
+--> Zipped results to: /tmp/tmpbsqjpitt/full_20261022_011154.zip
+
+============================================================
+Training complete! All results saved to: /tmp/tmpbsqjpitt/full
+============================================================
+--> Time schedule: log_t | representation gradients t<T_K=1.05 (32 nodes) | score/sampling horizon T=1.35 (32 nodes)
+--> Outer/representation time weighting: canonical
+--> Inner/score-head time weighting on t<=T: unweighted-eps
+--> Score gradient routing: blockwise/decoupled (outer gradient to VAE, independent inner gradient to score parameters)
+--> Score-weight grid: mean=5.94482, rms=6.06959, range=[3.21003, 10.6198], CV=0.2060, ESS/N=0.9593, 1/mean=0.168214
+--> B_tmin: weight=0.05 (matched CSEM), std threshold=0.007748256
+--> Canonical stability controls: vae_clip=1, score_clip=1, disc_clip=1, encoder_warmup=0 epochs, encoder_CSEM_grad_ramp=0 epochs, same_head_tracking=0 step(s)/1 batch(es), grad_diag_every=off, outer=canonical, inner=unweighted-eps, rep_csem_w=0.05, head_loss_w=1, head_lr=0.0001, split_routing=True
+--> Starting Dual Co-training...
+Ep 1:   0%|          | 0/2 [00:00<?, ?it/s]Ep 1: 100%|██████████| 2/2 [00:00<00:00, 15.04it/s]                                                   Ep 1 | LSI: 2.1484 | Rec: 1.1700 | KL(loss): 0.00233 | K_T: 0.00233 | mu_rms: 0.1877 | mu_rms_med: 0.1826 | post_var_mean: 1.04473 | post_var_med: 1.01322 | post_std_mean: 1.01776 | logvar_med: 0.0131 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.1s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.2024/2.1479 | head-metric MSE=0.0358 | w mean/rms/max=6.785/7.137/10.620 | grad VAE/score=2.26/2.26 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.00025/0.0001 | same-head updates=0
+--> Time schedule: log_t | representation gradients t<T_K=1.05 (32 nodes) | score/sampling horizon T=1.35 (32 nodes)
+--> Outer/representation time weighting: canonical
+--> Inner/score-head time weighting on t<=T: unweighted-eps
+--> Score gradient routing: blockwise/decoupled (outer gradient to VAE, independent inner gradient to score parameters)
+--> Score-weight grid: mean=5.94482, rms=6.06959, range=[3.21003, 10.6198], CV=0.2060, ESS/N=0.9593, 1/mean=0.168214
+--> B_tmin: weight=0.05 (matched CSEM), std threshold=0.007748256
+--> Canonical stability controls: vae_clip=1, score_clip=1, disc_clip=1, encoder_warmup=0 epochs, encoder_CSEM_grad_ramp=0 epochs, same_head_tracking=0 step(s)/1 batch(es), grad_diag_every=off, outer=canonical, inner=unweighted-eps, rep_csem_w=0.05, head_loss_w=1, head_lr=0.0001, split_routing=True
+--> Starting Dual Co-training...
+Ep 2:   0%|          | 0/2 [00:00<?, ?it/s]Ep 2: 100%|██████████| 2/2 [00:00<00:00, 15.13it/s]                                                   Ep 2 | LSI: 0.2840 | Rec: 1.1447 | KL(loss): 0.00352 | K_T: 0.00352 | mu_rms: 0.2281 | mu_rms_med: 0.2204 | post_var_mean: 1.08483 | post_var_med: 1.03545 | post_std_mean: 1.03429 | logvar_med: 0.0348 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.1s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.0490/0.2839 | head-metric MSE=0.2022 | w mean/rms/max=5.680/5.682/5.901 | grad VAE/score=1.82/1.82 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.000125/5.05e-05 | same-head updates=0
+--> Saved loss history to /tmp/tmpbsqjpitt/partial/dataframes/loss_history.csv
+--> Saved eval metrics to /tmp/tmpbsqjpitt/partial/dataframes/eval_metrics.csv
+--> Full visualization suite disabled for mechanism run.
+--> Saved configuration to /tmp/tmpbsqjpitt/partial/config.txt
+--> Zipped results to: /tmp/tmpbsqjpitt/partial_20261022_011156.zip
+
+============================================================
+Training complete! All results saved to: /tmp/tmpbsqjpitt/partial
+============================================================
+--> Time schedule: log_t | representation gradients t<T_K=1.05 (32 nodes) | score/sampling horizon T=1.35 (32 nodes)
+--> Outer/representation time weighting: canonical
+--> Inner/score-head time weighting on t<=T: unweighted-eps
+--> Score gradient routing: blockwise/decoupled (outer gradient to VAE, independent inner gradient to score parameters)
+--> Score-weight grid: mean=5.94482, rms=6.06959, range=[3.21003, 10.6198], CV=0.2060, ESS/N=0.9593, 1/mean=0.168214
+--> B_tmin: weight=0.05 (matched CSEM), std threshold=0.007748256
+--> Canonical stability controls: vae_clip=1, score_clip=1, disc_clip=1, encoder_warmup=0 epochs, encoder_CSEM_grad_ramp=0 epochs, same_head_tracking=0 step(s)/1 batch(es), grad_diag_every=off, outer=canonical, inner=unweighted-eps, rep_csem_w=0.05, head_loss_w=1, head_lr=0.0001, split_routing=True
+--> Starting Dual Co-training...
+Ep 1:   0%|          | 0/2 [00:00<?, ?it/s]                                           Ep 1 | LSI: 2.1743 | Rec: 1.0961 | KL(loss): 0.00825 | K_T: 0.00825 | mu_rms: 0.3570 | mu_rms_med: 0.3523 | post_var_mean: 1.02672 | post_var_med: 0.96873 | post_std_mean: 0.99956 | logvar_med: -0.0321 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.1s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.2049/2.1738 | head-metric MSE=0.0374 | w mean/rms/max=6.785/7.137/10.620 | grad VAE/score=1.17/1.17 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.00025/0.0001 | same-head updates=0
+Ep 2:   0%|          | 0/2 [00:00<?, ?it/s]                                           Ep 2 | LSI: 0.2977 | Rec: 1.0865 | KL(loss): 0.00835 | K_T: 0.00835 | mu_rms: 0.3574 | mu_rms_med: 0.3444 | post_var_mean: 1.08266 | post_var_med: 1.01932 | post_std_mean: 1.02624 | logvar_med: 0.0191 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.1s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.0513/0.2975 | head-metric MSE=0.2026 | w mean/rms/max=5.680/5.682/5.901 | grad VAE/score=1.11/1.11 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.000125/5.05e-05 | same-head updates=0
+--> Saved loss history to /tmp/tmpbsqjpitt/oldflat/dataframes/loss_history.csv
+--> Saved eval metrics to /tmp/tmpbsqjpitt/oldflat/dataframes/eval_metrics.csv
+--> Full visualization suite disabled for mechanism run.
+--> Saved configuration to /tmp/tmpbsqjpitt/oldflat/config.txt
+--> Zipped results to: /tmp/tmpbsqjpitt/oldflat_20261022_011157.zip
+
+============================================================
+Training complete! All results saved to: /tmp/tmpbsqjpitt/oldflat
+============================================================
+--> Time schedule: log_t | representation gradients t<T_K=1.05 (32 nodes) | score/sampling horizon T=1.35 (32 nodes)
+--> Outer/representation time weighting: canonical
+--> Inner/score-head time weighting on t<=T: unweighted-eps
+--> Score gradient routing: blockwise/decoupled (outer gradient to VAE, independent inner gradient to score parameters)
+--> Score-weight grid: mean=5.94482, rms=6.06959, range=[3.21003, 10.6198], CV=0.2060, ESS/N=0.9593, 1/mean=0.168214
+--> B_tmin: weight=0.05 (matched CSEM), std threshold=0.007748256
+--> Canonical stability controls: vae_clip=1, score_clip=1, disc_clip=1, encoder_warmup=0 epochs, encoder_CSEM_grad_ramp=0 epochs, same_head_tracking=0 step(s)/1 batch(es), grad_diag_every=off, outer=canonical, inner=unweighted-eps, rep_csem_w=0.05, head_loss_w=1, head_lr=0.0001, split_routing=True
+--> Starting Dual Co-training...
+Ep 1:   0%|          | 0/2 [00:00<?, ?it/s]                                           Ep 1 | LSI: 2.1743 | Rec: 1.0961 | KL(loss): 0.00825 | K_T: 0.00825 | mu_rms: 0.3570 | mu_rms_med: 0.3523 | post_var_mean: 1.02672 | post_var_med: 0.96873 | post_std_mean: 0.99956 | logvar_med: -0.0321 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.1s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.2049/2.1738 | head-metric MSE=0.0374 | w mean/rms/max=6.785/7.137/10.620 | grad VAE/score=1.17/1.17 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.00025/0.0001 | same-head updates=0
+Ep 2:   0%|          | 0/2 [00:00<?, ?it/s]                                           Ep 2 | LSI: 0.2977 | Rec: 1.0865 | KL(loss): 0.00835 | K_T: 0.00835 | mu_rms: 0.3574 | mu_rms_med: 0.3444 | post_var_mean: 1.08266 | post_var_med: 1.01932 | post_std_mean: 1.02624 | logvar_med: 0.0191 | Perc: 0.0000 | GAN_d: 0.0000 | GAN_g: 0.0000 | 0.1s/ep | arm ETA~0.0m
+  Stability | raw/weighted score MSE=0.0513/0.2975 | head-metric MSE=0.2026 | w mean/rms/max=5.680/5.682/5.901 | grad VAE/score=1.11/1.11 | clip rate VAE/score=100.0%/100.0% | disc=0.0% | encoder CSEM grad=1.000 | encoder detached=False | LR VAE/score=0.000125/5.05e-05 | same-head updates=0
+--> Saved loss history to /tmp/tmpbsqjpitt/newflat/dataframes/loss_history.csv
+--> Saved eval metrics to /tmp/tmpbsqjpitt/newflat/dataframes/eval_metrics.csv
+--> Full visualization suite disabled for mechanism run.
+--> Saved configuration to /tmp/tmpbsqjpitt/newflat/config.txt
+--> Zipped results to: /tmp/tmpbsqjpitt/newflat_20261022_011158.zip
+
+============================================================
+Training complete! All results saved to: /tmp/tmpbsqjpitt/newflat
+============================================================
+PASS: actual routed trainer updates; exact uninterrupted/resume equality; exact flat+B baseline parity (reduced capacity synthetic RGB)
+PASS: naive/corrected/DSM frozen optimizer updates and exact frozen resume (reduced capacity synthetic RGB)
+
+--- Evaluation: Synthetic @ Ep 1 ---
+  Extracting features for FID...
+  Skipping invariant LSI-gap diagnostic for deployment grid.
+  Exact aggregate-score diagnostics disabled.
+
+  >>> Sweep Results [Synthetic] <<<
+  Config                                   | Desc                 | FID      | KID        | SW2        | Div      | LSI Gap    | MSE(eps)   | MSE(score)
+  ------------------------------------------------------------------------------------------------------------------------------------------------------
+  VAE_Rec_eps@0                            | Recon (posterior z)  | 3.10     | 0.0000     | 1.064441   | 0.0000   | 0.0000     | nan        | nan       
+  rk4_ode@2_randtok_cfg2.5_temp1_initgaussianTK1p05 | Gaussian initialization | 2.99     | 0.0000     | 1.336487   | 0.0000   | nan        | nan        | nan       
+  rk4_ode@2_randtok_cfg2.5_temp1_initgaussianT1p35 | Gaussian initialization | 3.09     | 0.0000     | 5.432330   | 0.0000   | nan        | nan        | nan       
+  heun_sde@20_randtok_cfg2.5_temp1_initgaussianT1p35 | Paper solver comparison | 2.94     | 0.0000     | 11.376366  | 0.0000   | nan        | nan        | nan       
+  rk4_ode@20_randtok_cfg2.5_temp1_initgaussianT1p35 | Paper solver comparison | 3.11     | 0.0000     | 5.237330   | 0.0000   | nan        | nan        | nan       
+  ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+--- Evaluation: Synthetic @ Ep 1 ---
+  Extracting features for FID...
+  Skipping invariant LSI-gap diagnostic for deployment grid.
+  Exact aggregate-score diagnostics disabled.
+
+  >>> Sweep Results [Synthetic] <<<
+  Config                                   | Desc                 | FID      | KID        | SW2        | Div      | LSI Gap    | MSE(eps)   | MSE(score)
+  ------------------------------------------------------------------------------------------------------------------------------------------------------
+  VAE_Rec_eps@0                            | Recon (posterior z)  | 0.42     | 0.0000     | 0.626500   | 0.0000   | 0.0000     | nan        | nan       
+  rk4_ode@2_randtok_cfg2.5_temp1_initgaussianTK1p05 | Gaussian initialization | 0.62     | 0.0000     | 2.299575   | 0.0000   | nan        | nan        | nan       
+  rk4_ode@2_randtok_cfg2.5_temp1_initgaussianT1p35 | Gaussian initialization | 0.68     | 0.0000     | 9.222413   | 0.0000   | nan        | nan        | nan       
+  heun_sde@20_randtok_cfg2.5_temp1_initgaussianT1p35 | Paper solver comparison | 0.62     | 0.0000     | 20.578505  | 0.0000   | nan        | nan        | nan       
+  rk4_ode@20_randtok_cfg2.5_temp1_initgaussianT1p35 | Paper solver comparison | 0.68     | 0.0000     | 8.902981   | 0.0000   | nan        | nan        | nan       
+  ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+PASS: coherent posterior A/B evaluation; joint RK4; inherited metric columns; invalid joint-Gaussian gap disabled (synthetic features only)

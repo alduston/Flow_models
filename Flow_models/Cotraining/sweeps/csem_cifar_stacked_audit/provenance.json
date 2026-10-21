@@ -1,0 +1,36 @@
+{
+  "date": "2026-10-21",
+  "purpose": "CIFAR transfer of focused FMNIST stacked mechanism comparisons",
+  "source_bundles": [
+    {
+      "name": "csem_cifar_direct_cascade_800.zip",
+      "library_file_id": "libfile_7fa3c7f3460881918286ef76ba958f6b",
+      "date": "2026-10-13",
+      "sha256": "ae6e6602519eaa7bb94f7b95d726728a4dee7851e7aa53848128b9ea66ec4524"
+    },
+    {
+      "name": "stacked_csem_mechanism.zip",
+      "library_file_id": "libfile_2421a6c522908191852c0e08cc5b8a39",
+      "date": "2026-10-17",
+      "sha256": "988b10e4b1f924ec60e8582b82dcb389fb530a3f9b94dc5edb09ab09e3497ad8"
+    }
+  ],
+  "interpretation_report": {
+    "name": "stacked_csem_report (3) (2).pdf",
+    "library_file_id": "libfile_5482a75b6b0c8191a68c50036456352e",
+    "date": "2026-10-21"
+  },
+  "design": {
+    "joint_cells": 12,
+    "frozen_cells": 12,
+    "seeds": [
+      42,
+      43
+    ],
+    "joint_epochs": 800,
+    "frozen_epochs": 50,
+    "primary_endpoint": "final full-T Gaussian, temperature 1, 10,000 test images, RK4-20, CFG 2.5"
+  },
+  "cluster_executed": false,
+  "local_checks": "validation/software_checks.log; validation/compiler_checks.log"
+}

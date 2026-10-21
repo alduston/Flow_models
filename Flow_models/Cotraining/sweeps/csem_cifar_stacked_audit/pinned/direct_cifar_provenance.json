@@ -1,0 +1,34 @@
+{
+  "bundle": "csem_cifar_direct_cascade_800",
+  "created_date": "2026-10-13",
+  "cells": 8,
+  "epochs": 800,
+  "source_sha256": {
+    "core.py": "295b44ce33f8e55cefce1bf0dcfb535bc4cea5e8cfa3b2f809d02e95982ce54e",
+    "suite.py": "c8b33af4177e914397b78ebd7d7dcd91d4c92db1249b9765270d11004d8b6e04",
+    "paper_io.py": "85fd5917d0d92ee1c22258c17b33b50ea009ec8c2c1e1791c7b5fe1c29731978",
+    "paper.py": "5804f94081c086df0ecb096f4e839e42536c0b6bfc8935d3aadc09b9aa8498fd",
+    "direct_models.py": "ad81492254ebdffb42075668f037fc75ce701f3b4c1864ca4364617da6489ad8",
+    "hier_models.py": "32a3ad9c2472be000dbe773667b403ec5804724eb2833ef3c7c863e55b4d8cfa",
+    "hier_engine.py": "9ad3d5aca1c052ef88dec43e640e223c6302436390dc1bd04832f949f98108c0",
+    "hier_eval.py": "5decb45dfbb967e81759559a75625076a6cfe23bb0e989f703c64dc5ba57066d",
+    "band_regularizer.py": "efa6833e7a20675ef8ff9c5bbe58efea71b4b495b6145d8c506bcbd031c3416c",
+    "compile_results.py": "43aa0db09acd101af71f92d69b310ecd375c7c478e9f481a344a34795627a806",
+    "tests.py": "752530a03b016f3e572d3284ecadc944e164e71aa39e92dc21a2647846a77217",
+    "job.slurm": "7ebbc54f6540a70cd112d34930fe77208b0044f262d36a8bca0f8267e0575334",
+    "manifest.csv": "7ae1473b35bcdf9c12493bd96e9fdd057c2c8c3f009034fd85ab30a99ed27455",
+    "requirements.txt": "9a7ae3a9b62639e436f9c5d997bbe36647114180d94907a82710027f62fb6680",
+    ".gitignore": "4e34b7865fe101b1ab725846854e2a6bdaebb8bb3dff16088d7d0d6426bfc73c"
+  },
+  "original_cifar_sha256": {
+    "core.py": "295b44ce33f8e55cefce1bf0dcfb535bc4cea5e8cfa3b2f809d02e95982ce54e",
+    "suite.py": "c8b33af4177e914397b78ebd7d7dcd91d4c92db1249b9765270d11004d8b6e04",
+    "paper_io.py": "f722565529679a2aa363402c3b7720d7c6275790af2020943338b32c52791f15"
+  },
+  "original_bundle_sha256": "e2ae7b23690a761ae9ff6eee964ace593224ba26fec1de6bc6ef507873c8298a",
+  "architecture_note_sha256": "bfb949acd73a19924f36bbb50deddbf7d6cda533c7f4ce4173f0f48492c383ea",
+  "direct_fmnist_trainer_sha256": "11db5d5ca81d9f51f5f361f86e029ecc7e2c83a2b41d424249b3076ee42c568f",
+  "scientific_change": "All cascades use direct Z2; noisy-root reconstruction and clean-ancestor conditional CSEM; CIFAR recipe preserved",
+  "validation_scope": "Offline CPU model/trainer/evaluator/compile checks; no real CIFAR training/FID results",
+  "validation_update": "Name missing runtime files explicitly; documentation/gitignore are optional and never block mathematical validation"
+}
