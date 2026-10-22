@@ -1,0 +1,12 @@
+{
+  "library_source_id": "libfile_2421a6c522908191852c0e08cc5b8a39",
+  "source_zip_sha256": "988b10e4b1f924ec60e8582b82dcb389fb530a3f9b94dc5edb09ab09e3497ad8",
+  "original_cell": 3,
+  "original_name": "b2_full_r0.5_s43",
+  "epoch": 500,
+  "fid_cfg3": 4.3040228295,
+  "fid_cfg1": 5.3848377148,
+  "fid_recon_approx": 2.738,
+  "other_seed42_fid_cfg3": 4.5634474009,
+  "provenance": "Delivered stacked CSEM consolidated experimental report, Table 4 and endpoint appendix; historical values, not fresh results."
+}

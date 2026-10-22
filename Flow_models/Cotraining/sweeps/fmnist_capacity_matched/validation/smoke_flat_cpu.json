@@ -1,0 +1,8 @@
+{
+  "arm": "flat",
+  "device": "cpu",
+  "epochs": 2,
+  "synthetic": true,
+  "sampling": "CFG1/3 generation and posterior recon",
+  "diagnostics": true
+}

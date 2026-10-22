@@ -1,0 +1,10 @@
+{
+  "python_syntax": true,
+  "bash_syntax": true,
+  "slurm_dry_run_jobs": 20,
+  "empty_live_report": true,
+  "full_training_performed": false,
+  "gpu_training_tested": false,
+  "four_cpu_smokes": true,
+  "bitwise_resume": true
+}

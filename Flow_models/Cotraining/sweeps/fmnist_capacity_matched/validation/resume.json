@@ -1,0 +1,5 @@
+{
+  "bitwise_resume": true,
+  "epochs": 2,
+  "optimizer_scheduler_rng": true
+}

@@ -1,0 +1,8 @@
+{
+  "arm": "flat_three_encoder",
+  "device": "cpu",
+  "epochs": 2,
+  "synthetic": true,
+  "sampling": "CFG1/3 generation and posterior recon",
+  "diagnostics": true
+}
