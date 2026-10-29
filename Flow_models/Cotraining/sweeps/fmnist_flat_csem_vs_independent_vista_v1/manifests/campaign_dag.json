@@ -1,0 +1,575 @@
+[
+  {
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_joint_s42",
+    "seed": 42,
+    "stage": "joint"
+  },
+  {
+    "beta0": 0.0,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.01,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.01_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.03,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.03_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.07,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.07_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.15,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.15_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.3,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.3_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "deps": [
+      "screen_joint_s42",
+      "screen_vae_b0_s42",
+      "screen_vae_b0.01_s42",
+      "screen_vae_b0.03_s42",
+      "screen_vae_b0.07_s42",
+      "screen_vae_b0.15_s42",
+      "screen_vae_b0.3_s42"
+    ],
+    "group": "screen",
+    "kind": "shortlist",
+    "name": "shortlist"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "name": "dev_vae_k0_s43",
+    "seed": 43,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k0_lr0_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k0_lr0_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k0_lr1_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k0_lr1_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k0_lr0_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k0_lr0_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k0_lr1_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k0_lr1_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "name": "dev_vae_k1_s43",
+    "seed": 43,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k1_lr0_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k1_lr0_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k1_lr1_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k1_lr1_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k1_lr0_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k1_lr0_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k1_lr1_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k1_lr1_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "deps": [
+      "dev_prior_dsm_k0_lr0_s42",
+      "dev_prior_csem_k0_lr0_s42",
+      "dev_prior_dsm_k0_lr1_s42",
+      "dev_prior_csem_k0_lr1_s42",
+      "dev_prior_dsm_k0_lr0_s43",
+      "dev_prior_csem_k0_lr0_s43",
+      "dev_prior_dsm_k0_lr1_s43",
+      "dev_prior_csem_k0_lr1_s43",
+      "dev_prior_dsm_k1_lr0_s42",
+      "dev_prior_csem_k1_lr0_s42",
+      "dev_prior_dsm_k1_lr1_s42",
+      "dev_prior_csem_k1_lr1_s42",
+      "dev_prior_dsm_k1_lr0_s43",
+      "dev_prior_csem_k1_lr0_s43",
+      "dev_prior_dsm_k1_lr1_s43",
+      "dev_prior_csem_k1_lr1_s43"
+    ],
+    "group": "development",
+    "kind": "freeze",
+    "name": "freeze"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_joint_s47",
+    "seed": 47,
+    "stage": "joint"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_vae_s47",
+    "seed": 47,
+    "selected": true,
+    "stage": "vae_pretrain"
+  },
+  {
+    "deps": [
+      "final_vae_s47",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_dsm_s47",
+    "seed": 47,
+    "selected": true,
+    "stage": "prior_dsm"
+  },
+  {
+    "deps": [
+      "final_vae_s47",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_csem_s47",
+    "seed": 47,
+    "selected": true,
+    "stage": "prior_csem"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_joint_s48",
+    "seed": 48,
+    "stage": "joint"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_vae_s48",
+    "seed": 48,
+    "selected": true,
+    "stage": "vae_pretrain"
+  },
+  {
+    "deps": [
+      "final_vae_s48",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_dsm_s48",
+    "seed": 48,
+    "selected": true,
+    "stage": "prior_dsm"
+  },
+  {
+    "deps": [
+      "final_vae_s48",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_csem_s48",
+    "seed": 48,
+    "selected": true,
+    "stage": "prior_csem"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_joint_s49",
+    "seed": 49,
+    "stage": "joint"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_vae_s49",
+    "seed": 49,
+    "selected": true,
+    "stage": "vae_pretrain"
+  },
+  {
+    "deps": [
+      "final_vae_s49",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_dsm_s49",
+    "seed": 49,
+    "selected": true,
+    "stage": "prior_dsm"
+  },
+  {
+    "deps": [
+      "final_vae_s49",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_csem_s49",
+    "seed": 49,
+    "selected": true,
+    "stage": "prior_csem"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_joint_s50",
+    "seed": 50,
+    "stage": "joint"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_vae_s50",
+    "seed": 50,
+    "selected": true,
+    "stage": "vae_pretrain"
+  },
+  {
+    "deps": [
+      "final_vae_s50",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_dsm_s50",
+    "seed": 50,
+    "selected": true,
+    "stage": "prior_dsm"
+  },
+  {
+    "deps": [
+      "final_vae_s50",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_csem_s50",
+    "seed": 50,
+    "selected": true,
+    "stage": "prior_csem"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_joint_s51",
+    "seed": 51,
+    "stage": "joint"
+  },
+  {
+    "deps": [
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_vae_s51",
+    "seed": 51,
+    "selected": true,
+    "stage": "vae_pretrain"
+  },
+  {
+    "deps": [
+      "final_vae_s51",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_dsm_s51",
+    "seed": 51,
+    "selected": true,
+    "stage": "prior_dsm"
+  },
+  {
+    "deps": [
+      "final_vae_s51",
+      "freeze"
+    ],
+    "group": "final",
+    "kind": "train",
+    "name": "final_prior_csem_s51",
+    "seed": 51,
+    "selected": true,
+    "stage": "prior_csem"
+  },
+  {
+    "deps": [
+      "final_joint_s47",
+      "final_vae_s47",
+      "final_prior_dsm_s47",
+      "final_prior_csem_s47",
+      "final_joint_s48",
+      "final_vae_s48",
+      "final_prior_dsm_s48",
+      "final_prior_csem_s48",
+      "final_joint_s49",
+      "final_vae_s49",
+      "final_prior_dsm_s49",
+      "final_prior_csem_s49",
+      "final_joint_s50",
+      "final_vae_s50",
+      "final_prior_dsm_s50",
+      "final_prior_csem_s50",
+      "final_joint_s51",
+      "final_vae_s51",
+      "final_prior_dsm_s51",
+      "final_prior_csem_s51"
+    ],
+    "group": "final",
+    "kind": "report",
+    "name": "report"
+  }
+]

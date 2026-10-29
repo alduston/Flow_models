@@ -1,0 +1,323 @@
+[
+  {
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_joint_s42",
+    "seed": 42,
+    "stage": "joint"
+  },
+  {
+    "beta0": 0.0,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.01,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.01_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.03,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.03_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.07,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.07_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.15,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.15_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta0": 0.3,
+    "deps": [],
+    "group": "screen",
+    "kind": "train",
+    "name": "screen_vae_b0.3_s42",
+    "seed": 42,
+    "stage": "vae_pretrain"
+  },
+  {
+    "deps": [
+      "screen_joint_s42",
+      "screen_vae_b0_s42",
+      "screen_vae_b0.01_s42",
+      "screen_vae_b0.03_s42",
+      "screen_vae_b0.07_s42",
+      "screen_vae_b0.15_s42",
+      "screen_vae_b0.3_s42"
+    ],
+    "group": "screen",
+    "kind": "shortlist",
+    "name": "shortlist"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "name": "dev_vae_k0_s43",
+    "seed": 43,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k0_lr0_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k0_lr0_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k0_lr1_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k0_lr1_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k0_lr0_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k0_lr0_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k0_lr1_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 0,
+    "deps": [
+      "shortlist",
+      "dev_vae_k0_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k0_lr1_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "name": "dev_vae_k1_s43",
+    "seed": 43,
+    "stage": "vae_pretrain"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k1_lr0_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k1_lr0_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k1_lr1_s42",
+    "seed": 42,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k1_lr1_s42",
+    "seed": 42,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_dsm_k1_lr0_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0003333333333333334,
+    "name": "dev_prior_csem_k1_lr0_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_dsm_k1_lr1_s43",
+    "seed": 43,
+    "stage": "prior_dsm"
+  },
+  {
+    "beta_slot": 1,
+    "deps": [
+      "shortlist",
+      "dev_vae_k1_s43"
+    ],
+    "group": "development",
+    "kind": "train",
+    "lr_prior": 0.0008,
+    "name": "dev_prior_csem_k1_lr1_s43",
+    "seed": 43,
+    "stage": "prior_csem"
+  },
+  {
+    "deps": [
+      "dev_prior_dsm_k0_lr0_s42",
+      "dev_prior_csem_k0_lr0_s42",
+      "dev_prior_dsm_k0_lr1_s42",
+      "dev_prior_csem_k0_lr1_s42",
+      "dev_prior_dsm_k0_lr0_s43",
+      "dev_prior_csem_k0_lr0_s43",
+      "dev_prior_dsm_k0_lr1_s43",
+      "dev_prior_csem_k0_lr1_s43",
+      "dev_prior_dsm_k1_lr0_s42",
+      "dev_prior_csem_k1_lr0_s42",
+      "dev_prior_dsm_k1_lr1_s42",
+      "dev_prior_csem_k1_lr1_s42",
+      "dev_prior_dsm_k1_lr0_s43",
+      "dev_prior_csem_k1_lr0_s43",
+      "dev_prior_dsm_k1_lr1_s43",
+      "dev_prior_csem_k1_lr1_s43"
+    ],
+    "group": "development",
+    "kind": "freeze",
+    "name": "freeze"
+  }
+]

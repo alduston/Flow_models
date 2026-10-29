@@ -1,0 +1,87 @@
+{
+  "protocol": {
+    "jobs": 20,
+    "seeds": [
+      42,
+      43,
+      44,
+      45,
+      46
+    ],
+    "two_block_reference_config": "exact match",
+    "packing": "exact permutation"
+  },
+  "compiler": "live CSVs, matched epochs, delta sign, endpoint cohorts and strict completion",
+  "models": {
+    "counts": {
+      "flat": {
+        "bottom_up_encoder": 2358664,
+        "conditional_posteriors": 779142,
+        "shared_root_features": 1105664,
+        "decoder": 2125377,
+        "vae": 6368847,
+        "score_head": 12159556,
+        "total_vae_plus_score": 18528403,
+        "stochastic_blocks": 1,
+        "storage_factors": 2,
+        "latent_coordinates": 256
+      },
+      "stack2": {
+        "bottom_up_encoder": 2358664,
+        "conditional_posteriors": 779142,
+        "shared_root_features": 1105664,
+        "decoder": 2125377,
+        "vae": 6368847,
+        "score_head": 12159556,
+        "total_vae_plus_score": 18528403,
+        "stochastic_blocks": 2,
+        "storage_factors": 2,
+        "latent_coordinates": 256
+      },
+      "flat_three_encoder": {
+        "bottom_up_encoder": 2358664,
+        "conditional_posteriors": 779112,
+        "shared_root_features": 1105664,
+        "decoder": 2125377,
+        "vae": 6368817,
+        "score_head": 12159556,
+        "total_vae_plus_score": 18528373,
+        "stochastic_blocks": 1,
+        "storage_factors": 3,
+        "latent_coordinates": 256
+      },
+      "stack3": {
+        "bottom_up_encoder": 2358664,
+        "conditional_posteriors": 779112,
+        "shared_root_features": 1105664,
+        "decoder": 2125377,
+        "vae": 6368817,
+        "score_head": 12159556,
+        "total_vae_plus_score": 18528373,
+        "stochastic_blocks": 3,
+        "storage_factors": 3,
+        "latent_coordinates": 256
+      }
+    },
+    "routes": {
+      "flat": {
+        "no_unused_vae_parameters": true,
+        "posterior_parent_routes": "absent"
+      },
+      "stack2": {
+        "no_unused_vae_parameters": true,
+        "posterior_parent_routes": "present"
+      },
+      "flat_three_encoder": {
+        "no_unused_vae_parameters": true,
+        "posterior_parent_routes": "absent"
+      },
+      "stack3": {
+        "no_unused_vae_parameters": true,
+        "posterior_parent_routes": "present"
+      }
+    },
+    "shared_head_decoder_encoder": "tensor-identical at seed42"
+  },
+  "reference_equivalence": "bitwise identical production initialization, sampled losses/reconstruction, clipped gradients, and AdamW update (MSE+score+KL+band; LPIPS/GAN disabled for this local check)"
+}

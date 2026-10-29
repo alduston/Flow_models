@@ -1,0 +1,68 @@
+{
+  "selected_manifest_cell": 2,
+  "model": "flat_three_encoder",
+  "unchanged_files": [
+    "models.py",
+    "original_models.py",
+    "vae_three.py",
+    "fmnist_reference.py",
+    "original_experiments.py",
+    "paper_io.py",
+    "prepare_cache.py",
+    "pinned/__init__.py",
+    "pinned/stacked_original.py",
+    "pinned/cascade_three_block.py",
+    "pinned/stacked_two_block.py"
+  ],
+  "changed_existing_config_fields": {
+    "checkpoint_every": {
+      "old": 5,
+      "new": 1
+    },
+    "archive_epochs": {
+      "old": [
+        100,
+        200,
+        300,
+        400,
+        500
+      ],
+      "new": [
+        50,
+        100,
+        150,
+        200,
+        250,
+        300,
+        350,
+        400,
+        450,
+        500
+      ]
+    },
+    "diagnostic_every": {
+      "old": 25,
+      "new": 0
+    },
+    "witness_every": {
+      "old": 100,
+      "new": 0
+    },
+    "sampling_check_every": {
+      "old": 100,
+      "new": 0
+    },
+    "diagnostic_at_start": {
+      "old": true,
+      "new": false
+    },
+    "save_array_samples": {
+      "old": 256,
+      "new": 100
+    }
+  },
+  "original_joint_loss_and_optimizer_fields": "all unchanged",
+  "training_split_change": "new comparison trains on fixed50k, validation10k per supplied plan",
+  "historical_reported_endpoint": 4.322968535,
+  "historical_reported_mean": 4.5597724371
+}

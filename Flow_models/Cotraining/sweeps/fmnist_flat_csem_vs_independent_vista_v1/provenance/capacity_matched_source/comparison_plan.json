@@ -1,0 +1,45 @@
+{
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "confirmation_seeds": [
+    44,
+    45,
+    46
+  ],
+  "rep_multiplier": 0.5,
+  "primary_endpoint": {
+    "epoch": 500,
+    "cfg": 3,
+    "steps": 20,
+    "init": "gaussian",
+    "num_eval": 10000,
+    "backend": "inception-legacy"
+  },
+  "primary_pairs": [
+    [
+      "stack2",
+      "flat"
+    ],
+    [
+      "stack3",
+      "flat_three_encoder"
+    ]
+  ],
+  "secondary_pairs": [
+    [
+      "stack3",
+      "flat"
+    ],
+    [
+      "stack3",
+      "stack2"
+    ]
+  ],
+  "uncertainty": "Descriptive pointwise Student-t intervals over paired training seeds; no automatic superiority declaration.",
+  "scope": "Stochastic posterior hierarchy at a common recipe, score/decoder architecture and parameter budget; not universal best-flat-vs-best-stack ranking."
+}

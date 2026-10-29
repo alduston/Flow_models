@@ -1,0 +1,28 @@
+{
+  "compiler": {
+    "duplicate_rejection": true,
+    "known_paired_difference": -1.0,
+    "missing_seed_rejection": true,
+    "plots": "PDF/SVG/PNG generated from isolated fixtures",
+    "strict_seed_count": 5
+  },
+  "fixture_metrics": "temporary only, never production",
+  "scheduler": {
+    "dependencies": "all exact afterok parent IDs",
+    "repeat_submission": "no duplicates",
+    "slurm_jobs": 48,
+    "training_tasks": 45
+  },
+  "selection": {
+    "common_recipe_selection": "both objectives and both development seeds",
+    "immutability": true,
+    "shortlist": "reconstruction match and frontier"
+  },
+  "statistics": {
+    "ci95_high": 4.963243161477557,
+    "ci95_low": 1.0367568385224428,
+    "mean": 3.0,
+    "n": 5,
+    "sd": 1.5811388300841898
+  }
+}

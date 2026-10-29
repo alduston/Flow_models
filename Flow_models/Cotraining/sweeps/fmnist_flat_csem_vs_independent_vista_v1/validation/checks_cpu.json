@@ -1,0 +1,28 @@
+{
+  "device": "cpu",
+  "model_checks": {
+    "analytic_teacher": "exact flat Gaussian",
+    "encoder_routing": "VAE score gradients exactly half; head gradients identical",
+    "frozen_vae": "all tensors and gradients verified",
+    "parameters": {
+      "bottom_up_encoder": 2358664,
+      "conditional_posteriors": 779112,
+      "decoder": 2125377,
+      "latent_coordinates": 256,
+      "score_head": 12159556,
+      "shared_root_features": 1105664,
+      "stochastic_blocks": 1,
+      "storage_factors": 3,
+      "total_vae_plus_score": 18528373,
+      "vae": 6368817
+    },
+    "posterior_ancestry": "sample independent"
+  },
+  "production_gpu_training_performed": false,
+  "resume_checks": {
+    "joint": "uninterrupted and resumed model/optimizer/EMA/RNG tensors identical; reloaded inference verified",
+    "prior_csem": "uninterrupted and resumed model/optimizer/EMA/RNG tensors identical; reloaded inference verified",
+    "prior_dsm": "uninterrupted and resumed model/optimizer/EMA/RNG tensors identical; reloaded inference verified",
+    "vae_pretrain": "uninterrupted and resumed model/optimizer/EMA/RNG tensors identical; reloaded inference verified"
+  }
+}
